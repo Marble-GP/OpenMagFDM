@@ -1,8 +1,8 @@
 The MIT License (MIT)
 
-# OpenMagFDM
-- MagFieldSolver:A Finite Divison Method (FDM) solver of magnetic field, defined by a PNG image and a YAML configuration file.  
-- MagFieldSolver WebUI: A web application for visualizing FDM results.  
+OpenMagFDM
+    MagFieldSolver:A Finite Divison Method (FDM) solver of magnetic field, defined by a PNG image and a YAML configuration file.  
+    MagFieldSolver WebUI: A web application for visualizing FDM results.  
 
 Copyright © 2025 S.WATANABE
 
