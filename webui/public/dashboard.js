@@ -14,8 +14,23 @@ let cachedData = {
     az: {},
     mu: {},
     forces: {},
-    stressVectors: {}
+    stressVectors: {},
+    energyDensity: {}
 };
+
+// ===== ユーティリティ関数 =====
+/**
+ * 2D配列を上下反転（解析座標系 y-up → 画像座標系 y-down に変換）
+ * @param {Array<Array<number>>} data - 2D配列
+ * @returns {Array<Array<number>>} - 反転された2D配列
+ */
+function flipVertical(data) {
+    if (!data || !Array.isArray(data) || data.length === 0) {
+        return data;
+    }
+    // 配列を複製して反転（元のデータを変更しない）
+    return data.slice().reverse();
+}
 
 // プロット定義
 const plotDefinitions = {
@@ -24,6 +39,7 @@ const plotDefinitions = {
     b_magnitude: { name: '|B|分布', icon: '🧲', render: renderBMagnitude },
     h_magnitude: { name: '|H|分布', icon: '⚡', render: renderHMagnitude },
     mu_distribution: { name: '透磁率分布', icon: '🎨', render: renderMuDistribution },
+    energy_density: { name: 'エネルギー密度分布', icon: '⚡', render: renderEnergyDensity },
     az_boundary: { name: 'Az+境界', icon: '📐', render: renderAzBoundary },
     material_image: { name: '材質画像', icon: '🖼️', render: renderMaterialImage },
     step_input_image: { name: 'ステップ入力画像', icon: '🎞️', render: renderStepInputImage },
@@ -599,10 +615,23 @@ async function loadStepData(step) {
             const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(currentResultPath)}&file=Mu/step_${String(step).padStart(4, '0')}.csv`);
             const muData = await muResponse.json();
 
+            // エネルギー密度も読み込み（存在しない場合は無視）
+            let energyData = { success: false, data: null };
+            try {
+                const energyResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(currentResultPath)}&file=EnergyDensity/step_${String(step).padStart(4, '0')}.csv`);
+                energyData = await energyResponse.json();
+            } catch (e) {
+                console.log(`Energy density data not available for step ${step}`);
+            }
+
             if (azData.success && muData.success) {
-                cachedData.az[cacheKey] = azData.data;
-                cachedData.mu[cacheKey] = muData.data;
-                console.log(`Step ${step} data loaded: Az size ${azData.data.length}x${azData.data[0]?.length}`);
+                // 解析座標系（y-up）から画像座標系（y-down）に変換するため上下反転
+                cachedData.az[cacheKey] = flipVertical(azData.data);
+                cachedData.mu[cacheKey] = flipVertical(muData.data);
+                if (energyData.success) {
+                    cachedData.energyDensity[cacheKey] = flipVertical(energyData.data);
+                }
+                console.log(`Step ${step} data loaded and flipped: Az size ${azData.data.length}x${azData.data[0]?.length}`);
             } else {
                 console.error(`Failed to load step ${step}: Az success=${azData.success}, Mu success=${muData.success}`);
             }
@@ -613,7 +642,8 @@ async function loadStepData(step) {
 
     return {
         az: cachedData.az[cacheKey],
-        mu: cachedData.mu[cacheKey]
+        mu: cachedData.mu[cacheKey],
+        energyDensity: cachedData.energyDensity[cacheKey]
     };
 }
 
@@ -1124,6 +1154,35 @@ async function renderMuDistribution(container, step) {
         width: size.width,
         height: size.height,
         margin: { l: 35, r: 10, t: 10, b: 35 },
+        dragmode: false
+    }, { responsive: true, displayModeBar: false });
+}
+
+// エネルギー密度分布
+async function renderEnergyDensity(container, step) {
+    const data = await loadStepData(step);
+    if (!data.energyDensity) {
+        container.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;">エネルギー密度データがありません</div>';
+        return;
+    }
+
+    container.innerHTML = '';
+    const size = getContainerSize(container);
+
+    await Plotly.newPlot(container, [{
+        z: data.energyDensity,
+        type: 'heatmap',
+        colorscale: 'Hot',
+        colorbar: {
+            title: 'J/m³'
+        }
+    }], {
+        width: size.width,
+        height: size.height,
+        margin: { l: 35, r: 60, t: 10, b: 35 },
+        // title: `エネルギー密度分布 (Step ${step})`,
+        xaxis: { title: 'X [pixel]' },
+        yaxis: { title: 'Y [pixel]' },
         dragmode: false
     }, { responsive: true, displayModeBar: false });
 }
