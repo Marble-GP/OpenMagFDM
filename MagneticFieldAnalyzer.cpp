@@ -31,6 +31,9 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
     transient_matrix_nnz = 0;
     boundary_cache_valid = false;
     use_iterative_solver = false;
+
+    // Initialize magnetic field step tracking
+    current_field_step = -1;  // Not calculated yet
 }
 
 void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
@@ -104,9 +107,22 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         r_end = config["polar_domain"]["r_end"].as<double>(1.0);
         r_orientation = config["polar_domain"]["r_orientation"].as<std::string>("horizontal");
 
-        // Parse theta_range (supports tinyexpr formula like "2*pi" or "pi/2")
+        // Parse theta_range (supports tinyexpr formula like "2*pi" or "pi/2", or numeric values)
         if (config["polar_domain"]["theta_range"]) {
-            std::string theta_str = config["polar_domain"]["theta_range"].as<std::string>("2*pi");
+            std::string theta_str;
+            try {
+                // Try to read as string first (for formulas like "2*pi/12")
+                theta_str = config["polar_domain"]["theta_range"].as<std::string>();
+            } catch (...) {
+                // If that fails, try to read as double and convert to string
+                try {
+                    double val = config["polar_domain"]["theta_range"].as<double>();
+                    theta_str = std::to_string(val);
+                } catch (...) {
+                    std::cerr << "Warning: Failed to read theta_range, using default 2*pi" << std::endl;
+                    theta_str = "2*pi";
+                }
+            }
             te_parser parser;
             theta_range = parser.evaluate(theta_str);
             if (std::isnan(theta_range)) {
@@ -819,26 +835,130 @@ void MagneticFieldAnalyzer::calculateMagneticField() {
     std::cout << "Magnetic field calculated" << std::endl;
 }
 
+// ===== Helper methods for periodic boundary-aware filtering =====
+
+/**
+ * @brief Apply Laplacian filter with periodic boundary conditions
+ * @param src Source image
+ * @param dst Destination image (CV_16S)
+ * @param ksize Kernel size (default: 3)
+ */
+void MagneticFieldAnalyzer::applyLaplacianWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int ksize) {
+    // Check which boundaries are periodic
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
+    if (!x_periodic && !y_periodic) {
+        // No periodic boundaries - use standard Laplacian
+        cv::Laplacian(src, dst, CV_16S, ksize);
+        return;
+    }
+
+    // Expand image with appropriate boundary conditions
+    int border = ksize / 2;
+    cv::Mat expanded;
+
+    if (x_periodic && y_periodic) {
+        // Both periodic - use BORDER_WRAP
+        cv::copyMakeBorder(src, expanded, border, border, border, border, cv::BORDER_WRAP);
+    } else if (x_periodic && !y_periodic) {
+        // X periodic, Y replicate - do in two steps
+        cv::Mat temp;
+        cv::copyMakeBorder(src, temp, 0, 0, border, border, cv::BORDER_WRAP);
+        cv::copyMakeBorder(temp, expanded, border, border, 0, 0, cv::BORDER_REPLICATE);
+    } else if (!x_periodic && y_periodic) {
+        // X replicate, Y periodic - do in two steps
+        cv::Mat temp;
+        cv::copyMakeBorder(src, temp, border, border, 0, 0, cv::BORDER_WRAP);
+        cv::copyMakeBorder(temp, expanded, 0, 0, border, border, cv::BORDER_REPLICATE);
+    }
+
+    // Apply Laplacian on expanded image
+    cv::Mat expanded_result;
+    cv::Laplacian(expanded, expanded_result, CV_16S, ksize);
+
+    // Extract the center region (original size)
+    cv::Rect roi(border, border, src.cols, src.rows);
+    dst = expanded_result(roi).clone();
+}
+
+/**
+ * @brief Apply Sobel filter with periodic boundary conditions
+ * @param src Source image
+ * @param dst Destination image (CV_64F)
+ * @param dx Derivative order in x
+ * @param dy Derivative order in y
+ * @param ksize Kernel size (default: 3)
+ */
+void MagneticFieldAnalyzer::applySobelWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int dx, int dy, int ksize) {
+    // Check which boundaries are periodic
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
+    if (!x_periodic && !y_periodic) {
+        // No periodic boundaries - use standard Sobel
+        cv::Sobel(src, dst, CV_64F, dx, dy, ksize);
+        return;
+    }
+
+    // Expand image with appropriate boundary conditions
+    int border = ksize / 2;
+    cv::Mat expanded;
+
+    if (x_periodic && y_periodic) {
+        // Both periodic - use BORDER_WRAP
+        cv::copyMakeBorder(src, expanded, border, border, border, border, cv::BORDER_WRAP);
+    } else if (x_periodic && !y_periodic) {
+        // X periodic, Y replicate - do in two steps
+        cv::Mat temp;
+        cv::copyMakeBorder(src, temp, 0, 0, border, border, cv::BORDER_WRAP);
+        cv::copyMakeBorder(temp, expanded, border, border, 0, 0, cv::BORDER_REPLICATE);
+    } else if (!x_periodic && y_periodic) {
+        // X replicate, Y periodic - do in two steps
+        cv::Mat temp;
+        cv::copyMakeBorder(src, temp, border, border, 0, 0, cv::BORDER_WRAP);
+        cv::copyMakeBorder(temp, expanded, 0, 0, border, border, cv::BORDER_REPLICATE);
+    }
+
+    // Apply Sobel on expanded image
+    cv::Mat expanded_result;
+    cv::Sobel(expanded, expanded_result, CV_64F, dx, dy, ksize);
+
+    // Extract the center region (original size)
+    cv::Rect roi(border, border, src.cols, src.rows);
+    dst = expanded_result(roi).clone();
+}
+
 cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
     // Laplacian kernel size = 3, so influence range is ±1 pixel (use ±2 for safety)
     const int KERNEL_MARGIN = 2;
 
+    // Check which boundaries are periodic
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
     // Check if we can use incremental update (transient analysis with sliding)
-    bool use_incremental = boundary_cache_valid && transient_config.enabled && transient_config.enable_sliding;
+    // Disable incremental update if periodic BC is active (filter results are position-dependent)
+    bool use_incremental = boundary_cache_valid && transient_config.enabled && transient_config.enable_sliding
+                          && !x_periodic && !y_periodic;
 
     cv::Mat boundaries;
 
     if (!use_incremental) {
-        // Full boundary detection (first time or cache invalid)
-        std::cout << "Boundaries: Full detection (Laplacian filter)" << std::endl;
+        // Full boundary detection (first time, cache invalid, or periodic BC active)
+        if (x_periodic || y_periodic) {
+            std::cout << "Boundaries: Full detection (periodic BC requires full recomputation)" << std::endl;
+        } else {
+            std::cout << "Boundaries: Full detection (Laplacian filter)" << std::endl;
+        }
 
         // Convert material map to grayscale for boundary detection
         cv::Mat gray;
         cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
 
-        // Apply Laplacian filter for edge detection
+        // Apply Laplacian filter for edge detection (with periodic BC if applicable)
         cv::Mat laplacian_s16;
-        cv::Laplacian(gray, laplacian_s16, CV_16S, 3);
+        applyLaplacianWithPeriodicBC(gray, laplacian_s16, 3);
 
         // Convert to absolute value
         cv::Mat laplacian_abs;
@@ -893,7 +1013,9 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
                 cv::Mat gray_roi = gray(roi);
                 cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
 
-                cv::Laplacian(gray_roi, laplacian_s16, CV_16S, 3);
+                // Note: ROI processing doesn't fully respect periodic BC at ROI boundaries
+                // For full accuracy, consider recomputing the entire image
+                applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
                 cv::convertScaleAbs(laplacian_s16, laplacian_abs);
                 cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
 
@@ -934,7 +1056,8 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
                 cv::Mat gray_roi = gray(roi);
                 cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
 
-                cv::Laplacian(gray_roi, laplacian_s16, CV_16S, 3);
+                // Note: ROI processing doesn't fully respect periodic BC at ROI boundaries
+                applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
                 cv::convertScaleAbs(laplacian_s16, laplacian_abs);
                 cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
 
@@ -968,18 +1091,19 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
 }
 
 
-void MagneticFieldAnalyzer::calculateMaxwellStress() {
+void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     std::cout << "\n=== Calculating Maxwell Stress (polar-aware, Sobel normals) ===" << std::endl;
 
-    // --- ensure magnetic fields exist (in analysis orientation) ---
-    if (coordinate_system == "polar") {
-        if (Br.size() == 0 || Btheta.size() == 0) {
+    // --- Calculate magnetic field if not already done for this step ---
+    if (current_field_step != step || Bx.size() == 0 || By.size() == 0) {
+        if (coordinate_system == "polar") {
             calculateMagneticFieldPolar();
-        }
-    } else {
-        if (Bx.size() == 0 || By.size() == 0) {
+        } else {
             calculateMagneticField();
         }
+        current_field_step = step;  // Mark field as calculated for this step
+    } else {
+        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
     }
 
     // --- get boundaries (image coords y-down) but DO NOT modify class image ---
@@ -1041,9 +1165,10 @@ void MagneticFieldAnalyzer::calculateMaxwellStress() {
         // cv::flip(mat_mask_flipped, mat_mask_flipped, 0);
 
         // compute Sobel on flipped mat_mask (we want gradients consistent with analysis indices)
+        // Use periodic BC-aware Sobel for accurate normal vectors at boundaries
         cv::Mat gx, gy;
-        cv::Sobel(mat_mask_flipped, gx, CV_64F, 1, 0, 3);
-        cv::Sobel(mat_mask_flipped, gy, CV_64F, 0, 1, 3);
+        applySobelWithPeriodicBC(mat_mask_flipped, gx, 1, 0, 3);
+        applySobelWithPeriodicBC(mat_mask_flipped, gy, 0, 1, 3);
 
         ForceResult result;
         result.material_name = name;
@@ -1057,14 +1182,22 @@ void MagneticFieldAnalyzer::calculateMaxwellStress() {
 
         int rows = mat_mask_flipped.rows;
         int cols = mat_mask_flipped.cols;
-        int dbg_cnt = 0;
 
         // First pass: calculate stress at boundary pixels and store in map
         std::map<std::pair<int,int>, BoundaryStressPoint> stress_map;
 
-        // iterate over interior pixels in analysis coords (y up)
-        for (int j = 1; j < rows - 1; ++j) {
-            for (int i = 1; i < cols - 1; ++i) {
+        // Determine loop range based on periodic boundary conditions
+        // For periodic BC, include image boundaries; otherwise skip them
+        bool x_periodic_loop = (bc_left.type == "periodic" && bc_right.type == "periodic");
+        bool y_periodic_loop = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+        int j_start = y_periodic_loop ? 0 : 1;
+        int j_end = y_periodic_loop ? rows : (rows - 1);
+        int i_start = x_periodic_loop ? 0 : 1;
+        int i_end = x_periodic_loop ? cols : (cols - 1);
+
+        // iterate over pixels in analysis coords (y up)
+        for (int j = j_start; j < j_end; ++j) {
+            for (int i = i_start; i < i_end; ++i) {
                 // must be material pixel (mat_mask_flipped) and a boundary pixel (boundaries_flipped)
                 if (mat_mask_flipped.at<uchar>(j, i) == 0) continue;
 
@@ -1086,11 +1219,33 @@ void MagneticFieldAnalyzer::calculateMaxwellStress() {
                 // fallback: 8-neighbor search to find adjacent background pixel
                 if (n_norm < EPS_NORMAL) {
                     bool found = false;
+                    // Check which boundaries are periodic
+                    bool x_periodic_fallback = (bc_left.type == "periodic" && bc_right.type == "periodic");
+                    bool y_periodic_fallback = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
                     const int offsets[8][2] = { {1,0},{1,1},{0,1},{-1,1},{-1,0},{-1,-1},{0,-1},{1,-1} };
                     for (int k=0;k<8 && !found;++k) {
                         int ii = i + offsets[k][0];
                         int jj = j + offsets[k][1];
-                        if (ii < 0 || ii >= cols || jj < 0 || jj >= rows) continue;
+
+                        // Apply periodic wrapping or skip if out of bounds
+                        bool valid = true;
+                        if (ii < 0 || ii >= cols) {
+                            if (x_periodic_fallback) {
+                                ii = (ii + cols) % cols;
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        if (jj < 0 || jj >= rows) {
+                            if (y_periodic_fallback) {
+                                jj = (jj + rows) % rows;
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        if (!valid) continue;
+
                         if (mat_mask_flipped.at<uchar>(jj, ii) == 0) {
                             n_img_x = static_cast<double>(offsets[k][0]);
                             n_img_y = static_cast<double>(offsets[k][1]);
@@ -1235,8 +1390,19 @@ void MagneticFieldAnalyzer::calculateMaxwellStress() {
                 double bx_out = 0.0, by_out = 0.0;
                 if (coordinate_system == "cartesian") {
                     // Bx/By are Eigen matrices with rows/cols corresponding to analysis indexing
-                    int bi = std::clamp(i_out, 0, static_cast<int>(Bx.cols()) - 1);
-                    int bj = std::clamp(j_out, 0, static_cast<int>(Bx.rows()) - 1);
+                    // Use periodic wrapping or clamping based on boundary conditions
+                    int bi = i_out;
+                    int bj = j_out;
+                    if (x_periodic) {
+                        bi = (bi + static_cast<int>(Bx.cols())) % static_cast<int>(Bx.cols());
+                    } else {
+                        bi = std::clamp(bi, 0, static_cast<int>(Bx.cols()) - 1);
+                    }
+                    if (y_periodic) {
+                        bj = (bj + static_cast<int>(Bx.rows())) % static_cast<int>(Bx.rows());
+                    } else {
+                        bj = std::clamp(bj, 0, static_cast<int>(Bx.rows()) - 1);
+                    }
                     bx_out = Bx(bj, bi);
                     by_out = By(bj, bi);
                 } else {
@@ -1336,18 +1502,6 @@ void MagneticFieldAnalyzer::calculateMaxwellStress() {
                 stress_point.B_magnitude = std::sqrt(bx_out * bx_out + by_out * by_out);
                 stress_point.material = name;
                 stress_map[std::make_pair(i, j)] = stress_point;
-
-                if (dbg_cnt < 12) {
-                    // For debug output, compute br_local and btheta_local for both coordinate systems
-                    double br_local_dbg = bx_out * std::cos(theta) + by_out * std::sin(theta);
-                    double btheta_local_dbg = -bx_out * std::sin(theta) + by_out * std::cos(theta);
-
-                    std::cout << "[DBG_FORCE] pix=("<<i<<","<<j<<") out=("<<i_out<<","<<j_out<<") "
-                              << "n_img=("<<n_img_x<<","<<n_img_y<<") n_phys=("<<n_phys_x<<","<<n_phys_y<<") "
-                              << "B_out=("<<bx_out<<","<<by_out<<") br_bt=("<<br_local_dbg<<","<<btheta_local_dbg<<") "
-                              << "fx="<<fx<<" fy="<<fy<<" ds="<<ds<<" dT_origin="<<(x_phys*dFy - y_phys*dFx) << std::endl;
-                    dbg_cnt++;
-                }
             }
         }
 
@@ -1483,6 +1637,89 @@ void MagneticFieldAnalyzer::calculateMaxwellStress() {
     std::cout << "\nMaxwell stress (polar-aware, Sobel normals) calculation complete!" << std::endl;
 }
 
+double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
+    std::cout << "\n=== Calculating Total Magnetic Energy ===" << std::endl;
+
+    // --- Calculate magnetic field if not already done for this step ---
+    if (current_field_step != step || Bx.size() == 0 || By.size() == 0) {
+        if (coordinate_system == "polar") {
+            calculateMagneticFieldPolar();
+        } else {
+            calculateMagneticField();
+        }
+        current_field_step = step;  // Mark field as calculated for this step
+    } else {
+        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
+    }
+
+    // Check mu_map
+    if (mu_map.size() == 0) {
+        std::cerr << "[ERROR] mu_map is not initialized" << std::endl;
+        return 0.0;
+    }
+
+    double total_energy = 0.0;
+
+    if (coordinate_system == "cartesian") {
+        // Cartesian coordinates: use Eigen array operations for efficiency
+        int rows = Bx.rows();
+        int cols = Bx.cols();
+
+        // Verify dimensions match
+        if (mu_map.rows() != rows || mu_map.cols() != cols) {
+            std::cerr << "[ERROR] Dimension mismatch: Bx(" << rows << "x" << cols
+                      << ") vs mu_map(" << mu_map.rows() << "x" << mu_map.cols() << ")" << std::endl;
+            return 0.0;
+        }
+
+        // Calculate B² using Eigen array operations (element-wise)
+        Eigen::ArrayXXd B_squared = Bx.array().square() + By.array().square();
+
+        // Calculate energy density: w = B²/(2μ) [J/m³]
+        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
+
+        // Sum all energy densities and multiply by volume element
+        double dV = dx * dy;  // [m²] per unit depth
+        total_energy = energy_density.sum() * dV;  // [J/m]
+
+        std::cout << "  Grid size: " << rows << " x " << cols << std::endl;
+        std::cout << "  dx = " << dx << " m, dy = " << dy << " m" << std::endl;
+        std::cout << "  Max energy density: " << energy_density.maxCoeff() << " J/m³" << std::endl;
+        std::cout << "  Total energy: " << total_energy << " J/m (per unit depth)" << std::endl;
+
+    } else {
+        // Polar coordinates
+        int rows = Br.rows();
+        int cols = Br.cols();
+
+        if (mu_map.rows() != rows || mu_map.cols() != cols) {
+            std::cerr << "[ERROR] Dimension mismatch in polar coordinates" << std::endl;
+            return 0.0;
+        }
+
+        // Calculate B² = Br² + Bθ²
+        Eigen::ArrayXXd B_squared = Br.array().square() + Btheta.array().square();
+
+        // Calculate energy density
+        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
+
+        // Sum with polar volume element: dV = r * dr * dθ
+        for (int i = 0; i < rows; ++i) {
+            for (int j = 0; j < cols; ++j) {
+                int ir = (r_orientation == "horizontal") ? j : i;
+                ir = std::clamp(ir, 0, nr - 1);
+                double r = r_coords[ir];
+                double dV = r * dr * dtheta;
+                total_energy += energy_density(i, j) * dV;
+            }
+        }
+
+        std::cout << "  Grid size (r x θ): " << rows << " x " << cols << std::endl;
+        std::cout << "  Total energy: " << total_energy << " J/m (per unit depth)" << std::endl;
+    }
+
+    return total_energy;
+}
 
 
 void MagneticFieldAnalyzer::exportForcesToCSV(const std::string& output_path) const {
@@ -1593,6 +1830,7 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     std::string boundary_folder = base_folder + "/BoundaryImg";
     std::string forces_folder = base_folder + "/Forces";
     std::string input_image_folder = base_folder + "/InputImg";
+    std::string energy_density_folder = base_folder + "/EnergyDensity";
 
     system(("mkdir -p \"" + az_folder + "\"").c_str());
     system(("mkdir -p \"" + mu_folder + "\"").c_str());
@@ -1600,6 +1838,7 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     system(("mkdir -p \"" + boundary_folder + "\"").c_str());
     system(("mkdir -p \"" + forces_folder + "\"").c_str());
     system(("mkdir -p \"" + input_image_folder + "\"").c_str());
+    system(("mkdir -p \"" + energy_density_folder + "\"").c_str());
 
     // Format step number with leading zeros (e.g., step_0001)
     std::ostringstream step_str;
@@ -1645,6 +1884,28 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
         system(("mkdir -p \"" + stress_vectors_folder + "\"").c_str());
         std::string stress_vectors_path = stress_vectors_folder + "/" + step_name + ".csv";
         exportBoundaryStressVectors(stress_vectors_path);
+    }
+
+    // Export energy density distribution
+    if (coordinate_system == "cartesian" && Bx.size() > 0 && By.size() > 0 && mu_map.size() > 0) {
+        // Calculate B² and energy density
+        Eigen::ArrayXXd B_squared = Bx.array().square() + By.array().square();
+        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
+
+        // Export to CSV
+        std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
+        std::ofstream file(energy_density_path);
+        if (file.is_open()) {
+            for (int j = 0; j < energy_density.rows(); ++j) {
+                for (int i = 0; i < energy_density.cols(); ++i) {
+                    file << energy_density(j, i);
+                    if (i < energy_density.cols() - 1) file << ",";
+                }
+                file << "\n";
+            }
+            file.close();
+            std::cout << "Energy density exported to: " << energy_density_path << std::endl;
+        }
     }
 
     std::cout << "\n=== Results exported to folder structure ===" << std::endl;
@@ -2882,8 +3143,12 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             solve();
         }
 
-        // 3. Calculate Maxwell stress
-        calculateMaxwellStress();
+        // 3. Calculate Maxwell stress (pass step number for field caching)
+        calculateMaxwellStress(step + 1);
+
+        // 3.5. Calculate total magnetic energy (reuses calculated field from step)
+        double total_energy = calculateTotalMagneticEnergy(step + 1);
+        std::cout << "Step " << step+1 << " Total Magnetic Energy: " << total_energy << " J/m" << std::endl;
 
         // 4. Export results for this step
         exportResults(output_dir, step);

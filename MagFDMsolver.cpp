@@ -315,6 +315,10 @@ int main(int argc, char* argv[]) {
             // Calculate Maxwell stress and forces
             analyzer.calculateMaxwellStress();
 
+            // Calculate total magnetic energy
+            double total_energy = analyzer.calculateTotalMagneticEnergy();
+            std::cout << "Total Magnetic Energy: " << total_energy << " J/m" << std::endl;
+
             // Export all results to folder structure
             std::cout << "\n=== Exporting Results ===" << std::endl;
             analyzer.exportResults(base_folder, 0);

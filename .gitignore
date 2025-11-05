@@ -83,6 +83,9 @@ CMakeFiles/
 # Output directories
 output_*/
 
+# prototype scripts
+scripts/
+
 # Test files
 uploads/*.png
 uploads/*.jpg

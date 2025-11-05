@@ -93,8 +93,16 @@ public:
 
     /**
      * @brief Calculate Maxwell stress and electromagnetic forces
+     * @param step Step number for field caching (-1 for static analysis)
      */
-    void calculateMaxwellStress();
+    void calculateMaxwellStress(int step = -1);
+
+    /**
+     * @brief Calculate total magnetic energy of the system
+     * @param step Step number for field caching (-1 for static analysis)
+     * @return Total magnetic energy [J/m] (per unit depth)
+     */
+    double calculateTotalMagneticEnergy(int step = -1);
 
     /**
      * @brief Export force results to CSV file
@@ -265,9 +273,16 @@ private:
     void calculateMagneticField();
     void calculateMagneticFieldPolar();
 
+    // Helper method for periodic boundary-aware filtering
+    void applyLaplacianWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int ksize = 3);
+    void applySobelWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int dx, int dy, int ksize = 3);
+
     // Magnetic field components
     Eigen::MatrixXd Bx, By;  // Magnetic flux density components (Cartesian)
     Eigen::MatrixXd Br, Btheta;  // Magnetic flux density components (Polar)
+
+    // Step tracking for magnetic field calculations
+    int current_field_step;  // Current step for which Bx,By (or Br,Btheta) are calculated (-1 = not calculated or static)
 };
 
 #endif // MAGNETICFIELDANALYZER_H

@@ -1,7 +1,7 @@
 # 2次元磁場解析設定ファイル
 
 # 座標系設定
-coordinate_system: cartesian  # cartesian (直交座標) or polar (極座標)
+coordinate_system: polar  # cartesian (直交座標) or polar (極座標)
 
 # メッシュ設定（直交座標の場合）
 mesh:
@@ -11,9 +11,9 @@ mesh:
 # 極座標ドメイン設定（coordinate_system: polar の場合）
 polar_domain:
   r_start: 0.2  # 内半径 [m] (0 < r_start < r_end)
-  r_end: 0.25    # 外半径 [m]
+  r_end: 0.3    # 外半径 [m]
   r_orientation: horizontal  # r方向: horizontal (列方向) or vertical (行方向)
-  theta_range: 2*pi/12  # θ方向の範囲 [rad] (デフォルト: 2*pi, 扇形の場合は pi/2 など)
+  theta_range: 1  # θ方向の範囲 [rad] (デフォルト: 2*pi, 扇形の場合は pi/2 など)
   # θ方向は r_orientation と垂直な方向で 0 ~ theta_range
 
 # 極座標境界条件
@@ -115,7 +115,7 @@ transient:
   slide_direction: vertical  # スライド方向
   # vertical: slide_region_start <= x <= slide_region_end の縦帯領域をy方向にスライド
   # horizontal: slide_region_start <= y <= slide_region_end の横帯領域をx方向にスライド
-  slide_region_start: 180  # スライド領域の開始位置 [ピクセル] (左上が原点[0,0])
-  slide_region_end: 320   # スライド領域の終了位置 [ピクセル]
+  slide_region_start: 200  # スライド領域の開始位置 [ピクセル] (左上が原点[0,0])
+  slide_region_end: 300   # スライド領域の終了位置 [ピクセル]
   slide_pixels_per_step: 10  # 1ステップあたりの移動量 [ピクセル] (循環シフト量)
 
