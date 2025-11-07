@@ -237,7 +237,9 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         int count = 0;
 
         if (coordinate_system == "polar") {
-            // For polar coordinates, map image to (r, theta) based on r_orientation
+            // For polar coordinates, do NOT flip image
+            // In polar coordinates, theta increases counterclockwise from x-axis
+            // Image rows map directly to theta indices (row 0 -> theta=0)
             if (r_orientation == "horizontal") {
                 // r: cols (i), theta: rows (j)
                 for (int j = 0; j < ntheta; j++) {
@@ -1095,7 +1097,8 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     std::cout << "\n=== Calculating Maxwell Stress (polar-aware, Sobel normals) ===" << std::endl;
 
     // --- Calculate magnetic field if not already done for this step ---
-    if (current_field_step != step || Bx.size() == 0 || By.size() == 0) {
+    // current_field_step is initialized to -1, so first call always recalculates
+    if (current_field_step != step) {
         if (coordinate_system == "polar") {
             calculateMagneticFieldPolar();
         } else {
@@ -1119,14 +1122,26 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     // NOTE: we will create mat_mask_img for each material inside loop below, but if many materials
     // reuse logic can be adjusted. For clarity, build per-material later. Here just ensure boundaries_img valid.
 
-    // --- flip boundaries -> analytic coords (y up) ---
+    // --- Coordinate system dependent processing ---
     cv::Mat boundaries_flipped;
-    cv::flip(boundaries_img, boundaries_flipped, 0); // 0 = flip around x-axis (vertical flip)
-    // cv::flip(boundaries_flipped, boundaries_flipped, 0); // 0 = flip around x-axis (vertical flip)
+    double cx_physical, cy_physical;
 
-    // Precompute physical center (using same convention as previous outputs)
-    double cx_physical = (static_cast<double>(image.cols) * dx) / 2.0;
-    double cy_physical = (static_cast<double>(image.rows) * dy) / 2.0;
+    if (coordinate_system == "cartesian") {
+        // Cartesian: flip boundaries to analysis coords (y up)
+        cv::flip(boundaries_img, boundaries_flipped, 0);
+
+        // Physical center for Cartesian
+        cx_physical = (static_cast<double>(image.cols) * dx) / 2.0;
+        cy_physical = (static_cast<double>(image.rows) * dy) / 2.0;
+    } else {
+        // Polar: do NOT flip (theta mapping must be preserved)
+        boundaries_flipped = boundaries_img.clone();
+
+        // For polar coordinates, center is at origin (r=0, theta=any)
+        // Torque calculation is about origin, so center offset is zero
+        cx_physical = 0.0;
+        cy_physical = 0.0;
+    }
 
     // Prepare results containers
     force_results.clear();
@@ -1150,7 +1165,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
 
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255,255,255});
 
-        // Build mat_mask in image coords (y down) from image, then flip to analysis coords (y up)
+        // Build mat_mask from image
         cv::Mat mat_mask_img_local(image.rows, image.cols, CV_8U, cv::Scalar(0));
         for (int r = 0; r < image.rows; ++r) {
             for (int c = 0; c < image.cols; ++c) {
@@ -1160,9 +1175,16 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 }
             }
         }
+
+        // Coordinate system dependent processing
         cv::Mat mat_mask_flipped;
-        cv::flip(mat_mask_img_local, mat_mask_flipped, 0); // flip to analysis coords (y up)
-        // cv::flip(mat_mask_flipped, mat_mask_flipped, 0);
+        if (coordinate_system == "cartesian") {
+            // Cartesian: flip to analysis coords (y up)
+            cv::flip(mat_mask_img_local, mat_mask_flipped, 0);
+        } else {
+            // Polar: do NOT flip (preserve theta mapping)
+            mat_mask_flipped = mat_mask_img_local.clone();
+        }
 
         // compute Sobel on flipped mat_mask (we want gradients consistent with analysis indices)
         // Use periodic BC-aware Sobel for accurate normal vectors at boundaries
@@ -1641,7 +1663,8 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
     std::cout << "\n=== Calculating Total Magnetic Energy ===" << std::endl;
 
     // --- Calculate magnetic field if not already done for this step ---
-    if (current_field_step != step || Bx.size() == 0 || By.size() == 0) {
+    // current_field_step is initialized to -1, so first call always recalculates
+    if (current_field_step != step) {
         if (coordinate_system == "polar") {
             calculateMagneticFieldPolar();
         } else {
@@ -2037,7 +2060,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                     // Treat as if r_{-1/2} = r_{+1/2} for stability
                     std::cerr << "Warning: r_imh <= 0 at inner Neumann BC (r=" << r << "), using mirror approximation" << std::endl;
                     double r_imh_eff = r_iph;  // Mirror approximation
-                    double a_im_eff = (r_imh_eff / r) / (mu_inner * dr * dr);
+                    double a_im_eff = r_imh_eff / (mu_inner * dr * dr);
                     triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im_eff + a_ip));
                     coeff_center -= (a_im_eff + a_ip);
                 } else {
@@ -2452,6 +2475,7 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
 
             // Update jz_map for matching pixels
             if (coordinate_system == "polar") {
+                // For polar coordinates, do NOT flip image
                 if (r_orientation == "horizontal") {
                     for (int j = 0; j < ntheta; j++) {
                         for (int i = 0; i < nr; i++) {
