@@ -921,20 +921,17 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
         const Br = Array(rows).fill(0).map(() => Array(cols).fill(0));
         const Btheta = Array(rows).fill(0).map(() => Array(cols).fill(0));
 
+        // Polar coordinates are ALWAYS periodic in theta direction
         for (let jt = 0; jt < ntheta; jt++) {
             for (let ir = 0; ir < nr; ir++) {
                 const r = r_coords[ir];
                 const safe_r = Math.max(r, 1e-15);
 
                 // Br = (1/r) * ∂Az/∂θ
-                let dAz_dtheta = 0;
-                if (jt === 0) {
-                    dAz_dtheta = (Az[1][ir] - Az[0][ir]) / dtheta;
-                } else if (jt === ntheta - 1) {
-                    dAz_dtheta = (Az[ntheta-1][ir] - Az[ntheta-2][ir]) / dtheta;
-                } else {
-                    dAz_dtheta = (Az[jt+1][ir] - Az[jt-1][ir]) / (2 * dtheta);
-                }
+                // IMPORTANT: Use periodic boundary in theta direction
+                const jt_next = (jt + 1) % ntheta;
+                const jt_prev = (jt - 1 + ntheta) % ntheta;
+                const dAz_dtheta = (Az[jt_next][ir] - Az[jt_prev][ir]) / (2 * dtheta);
                 Br[jt][ir] = dAz_dtheta / safe_r;
 
                 // Bθ = -∂Az/∂r

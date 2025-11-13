@@ -163,12 +163,10 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
 
     // Calculate mesh spacing
     dr = (r_end - r_start) / (nr - 1);
-    // Angular spacing: periodic vs sector domain
-    if (std::abs(theta_range - 2.0 * M_PI) < 1e-12) {
-        dtheta = theta_range / static_cast<double>(ntheta); // periodic sampling over [0,2pi)
-    } else {
-        dtheta = (ntheta > 1) ? (theta_range / static_cast<double>(ntheta - 1)) : theta_range;
-    }
+    // Angular spacing: In polar coordinates, θ is always periodic
+    // θ=0 and θ=theta_range represent the same radial line
+    // Therefore, we divide theta_range by ntheta (NOT ntheta-1)
+    dtheta = theta_range / static_cast<double>(ntheta);  // Periodic sampling: [0, theta_range)
 
     std::cout << "Polar domain: r = [" << r_start << ", " << r_end << "] m, theta = [0, "
               << theta_range << "] rad (" << (theta_range * 180.0 / M_PI) << " deg)" << std::endl;
@@ -207,9 +205,21 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
     std::cout << "Boundary conditions: inner=" << bc_inner.type
               << ", outer=" << bc_outer.type << std::endl;
 
-    // Initialize material property matrices (nr x ntheta)
-    mu_map = Eigen::MatrixXd::Constant(nr, ntheta, MU_0);
-    jz_map = Eigen::MatrixXd::Zero(nr, ntheta);
+    // Initialize material property matrices with r_orientation-dependent shape
+    // This must match the shape of Br, Btheta, and Az matrices
+    if (r_orientation == "horizontal") {
+        // Image is (ntheta, nr) = (rows, cols)
+        // Matrices: (ntheta, nr) with indexing (theta_idx, r_idx)
+        mu_map = Eigen::MatrixXd::Constant(ntheta, nr, MU_0);
+        jz_map = Eigen::MatrixXd::Zero(ntheta, nr);
+        std::cout << "Material property matrices: (" << ntheta << " x " << nr << ") = (theta x r)" << std::endl;
+    } else {  // vertical
+        // Image is (nr, ntheta) = (rows, cols)
+        // Matrices: (nr, ntheta) with indexing (r_idx, theta_idx)
+        mu_map = Eigen::MatrixXd::Constant(nr, ntheta, MU_0);
+        jz_map = Eigen::MatrixXd::Zero(nr, ntheta);
+        std::cout << "Material property matrices: (" << nr << " x " << ntheta << ") = (r x theta)" << std::endl;
+    }
 }
 
 void MagneticFieldAnalyzer::setupMaterialProperties() {
@@ -237,26 +247,31 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         int count = 0;
 
         if (coordinate_system == "polar") {
-            // For polar coordinates, do NOT flip image
-            // In polar coordinates, theta increases counterclockwise from x-axis
-            // Image rows map directly to theta indices (row 0 -> theta=0)
+            // For polar coordinates, flip image to match analysis coordinates
+            // Convention: image bottom (row=ntheta-1) -> theta=0, image top (row=0) -> theta=theta_range
+            // This ensures theta increases upward (counterclockwise from x-axis, like standard y-axis)
+            cv::Mat image_flipped;
+            cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
+
             if (r_orientation == "horizontal") {
-                // r: cols (i), theta: rows (j)
+                // r: cols (i), theta: rows (j, after flip)
+                // mu_map shape: (ntheta, nr), indexing: (theta_idx, r_idx) = (j, i)
                 for (int j = 0; j < ntheta; j++) {
                     for (int i = 0; i < nr; i++) {
-                        cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
+                        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                            mu_map(i, j) = mu_r * MU_0;  // (r_idx, theta_idx)
-                            jz_map(i, j) = jz;
+                            mu_map(j, i) = mu_r * MU_0;  // (theta_idx, r_idx)
+                            jz_map(j, i) = jz;
                             count++;
                         }
                     }
                 }
             } else {  // vertical
                 // r: rows (j), theta: cols (i)
+                // mu_map shape: (nr, ntheta), indexing: (r_idx, theta_idx) = (j, i)
                 for (int j = 0; j < nr; j++) {
                     for (int i = 0; i < ntheta; i++) {
-                        cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
+                        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                             mu_map(j, i) = mu_r * MU_0;  // (r_idx, theta_idx)
                             jz_map(j, i) = jz;
@@ -387,8 +402,14 @@ double MagneticFieldAnalyzer::muAtGrid(int i, int j) const {
         ir = std::min(std::max(ir, 0), nr - 1);
         jt = std::min(std::max(jt, 0), ntheta - 1);
 
-        // mu_map was created as (nr, ntheta) in setupPolarSystem
-        return mu_map(ir, jt);
+        // Access mu_map with orientation-dependent indexing
+        if (r_orientation == "horizontal") {
+            // mu_map shape: (ntheta, nr), indexing: (theta_idx, r_idx)
+            return mu_map(jt, ir);
+        } else {
+            // mu_map shape: (nr, ntheta), indexing: (r_idx, theta_idx)
+            return mu_map(ir, jt);
+        }
     } else {
         // Cartesian: mu_map stored as (ny, nx)
         // mu_map(rows=ny, cols=nx) -> mu_map(j, i)
@@ -1092,6 +1113,30 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
     return boundaries;
 }
 
+// ============================================================================
+// Helper functions for polar coordinate indexing
+// ============================================================================
+
+// Helper functions to access mu_map and jz_map in polar coordinates with correct indexing
+inline double getMuPolar(const Eigen::MatrixXd& mu_map, int r_idx, int theta_idx, const std::string& r_orientation) {
+    if (r_orientation == "horizontal") {
+        // mu_map shape: (ntheta, nr), indexing: (theta_idx, r_idx)
+        return mu_map(theta_idx, r_idx);
+    } else {
+        // mu_map shape: (nr, ntheta), indexing: (r_idx, theta_idx)
+        return mu_map(r_idx, theta_idx);
+    }
+}
+
+inline double getJzPolar(const Eigen::MatrixXd& jz_map, int r_idx, int theta_idx, const std::string& r_orientation) {
+    if (r_orientation == "horizontal") {
+        // jz_map shape: (ntheta, nr), indexing: (theta_idx, r_idx)
+        return jz_map(theta_idx, r_idx);
+    } else {
+        // jz_map shape: (nr, ntheta), indexing: (r_idx, theta_idx)
+        return jz_map(r_idx, theta_idx);
+    }
+}
 
 void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     std::cout << "\n=== Calculating Maxwell Stress (polar-aware, Sobel normals) ===" << std::endl;
@@ -1122,21 +1167,16 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     // NOTE: we will create mat_mask_img for each material inside loop below, but if many materials
     // reuse logic can be adjusted. For clarity, build per-material later. Here just ensure boundaries_img valid.
 
-    // --- Coordinate system dependent processing ---
+    // --- Flip boundaries to analysis coordinates (both Cartesian and Polar) ---
     cv::Mat boundaries_flipped;
+    cv::flip(boundaries_img, boundaries_flipped, 0); // 0 = flip around x-axis (vertical flip)
+
+    // Precompute physical center (using same convention as previous outputs)
     double cx_physical, cy_physical;
-
     if (coordinate_system == "cartesian") {
-        // Cartesian: flip boundaries to analysis coords (y up)
-        cv::flip(boundaries_img, boundaries_flipped, 0);
-
-        // Physical center for Cartesian
         cx_physical = (static_cast<double>(image.cols) * dx) / 2.0;
         cy_physical = (static_cast<double>(image.rows) * dy) / 2.0;
     } else {
-        // Polar: do NOT flip (theta mapping must be preserved)
-        boundaries_flipped = boundaries_img.clone();
-
         // For polar coordinates, center is at origin (r=0, theta=any)
         // Torque calculation is about origin, so center offset is zero
         cx_physical = 0.0;
@@ -1176,15 +1216,9 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
             }
         }
 
-        // Coordinate system dependent processing
+        // Flip material mask to analysis coords (both Cartesian and Polar)
         cv::Mat mat_mask_flipped;
-        if (coordinate_system == "cartesian") {
-            // Cartesian: flip to analysis coords (y up)
-            cv::flip(mat_mask_img_local, mat_mask_flipped, 0);
-        } else {
-            // Polar: do NOT flip (preserve theta mapping)
-            mat_mask_flipped = mat_mask_img_local.clone();
-        }
+        cv::flip(mat_mask_img_local, mat_mask_flipped, 0); // flip to analysis coords (y up)
 
         // compute Sobel on flipped mat_mask (we want gradients consistent with analysis indices)
         // Use periodic BC-aware Sobel for accurate normal vectors at boundaries
@@ -1410,6 +1444,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
 
                 // sample B at outside sample (i_out,j_out) and convert to polar at theta
                 double bx_out = 0.0, by_out = 0.0;
+                double br_out = 0.0, bt_out = 0.0;  // For polar coordinates
                 if (coordinate_system == "cartesian") {
                     // Bx/By are Eigen matrices with rows/cols corresponding to analysis indexing
                     // Use periodic wrapping or clamping based on boundary conditions
@@ -1428,6 +1463,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     bx_out = Bx(bj, bi);
                     by_out = By(bj, bi);
                 } else {
+                    // Polar coordinates: sample Br and Btheta directly
                     int ir_out = (r_orientation == "horizontal") ? i_out : j_out;
                     int jt_out = (r_orientation == "horizontal") ? j_out : i_out;
                     ir_out = std::clamp(ir_out, 0, nr-1);
@@ -1440,49 +1476,59 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                         br_sample = Br(ir_out, jt_out);
                         bt_sample = Btheta(ir_out, jt_out);
                     }
-                    double theta_out = jt_out * dtheta;
+                    // Store polar components for Maxwell stress calculation
+                    br_out = br_sample;
+                    bt_out = bt_sample;
+
+                    // CRITICAL FIX: Compute theta from PHYSICAL coordinates, not from index
+                    // This avoids systematic bias from grid-index-based angle calculation
+                    // Sample point physical coordinates
+                    double r_sample = r_coords[ir_out];
+                    double theta_sample_index = jt_out * dtheta;  // Keep for reference
+                    double x_sample = r_sample * std::cos(theta_sample_index);
+                    double y_sample = r_sample * std::sin(theta_sample_index);
+                    // Use atan2 to get physical angle
+                    double theta_out = std::atan2(y_sample, x_sample);
+                    if (theta_out < 0.0) theta_out += 2.0 * M_PI;  // Normalize to [0, 2π)
+
+                    // Convert to Cartesian using physical angle
                     bx_out = br_sample * std::cos(theta_out) - bt_sample * std::sin(theta_out);
                     by_out = br_sample * std::sin(theta_out) + bt_sample * std::cos(theta_out);
                 }
 
-                double fx, fy;
-
+                // Get permeability at the BOUNDARY point (i, j), NOT the sample point
+                // CRITICAL FIX: The sample point (i_out, j_out) is OUTSIDE the material (in air),
+                // so mu_sample would be MU_0. We must use mu at the boundary point (inside material).
+                // This is the most likely cause of systematic torque bias.
+                double mu_local = MU_0;
                 if (coordinate_system == "cartesian") {
-                    // Cartesian Maxwell stress tensor (no coordinate transformation)
-                    // T_xx = (Bx^2 - By^2) / (2μ0)
-                    // T_yy = (By^2 - Bx^2) / (2μ0)
-                    // T_xy = (Bx*By) / μ0
-                    double T_xx = (bx_out*bx_out - by_out*by_out) / (2.0 * mu0);
-                    double T_yy = (by_out*by_out - bx_out*bx_out) / (2.0 * mu0);
-                    double T_xy = (bx_out * by_out) / mu0;
-
-                    // Traction: t = T · n
-                    fx = T_xx * n_phys_x + T_xy * n_phys_y;
-                    fy = T_xy * n_phys_x + T_yy * n_phys_y;
+                    int bi = std::clamp(i, 0, static_cast<int>(mu_map.cols())-1);
+                    int bj = std::clamp(j, 0, static_cast<int>(mu_map.rows())-1);
+                    mu_local = mu_map(bj, bi);
                 } else {
-                    // Polar coordinate system: use polar Maxwell stress
-                    double br_local = bx_out * std::cos(theta) + by_out * std::sin(theta);
-                    double btheta_local = -bx_out * std::sin(theta) + by_out * std::cos(theta);
-
-                    // Maxwell stress components (polar)
-                    double B_r = br_local;
-                    double B_t = btheta_local;
-                    double T_rr = (B_r*B_r - B_t*B_t) / (2.0 * mu0);
-                    double T_tt = (B_t*B_t - B_r*B_r) / (2.0 * mu0);
-                    double T_rt = (B_r * B_t) / mu0;
-
-                    // decompose normal to polar
-                    double n_r = n_phys_x * er_x + n_phys_y * er_y;
-                    double n_t = n_phys_x * et_x + n_phys_y * et_y;
-
-                    // traction scalars
-                    double t_r_s = T_rr * n_r + T_rt * n_t;
-                    double t_t_s = T_rt * n_r + T_tt * n_t;
-
-                    // convert to cartesian physical traction
-                    fx = t_r_s * er_x + t_t_s * et_x;
-                    fy = t_r_s * er_y + t_t_s * et_y;
+                    // Polar: use boundary point (i, j) NOT sample point (i_out, j_out)
+                    mu_local = getMuPolar(mu_map, ir, jt, r_orientation);
                 }
+
+                // Maxwell stress calculation: Use Cartesian coordinates for BOTH coordinate systems
+                // CRITICAL FIX: Avoid basis vector inconsistencies by always computing in Cartesian
+                // For polar coordinates, bx_out and by_out have already been computed from Br, Btheta
+                // at lines 1484-1485, so we can use them directly.
+
+                // Cartesian Maxwell stress tensor: T = B⊗H - 0.5(B·H)I
+                // where H = B/μ (linear material)
+                double Hx = bx_out / mu_local;
+                double Hy = by_out / mu_local;
+                double B_dot_H = bx_out * Hx + by_out * Hy;
+
+                // T_ij = Bi*Hj - 0.5*(B·H)*δij
+                double T_xx = bx_out * Hx - 0.5 * B_dot_H;
+                double T_yy = by_out * Hy - 0.5 * B_dot_H;
+                double T_xy = bx_out * Hy; // = by_out * Hx by symmetry
+
+                // Traction: t = T · n (Cartesian)
+                double fx = T_xx * n_phys_x + T_xy * n_phys_y;
+                double fy = T_xy * n_phys_x + T_yy * n_phys_y;
 
                 // accumulate
                 result.pixel_count++;
@@ -1491,12 +1537,28 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
 
                 // Radial force: for polar use T_rr component, for cartesian use magnitude
                 if (coordinate_system == "polar") {
-                    double n_r = n_phys_x * er_x + n_phys_y * er_y;
-                    double n_t = n_phys_x * et_x + n_phys_y * et_y;
-                    double B_r = bx_out * std::cos(theta) + by_out * std::sin(theta);
-                    double B_t = -bx_out * std::sin(theta) + by_out * std::cos(theta);
-                    double T_rr = (B_r*B_r - B_t*B_t) / (2.0 * mu0);
-                    double T_rt = (B_r * B_t) / mu0;
+                    // Use consistent polar basis at sample point (theta_out)
+                    int ir_out_local = (r_orientation == "horizontal") ? i_out : j_out;
+                    int jt_out_local = (r_orientation == "horizontal") ? j_out : i_out;
+                    ir_out_local = std::clamp(ir_out_local, 0, nr-1);
+                    jt_out_local = std::clamp(jt_out_local, 0, ntheta-1);
+                    double theta_out_local = jt_out_local * dtheta;
+                    double er_out_local_x = std::cos(theta_out_local);
+                    double er_out_local_y = std::sin(theta_out_local);
+                    double et_out_local_x = -std::sin(theta_out_local);
+                    double et_out_local_y = std::cos(theta_out_local);
+
+                    double n_r = n_phys_x * er_out_local_x + n_phys_y * er_out_local_y;
+                    double n_t = n_phys_x * et_out_local_x + n_phys_y * et_out_local_y;
+                    // Use br_out, bt_out directly (already computed above)
+                    double B_r = br_out;
+                    double B_t = bt_out;
+                    // Maxwell stress using H = B/μ
+                    double H_r = B_r / mu_local;
+                    double H_t = B_t / mu_local;
+                    double B_dot_H_local = B_r * H_r + B_t * H_t;
+                    double T_rr = B_r * H_r - 0.5 * B_dot_H_local;
+                    double T_rt = B_r * H_t;
                     double t_r_s = T_rr * n_r + T_rt * n_t;
                     result.force_radial += t_r_s * ds;
                 }
@@ -1504,8 +1566,21 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
 
                 double dFx = fx * ds;
                 double dFy = fy * ds;
+
+                // Torque calculation: use Cartesian formula for both coordinate systems
+                // IMPORTANT: For consistency and to avoid basis vector issues in polar coordinates,
+                // always use the Cartesian formula: τ_z = x * F_y - y * F_x
+                // x_phys, y_phys are already computed for both coordinate systems (lines 1413-1418)
+                // fx, fy are already converted to Cartesian (lines 1522-1523 or 1567-1568)
                 result.torque_origin += x_phys * dFy - y_phys * dFx;
-                result.torque_center += (x_phys - cx_physical) * dFy - (y_phys - cy_physical) * dFx;
+
+                if (coordinate_system == "polar") {
+                    // In polar coordinates centered at origin, torque_center = torque_origin
+                    result.torque_center += x_phys * dFy - y_phys * dFx;
+                } else {
+                    // Cartesian coordinates: use offset from center
+                    result.torque_center += (x_phys - cx_physical) * dFy - (y_phys - cy_physical) * dFx;
+                }
                 result.torque = result.torque_origin;
 
                 // Record boundary stress vector in map (for later full-grid export)
@@ -1591,6 +1666,8 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 // calc all field energy, not just boundary
                 // Check if this pixel belongs to the material
                 // if (mat_mask_flipped.at<uchar>(j, i) == 0) continue;
+
+                // Get permeability at this pixel (mu_map shape matches mat_mask_flipped shape)
                 mu_material = mu_map(j, i); 
 
                 // Get magnetic field at this pixel
@@ -1929,6 +2006,25 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
             file.close();
             std::cout << "Energy density exported to: " << energy_density_path << std::endl;
         }
+    } else if (coordinate_system == "polar" && Br.size() > 0 && Btheta.size() > 0 && mu_map.size() > 0) {
+        // Polar coordinates: Calculate B² and energy density
+        Eigen::ArrayXXd B_squared = Br.array().square() + Btheta.array().square();
+        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
+
+        // Export to CSV
+        std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
+        std::ofstream file(energy_density_path);
+        if (file.is_open()) {
+            for (int j = 0; j < energy_density.rows(); ++j) {
+                for (int i = 0; i < energy_density.cols(); ++i) {
+                    file << energy_density(j, i);
+                    if (i < energy_density.cols() - 1) file << ",";
+                }
+                file << "\n";
+            }
+            file.close();
+            std::cout << "Energy density (polar) exported to: " << energy_density_path << std::endl;
+        }
     }
 
     std::cout << "\n=== Results exported to folder structure ===" << std::endl;
@@ -1951,28 +2047,34 @@ double MagneticFieldAnalyzer::getMuAtInterfacePolar(double r_idx, int theta_idx,
             // Integer index (or very close to integer)
             if (r_idx_int > 0 && r_idx_int < nr - 1) {
                 // Harmonic mean of adjacent cells
-                return 2.0 / (1.0/mu_map(r_idx_int, theta_idx) + 1.0/mu_map(r_idx_int + 1, theta_idx));
+                double mu1 = getMuPolar(mu_map, r_idx_int, theta_idx, r_orientation);
+                double mu2 = getMuPolar(mu_map, r_idx_int + 1, theta_idx, r_orientation);
+                return 2.0 / (1.0/mu1 + 1.0/mu2);
             } else {
                 // Boundary: use nearest valid cell
                 int r_safe = std::min(std::max(r_idx_int, 0), nr - 1);
-                return mu_map(r_safe, theta_idx);
+                return getMuPolar(mu_map, r_safe, theta_idx, r_orientation);
             }
         } else {
             // Half-integer index (e.g., i ± 0.5 for interface)
             int r_low = static_cast<int>(std::floor(r_idx));
             if (r_low >= 0 && r_low < nr - 1) {
                 // Harmonic mean at interface between r_low and r_low+1
-                return 2.0 / (1.0/mu_map(r_low, theta_idx) + 1.0/mu_map(r_low + 1, theta_idx));
+                double mu1 = getMuPolar(mu_map, r_low, theta_idx, r_orientation);
+                double mu2 = getMuPolar(mu_map, r_low + 1, theta_idx, r_orientation);
+                return 2.0 / (1.0/mu1 + 1.0/mu2);
             } else {
                 // Boundary or out of range: clamp to valid cell
                 int r_safe = std::min(std::max(r_low, 0), nr - 1);
-                return mu_map(r_safe, theta_idx);
+                return getMuPolar(mu_map, r_safe, theta_idx, r_orientation);
             }
         }
     } else {
         // Theta direction interface (for future use with θ-varying μ)
         int theta_next = (theta_idx + 1) % ntheta;
-        return 2.0 / (1.0/mu_map(r_idx_int, theta_idx) + 1.0/mu_map(r_idx_int, theta_next));
+        double mu1 = getMuPolar(mu_map, r_idx_int, theta_idx, r_orientation);
+        double mu2 = getMuPolar(mu_map, r_idx_int, theta_next, r_orientation);
+        return 2.0 / (1.0/mu1 + 1.0/mu2);
     }
 }
 
@@ -1987,7 +2089,9 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
     triplets.reserve(n * 7);  // Estimate: 7 non-zeros per row
 
     // Determine boundary condition type (move outside loop for efficiency)
-    bool is_periodic = (std::abs(theta_range - 2.0 * M_PI) < 1e-9);
+    // IMPORTANT: In polar coordinates, θ direction is ALWAYS periodic by physical definition
+    // θ=0 and θ=theta_range represent the same radial line
+    bool is_periodic = true;  // Always periodic in polar coordinates
 
     // Build equation for each grid point
     for (int i = 0; i < nr; i++) {  // Radial direction
@@ -2035,7 +2139,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             // Get permeability at interfaces
             double mu_inner = getMuAtInterfacePolar(i - 0.5, j, "r");  // μ_{i-1/2}
             double mu_outer = getMuAtInterfacePolar(i + 0.5, j, "r");  // μ_{i+1/2}
-            double mu_current = mu_map(i, j);
+            double mu_current = getMuPolar(mu_map, i, j, r_orientation);
 
             // Radial coefficients with r-weighting (divergence form)
             // CRITICAL FIX: Use r-weighted formulation for symmetry
@@ -2113,9 +2217,12 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             }
 
             // harmonic mean of mu between (i,j) and (i,j_prev)
-            double mu_theta_prev = 2.0 / (1.0 / mu_map(i, j) + 1.0 / mu_map(i, j_prev_idx));
+            double mu_ij = getMuPolar(mu_map, i, j, r_orientation);
+            double mu_prev = getMuPolar(mu_map, i, j_prev_idx, r_orientation);
+            double mu_next = getMuPolar(mu_map, i, j_next_idx, r_orientation);
+            double mu_theta_prev = 2.0 / (1.0 / mu_ij + 1.0 / mu_prev);
             // harmonic mean of mu between (i,j) and (i,j_next)
-            double mu_theta_next = 2.0 / (1.0 / mu_map(i, j) + 1.0 / mu_map(i, j_next_idx));
+            double mu_theta_next = 2.0 / (1.0 / mu_ij + 1.0 / mu_next);
 
             // coeffs for interface flux (symmetric)
             // After r-weighting: (1/r²) term becomes (1/r)
@@ -2160,7 +2267,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             // Right-hand side (current density)
             // After r-weighting: RHS becomes -r·Jz
-            rhs(idx) = -jz_map(i, j) * r;
+            rhs(idx) = -getJzPolar(jz_map, i, j, r_orientation) * r;
         }
     }
 
@@ -2277,7 +2384,9 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
         Btheta = Eigen::MatrixXd::Zero(nr, ntheta);
     }
 
-    bool is_periodic = (std::abs(theta_range - 2.0 * M_PI) < 1e-9);
+    // IMPORTANT: In polar coordinates, θ direction is ALWAYS periodic by physical definition
+    // θ=0 and θ=theta_range represent the same radial line
+    bool is_periodic = true;  // Always periodic in polar coordinates
 
     // Calculate field components: Br = (1/r)∂Az/∂θ, Btheta = -∂Az/∂r
     for (int i = 0; i < nr; i++) {
@@ -2454,7 +2563,8 @@ double MagneticFieldAnalyzer::evaluateJz(const JzValue& jz_val, int step) {
 }
 
 void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
-    // Update jz_map for the given step
+    // Update mu_map and jz_map for ALL materials at the given step
+    // This function is called at the beginning of each step, after slideImageRegion()
     if (!config["materials"]) {
         return;
     }
@@ -2469,47 +2579,53 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         // Get relative permeability
         double mu_r = props["mu_r"].as<double>(1.0);
 
-        // Evaluate Jz for this step
+        // Evaluate Jz for this step (0.0 if not defined)
+        double jz = 0.0;
         if (material_jz.find(name) != material_jz.end()) {
-            double jz = evaluateJz(material_jz[name], step);
+            jz = evaluateJz(material_jz[name], step);
+        }
 
-            // Update jz_map for matching pixels
-            if (coordinate_system == "polar") {
-                // For polar coordinates, do NOT flip image
-                if (r_orientation == "horizontal") {
-                    for (int j = 0; j < ntheta; j++) {
-                        for (int i = 0; i < nr; i++) {
-                            cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
-                            if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                                jz_map(i, j) = jz;
-                                mu_map(i, j) = mu_r * MU_0;
-                            }
-                        }
-                    }
-                } else {  // vertical
-                    for (int j = 0; j < nr; j++) {
-                        for (int i = 0; i < ntheta; i++) {
-                            cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
-                            if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                                jz_map(j, i) = jz;
-                                mu_map(j, i) = mu_r * MU_0;
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Cartesian coordinates
-                // Create flipped image to match analysis coordinates (y up)
-                cv::Mat image_flipped;
-                cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
+        // Update mu_map and jz_map for ALL matching pixels
+        if (coordinate_system == "polar") {
+            // For polar coordinates, flip image to match analysis coordinates
+            cv::Mat image_flipped;
+            cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
 
-                for (int j = 0; j < ny; j++) {
-                    for (int i = 0; i < nx; i++) {
+            if (r_orientation == "horizontal") {
+                // mu_map shape: (ntheta, nr), indexing: (theta_idx, r_idx) = (j, i)
+                for (int j = 0; j < ntheta; j++) {
+                    for (int i = 0; i < nr; i++) {
                         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                             jz_map(j, i) = jz;
                             mu_map(j, i) = mu_r * MU_0;
                         }
+                    }
+                }
+            } else {  // vertical
+                // mu_map shape: (nr, ntheta), indexing: (r_idx, theta_idx) = (j, i)
+                for (int j = 0; j < nr; j++) {
+                    for (int i = 0; i < ntheta; i++) {
+                        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                        if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                            jz_map(j, i) = jz;
+                            mu_map(j, i) = mu_r * MU_0;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Cartesian coordinates
+            // Create flipped image to match analysis coordinates (y up)
+            cv::Mat image_flipped;
+            cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
+
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                        jz_map(j, i) = jz;
+                        mu_map(j, i) = mu_r * MU_0;
                     }
                 }
             }
@@ -3188,58 +3304,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // 5. Slide image for next step (except for last step)
         if (step < transient_config.total_steps - 1 && transient_config.enable_sliding) {
             slideImageRegion();
-
-            // Rebuild material properties after sliding
-            // We need to remap mu_map based on new image configuration
-            if (coordinate_system == "polar") {
-                mu_map = Eigen::MatrixXd::Constant(nr, ntheta, MU_0);
-            } else {
-                mu_map = Eigen::MatrixXd::Constant(ny, nx, MU_0);
-            }
-
-            // Re-apply material mu_r values for ALL materials
-            for (const auto& material : config["materials"]) {
-                std::string name = material.first.as<std::string>();
-                const auto& props = material.second;
-                std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
-                double mu_r = props["mu_r"].as<double>(1.0);
-
-                if (coordinate_system == "polar") {
-                    if (r_orientation == "horizontal") {
-                        for (int j = 0; j < ntheta; j++) {
-                            for (int i = 0; i < nr; i++) {
-                                cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
-                                if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                                    mu_map(i, j) = mu_r * MU_0;
-                                }
-                            }
-                        }
-                    } else {
-                        for (int j = 0; j < nr; j++) {
-                            for (int i = 0; i < ntheta; i++) {
-                                cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
-                                if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                                    mu_map(j, i) = mu_r * MU_0;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Cartesian coordinates
-                    // Create flipped image to match analysis coordinates (y up)
-                    cv::Mat image_flipped;
-                    cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
-
-                    for (int j = 0; j < ny; j++) {
-                        for (int i = 0; i < nx; i++) {
-                            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
-                            if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                                mu_map(j, i) = mu_r * MU_0;
-                            }
-                        }
-                    }
-                }
-            }
+            // Material properties (mu_map, jz_map) will be updated by setupMaterialPropertiesForStep() at next step
         }
     }
 

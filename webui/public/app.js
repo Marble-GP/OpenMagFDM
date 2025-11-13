@@ -1,12 +1,15 @@
 // グローバル変数
 let azData = null;
 let muData = null;
+let conditionsData = null;  // conditions.json from analysis results
 
 // DOM要素の取得
 const azFileInput = document.getElementById('azFile');
 const muFileInput = document.getElementById('muFile');
+const conditionsFileInput = document.getElementById('conditionsFile');
 const azStatus = document.getElementById('azStatus');
 const muStatus = document.getElementById('muStatus');
+const conditionsStatus = document.getElementById('conditionsStatus');
 const visualizeBtn = document.getElementById('visualizeBtn');
 const loading = document.getElementById('loading');
 const infoPanel = document.getElementById('infoPanel');
@@ -16,6 +19,7 @@ const visualizationArea = document.getElementById('visualizationArea');
 // ファイル選択イベント
 azFileInput.addEventListener('change', (e) => handleFileUpload(e, 'az'));
 muFileInput.addEventListener('change', (e) => handleFileUpload(e, 'mu'));
+conditionsFileInput.addEventListener('change', (e) => handleFileUpload(e, 'conditions'));
 visualizeBtn.addEventListener('click', visualize);
 
 /**
@@ -61,28 +65,58 @@ async function parseCSV(file) {
 }
 
 /**
+ * JSONファイルを読み込んで解析
+ */
+async function parseJSON(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = (e) => {
+            try {
+                const json = JSON.parse(e.target.result);
+                resolve(json);
+            } catch (error) {
+                reject(error);
+            }
+        };
+
+        reader.onerror = () => reject(new Error('JSONファイルの読み込みに失敗しました'));
+        reader.readAsText(file);
+    });
+}
+
+/**
  * ファイルアップロード処理
  */
 async function handleFileUpload(event, type) {
     const file = event.target.files[0];
     if (!file) return;
 
-    const statusElement = type === 'az' ? azStatus : muStatus;
+    const statusElement = type === 'az' ? azStatus : (type === 'mu' ? muStatus : conditionsStatus);
     statusElement.className = 'file-status';
     statusElement.textContent = '読み込み中...';
     statusElement.style.display = 'block';
 
     try {
-        const data = await parseCSV(file);
+        let data;
+        if (type === 'conditions') {
+            data = await parseJSON(file);
+        } else {
+            data = await parseCSV(file);
+        }
 
         if (type === 'az') {
             azData = data;
             azStatus.className = 'file-status success';
             azStatus.textContent = `✓ 読み込み完了: ${data.length} x ${data[0].length}`;
-        } else {
+        } else if (type === 'mu') {
             muData = data;
             muStatus.className = 'file-status success';
             muStatus.textContent = `✓ 読み込み完了: ${data.length} x ${data[0].length}`;
+        } else if (type === 'conditions') {
+            conditionsData = data;
+            conditionsStatus.className = 'file-status success';
+            conditionsStatus.textContent = `✓ 読み込み完了: ${data.coordinate_system || 'cartesian'} 座標系`;
         }
 
         // 両方のファイルが読み込まれたらボタンを有効化
@@ -95,6 +129,10 @@ async function handleFileUpload(event, type) {
 
         if (type === 'az') {
             azData = null;
+        } else if (type === 'mu') {
+            muData = null;
+        } else if (type === 'conditions') {
+            conditionsData = null;
         } else {
             muData = null;
         }
@@ -103,51 +141,126 @@ async function handleFileUpload(event, type) {
 }
 
 /**
- * 磁束密度の計算
- * Bx = ∂Az/∂y
- * By = -∂Az/∂x
+ * 磁束密度の計算 (座標系自動判定)
+ * Cartesian: Bx = ∂Az/∂y, By = -∂Az/∂x
+ * Polar: Br = (1/r)·∂Az/∂θ, Bθ = -∂Az/∂r
  */
 function calculateMagneticField(Az, dx, dy) {
     const rows = Az.length;
     const cols = Az[0].length;
 
-    // Bx = ∂Az/∂y
-    const Bx = Array(rows).fill(0).map(() => Array(cols).fill(0));
-    for (let j = 0; j < rows; j++) {
-        for (let i = 0; i < cols; i++) {
-            if (j === 0) {
-                Bx[j][i] = (Az[1][i] - Az[0][i]) / dy;
-            } else if (j === rows - 1) {
-                Bx[j][i] = (Az[rows-1][i] - Az[rows-2][i]) / dy;
-            } else {
-                Bx[j][i] = (Az[j+1][i] - Az[j-1][i]) / (2 * dy);
+    // Check coordinate system from conditions.json
+    const isPolar = conditionsData && conditionsData.coordinate_system === 'polar';
+
+    if (isPolar) {
+        // Polar coordinates calculation
+        const r_orientation = conditionsData.polar.r_orientation;
+        const r_start = conditionsData.polar.r_start;
+        const r_end = conditionsData.polar.r_end;
+        const dr = conditionsData.dr;
+        const dtheta = conditionsData.dtheta;
+
+        // Generate r coordinate array
+        const nr = (r_orientation === 'horizontal') ? cols : rows;
+        const ntheta = (r_orientation === 'horizontal') ? rows : cols;
+        const r_coords = Array(nr).fill(0).map((_, i) => r_start + i * dr);
+
+        const Br = Array(rows).fill(0).map(() => Array(cols).fill(0));
+        const Btheta = Array(rows).fill(0).map(() => Array(cols).fill(0));
+
+        // Polar coordinates are ALWAYS periodic in theta direction
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                // Determine r and theta indices based on orientation
+                const ir = (r_orientation === 'horizontal') ? i : j;
+                const itheta = (r_orientation === 'horizontal') ? j : i;
+
+                const r = r_coords[ir];
+
+                // Br = (1/r) * ∂Az/∂θ (periodic in theta)
+                const j_next = (itheta + 1) % ntheta;
+                const j_prev = (itheta - 1 + ntheta) % ntheta;
+
+                let dAz_dtheta;
+                if (r_orientation === 'horizontal') {
+                    dAz_dtheta = (Az[j_next][i] - Az[j_prev][i]) / (2 * dtheta);
+                } else {
+                    dAz_dtheta = (Az[j][j_next] - Az[j][j_prev]) / (2 * dtheta);
+                }
+
+                Br[j][i] = dAz_dtheta / (r > 1e-15 ? r : 1e-15);
+
+                // Bθ = -∂Az/∂r
+                let dAz_dr;
+                if (r_orientation === 'horizontal') {
+                    if (i === 0) {
+                        dAz_dr = (Az[j][1] - Az[j][0]) / dr;
+                    } else if (i === cols - 1) {
+                        dAz_dr = (Az[j][cols-1] - Az[j][cols-2]) / dr;
+                    } else {
+                        dAz_dr = (Az[j][i+1] - Az[j][i-1]) / (2 * dr);
+                    }
+                } else {
+                    if (j === 0) {
+                        dAz_dr = (Az[1][i] - Az[0][i]) / dr;
+                    } else if (j === rows - 1) {
+                        dAz_dr = (Az[rows-1][i] - Az[rows-2][i]) / dr;
+                    } else {
+                        dAz_dr = (Az[j+1][i] - Az[j-1][i]) / (2 * dr);
+                    }
+                }
+
+                Btheta[j][i] = -dAz_dr;
             }
         }
-    }
 
-    // By = -∂Az/∂x
-    const By = Array(rows).fill(0).map(() => Array(cols).fill(0));
-    for (let j = 0; j < rows; j++) {
-        for (let i = 0; i < cols; i++) {
-            if (i === 0) {
-                By[j][i] = -(Az[j][1] - Az[j][0]) / dx;
-            } else if (i === cols - 1) {
-                By[j][i] = -(Az[j][cols-1] - Az[j][cols-2]) / dx;
-            } else {
-                By[j][i] = -(Az[j][i+1] - Az[j][i-1]) / (2 * dx);
+        // |B| = sqrt(Br^2 + Bθ^2)
+        const B = Array(rows).fill(0).map(() => Array(cols).fill(0));
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                B[j][i] = Math.sqrt(Br[j][i]**2 + Btheta[j][i]**2);
             }
         }
-    }
 
-    // |B| = sqrt(Bx^2 + By^2)
-    const B = Array(rows).fill(0).map(() => Array(cols).fill(0));
-    for (let j = 0; j < rows; j++) {
-        for (let i = 0; i < cols; i++) {
-            B[j][i] = Math.sqrt(Bx[j][i]**2 + By[j][i]**2);
+        return { Bx: Br, By: Btheta, B };
+
+    } else {
+        // Cartesian coordinates calculation (original code)
+        const Bx = Array(rows).fill(0).map(() => Array(cols).fill(0));
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                if (j === 0) {
+                    Bx[j][i] = (Az[1][i] - Az[0][i]) / dy;
+                } else if (j === rows - 1) {
+                    Bx[j][i] = (Az[rows-1][i] - Az[rows-2][i]) / dy;
+                } else {
+                    Bx[j][i] = (Az[j+1][i] - Az[j-1][i]) / (2 * dy);
+                }
+            }
         }
-    }
 
-    return { Bx, By, B };
+        const By = Array(rows).fill(0).map(() => Array(cols).fill(0));
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                if (i === 0) {
+                    By[j][i] = -(Az[j][1] - Az[j][0]) / dx;
+                } else if (i === cols - 1) {
+                    By[j][i] = -(Az[j][cols-1] - Az[j][cols-2]) / dx;
+                } else {
+                    By[j][i] = -(Az[j][i+1] - Az[j][i-1]) / (2 * dx);
+                }
+            }
+        }
+
+        const B = Array(rows).fill(0).map(() => Array(cols).fill(0));
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                B[j][i] = Math.sqrt(Bx[j][i]**2 + By[j][i]**2);
+            }
+        }
+
+        return { Bx, By, B };
+    }
 }
 
 /**
