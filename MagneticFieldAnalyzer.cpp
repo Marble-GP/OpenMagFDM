@@ -1578,73 +1578,19 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 double ds = std::sqrt( (t_r * len_r)*(t_r * len_r) + (t_t * len_t)*(t_t * len_t) );
                 if (ds <= 0.0) ds = DS_MIN;
 
-                // sample B at outside sample (i_out,j_out) and convert to polar at theta
-                double bx_out = 0.0, by_out = 0.0;
-                double br_out = 0.0, bt_out = 0.0;  // For polar coordinates
-                if (coordinate_system == "cartesian") {
-                    // Bx/By are Eigen matrices with rows/cols corresponding to analysis indexing
-                    // Use periodic wrapping or clamping based on boundary conditions
-                    int bi = i_out;
-                    int bj = j_out;
-                    if (x_periodic) {
-                        bi = (bi + static_cast<int>(Bx.cols())) % static_cast<int>(Bx.cols());
-                    } else {
-                        bi = std::clamp(bi, 0, static_cast<int>(Bx.cols()) - 1);
-                    }
-                    if (y_periodic) {
-                        bj = (bj + static_cast<int>(Bx.rows())) % static_cast<int>(Bx.rows());
-                    } else {
-                        bj = std::clamp(bj, 0, static_cast<int>(Bx.rows()) - 1);
-                    }
-                    bx_out = Bx(bj, bi);
-                    by_out = By(bj, bi);
-                } else {
-                    // Polar coordinates: sample Br and Btheta directly
-                    int ir_out = (r_orientation == "horizontal") ? i_out : j_out;
-                    int jt_out = (r_orientation == "horizontal") ? j_out : i_out;
-                    ir_out = std::clamp(ir_out, 0, nr-1);
-                    jt_out = std::clamp(jt_out, 0, ntheta-1);
-                    double br_sample = 0.0, bt_sample = 0.0;
-                    if (r_orientation == "horizontal") {
-                        br_sample = Br(jt_out, ir_out);
-                        bt_sample = Btheta(jt_out, ir_out);
-                    } else {
-                        br_sample = Br(ir_out, jt_out);
-                        bt_sample = Btheta(ir_out, jt_out);
-                    }
-                    // Store polar components for Maxwell stress calculation
-                    br_out = br_sample;
-                    bt_out = bt_sample;
+                // CRITICAL FIX: Sample B and μ at SAME physical point using bilinear interpolation
+                // Calculate sample point physical coordinates (outside boundary, along normal)
+                double sample_distance = (coordinate_system == "polar") ? dr : std::max(dx, dy);
+                double x_sample = x_phys + n_phys_x * sample_distance;
+                double y_sample = y_phys + n_phys_y * sample_distance;
 
-                    // CRITICAL FIX: Compute theta from PHYSICAL coordinates, not from index
-                    // This avoids systematic bias from grid-index-based angle calculation
-                    // Sample point physical coordinates
-                    double r_sample = r_coords[ir_out];
-                    double theta_sample_index = jt_out * dtheta;  // Keep for reference
-                    double x_sample = r_sample * std::cos(theta_sample_index);
-                    double y_sample = r_sample * std::sin(theta_sample_index);
-                    // Use atan2 to get physical angle
-                    double theta_out = std::atan2(y_sample, x_sample);
-                    if (theta_out < 0.0) theta_out += 2.0 * M_PI;  // Normalize to [0, 2π)
+                // Use unified sampling function to get B and μ at the SAME location
+                PolarSample sample = sampleFieldsAtPhysicalPoint(x_sample, y_sample);
 
-                    // Convert to Cartesian using physical angle
-                    bx_out = br_sample * std::cos(theta_out) - bt_sample * std::sin(theta_out);
-                    by_out = br_sample * std::sin(theta_out) + bt_sample * std::cos(theta_out);
-                }
-
-                // Get permeability at the BOUNDARY point (i, j), NOT the sample point
-                // CRITICAL FIX: The sample point (i_out, j_out) is OUTSIDE the material (in air),
-                // so mu_sample would be MU_0. We must use mu at the boundary point (inside material).
-                // This is the most likely cause of systematic torque bias.
-                double mu_local = MU_0;
-                if (coordinate_system == "cartesian") {
-                    int bi = std::clamp(i, 0, static_cast<int>(mu_map.cols())-1);
-                    int bj = std::clamp(j, 0, static_cast<int>(mu_map.rows())-1);
-                    mu_local = mu_map(bj, bi);
-                } else {
-                    // Polar: use boundary point (i, j) NOT sample point (i_out, j_out)
-                    mu_local = getMuPolar(mu_map, ir, jt, r_orientation);
-                }
+                // Extract Cartesian B components and μ
+                double bx_out = sample.Bx;
+                double by_out = sample.By;
+                double mu_local = sample.mu;
 
                 // Maxwell stress calculation: Use Cartesian coordinates for BOTH coordinate systems
                 // CRITICAL FIX: Avoid basis vector inconsistencies by always computing in Cartesian
@@ -1673,22 +1619,20 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
 
                 // Radial force: for polar use T_rr component, for cartesian use magnitude
                 if (coordinate_system == "polar") {
-                    // Use consistent polar basis at sample point (theta_out)
-                    int ir_out_local = (r_orientation == "horizontal") ? i_out : j_out;
-                    int jt_out_local = (r_orientation == "horizontal") ? j_out : i_out;
-                    ir_out_local = std::clamp(ir_out_local, 0, nr-1);
-                    jt_out_local = std::clamp(jt_out_local, 0, ntheta-1);
-                    double theta_out_local = jt_out_local * dtheta;
-                    double er_out_local_x = std::cos(theta_out_local);
-                    double er_out_local_y = std::sin(theta_out_local);
-                    double et_out_local_x = -std::sin(theta_out_local);
-                    double et_out_local_y = std::cos(theta_out_local);
+                    // Use consistent polar basis at sample point
+                    double theta_sample = sample.theta_phys;
+                    double er_sample_x = std::cos(theta_sample);
+                    double er_sample_y = std::sin(theta_sample);
+                    double et_sample_x = -std::sin(theta_sample);
+                    double et_sample_y = std::cos(theta_sample);
 
-                    double n_r = n_phys_x * er_out_local_x + n_phys_y * er_out_local_y;
-                    double n_t = n_phys_x * et_out_local_x + n_phys_y * et_out_local_y;
-                    // Use br_out, bt_out directly (already computed above)
-                    double B_r = br_out;
-                    double B_t = bt_out;
+                    double n_r = n_phys_x * er_sample_x + n_phys_y * er_sample_y;
+                    double n_t = n_phys_x * et_sample_x + n_phys_y * et_sample_y;
+
+                    // Use polar B components from sample
+                    double B_r = sample.Br;
+                    double B_t = sample.Btheta;
+
                     // Maxwell stress using H = B/μ
                     double H_r = B_r / mu_local;
                     double H_t = B_t / mu_local;
@@ -1730,9 +1674,9 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 stress_point.ds = ds;
                 stress_point.nx = n_phys_x;
                 stress_point.ny = n_phys_y;
-                stress_point.Bx = bx_out;
-                stress_point.By = by_out;
-                stress_point.B_magnitude = std::sqrt(bx_out * bx_out + by_out * by_out);
+                stress_point.Bx = sample.Bx;
+                stress_point.By = sample.By;
+                stress_point.B_magnitude = std::sqrt(sample.Bx * sample.Bx + sample.By * sample.By);
                 stress_point.material = name;
                 stress_map[std::make_pair(i, j)] = stress_point;
             }
