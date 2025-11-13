@@ -1138,6 +1138,142 @@ inline double getJzPolar(const Eigen::MatrixXd& jz_map, int r_idx, int theta_idx
     }
 }
 
+// Structure to hold sampled field values at a physical point in polar coordinates
+struct PolarSample {
+    double x_phys, y_phys;       // Cartesian physical coordinates
+    double r_phys, theta_phys;   // Polar physical coordinates
+    double Bx, By;               // Cartesian B components
+    double Br, Btheta;           // Polar B components (for reference)
+    double mu;                   // Permeability at this point
+};
+
+// Bilinear interpolation for polar coordinates with periodic theta boundary
+// Input: physical coordinates (r_phys, theta_phys)
+// Output: interpolated field value
+inline double bilinearInterpolatePolar(
+    const Eigen::MatrixXd& field,
+    double r_phys, double theta_phys,
+    double r_start, double dr, double dtheta,
+    int nr, int ntheta,
+    const std::string& r_orientation) {
+
+    // Convert physical coordinates to continuous grid indices
+    double r_idx_cont = (r_phys - r_start) / dr;
+    double theta_idx_cont = theta_phys / dtheta;
+
+    // Clamp r index to valid range [0, nr-2] (need r0+1 to be valid)
+    r_idx_cont = std::max(0.0, std::min(r_idx_cont, static_cast<double>(nr - 2) + 0.999));
+
+    // Wrap theta index for periodicity (θ ∈ [0, 2π) maps to index ∈ [0, ntheta))
+    theta_idx_cont = std::fmod(theta_idx_cont, static_cast<double>(ntheta));
+    if (theta_idx_cont < 0.0) theta_idx_cont += ntheta;
+
+    // Get integer indices (floor)
+    int r0 = static_cast<int>(std::floor(r_idx_cont));
+    int t0 = static_cast<int>(std::floor(theta_idx_cont));
+
+    // Clamp to ensure valid indices
+    r0 = std::max(0, std::min(r0, nr - 2));
+    int r1 = r0 + 1;
+
+    // Theta wraps periodically
+    int t1 = (t0 + 1) % ntheta;
+
+    // Interpolation weights
+    double wr = r_idx_cont - r0;
+    double wt = theta_idx_cont - t0;
+
+    // Clamp weights to [0, 1]
+    wr = std::max(0.0, std::min(1.0, wr));
+    wt = std::max(0.0, std::min(1.0, wt));
+
+    // Sample field at 4 corners (handle r_orientation)
+    double v00, v10, v01, v11;
+    if (r_orientation == "horizontal") {
+        // field shape: (ntheta, nr), indexing: (theta_idx, r_idx)
+        v00 = field(t0, r0);
+        v10 = field(t0, r1);
+        v01 = field(t1, r0);
+        v11 = field(t1, r1);
+    } else {
+        // field shape: (nr, ntheta), indexing: (r_idx, theta_idx)
+        v00 = field(r0, t0);
+        v10 = field(r1, t0);
+        v01 = field(r0, t1);
+        v11 = field(r1, t1);
+    }
+
+    // Bilinear interpolation: first interpolate in r, then in theta
+    double v0 = (1.0 - wr) * v00 + wr * v10;  // at t0
+    double v1 = (1.0 - wr) * v01 + wr * v11;  // at t1
+    return (1.0 - wt) * v0 + wt * v1;
+}
+
+// Sample B, μ, and coordinates at a physical point with consistent interpolation
+// CRITICAL: This ensures B and μ are evaluated at the SAME physical location
+PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysicalPoint(double x_phys, double y_phys) {
+    PolarSample sample;
+    sample.x_phys = x_phys;
+    sample.y_phys = y_phys;
+
+    if (coordinate_system == "cartesian") {
+        // Cartesian coordinates: straightforward interpolation
+        // Convert physical coords to grid indices
+        double i_cont = x_phys / dx;
+        double j_cont = y_phys / dy;
+
+        // Clamp to valid range
+        i_cont = std::max(0.0, std::min(i_cont, static_cast<double>(nx - 1)));
+        j_cont = std::max(0.0, std::min(j_cont, static_cast<double>(ny - 1)));
+
+        // Get integer indices
+        int i0 = static_cast<int>(std::floor(i_cont));
+        int j0 = static_cast<int>(std::floor(j_cont));
+        int i1 = std::min(i0 + 1, nx - 1);
+        int j1 = std::min(j0 + 1, ny - 1);
+
+        // Interpolation weights
+        double wi = i_cont - i0;
+        double wj = j_cont - j0;
+
+        // Bilinear interpolation for Bx, By, mu
+        double Bx00 = Bx(j0, i0), Bx10 = Bx(j0, i1), Bx01 = Bx(j1, i0), Bx11 = Bx(j1, i1);
+        double By00 = By(j0, i0), By10 = By(j0, i1), By01 = By(j1, i0), By11 = By(j1, i1);
+        double mu00 = mu_map(j0, i0), mu10 = mu_map(j0, i1), mu01 = mu_map(j1, i0), mu11 = mu_map(j1, i1);
+
+        sample.Bx = (1-wi)*(1-wj)*Bx00 + wi*(1-wj)*Bx10 + (1-wi)*wj*Bx01 + wi*wj*Bx11;
+        sample.By = (1-wi)*(1-wj)*By00 + wi*(1-wj)*By10 + (1-wi)*wj*By01 + wi*wj*By11;
+        sample.mu = (1-wi)*(1-wj)*mu00 + wi*(1-wj)*mu10 + (1-wi)*wj*mu01 + wi*wj*mu11;
+
+        // Polar coords for reference
+        sample.r_phys = std::sqrt(x_phys*x_phys + y_phys*y_phys);
+        sample.theta_phys = std::atan2(y_phys, x_phys);
+        if (sample.theta_phys < 0.0) sample.theta_phys += 2.0 * M_PI;
+        sample.Br = 0.0;      // Not computed for Cartesian
+        sample.Btheta = 0.0;
+
+    } else {
+        // Polar coordinates: use bilinear interpolation with theta wrapping
+        sample.r_phys = std::sqrt(x_phys*x_phys + y_phys*y_phys);
+        sample.theta_phys = std::atan2(y_phys, x_phys);
+        if (sample.theta_phys < 0.0) sample.theta_phys += 2.0 * M_PI;
+
+        // Interpolate Br, Btheta, mu at (r_phys, theta_phys)
+        sample.Br = bilinearInterpolatePolar(Br, sample.r_phys, sample.theta_phys,
+                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+        sample.Btheta = bilinearInterpolatePolar(Btheta, sample.r_phys, sample.theta_phys,
+                                                r_start, dr, dtheta, nr, ntheta, r_orientation);
+        sample.mu = bilinearInterpolatePolar(mu_map, sample.r_phys, sample.theta_phys,
+                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+
+        // Convert to Cartesian using the SAME theta from atan2
+        sample.Bx = sample.Br * std::cos(sample.theta_phys) - sample.Btheta * std::sin(sample.theta_phys);
+        sample.By = sample.Br * std::sin(sample.theta_phys) + sample.Btheta * std::cos(sample.theta_phys);
+    }
+
+    return sample;
+}
+
 void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     std::cout << "\n=== Calculating Maxwell Stress (polar-aware, Sobel normals) ===" << std::endl;
 

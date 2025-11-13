@@ -273,6 +273,9 @@ private:
     void calculateMagneticField();
     void calculateMagneticFieldPolar();
 
+    // Sampling method for consistent B and μ evaluation at physical points
+    PolarSample sampleFieldsAtPhysicalPoint(double x_phys, double y_phys);
+
     // Helper method for periodic boundary-aware filtering
     void applyLaplacianWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int ksize = 3);
     void applySobelWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int dx, int dy, int ksize = 3);
