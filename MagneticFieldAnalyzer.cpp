@@ -1341,6 +1341,16 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
         cy_physical = 0.0;
     }
 
+    // Calculate cumulative rotation angle offset for transient analysis
+    // CRITICAL: This offset is used for physical coordinate calculation (x_phys, y_phys)
+    // but must be REMOVED when sampling magnetic fields from image-based arrays
+    double theta_offset = 0.0;
+    if (coordinate_system == "polar" && step >= 0 && transient_config.enabled && transient_config.enable_sliding) {
+        theta_offset = step * transient_config.slide_pixels_per_step * dtheta;
+        std::cout << "Transient analysis: cumulative rotation offset = " << theta_offset << " rad ("
+                  << (theta_offset * 180.0 / M_PI) << " deg) at step " << step << std::endl;
+    }
+
     // Prepare results containers
     force_results.clear();
     boundary_stress_vectors.clear();  // Clear boundary stress vectors for new calculation
@@ -1569,15 +1579,8 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     r_phys = r_coords[ir];
 
                     // CRITICAL FIX: Account for cumulative rotation from image sliding
-                    // In transient analysis, the image rotates step-by-step in theta direction
-                    // This causes pixel index jt to wrap at periodic boundary, but physical
-                    // coordinates must remain continuous. Add cumulative rotation angle.
-                    double theta_offset = 0.0;
-                    if (step >= 0 && transient_config.enabled && transient_config.enable_sliding) {
-                        // Each step slides by slide_pixels_per_step pixels in theta direction
-                        theta_offset = step * transient_config.slide_pixels_per_step * dtheta;
-                    }
-
+                    // theta_offset is calculated at function scope (line 1347-1352)
+                    // Physical coordinates include cumulative rotation for correct torque calculation
                     theta = jt * dtheta + theta_offset;
                     x_phys = r_phys * std::cos(theta);
                     y_phys = r_phys * std::sin(theta);
@@ -1624,16 +1627,24 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     double n_r = n_phys_x * std::cos(theta) + n_phys_y * std::sin(theta);
                     double n_theta = -n_phys_x * std::sin(theta) + n_phys_y * std::cos(theta);
 
-                    // Calculate sample point in polar coordinates
+                    // Calculate sample point in polar coordinates (physical system with cumulative rotation)
                     double r_sample = r_phys + sample_distance * n_r;
-                    double theta_sample = theta + (r_phys > 0.0 ? (sample_distance * n_theta / r_phys) : 0.0);
+                    double theta_sample_phys = theta + (r_phys > 0.0 ? (sample_distance * n_theta / r_phys) : 0.0);
 
-                    // Wrap theta to [0, 2π)
-                    while (theta_sample < 0.0) theta_sample += 2.0 * M_PI;
-                    while (theta_sample >= 2.0 * M_PI) theta_sample -= 2.0 * M_PI;
+                    // CRITICAL: Convert physical theta back to image theta for field sampling
+                    // Magnetic fields are stored in image coordinate system (without cumulative rotation)
+                    // Subtract theta_offset to get image-based theta for correct field lookup
+                    double theta_sample_image = theta_sample_phys - theta_offset;
 
-                    // Use polar-coordinate sampling (no atan2!)
-                    sample = sampleFieldsAtPolarPoint(r_sample, theta_sample);
+                    // Wrap theta to [0, 2π) for image coordinate system
+                    while (theta_sample_image < 0.0) theta_sample_image += 2.0 * M_PI;
+                    while (theta_sample_image >= 2.0 * M_PI) theta_sample_image -= 2.0 * M_PI;
+
+                    // Sample fields using image coordinates
+                    sample = sampleFieldsAtPolarPoint(r_sample, theta_sample_image);
+
+                    // Convert sample coordinates back to physical system for record
+                    sample.theta_phys = theta_sample_phys;
                 } else {
                     // For Cartesian coordinates: use Cartesian sampling
                     double sample_distance = std::max(dx, dy);
