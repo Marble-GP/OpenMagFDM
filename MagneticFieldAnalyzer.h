@@ -116,6 +116,15 @@ public:
      */
     void exportBoundaryStressVectors(const std::string& output_path) const;
 
+    // Structure to hold sampled field values at a physical point (public for method return type)
+    struct PolarSample {
+        double x_phys, y_phys;       // Cartesian physical coordinates
+        double r_phys, theta_phys;   // Polar physical coordinates
+        double Bx, By;               // Cartesian B components
+        double Br, Btheta;           // Polar B components (for reference)
+        double mu;                   // Permeability at this point
+    };
+
 private:
     // Dynamic current density representation
     enum class JzType {
@@ -275,6 +284,9 @@ private:
 
     // Sampling method for consistent B and μ evaluation at physical points
     PolarSample sampleFieldsAtPhysicalPoint(double x_phys, double y_phys);
+
+    // Overload for polar coordinates: directly use r_phys, theta_phys to avoid atan2 inconsistency
+    PolarSample sampleFieldsAtPolarPoint(double r_phys, double theta_phys);
 
     // Helper method for periodic boundary-aware filtering
     void applyLaplacianWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int ksize = 3);

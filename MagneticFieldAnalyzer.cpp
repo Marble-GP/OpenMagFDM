@@ -1138,15 +1138,6 @@ inline double getJzPolar(const Eigen::MatrixXd& jz_map, int r_idx, int theta_idx
     }
 }
 
-// Structure to hold sampled field values at a physical point in polar coordinates
-struct PolarSample {
-    double x_phys, y_phys;       // Cartesian physical coordinates
-    double r_phys, theta_phys;   // Polar physical coordinates
-    double Bx, By;               // Cartesian B components
-    double Br, Btheta;           // Polar B components (for reference)
-    double mu;                   // Permeability at this point
-};
-
 // Bilinear interpolation for polar coordinates with periodic theta boundary
 // Input: physical coordinates (r_phys, theta_phys)
 // Output: interpolated field value
@@ -1211,8 +1202,8 @@ inline double bilinearInterpolatePolar(
 
 // Sample B, μ, and coordinates at a physical point with consistent interpolation
 // CRITICAL: This ensures B and μ are evaluated at the SAME physical location
-PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysicalPoint(double x_phys, double y_phys) {
-    PolarSample sample;
+MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysicalPoint(double x_phys, double y_phys) {
+    MagneticFieldAnalyzer::PolarSample sample;
     sample.x_phys = x_phys;
     sample.y_phys = y_phys;
 
@@ -1269,6 +1260,37 @@ PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysicalPoint(double x_phys, do
         // Convert to Cartesian using the SAME theta from atan2
         sample.Bx = sample.Br * std::cos(sample.theta_phys) - sample.Btheta * std::sin(sample.theta_phys);
         sample.By = sample.Br * std::sin(sample.theta_phys) + sample.Btheta * std::cos(sample.theta_phys);
+    }
+
+    return sample;
+}
+
+// Polar coordinate version: directly use r_phys and theta_phys to avoid atan2 inconsistency
+// CRITICAL: This ensures exact consistency between boundary point and sample point calculations
+MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPolarPoint(double r_phys, double theta_phys) {
+    MagneticFieldAnalyzer::PolarSample sample;
+
+    // Convert to Cartesian for the record
+    sample.x_phys = r_phys * std::cos(theta_phys);
+    sample.y_phys = r_phys * std::sin(theta_phys);
+    sample.r_phys = r_phys;
+    sample.theta_phys = theta_phys;
+
+    if (coordinate_system == "polar") {
+        // Interpolate Br, Btheta, mu at (r_phys, theta_phys)
+        sample.Br = bilinearInterpolatePolar(Br, r_phys, theta_phys,
+                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+        sample.Btheta = bilinearInterpolatePolar(Btheta, r_phys, theta_phys,
+                                                r_start, dr, dtheta, nr, ntheta, r_orientation);
+        sample.mu = bilinearInterpolatePolar(mu_map, r_phys, theta_phys,
+                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+
+        // Convert to Cartesian using the SAME theta (no atan2!)
+        sample.Bx = sample.Br * std::cos(theta_phys) - sample.Btheta * std::sin(theta_phys);
+        sample.By = sample.Br * std::sin(theta_phys) + sample.Btheta * std::cos(theta_phys);
+    } else {
+        // Cartesian system: fall back to x-y version
+        return sampleFieldsAtPhysicalPoint(sample.x_phys, sample.y_phys);
     }
 
     return sample;
@@ -1579,13 +1601,35 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 if (ds <= 0.0) ds = DS_MIN;
 
                 // CRITICAL FIX: Sample B and μ at SAME physical point using bilinear interpolation
-                // Calculate sample point physical coordinates (outside boundary, along normal)
-                double sample_distance = (coordinate_system == "polar") ? dr : std::max(dx, dy);
-                double x_sample = x_phys + n_phys_x * sample_distance;
-                double y_sample = y_phys + n_phys_y * sample_distance;
+                // Calculate sample point in the SAME coordinate system to avoid atan2 inconsistency
+                MagneticFieldAnalyzer::PolarSample sample;
 
-                // Use unified sampling function to get B and μ at the SAME location
-                PolarSample sample = sampleFieldsAtPhysicalPoint(x_sample, y_sample);
+                if (coordinate_system == "polar") {
+                    // For polar coordinates: calculate sample point directly in polar coords
+                    // This avoids atan2 inconsistency between boundary and sample points
+                    double sample_distance = dr;
+
+                    // Decompose normal into polar components
+                    double n_r = n_phys_x * std::cos(theta) + n_phys_y * std::sin(theta);
+                    double n_theta = -n_phys_x * std::sin(theta) + n_phys_y * std::cos(theta);
+
+                    // Calculate sample point in polar coordinates
+                    double r_sample = r_phys + sample_distance * n_r;
+                    double theta_sample = theta + (r_phys > 0.0 ? (sample_distance * n_theta / r_phys) : 0.0);
+
+                    // Wrap theta to [0, 2π)
+                    while (theta_sample < 0.0) theta_sample += 2.0 * M_PI;
+                    while (theta_sample >= 2.0 * M_PI) theta_sample -= 2.0 * M_PI;
+
+                    // Use polar-coordinate sampling (no atan2!)
+                    sample = sampleFieldsAtPolarPoint(r_sample, theta_sample);
+                } else {
+                    // For Cartesian coordinates: use Cartesian sampling
+                    double sample_distance = std::max(dx, dy);
+                    double x_sample = x_phys + n_phys_x * sample_distance;
+                    double y_sample = y_phys + n_phys_y * sample_distance;
+                    sample = sampleFieldsAtPhysicalPoint(x_sample, y_sample);
+                }
 
                 // Extract Cartesian B components and μ
                 double bx_out = sample.Bx;
