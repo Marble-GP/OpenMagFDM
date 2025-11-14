@@ -1567,7 +1567,18 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     ir = std::clamp(ir, 0, nr-1);
                     jt = std::clamp(jt, 0, ntheta-1);
                     r_phys = r_coords[ir];
-                    theta = jt * dtheta;
+
+                    // CRITICAL FIX: Account for cumulative rotation from image sliding
+                    // In transient analysis, the image rotates step-by-step in theta direction
+                    // This causes pixel index jt to wrap at periodic boundary, but physical
+                    // coordinates must remain continuous. Add cumulative rotation angle.
+                    double theta_offset = 0.0;
+                    if (step >= 0 && transient_config.enabled && transient_config.enable_sliding) {
+                        // Each step slides by slide_pixels_per_step pixels in theta direction
+                        theta_offset = step * transient_config.slide_pixels_per_step * dtheta;
+                    }
+
+                    theta = jt * dtheta + theta_offset;
                     x_phys = r_phys * std::cos(theta);
                     y_phys = r_phys * std::sin(theta);
                 } else {
