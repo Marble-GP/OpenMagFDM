@@ -143,7 +143,9 @@ void exportConditionsJSON(const std::string& output_path,
         double theta_range_deg = polar_section["theta_range"]
             ? polar_section["theta_range"].as<double>() : 360.0;
         double theta_range_rad = theta_range_deg * M_PI / 180.0;
-        double dtheta = theta_range_rad / (ntheta - 1);
+        // CRITICAL FIX: Periodic boundary condition requires dtheta = theta_range / ntheta
+        // NOT theta_range / (ntheta-1) which is for non-periodic grids
+        double dtheta = theta_range_rad / static_cast<double>(ntheta);
 
         json_file << "  \"dr\": " << dr << ",\n";
         json_file << "  \"dtheta\": " << dtheta << ",\n";

@@ -1144,20 +1144,22 @@ inline double getJzPolar(const Eigen::MatrixXd& jz_map, int r_idx, int theta_idx
 inline double bilinearInterpolatePolar(
     const Eigen::MatrixXd& field,
     double r_phys, double theta_phys,
-    double r_start, double dr, double dtheta,
+    double r_start, double dr, double dtheta, double theta_range,
     int nr, int ntheta,
     const std::string& r_orientation) {
 
     // Convert physical coordinates to continuous grid indices
     double r_idx_cont = (r_phys - r_start) / dr;
-    double theta_idx_cont = theta_phys / dtheta;
+
+    // FIX5: Normalize theta to [0, theta_range) in radians BEFORE converting to index
+    // CRITICAL: This handles sector models (theta_range < 2π) correctly
+    // Periodic boundary: theta = theta_range wraps to theta = 0
+    double theta_norm = std::fmod(theta_phys, theta_range);
+    if (theta_norm < 0.0) theta_norm += theta_range;
+    double theta_idx_cont = theta_norm / dtheta;
 
     // Clamp r index to valid range [0, nr-2] (need r0+1 to be valid)
     r_idx_cont = std::max(0.0, std::min(r_idx_cont, static_cast<double>(nr - 2) + 0.999));
-
-    // Wrap theta index for periodicity (θ ∈ [0, 2π) maps to index ∈ [0, ntheta))
-    theta_idx_cont = std::fmod(theta_idx_cont, static_cast<double>(ntheta));
-    if (theta_idx_cont < 0.0) theta_idx_cont += ntheta;
 
     // Get integer indices (floor)
     int r0 = static_cast<int>(std::floor(r_idx_cont));
@@ -1251,11 +1253,11 @@ MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysical
 
         // Interpolate Br, Btheta, mu at (r_phys, theta_phys)
         sample.Br = bilinearInterpolatePolar(Br, sample.r_phys, sample.theta_phys,
-                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
         sample.Btheta = bilinearInterpolatePolar(Btheta, sample.r_phys, sample.theta_phys,
-                                                r_start, dr, dtheta, nr, ntheta, r_orientation);
+                                                r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
         sample.mu = bilinearInterpolatePolar(mu_map, sample.r_phys, sample.theta_phys,
-                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
 
         // Convert to Cartesian using the SAME theta from atan2
         sample.Bx = sample.Br * std::cos(sample.theta_phys) - sample.Btheta * std::sin(sample.theta_phys);
@@ -1279,11 +1281,11 @@ MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPolarPoi
     if (coordinate_system == "polar") {
         // Interpolate Br, Btheta, mu at (r_phys, theta_phys)
         sample.Br = bilinearInterpolatePolar(Br, r_phys, theta_phys,
-                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
         sample.Btheta = bilinearInterpolatePolar(Btheta, r_phys, theta_phys,
-                                                r_start, dr, dtheta, nr, ntheta, r_orientation);
+                                                r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
         sample.mu = bilinearInterpolatePolar(mu_map, r_phys, theta_phys,
-                                            r_start, dr, dtheta, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
 
         // Convert to Cartesian using the SAME theta (no atan2!)
         sample.Bx = sample.Br * std::cos(theta_phys) - sample.Btheta * std::sin(theta_phys);
@@ -1566,14 +1568,6 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     }
                 }
 
-                // convert image-space normal -> physical-space normal:
-                // because we flipped masks, j index already follows physical y-up convention,
-                // so we do NOT flip sign here. (We flipped earlier so indexes match physical).
-                // However if your B-field arrays were computed under a different convention,
-                // you may need to flip signs accordingly.
-                double n_phys_x = n_img_x;
-                double n_phys_y = n_img_y;
-
                 // Map pixel(i,j) -> physical coords & polar indices
                 double x_phys = 0.0, y_phys = 0.0;
                 double r_phys = 0.0, theta = 0.0;
@@ -1597,6 +1591,49 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     y_phys = static_cast<double>(j) * dy;
                     r_phys = std::sqrt(x_phys*x_phys + y_phys*y_phys);
                     theta = (r_phys > 0.0) ? std::atan2(y_phys, x_phys) : 0.0;
+                }
+
+                // CRITICAL FIX: Convert image-space normal to physical-space normal with proper scaling
+                // GPT Review: "Sobel gradient needs physical scaling, especially in polar coordinates"
+                double n_phys_x, n_phys_y;
+                if (coordinate_system == "polar") {
+                    // Polar coordinates: Scale by physical lengths (dr, r*dtheta)
+                    // r_orientation=horizontal: i→r direction, j→θ direction
+                    // Sobel gives image gradients (gx, gy) = (∂/∂i, ∂/∂j)
+                    // Physical gradients: ∂/∂r = (∂/∂i)/dr, ∂/∂θ = (∂/∂j)/(r*dθ)
+
+                    double n_r, n_theta;
+                    if (r_orientation == "horizontal") {
+                        // i→r, j→θ
+                        n_r = n_img_x / dr;
+                        n_theta = n_img_y / (r_phys * dtheta + 1e-12);  // Avoid division by zero at r=0
+                    } else {
+                        // i→θ, j→r
+                        n_r = n_img_y / dr;
+                        n_theta = n_img_x / (r_phys * dtheta + 1e-12);
+                    }
+
+                    // Convert polar normal to Cartesian
+                    n_phys_x = n_r * std::cos(theta) - n_theta * std::sin(theta);
+                    n_phys_y = n_r * std::sin(theta) + n_theta * std::cos(theta);
+
+                    // Normalize
+                    double norm = std::sqrt(n_phys_x * n_phys_x + n_phys_y * n_phys_y);
+                    if (norm > EPS_NORMAL) {
+                        n_phys_x /= norm;
+                        n_phys_y /= norm;
+                    }
+                } else {
+                    // Cartesian coordinates: Scale by dx, dy
+                    n_phys_x = n_img_x / dx;
+                    n_phys_y = n_img_y / dy;
+
+                    // Normalize
+                    double norm = std::sqrt(n_phys_x * n_phys_x + n_phys_y * n_phys_y);
+                    if (norm > EPS_NORMAL) {
+                        n_phys_x /= norm;
+                        n_phys_y /= norm;
+                    }
                 }
 
                 // basis vectors
@@ -1643,9 +1680,10 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     // Subtract theta_offset to get image-based theta for correct field lookup
                     double theta_sample_image = theta_sample_phys - theta_offset;
 
-                    // Wrap theta to [0, 2π) for image coordinate system
-                    while (theta_sample_image < 0.0) theta_sample_image += 2.0 * M_PI;
-                    while (theta_sample_image >= 2.0 * M_PI) theta_sample_image -= 2.0 * M_PI;
+                    // FIX2: Wrap theta to [0, theta_range) for image coordinate system
+                    // CRITICAL: Use theta_range (not 2π) to handle sector models correctly
+                    while (theta_sample_image < 0.0) theta_sample_image += theta_range;
+                    while (theta_sample_image >= theta_range) theta_sample_image -= theta_range;
 
                     // Sample fields using image coordinates
                     sample = sampleFieldsAtPolarPoint(r_sample, theta_sample_image);
