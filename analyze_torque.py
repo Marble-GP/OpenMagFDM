@@ -4,7 +4,7 @@ import glob
 import os
 
 # Read all force files
-force_dir = "output_20251115_120232/Forces"
+force_dir = "output_20251115_122217/Forces"
 force_files = sorted(glob.glob(f"{force_dir}/step_*.csv"))
 
 # Extract data
