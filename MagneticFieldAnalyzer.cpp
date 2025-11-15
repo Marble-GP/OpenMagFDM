@@ -1699,14 +1699,12 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     sample = sampleFieldsAtPhysicalPoint(x_sample, y_sample);
                 }
 
-                // Extract Cartesian B components
-                double bx_out = sample.Bx;
-                double by_out = sample.By;
-
-                // FIX8: Use material μ from boundary pixel directly (not interpolated)
-                // Physical interpretation: The material at the boundary exerts force,
-                // so use the material's permeability, not a mixed/interpolated value
+                // FIX11: Extract B and μ from boundary pixel directly (not interpolated)
+                // Same reasoning as Fix8: boundary is material/air interface
+                // Interpolation mixes material and air values → use material side only
+                double bx_out = 0.0, by_out = 0.0;
                 double mu_boundary = 0.0;
+
                 if (coordinate_system == "polar") {
                     int ir_boundary, jt_boundary;
                     if (r_orientation == "horizontal") {
@@ -1719,14 +1717,26 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     ir_boundary = std::clamp(ir_boundary, 0, nr - 1);
                     jt_boundary = std::clamp(jt_boundary, 0, ntheta - 1);
 
+                    // Get Br, Btheta, mu from boundary pixel
+                    double br_boundary, bt_boundary;
                     if (r_orientation == "horizontal") {
+                        br_boundary = Br(jt_boundary, ir_boundary);
+                        bt_boundary = Btheta(jt_boundary, ir_boundary);
                         mu_boundary = mu_map(jt_boundary, ir_boundary);
                     } else {
+                        br_boundary = Br(ir_boundary, jt_boundary);
+                        bt_boundary = Btheta(ir_boundary, jt_boundary);
                         mu_boundary = mu_map(ir_boundary, jt_boundary);
                     }
+
+                    // Convert B from polar to Cartesian using boundary theta
+                    bx_out = br_boundary * std::cos(theta) - bt_boundary * std::sin(theta);
+                    by_out = br_boundary * std::sin(theta) + bt_boundary * std::cos(theta);
                 } else {
-                    int bi = std::clamp(i, 0, static_cast<int>(mu_map.cols()) - 1);
-                    int bj = std::clamp(j, 0, static_cast<int>(mu_map.rows()) - 1);
+                    int bi = std::clamp(i, 0, static_cast<int>(Bx.cols()) - 1);
+                    int bj = std::clamp(j, 0, static_cast<int>(Bx.rows()) - 1);
+                    bx_out = Bx(bj, bi);
+                    by_out = By(bj, bi);
                     mu_boundary = mu_map(bj, bi);
                 }
                 double mu_local = mu_boundary;
