@@ -1662,6 +1662,10 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 double x_phys = 0.0, y_phys = 0.0;
                 double r_phys = 0.0, theta = 0.0;
                 int ir = 0, jt = 0;
+
+                // FIX14: Torque calculation coordinates (rotor frame, independent of theta_offset)
+                double x_torque = 0.0, y_torque = 0.0;
+
                 if (coordinate_system == "polar") {
                     if (r_orientation == "horizontal") { ir = i; jt = j; }
                     else { ir = j; jt = i; }
@@ -1669,18 +1673,28 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     jt = std::clamp(jt, 0, ntheta-1);
                     r_phys = r_coords[ir];
 
-                    // CRITICAL FIX: Account for cumulative rotation from image sliding
-                    // theta_offset is calculated at function scope (line 1347-1352)
-                    // Physical coordinates include cumulative rotation for correct torque calculation
+                    // CRITICAL: For field sampling and export, use stator frame (with theta_offset)
+                    // theta_offset accounts for cumulative rotation from image sliding
                     theta = jt * dtheta + theta_offset;
                     x_phys = r_phys * std::cos(theta);
                     y_phys = r_phys * std::sin(theta);
+
+                    // FIX14: For torque calculation, use rotor frame (without theta_offset)
+                    // Torque is independent of coordinate system rotation (Galilean invariance)
+                    // "Torque is the same regardless of where you twist the cylinder"
+                    double theta_rotor = jt * dtheta;
+                    x_torque = r_phys * std::cos(theta_rotor);
+                    y_torque = r_phys * std::sin(theta_rotor);
                 } else {
                     // for cartesian: i->x, j->y (since we flipped masks, j increases upward)
                     x_phys = static_cast<double>(i) * dx;
                     y_phys = static_cast<double>(j) * dy;
                     r_phys = std::sqrt(x_phys*x_phys + y_phys*y_phys);
                     theta = (r_phys > 0.0) ? std::atan2(y_phys, x_phys) : 0.0;
+
+                    // FIX14: For Cartesian, torque coordinates are same as physical coordinates
+                    x_torque = x_phys;
+                    y_torque = y_phys;
                 }
 
                 // CRITICAL FIX: Convert image-space normal to physical-space normal with proper scaling
@@ -1703,9 +1717,13 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                         n_theta = n_img_x / (r_phys * dtheta + 1e-12);
                     }
 
-                    // Convert polar normal to Cartesian
-                    n_phys_x = n_r * std::cos(theta) - n_theta * std::sin(theta);
-                    n_phys_y = n_r * std::sin(theta) + n_theta * std::cos(theta);
+                    // FIX14B: Convert polar normal to Cartesian using rotor frame angle
+                    // The normal vector is calculated from material boundary geometry (rotor frame)
+                    // Must use theta_rotor (without theta_offset), not theta (with theta_offset)
+                    // This ensures Maxwell stress force components are in rotor frame, matching torque coordinates
+                    double theta_rotor = jt * dtheta;  // Rotor frame angle
+                    n_phys_x = n_r * std::cos(theta_rotor) - n_theta * std::sin(theta_rotor);
+                    n_phys_y = n_r * std::sin(theta_rotor) + n_theta * std::cos(theta_rotor);
 
                     // Normalize
                     double norm = std::sqrt(n_phys_x * n_phys_x + n_phys_y * n_phys_y);
@@ -1726,9 +1744,11 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     }
                 }
 
-                // basis vectors
-                double er_x = std::cos(theta), er_y = std::sin(theta);
-                double et_x = -std::sin(theta), et_y = std::cos(theta);
+                // FIX14B: Basis vectors in rotor frame (consistent with normal vector and B field)
+                // Use theta_rotor for polar coordinates, theta for Cartesian (no rotation concept)
+                double theta_for_basis = (coordinate_system == "polar") ? (jt * dtheta) : theta;
+                double er_x = std::cos(theta_for_basis), er_y = std::sin(theta_for_basis);
+                double et_x = -std::sin(theta_for_basis), et_y = std::cos(theta_for_basis);
 
                 // tangent vector physical
                 double t_phys_x = -n_phys_y;
@@ -1888,19 +1908,22 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 double dFx = fx * ds;
                 double dFy = fy * ds;
 
-                // Torque calculation: use Cartesian formula for both coordinate systems
-                // IMPORTANT: For consistency and to avoid basis vector issues in polar coordinates,
-                // always use the Cartesian formula: τ_z = x * F_y - y * F_x
-                // x_phys, y_phys are already computed for both coordinate systems (lines 1413-1418)
-                // fx, fy are already converted to Cartesian (lines 1522-1523 or 1567-1568)
-                result.torque_origin += x_phys * dFy - y_phys * dFx;
+                // FIX14: Torque calculation with Galilean invariance
+                // Use rotor frame coordinates (x_torque, y_torque) instead of stator frame (x_phys, y_phys)
+                // This ensures torque is independent of theta_offset (coordinate system rotation)
+                // Physical interpretation: "Torque is the same regardless of where you twist the cylinder"
+                //
+                // Cartesian formula: τ_z = x * F_y - y * F_x
+                // For polar coordinates: x_torque, y_torque are in rotor frame (no theta_offset)
+                // For Cartesian: x_torque = x_phys, y_torque = y_phys (no rotation concept)
+                result.torque_origin += x_torque * dFy - y_torque * dFx;
 
                 if (coordinate_system == "polar") {
                     // In polar coordinates centered at origin, torque_center = torque_origin
-                    result.torque_center += x_phys * dFy - y_phys * dFx;
+                    result.torque_center += x_torque * dFy - y_torque * dFx;
                 } else {
                     // Cartesian coordinates: use offset from center
-                    result.torque_center += (x_phys - cx_physical) * dFy - (y_phys - cy_physical) * dFx;
+                    result.torque_center += (x_torque - cx_physical) * dFy - (y_torque - cy_physical) * dFx;
                 }
                 result.torque = result.torque_origin;
 
