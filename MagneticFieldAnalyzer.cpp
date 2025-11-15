@@ -1729,9 +1729,11 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                         mu_boundary = mu_map(ir_boundary, jt_boundary);
                     }
 
-                    // Convert B from polar to Cartesian using boundary theta
-                    bx_out = br_boundary * std::cos(theta) - bt_boundary * std::sin(theta);
-                    by_out = br_boundary * std::sin(theta) + bt_boundary * std::cos(theta);
+                    // CRITICAL BUG FIX: Br, Btheta are in image coordinate system (no theta_offset)
+                    // Must use image theta (jt * dtheta) not physical theta (jt * dtheta + theta_offset)
+                    double theta_image = jt_boundary * dtheta;
+                    bx_out = br_boundary * std::cos(theta_image) - bt_boundary * std::sin(theta_image);
+                    by_out = br_boundary * std::sin(theta_image) + bt_boundary * std::cos(theta_image);
                 } else {
                     int bi = std::clamp(i, 0, static_cast<int>(Bx.cols()) - 1);
                     int bj = std::clamp(j, 0, static_cast<int>(Bx.rows()) - 1);
