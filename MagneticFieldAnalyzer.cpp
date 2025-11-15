@@ -868,8 +868,24 @@ void MagneticFieldAnalyzer::calculateMagneticField() {
  */
 void MagneticFieldAnalyzer::applyLaplacianWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int ksize) {
     // Check which boundaries are periodic
-    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
-    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    bool x_periodic = false;
+    bool y_periodic = false;
+
+    if (coordinate_system == "polar") {
+        // Polar coordinates: theta direction is always periodic
+        // Determine which image direction corresponds to theta
+        if (r_orientation == "horizontal") {
+            // r = x (columns), theta = y (rows) → y is periodic
+            y_periodic = true;
+        } else {
+            // r = y (rows), theta = x (columns) → x is periodic
+            x_periodic = true;
+        }
+    } else {
+        // Cartesian coordinates: check boundary conditions
+        x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+        y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    }
 
     if (!x_periodic && !y_periodic) {
         // No periodic boundaries - use standard Laplacian
@@ -915,8 +931,24 @@ void MagneticFieldAnalyzer::applyLaplacianWithPeriodicBC(const cv::Mat& src, cv:
  */
 void MagneticFieldAnalyzer::applySobelWithPeriodicBC(const cv::Mat& src, cv::Mat& dst, int dx, int dy, int ksize) {
     // Check which boundaries are periodic
-    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
-    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    bool x_periodic = false;
+    bool y_periodic = false;
+
+    if (coordinate_system == "polar") {
+        // Polar coordinates: theta direction is always periodic
+        // Determine which image direction corresponds to theta
+        if (r_orientation == "horizontal") {
+            // r = x (columns), theta = y (rows) → y is periodic
+            y_periodic = true;
+        } else {
+            // r = y (rows), theta = x (columns) → x is periodic
+            x_periodic = true;
+        }
+    } else {
+        // Cartesian coordinates: check boundary conditions
+        x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+        y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    }
 
     if (!x_periodic && !y_periodic) {
         // No periodic boundaries - use standard Sobel
@@ -957,8 +989,24 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
     const int KERNEL_MARGIN = 2;
 
     // Check which boundaries are periodic
-    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
-    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    bool x_periodic = false;
+    bool y_periodic = false;
+
+    if (coordinate_system == "polar") {
+        // Polar coordinates: theta direction is always periodic
+        // Determine which image direction corresponds to theta
+        if (r_orientation == "horizontal") {
+            // r = x (columns), theta = y (rows) → y is periodic
+            y_periodic = true;
+        } else {
+            // r = y (rows), theta = x (columns) → x is periodic
+            x_periodic = true;
+        }
+    } else {
+        // Cartesian coordinates: check boundary conditions
+        x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+        y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    }
 
     // Check if we can use incremental update (transient analysis with sliding)
     // Disable incremental update if periodic BC is active (filter results are position-dependent)
@@ -1419,10 +1467,24 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
         // First pass: calculate stress at boundary pixels and store in map
         std::map<std::pair<int,int>, BoundaryStressPoint> stress_map;
 
-        // Determine loop range based on periodic boundary conditions
+        // FIX13: Determine loop range based on periodic boundary conditions
         // For periodic BC, include image boundaries; otherwise skip them
-        bool x_periodic_loop = (bc_left.type == "periodic" && bc_right.type == "periodic");
-        bool y_periodic_loop = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+        bool x_periodic_loop = false;
+        bool y_periodic_loop = false;
+
+        if (coordinate_system == "polar") {
+            // Polar coordinates: theta direction is always periodic
+            if (r_orientation == "horizontal") {
+                y_periodic_loop = true;  // theta = y (rows) is periodic
+            } else {
+                x_periodic_loop = true;  // theta = x (columns) is periodic
+            }
+        } else {
+            // Cartesian coordinates
+            x_periodic_loop = (bc_left.type == "periodic" && bc_right.type == "periodic");
+            y_periodic_loop = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+        }
+
         int j_start = y_periodic_loop ? 0 : 1;
         int j_end = y_periodic_loop ? rows : (rows - 1);
         int i_start = x_periodic_loop ? 0 : 1;
@@ -1452,9 +1514,22 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 // fallback: 8-neighbor search to find adjacent background pixel
                 if (n_norm < EPS_NORMAL) {
                     bool found = false;
-                    // Check which boundaries are periodic
-                    bool x_periodic_fallback = (bc_left.type == "periodic" && bc_right.type == "periodic");
-                    bool y_periodic_fallback = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+                    // FIX13: Check which boundaries are periodic (handle polar coordinates)
+                    bool x_periodic_fallback = false;
+                    bool y_periodic_fallback = false;
+
+                    if (coordinate_system == "polar") {
+                        // Polar coordinates: theta direction is always periodic
+                        if (r_orientation == "horizontal") {
+                            y_periodic_fallback = true;
+                        } else {
+                            x_periodic_fallback = true;
+                        }
+                    } else {
+                        // Cartesian coordinates
+                        x_periodic_fallback = (bc_left.type == "periodic" && bc_right.type == "periodic");
+                        y_periodic_fallback = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+                    }
 
                     const int offsets[8][2] = { {1,0},{1,1},{0,1},{-1,1},{-1,0},{-1,-1},{0,-1},{1,-1} };
                     for (int k=0;k<8 && !found;++k) {
@@ -1493,10 +1568,25 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 n_img_x /= n_norm;
                 n_img_y /= n_norm;
 
-                // ensure normal points to background (probe along normal)
+                // FIX13: Ensure normal points to background (probe along normal)
                 // For periodic boundaries, use wrap instead of clamp
-                bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
-                bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+                bool x_periodic = false;
+                bool y_periodic = false;
+
+                if (coordinate_system == "polar") {
+                    // Polar coordinates: theta direction is always periodic
+                    if (r_orientation == "horizontal") {
+                        // r = x (columns), theta = y (rows) → y is periodic
+                        y_periodic = true;
+                    } else {
+                        // r = y (rows), theta = x (columns) → x is periodic
+                        x_periodic = true;
+                    }
+                } else {
+                    // Cartesian coordinates: check boundary conditions
+                    x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+                    y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+                }
 
                 auto probe_bg = [&](int step)->bool {
                     int ii = i + static_cast<int>(std::round(n_img_x * step));
