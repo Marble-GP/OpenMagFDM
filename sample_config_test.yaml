@@ -1,0 +1,121 @@
+# 2次元磁場解析設定ファイル
+
+# 座標系設定
+coordinate_system: polar  # cartesian (直交座標) or polar (極座標)
+
+# メッシュ設定（直交座標の場合）
+mesh:
+  dx: 0.2e-3  # X方向メッシュサイズ [m]
+  dy: 0.2e-3  # Y方向メッシュサイズ [m]
+
+# 極座標ドメイン設定（coordinate_system: polar の場合）
+polar_domain:
+  r_start: 0.2  # 内半径 [m] (0 < r_start < r_end)
+  r_end: 0.3    # 外半径 [m]
+  r_orientation: horizontal  # r方向: horizontal (列方向) or vertical (行方向)
+  theta_range: 0.5  # θ方向の範囲 [rad] (2*pi for full periodic domain)
+  # θ方向は r_orientation と垂直な方向で 0 ~ theta_range
+
+# 極座標境界条件
+polar_boundary_conditions:
+  inner:  # 内側 (r = r_start)
+    type: dirichlet
+    value: 0.0
+  outer:  # 外側 (r = r_end)
+    type: dirichlet
+    value: 0.0
+  # θ方向は自動的に周期境界条件
+
+# 直交座標の境界条件（4辺それぞれに設定）
+# type: dirichlet, neumann, periodic
+# 注意: 周期境界条件は対向する辺のペアで設定する必要があります
+boundary_conditions:
+  left:
+    type: dirichlet
+    value: 0.0
+  right:
+    type: dirichlet
+    value: 0.0
+  bottom:
+    type: periodic
+    value: 0.0
+  top:
+    type: periodic
+    value: 0.0
+
+# 材料設定（RGB値と物性値の対応）
+materials:
+  air:
+    rgb: [255, 255, 255]  # 白
+    mu_r: 1.0  # 比透磁率
+    jz: 0.0  # 電流密度 [A/m²]
+  
+  iron_stator:
+    rgb: [128, 128, 128]  # グレー（実際の画像の色）
+    mu_r: 100.0
+    jz: 0.0
+    calc_force: false  # マクスウェル応力による電磁力を計算
+
+  iron_rotor:
+    rgb: [100, 100, 100]  # グレー（実際の画像の色）
+    mu_r: 500.0
+    jz: 0.0
+    calc_force: true  # マクスウェル応力による電磁力を計算
+  
+  coil_positive_U:
+    rgb: [255, 0, 0]  # 赤
+    mu_r: 1.0
+    jz: 1.0e6*cos(2*pi*$step/100) * 0  # 正の電流
+
+  coil_negative_U:
+    rgb: [128, 0, 0]  # 暗い赤
+    mu_r: 1.0
+    jz: -1.0e6*cos(2*pi*$step/100) * 0  # 負の電流
+
+  coil_positive_V:
+    rgb: [0, 255, 0]  # 緑
+    mu_r: 1.0
+    jz: 1.0e6*cos(2*pi*$step/100 - 2*pi/3) * 0  # 正の電流
+
+  coil_negative_V:
+    rgb: [0, 128, 0]  # 暗い緑
+    mu_r: 1.0
+    jz: -1.0e6*cos(2*pi*$step/1002 - 2*pi/3) * 0  # 負の電流
+
+  coil_positive_W:
+    rgb: [0, 0, 255]  # 青
+    mu_r: 1.0
+    jz: 1.0e6*cos(2*pi*$step/100 + 2*pi/3) * 0  # 正の電流
+
+  coil_negative_W:
+    rgb: [0, 0, 128]  # 暗い青
+    mu_r: 1.0
+    jz: -1.0e6*cos(2*pi*$step/100 + 2*pi/3) * 0  # 負の電流
+
+  rotor_field_positive:
+    rgb: [255, 255, 0]  # 黄
+    mu_r: 1.0
+    jz: 1.0e9  # 正の電流
+
+  rotor_field_negative:
+    rgb: [100, 100, 0]  # 暗い黄
+    mu_r: 1.0
+    jz: -1.0e9  # 負の電流
+
+    # 過渡解析時の動的電流密度の例:
+    # jz: 1e6*cos(2*pi*$step/10)  # 数式表記（$step: ステップ番号）
+    # jz: [0, 0.5e6, 1e6, 0.5e6, 0, -0.5e6, -1e6, -0.5e6, 0, 0]  # 配列表記
+
+# 過渡解析設定（静的解析の場合は省略可）
+# enabled: true にすると、画像領域を循環シフトしながら解析を実行します
+transient:
+  enabled: true  # 過渡解析の有効/無効
+  enable_sliding: true # 画像スライドの有効/無効（falseの場合はJzのみ変化）
+  total_steps: 3 # 解析ステップ数
+  slide_direction: vertical  # スライド方向
+  # vertical: slide_region_start <= x <= slide_region_end の縦帯領域をy方向にスライド
+  # horizontal: slide_region_start <= y <= slide_region_end の横帯領域をx方向にスライド
+  slide_region_start: 110  # スライド領域の開始位置 [ピクセル] (左上が原点[0,0])
+  slide_region_end: 390   # スライド領域の終了位置 [ピクセル]
+  slide_pixels_per_step: 1  # 1ステップあたりの移動量 [ピクセル] (循環シフト量)
+

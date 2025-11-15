@@ -1345,6 +1345,13 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     // CRITICAL: This offset is used for physical coordinate calculation (x_phys, y_phys)
     // but must be REMOVED when sampling magnetic fields from image-based arrays
     double theta_offset = 0.0;
+
+    // DEBUG: Print all conditions
+    std::cout << "DEBUG calculateMaxwellStress: step=" << step
+              << ", coord_sys=" << coordinate_system
+              << ", transient.enabled=" << (transient_config.enabled ? "true" : "false")
+              << ", transient.enable_sliding=" << (transient_config.enable_sliding ? "true" : "false") << std::endl;
+
     if (coordinate_system == "polar" && step >= 0 && transient_config.enabled && transient_config.enable_sliding) {
         theta_offset = step * transient_config.slide_pixels_per_step * dtheta;
         std::cout << "Transient analysis: cumulative rotation offset = " << theta_offset << " rad ("
@@ -3430,10 +3437,13 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         }
 
         // 3. Calculate Maxwell stress (pass step number for field caching)
-        calculateMaxwellStress(step + 1);
+        // CRITICAL: Use step (not step+1) to match theta_offset with actual image shift state
+        // step=0: initial state (no shift) → theta_offset=0
+        // step=1: 1-pixel shifted → theta_offset=1*dtheta
+        calculateMaxwellStress(step);
 
         // 3.5. Calculate total magnetic energy (reuses calculated field from step)
-        double total_energy = calculateTotalMagneticEnergy(step + 1);
+        double total_energy = calculateTotalMagneticEnergy(step);
         std::cout << "Step " << step+1 << " Total Magnetic Energy: " << total_energy << " J/m" << std::endl;
 
         // 4. Export results for this step
