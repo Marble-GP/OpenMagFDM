@@ -1663,9 +1663,10 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 MagneticFieldAnalyzer::PolarSample sample;
 
                 if (coordinate_system == "polar") {
-                    // For polar coordinates: calculate sample point directly in polar coords
-                    // This avoids atan2 inconsistency between boundary and sample points
-                    double sample_distance = dr;
+                    // FIX7: Evaluate Maxwell stress ON the boundary, not offset by dr
+                    // Physical interpretation: Force is exerted by the material itself at its surface
+                    // Therefore, evaluate B and H at the boundary position, using material properties
+                    double sample_distance = 0.0;  // Changed from dr to 0 for on-boundary evaluation
 
                     // Decompose normal into polar components
                     double n_r = n_phys_x * std::cos(theta) + n_phys_y * std::sin(theta);
@@ -1691,17 +1692,44 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     // Convert sample coordinates back to physical system for record
                     sample.theta_phys = theta_sample_phys;
                 } else {
-                    // For Cartesian coordinates: use Cartesian sampling
-                    double sample_distance = std::max(dx, dy);
-                    double x_sample = x_phys + n_phys_x * sample_distance;
-                    double y_sample = y_phys + n_phys_y * sample_distance;
+                    // FIX7: For Cartesian coordinates, also evaluate on boundary (sample_distance = 0)
+                    double sample_distance = 0.0;  // Changed from std::max(dx, dy) to 0
+                    double x_sample = x_phys + n_phys_x * sample_distance;  // = x_phys
+                    double y_sample = y_phys + n_phys_y * sample_distance;  // = y_phys
                     sample = sampleFieldsAtPhysicalPoint(x_sample, y_sample);
                 }
 
-                // Extract Cartesian B components and μ
+                // Extract Cartesian B components
                 double bx_out = sample.Bx;
                 double by_out = sample.By;
-                double mu_local = sample.mu;
+
+                // FIX8: Use material μ from boundary pixel directly (not interpolated)
+                // Physical interpretation: The material at the boundary exerts force,
+                // so use the material's permeability, not a mixed/interpolated value
+                double mu_boundary = 0.0;
+                if (coordinate_system == "polar") {
+                    int ir_boundary, jt_boundary;
+                    if (r_orientation == "horizontal") {
+                        ir_boundary = i;
+                        jt_boundary = j;
+                    } else {
+                        ir_boundary = j;
+                        jt_boundary = i;
+                    }
+                    ir_boundary = std::clamp(ir_boundary, 0, nr - 1);
+                    jt_boundary = std::clamp(jt_boundary, 0, ntheta - 1);
+
+                    if (r_orientation == "horizontal") {
+                        mu_boundary = mu_map(jt_boundary, ir_boundary);
+                    } else {
+                        mu_boundary = mu_map(ir_boundary, jt_boundary);
+                    }
+                } else {
+                    int bi = std::clamp(i, 0, static_cast<int>(mu_map.cols()) - 1);
+                    int bj = std::clamp(j, 0, static_cast<int>(mu_map.rows()) - 1);
+                    mu_boundary = mu_map(bj, bi);
+                }
+                double mu_local = mu_boundary;
 
                 // Maxwell stress calculation: Use Cartesian coordinates for BOTH coordinate systems
                 // CRITICAL FIX: Avoid basis vector inconsistencies by always computing in Cartesian
