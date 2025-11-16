@@ -12,9 +12,11 @@ const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
 const SOLVER_PATH = path.join(__dirname, '..', 'build', 'MagFDMsolver');
 const CONFIG_PATH = path.join(__dirname, '..', 'sample_config.yaml');
+const USER_CONFIGS_DIR = path.join(__dirname, '..', 'configs');
 
-// アップロードディレクトリの作成
+// ディレクトリの作成
 fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(console.error);
+fs.mkdir(USER_CONFIGS_DIR, { recursive: true }).catch(console.error);
 
 // Multerの設定（ファイルアップロード用）
 const storage = multer.diskStorage({
@@ -40,16 +42,145 @@ app.use('/data', express.static(path.join(__dirname, '..')));
 
 // ===== API エンドポイント =====
 
+// Constants for security
+const MAX_FILE_SIZE = 100 * 1024; // 100KB
+const MAX_FILES_PER_USER = 20;
+const USER_EXPIRY_DAYS = 366;
+
+// Helper: Get user directory
+function getUserDir(userId) {
+    // Sanitize user ID to prevent directory traversal
+    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
+    return path.join(USER_CONFIGS_DIR, safeUserId);
+}
+
+// Helper: Get user-specific config file path
+function getUserConfigPath(userId, fileName) {
+    // Sanitize filename to prevent directory traversal
+    const safeName = path.basename(fileName || 'sample_config.yaml');
+    return path.join(getUserDir(userId), safeName);
+}
+
+// Helper: Initialize user directory with default config
+async function initializeUserDir(userId) {
+    const userDir = getUserDir(userId);
+    try {
+        await fs.access(userDir);
+        // Directory exists
+    } catch {
+        // Directory doesn't exist, create it
+        await fs.mkdir(userDir, { recursive: true });
+
+        // Copy default config
+        const defaultConfig = await fs.readFile(CONFIG_PATH, 'utf8');
+        const defaultConfigPath = path.join(userDir, 'sample_config.yaml');
+        await fs.writeFile(defaultConfigPath, defaultConfig, 'utf8');
+        console.log(`Initialized new user directory: ${userId}`);
+    }
+}
+
+// Helper: Enforce file count limit (keep newest 20 files)
+async function enforceFileLimit(userId) {
+    const userDir = getUserDir(userId);
+    try {
+        const files = await fs.readdir(userDir);
+        const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
+
+        if (yamlFiles.length > MAX_FILES_PER_USER) {
+            // Get file stats with modification times
+            const fileStats = await Promise.all(
+                yamlFiles.map(async (file) => {
+                    const filePath = path.join(userDir, file);
+                    const stats = await fs.stat(filePath);
+                    return { file, mtime: stats.mtime };
+                })
+            );
+
+            // Sort by modification time (oldest first)
+            fileStats.sort((a, b) => a.mtime - b.mtime);
+
+            // Delete oldest files
+            const filesToDelete = fileStats.slice(0, yamlFiles.length - MAX_FILES_PER_USER);
+            for (const { file } of filesToDelete) {
+                await fs.unlink(path.join(userDir, file));
+                console.log(`Deleted old file: ${userId}/${file}`);
+            }
+        }
+    } catch (error) {
+        console.error(`Error enforcing file limit for ${userId}:`, error);
+    }
+}
+
+// Helper: Clean up expired user directories (run on server start)
+async function cleanupExpiredUsers() {
+    try {
+        const users = await fs.readdir(USER_CONFIGS_DIR);
+        const expiryTime = Date.now() - (USER_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+        for (const user of users) {
+            const userDir = path.join(USER_CONFIGS_DIR, user);
+            const stats = await fs.stat(userDir);
+
+            if (stats.isDirectory() && stats.mtime < expiryTime) {
+                // Directory is older than expiry time
+                await fs.rm(userDir, { recursive: true, force: true });
+                console.log(`Cleaned up expired user directory: ${user}`);
+            }
+        }
+    } catch (error) {
+        console.error('Error cleaning up expired users:', error);
+    }
+}
+
+// Run cleanup on server start
+cleanupExpiredUsers();
+
+// Get list of YAML files for a user
+app.get('/api/config/list', async (req, res) => {
+    try {
+        const userId = req.query.userId || 'default';
+
+        // Initialize user directory if needed
+        await initializeUserDir(userId);
+
+        const userDir = getUserDir(userId);
+        const files = await fs.readdir(userDir);
+        const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
+
+        res.json({
+            success: true,
+            files: yamlFiles
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // YAML設定ファイルの読み込み
 app.get('/api/config', async (req, res) => {
     try {
-        const configData = await fs.readFile(CONFIG_PATH, 'utf8');
-        const config = yaml.load(configData);
-        res.json({
-            success: true,
-            config: config,
-            yaml: configData
-        });
+        const userId = req.query.userId || 'default';
+        const fileName = req.query.file || 'sample_config.yaml';
+
+        // Initialize user directory if needed
+        await initializeUserDir(userId);
+
+        const userConfigPath = getUserConfigPath(userId, fileName);
+
+        let configData;
+        try {
+            // Try to load user-specific config
+            configData = await fs.readFile(userConfigPath, 'utf8');
+        } catch (error) {
+            // File doesn't exist, return default config
+            configData = await fs.readFile(CONFIG_PATH, 'utf8');
+        }
+
+        // Return as plain text (YAML)
+        res.type('text/plain').send(configData);
     } catch (error) {
         res.status(500).json({
             success: false,
@@ -61,21 +192,45 @@ app.get('/api/config', async (req, res) => {
 // YAML設定ファイルの保存
 app.post('/api/config', async (req, res) => {
     try {
-        const { yaml: yamlContent } = req.body;
+        const { userId, file, content } = req.body;
 
-        // YAML検証
-        const parsed = yaml.load(yamlContent);
+        // Validate file size (100KB limit)
+        const contentSize = Buffer.byteLength(content, 'utf8');
+        if (contentSize > MAX_FILE_SIZE) {
+            return res.status(400).json({
+                success: false,
+                error: `File size (${(contentSize / 1024).toFixed(1)}KB) exceeds maximum allowed size (${MAX_FILE_SIZE / 1024}KB)`
+            });
+        }
 
-        // ファイルに書き込み
-        await fs.writeFile(CONFIG_PATH, yamlContent, 'utf8');
+        // YAML validation
+        try {
+            yaml.load(content);
+        } catch (yamlError) {
+            return res.status(400).json({
+                success: false,
+                error: `YAML syntax error: ${yamlError.message}`
+            });
+        }
+
+        // Initialize user directory if needed
+        await initializeUserDir(userId || 'default');
+
+        // Enforce file count limit
+        await enforceFileLimit(userId || 'default');
+
+        const userConfigPath = getUserConfigPath(userId || 'default', file);
+
+        // Save to user-specific file
+        await fs.writeFile(userConfigPath, content, 'utf8');
 
         res.json({
             success: true,
             message: 'Configuration saved successfully',
-            config: parsed
+            path: userConfigPath
         });
     } catch (error) {
-        res.status(400).json({
+        res.status(500).json({
             success: false,
             error: error.message
         });

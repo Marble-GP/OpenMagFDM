@@ -94,3 +94,4 @@ uploads/*.jpg
 
 # Node modules
 webui/node_modules/
+configs/

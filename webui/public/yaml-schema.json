@@ -1,0 +1,191 @@
+{
+  "keywords": {
+    "coordinate_system": {
+      "description": "Coordinate system type: 'cartesian' or 'polar'",
+      "values": ["cartesian", "polar"],
+      "example": "coordinate_system: polar"
+    },
+    "mesh": {
+      "description": "Mesh configuration for Cartesian coordinates",
+      "children": ["dx", "dy"]
+    },
+    "dx": {
+      "description": "Grid spacing in x-direction [m]",
+      "type": "number",
+      "example": "dx: 0.2e-3"
+    },
+    "dy": {
+      "description": "Grid spacing in y-direction [m]",
+      "type": "number",
+      "example": "dy: 0.2e-3"
+    },
+    "polar_domain": {
+      "description": "Polar coordinate domain configuration",
+      "children": ["r_start", "r_end", "r_orientation", "theta_range"]
+    },
+    "r_start": {
+      "description": "Inner radius [m], must satisfy 0 < r_start < r_end",
+      "type": "number",
+      "example": "r_start: 0.222"
+    },
+    "r_end": {
+      "description": "Outer radius [m]",
+      "type": "number",
+      "example": "r_end: 0.278"
+    },
+    "r_orientation": {
+      "description": "Radial direction orientation: 'horizontal' or 'vertical'",
+      "values": ["horizontal", "vertical"],
+      "example": "r_orientation: horizontal"
+    },
+    "theta_range": {
+      "description": "Angular range [rad], typically π/n for n-pole sector models",
+      "type": "number",
+      "example": "theta_range: 1.0471975512  # π/3 for 3-pole sector"
+    },
+    "polar_boundary_conditions": {
+      "description": "Boundary conditions for polar coordinates",
+      "children": ["inner", "outer"]
+    },
+    "inner": {
+      "description": "Inner boundary condition (at r=r_start)",
+      "children": ["type", "value"]
+    },
+    "outer": {
+      "description": "Outer boundary condition (at r=r_end)",
+      "children": ["type", "value"]
+    },
+    "type": {
+      "description": "Boundary condition type: 'dirichlet', 'neumann', or 'periodic'",
+      "values": ["dirichlet", "neumann", "periodic"],
+      "example": "type: dirichlet"
+    },
+    "value": {
+      "description": "Boundary condition value (for Dirichlet/Neumann)",
+      "type": "number",
+      "example": "value: 0.0"
+    },
+    "boundary_conditions": {
+      "description": "Boundary conditions for Cartesian coordinates (4 edges)",
+      "children": ["left", "right", "top", "bottom"]
+    },
+    "left": {
+      "description": "Left boundary condition",
+      "children": ["type", "value"]
+    },
+    "right": {
+      "description": "Right boundary condition",
+      "children": ["type", "value"]
+    },
+    "top": {
+      "description": "Top boundary condition",
+      "children": ["type", "value"]
+    },
+    "bottom": {
+      "description": "Bottom boundary condition",
+      "children": ["type", "value"]
+    },
+    "materials": {
+      "description": "Material definitions (any material name is allowed)",
+      "acceptsAnyChild": true,
+      "childrenProperties": ["rgb", "mu_r", "jz", "calc_force"]
+    },
+    "rgb": {
+      "description": "RGB color for material identification in input image [R, G, B]",
+      "type": "array",
+      "example": "rgb: [255, 255, 255]",
+      "validParents": ["materials"]
+    },
+    "mu_r": {
+      "description": "Relative permeability (dimensionless)",
+      "type": "number",
+      "example": "mu_r: 1.0",
+      "validParents": ["materials"]
+    },
+    "jz": {
+      "description": "Current density [A/m²], can be constant, formula, or array",
+      "type": "number|string|array",
+      "example": "jz: 1.0e9",
+      "validParents": ["materials"]
+    },
+    "calc_force": {
+      "description": "Calculate Maxwell stress force on this material (true/false)",
+      "type": "boolean",
+      "example": "calc_force: true",
+      "validParents": ["materials"]
+    },
+    "transient": {
+      "description": "Transient analysis configuration",
+      "children": ["enabled", "enable_sliding", "total_steps", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"]
+    },
+    "enabled": {
+      "description": "Enable transient analysis (true/false)",
+      "type": "boolean",
+      "example": "enabled: true"
+    },
+    "enable_sliding": {
+      "description": "Enable image sliding for rotor motion simulation (true/false)",
+      "type": "boolean",
+      "example": "enable_sliding: true"
+    },
+    "total_steps": {
+      "description": "Number of analysis steps",
+      "type": "integer",
+      "example": "total_steps: 167"
+    },
+    "slide_direction": {
+      "description": "Sliding direction: 'vertical' or 'horizontal'",
+      "values": ["vertical", "horizontal"],
+      "example": "slide_direction: vertical"
+    },
+    "slide_region_start": {
+      "description": "Start position of sliding region [pixels]",
+      "type": "integer",
+      "example": "slide_region_start: 110"
+    },
+    "slide_region_end": {
+      "description": "End position of sliding region [pixels]",
+      "type": "integer",
+      "example": "slide_region_end: 390"
+    },
+    "slide_pixels_per_step": {
+      "description": "Movement per step [pixels] (circular shift amount)",
+      "type": "integer",
+      "example": "slide_pixels_per_step: 1"
+    }
+  },
+  "snippets": {
+    "boundary_dirichlet": {
+      "name": "Dirichlet Boundary (value=0)",
+      "trigger": "type",
+      "snippet": "type: dirichlet\nvalue: 0.0"
+    },
+    "boundary_neumann": {
+      "name": "Neumann Boundary (value=0)",
+      "trigger": "type",
+      "snippet": "type: neumann\nvalue: 0.0"
+    },
+    "boundary_periodic": {
+      "name": "Periodic Boundary",
+      "trigger": "type",
+      "snippet": "type: periodic\nvalue: 0.0"
+    },
+    "material_template": {
+      "name": "Material Definition Template",
+      "trigger": "material",
+      "snippet": "rgb: [255, 255, 255]\nmu_r: 1.0\njz: 0.0\ncalc_force: false"
+    },
+    "transient_template": {
+      "name": "Transient Analysis Template",
+      "trigger": "transient",
+      "snippet": "enabled: true\nenable_sliding: true\ntotal_steps: 1\nslide_direction: vertical\nslide_region_start: 0\nslide_region_end: 1\nslide_pixels_per_step: 1"
+    }
+  },
+  "templates": {
+    "polar_2d_motor": {
+      "name": "Polar 2D Motor Analysis",
+      "description": "Template for 2D motor analysis in polar coordinates",
+      "content": "coordinate_system: polar\n\nmesh:\n  dx: 0.2e-3\n  dy: 0.2e-3\n\npolar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # π/3\n\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0.0\n  outer:\n    type: dirichlet\n    value: 0.0\n\nmaterials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n\n  iron_stator:\n    rgb: [128, 128, 128]\n    mu_r: 100.0\n    jz: 0.0\n    calc_force: false\n\n  iron_rotor:\n    rgb: [100, 100, 100]\n    mu_r: 500.0\n    jz: 0.0\n    calc_force: true\n\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 167\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n"
+    }
+  }
+}
