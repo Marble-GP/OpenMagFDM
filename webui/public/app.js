@@ -7,6 +7,7 @@ const AppState = {
     currentTab: 'config',
     configData: null,
     uploadedImage: null,
+    uploadedImageFilename: null,  // Uploaded image filename on server
     currentStep: 1,
     totalSteps: 1,
     resultsData: {},
@@ -613,6 +614,7 @@ async function handleImageUpload(event) {
         if (!response.ok) throw new Error('Failed to upload image');
 
         const result = await response.json();
+        AppState.uploadedImageFilename = result.filename;
         showStatus('solverStatus', `Image uploaded: ${result.filename}`, 'success');
     } catch (error) {
         showStatus('solverStatus', `Upload error: ${error.message}`, 'error');
@@ -628,21 +630,37 @@ async function runSolver() {
     outputDiv.textContent = 'Starting solver...\n';
 
     try {
+        // Check if image is uploaded
+        if (!AppState.uploadedImageFilename) {
+            throw new Error('Please upload a material image first');
+        }
+
+        // Get config file path
+        const configSelect = document.getElementById('configFileSelect');
+        const configFile = configSelect ? configSelect.value : 'sample_config.yaml';
+
         const response = await fetch('/api/solve', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ configFile: 'sample_config.yaml' })
+            body: JSON.stringify({
+                configFile: configFile,
+                imageFile: AppState.uploadedImageFilename,
+                userId: AppState.userId
+            })
         });
 
-        if (!response.ok) throw new Error('Solver execution failed');
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || 'Solver execution failed');
+        }
 
         const result = await response.json();
-        outputDiv.textContent += result.output || 'Solver completed successfully\n';
+        outputDiv.textContent += result.stdout || 'Solver completed successfully\n';
 
         showStatus('solverStatus', 'Solver completed successfully', 'success');
 
-        // Load quick preview
-        await loadQuickPreview();
+        // Load results and update dashboard
+        await loadResults();
 
     } catch (error) {
         showStatus('solverStatus', `Solver error: ${error.message}`, 'error');
@@ -809,14 +827,20 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
     const plotId = `plot-${plotIdCounter++}`;
     const containerId = `container-${plotId}`;
 
-    // Create widget content with control buttons
+    // Create widget content with control buttons and SVG icons
     const content = `
         <div class="plot-header">
             <span>${plotDef.name}</span>
             <div class="plot-controls">
-                <button class="interaction-mode-btn" data-plot-id="${plotId}" data-container-id="${containerId}" data-mode="disabled" title="Mode: Move" onclick="toggleInteractionMode('${plotId}', '${containerId}', this)">Move</button>
-                <button class="reset-zoom-btn" title="Reset Zoom" onclick="resetPlotZoom('${containerId}')">Reset</button>
-                <button class="remove-plot-btn" title="Remove" onclick="removePlot('${plotId}')">X</button>
+                <button class="interaction-mode-btn" data-plot-id="${plotId}" data-container-id="${containerId}" data-mode="disabled" title="Mode: Move" onclick="toggleInteractionMode('${plotId}', '${containerId}', this)">
+                    <img src="/icon/window.svg" alt="Move" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
+                </button>
+                <button class="reset-zoom-btn" title="Reset Zoom" onclick="resetPlotZoom('${containerId}')">
+                    <img src="/icon/reset.svg" alt="Reset" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
+                </button>
+                <button class="remove-plot-btn" title="Remove" onclick="removePlot('${plotId}')">
+                    <img src="/icon/remove.svg" alt="Remove" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
+                </button>
             </div>
         </div>
         <div class="plot-container" id="${containerId}" data-plot-type="${plotType}">
@@ -862,34 +886,39 @@ function toggleInteractionMode(plotId, containerId, button) {
     }
 
     const currentMode = button.dataset.mode;
-    let newMode, newText, newTitle, dragmode, tileMovable;
+    let newMode, newIcon, newTitle, dragmode, tileMovable;
 
     if (currentMode === 'zoom') {
         // Zoom -> Pan
         newMode = 'pan';
-        newText = 'Pan';
+        newIcon = '/icon/pan.svg';
         newTitle = 'Mode: Pan';
         dragmode = 'pan';
         tileMovable = false;
     } else if (currentMode === 'pan') {
         // Pan -> Move (disabled)
         newMode = 'disabled';
-        newText = 'Move';
+        newIcon = '/icon/window.svg';
         newTitle = 'Mode: Move';
         dragmode = false;
         tileMovable = true;
     } else {
         // Move -> Zoom
         newMode = 'zoom';
-        newText = 'Zoom';
+        newIcon = '/icon/zoom.svg';
         newTitle = 'Mode: Zoom';
         dragmode = 'zoom';
         tileMovable = false;
     }
 
     button.dataset.mode = newMode;
-    button.textContent = newText;
     button.title = newTitle;
+
+    // Update button icon
+    const img = button.querySelector('img');
+    if (img) {
+        img.src = newIcon;
+    }
 
     // Update Plotly dragmode
     Plotly.relayout(container, { dragmode: dragmode }).catch(err => {

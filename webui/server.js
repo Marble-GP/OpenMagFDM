@@ -36,6 +36,7 @@ app.use(express.json());
 
 // 静的ファイルの提供
 app.use(express.static('public'));
+app.use('/icon', express.static(path.join(__dirname, 'icon')));
 
 // 親ディレクトリのCSVファイルへのアクセス
 app.use('/data', express.static(path.join(__dirname, '..')));
@@ -282,12 +283,20 @@ app.get('/api/images', async (req, res) => {
 // ソルバーの実行
 app.post('/api/solve', async (req, res) => {
     try {
-        const { configFile, imageFile, outputFile } = req.body;
+        const { configFile, imageFile, userId } = req.body;
 
         // パスの構築
-        const configPath = configFile || CONFIG_PATH;
+        let configPath;
+        if (configFile) {
+            // User-specific config file
+            const userDir = getUserDir(userId || 'default');
+            configPath = path.join(userDir, configFile);
+        } else {
+            // Default config
+            configPath = CONFIG_PATH;
+        }
+
         const imagePath = path.join(UPLOAD_DIR, imageFile);
-        // const outputPath = outputFile || `output_${Date.now()}`;
 
         // ファイルの存在確認
         await fs.access(configPath);
