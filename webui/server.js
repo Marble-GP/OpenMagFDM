@@ -239,14 +239,14 @@ app.get('/', (req, res) => {
 // サーバー起動
 app.listen(PORT, () => {
     console.log('='.repeat(60));
-    console.log('🧲 MagFDM Visualizer Server (Integrated)');
+    console.log('MagFDM Visualizer Server (Integrated)');
     console.log('='.repeat(60));
-    console.log(`📡 Server running at: http://localhost:${PORT}`);
-    console.log(`📁 Serving files from: ${path.join(__dirname, 'public')}`);
-    console.log(`📊 CSV data directory: ${path.join(__dirname, '..')}`);
-    console.log(`🖼️  Upload directory: ${UPLOAD_DIR}`);
-    console.log(`⚙️  Solver path: ${SOLVER_PATH}`);
-    console.log(`📝 Config file: ${CONFIG_PATH}`);
+    console.log(`Server running at: http://localhost:${PORT}`);
+    console.log(`Serving files from: ${path.join(__dirname, 'public')}`);
+    console.log(`CSV data directory: ${path.join(__dirname, '..')}`);
+    console.log(`Upload directory: ${UPLOAD_DIR}`);
+    console.log(`Solver path: ${SOLVER_PATH}`);
+    console.log(`Config file: ${CONFIG_PATH}`);
     console.log('='.repeat(60));
     console.log('Available APIs:');
     console.log('  GET  /api/config          - Get YAML configuration');
