@@ -13,7 +13,9 @@ const AppState = {
     gridStack: null,
     aceEditor: null,  // Ace Editor instance
     yamlSchema: null,  // YAML schema for autocomplete
-    userId: null  // User identifier (from cookie)
+    userId: null,  // User identifier (from cookie)
+    animationTimer: null,  // Animation interval timer
+    isAnimating: false  // Animation state flag
 };
 
 // ===== Initialization =====
@@ -658,6 +660,23 @@ async function loadResults() {
 
         const data = await response.json();
         AppState.totalSteps = data.totalSteps || 1;
+        AppState.currentStep = 1;
+
+        // Update dashboard controls
+        const stepSlider = document.getElementById('stepSlider');
+        const totalStepsDisplay = document.getElementById('totalStepsDisplay');
+        const currentStepDisplay = document.getElementById('currentStep');
+
+        if (stepSlider) {
+            stepSlider.max = AppState.totalSteps;
+            stepSlider.value = 1;
+        }
+        if (totalStepsDisplay) {
+            totalStepsDisplay.textContent = AppState.totalSteps;
+        }
+        if (currentStepDisplay) {
+            currentStepDisplay.textContent = 1;
+        }
 
         showStatus('solverStatus', `Found ${AppState.totalSteps} steps`, 'info');
 
@@ -790,21 +809,23 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
     const plotId = `plot-${plotIdCounter++}`;
     const containerId = `container-${plotId}`;
 
-    // Create widget content
+    // Create widget content with control buttons
     const content = `
         <div class="plot-header">
             <span>${plotDef.name}</span>
             <div class="plot-controls">
-                <button onclick="removePlot('${plotId}')">Remove</button>
+                <button class="interaction-mode-btn" data-plot-id="${plotId}" data-container-id="${containerId}" data-mode="disabled" title="Mode: Move" onclick="toggleInteractionMode('${plotId}', '${containerId}', this)">Move</button>
+                <button class="reset-zoom-btn" title="Reset Zoom" onclick="resetPlotZoom('${containerId}')">Reset</button>
+                <button class="remove-plot-btn" title="Remove" onclick="removePlot('${plotId}')">X</button>
             </div>
         </div>
-        <div class="plot-container" id="${containerId}">
+        <div class="plot-container" id="${containerId}" data-plot-type="${plotType}">
             <div style="text-align: center; padding: 20px; color: #999;">Loading...</div>
         </div>
     `;
 
     // Add to GridStack
-    AppState.gridStack.addWidget({
+    const widget = AppState.gridStack.addWidget({
         x: x,
         y: y,
         w: w,
@@ -815,9 +836,8 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
 
     // Render plot
     setTimeout(async () => {
-        const step = parseInt(document.getElementById('stepInput').value) || 1;
         try {
-            await plotDef.render(containerId, step);
+            await plotDef.render(containerId, AppState.currentStep);
         } catch (error) {
             console.error(`Error rendering ${plotType}:`, error);
             document.getElementById(containerId).innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
@@ -833,19 +853,143 @@ function removePlot(plotId) {
     }
 }
 
-function loadStep() {
-    const step = parseInt(document.getElementById('stepInput').value) || 1;
+// ===== Interaction Mode Toggle =====
+function toggleInteractionMode(plotId, containerId, button) {
+    const container = document.getElementById(containerId);
+    if (!container || !container.data || !container.layout) {
+        console.warn('No Plotly plot found');
+        return;
+    }
 
-    // Reload all plots in dashboard with new step
-    const plots = document.querySelectorAll('.grid-stack-item');
-    plots.forEach(item => {
-        const content = item.querySelector('[id^="plot-"]');
-        if (content) {
-            // Determine plot type from content and reload
-            // This is simplified - you might want to store plot type in data attribute
-            loadAndPlot(content.id, 'heatmap', step);
+    const currentMode = button.dataset.mode;
+    let newMode, newText, newTitle, dragmode, tileMovable;
+
+    if (currentMode === 'zoom') {
+        // Zoom -> Pan
+        newMode = 'pan';
+        newText = 'Pan';
+        newTitle = 'Mode: Pan';
+        dragmode = 'pan';
+        tileMovable = false;
+    } else if (currentMode === 'pan') {
+        // Pan -> Move (disabled)
+        newMode = 'disabled';
+        newText = 'Move';
+        newTitle = 'Mode: Move';
+        dragmode = false;
+        tileMovable = true;
+    } else {
+        // Move -> Zoom
+        newMode = 'zoom';
+        newText = 'Zoom';
+        newTitle = 'Mode: Zoom';
+        dragmode = 'zoom';
+        tileMovable = false;
+    }
+
+    button.dataset.mode = newMode;
+    button.textContent = newText;
+    button.title = newTitle;
+
+    // Update Plotly dragmode
+    Plotly.relayout(container, { dragmode: dragmode }).catch(err => {
+        console.error('Failed to update drag mode:', err);
+    });
+
+    // Update GridStack tile movability
+    const widgetEl = document.getElementById(plotId);
+    if (widgetEl && AppState.gridStack) {
+        AppState.gridStack.movable(widgetEl, tileMovable);
+    }
+}
+
+// ===== Reset Plot Zoom =====
+function resetPlotZoom(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    if (container.data && container.layout) {
+        Plotly.relayout(container, {
+            'xaxis.autorange': true,
+            'yaxis.autorange': true
+        }).catch(err => {
+            console.error('Plotly reset zoom error:', err);
+        });
+    }
+}
+
+// ===== Reset All Plots =====
+function resetAllPlots() {
+    const containers = document.querySelectorAll('.plot-container[id^="container-"]');
+    containers.forEach(container => {
+        if (container.data && container.layout) {
+            Plotly.relayout(container, {
+                'xaxis.autorange': true,
+                'yaxis.autorange': true
+            }).catch(err => {
+                console.error('Plotly reset zoom error:', err);
+            });
         }
     });
+}
+
+// ===== Update All Plots =====
+async function updateAllPlots() {
+    const containers = document.querySelectorAll('.plot-container[data-plot-type]');
+
+    for (const container of containers) {
+        const plotType = container.dataset.plotType;
+        const plotDef = plotDefinitions[plotType];
+
+        if (plotDef) {
+            try {
+                await plotDef.render(container.id, AppState.currentStep);
+            } catch (error) {
+                console.error(`Error updating ${plotType}:`, error);
+            }
+        }
+    }
+}
+
+// ===== Animation Controls =====
+function playAnimation() {
+    if (AppState.isAnimating || AppState.totalSteps <= 1) return;
+
+    AppState.isAnimating = true;
+    document.getElementById('playBtn').style.display = 'none';
+    document.getElementById('pauseBtn').style.display = 'inline-block';
+
+    const speed = parseInt(document.getElementById('animSpeed').value);
+
+    AppState.animationTimer = setInterval(async () => {
+        AppState.currentStep++;
+        if (AppState.currentStep > AppState.totalSteps) {
+            AppState.currentStep = 1; // Loop
+        }
+
+        document.getElementById('stepSlider').value = AppState.currentStep;
+        document.getElementById('currentStep').textContent = AppState.currentStep;
+
+        await updateAllPlots();
+    }, speed);
+}
+
+function pauseAnimation() {
+    if (AppState.animationTimer) {
+        clearInterval(AppState.animationTimer);
+        AppState.animationTimer = null;
+    }
+
+    AppState.isAnimating = false;
+    document.getElementById('playBtn').style.display = 'inline-block';
+    document.getElementById('pauseBtn').style.display = 'none';
+}
+
+function setStep(step) {
+    pauseAnimation();
+    AppState.currentStep = step;
+    document.getElementById('currentStep').textContent = step;
+    updateAllPlots();
 }
 
 function clearDashboard() {
@@ -926,19 +1070,145 @@ async function renderStepInputImage(containerId, step) {
 }
 
 async function renderForceXTime(containerId, step) {
-    document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Force X-axis time series coming soon</p>';
+    try {
+        // Load force data for all steps
+        const response = await fetch(`/api/load-csv?type=ForceX&step=all`);
+        if (!response.ok) throw new Error('Failed to load force data');
+        const result = await response.json();
+
+        const container = document.getElementById(containerId);
+        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+
+        // Create marker sizes array - highlight current step
+        const markerSizes = xSteps.map((s, i) =>
+            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
+        );
+
+        const trace = {
+            x: xSteps,
+            y: result.data || xSteps.map(() => 0),
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Force X',
+            line: { color: '#667eea', width: 2 },
+            marker: { color: '#667eea', size: markerSizes }
+        };
+
+        await Plotly.newPlot(container, [trace], {
+            margin: { l: 50, r: 10, t: 10, b: 40 },
+            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            yaxis: { title: 'Force X [N/m]' },
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('Force X time plot error:', error);
+        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+    }
 }
 
 async function renderForceYTime(containerId, step) {
-    document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Force Y-axis time series coming soon</p>';
+    try {
+        const response = await fetch(`/api/load-csv?type=ForceY&step=all`);
+        if (!response.ok) throw new Error('Failed to load force data');
+        const result = await response.json();
+
+        const container = document.getElementById(containerId);
+        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+
+        const markerSizes = xSteps.map((s, i) =>
+            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
+        );
+
+        const trace = {
+            x: xSteps,
+            y: result.data || xSteps.map(() => 0),
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Force Y',
+            line: { color: '#764ba2', width: 2 },
+            marker: { color: '#764ba2', size: markerSizes }
+        };
+
+        await Plotly.newPlot(container, [trace], {
+            margin: { l: 50, r: 10, t: 10, b: 40 },
+            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            yaxis: { title: 'Force Y [N/m]' },
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('Force Y time plot error:', error);
+        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+    }
 }
 
 async function renderTorqueTime(containerId, step) {
-    document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Torque time series coming soon</p>';
+    try {
+        const response = await fetch(`/api/load-csv?type=Torque&step=all`);
+        if (!response.ok) throw new Error('Failed to load torque data');
+        const result = await response.json();
+
+        const container = document.getElementById(containerId);
+        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+
+        const markerSizes = xSteps.map((s, i) =>
+            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
+        );
+
+        const trace = {
+            x: xSteps,
+            y: result.data || xSteps.map(() => 0),
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Torque',
+            line: { color: '#f093fb', width: 2 },
+            marker: { color: '#f093fb', size: markerSizes }
+        };
+
+        await Plotly.newPlot(container, [trace], {
+            margin: { l: 50, r: 10, t: 10, b: 40 },
+            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            yaxis: { title: 'Torque [Nm/m]' },
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('Torque time plot error:', error);
+        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+    }
 }
 
 async function renderEnergyTime(containerId, step) {
-    document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Energy time series coming soon</p>';
+    try {
+        const response = await fetch(`/api/load-csv?type=Energy&step=all`);
+        if (!response.ok) throw new Error('Failed to load energy data');
+        const result = await response.json();
+
+        const container = document.getElementById(containerId);
+        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+
+        const markerSizes = xSteps.map((s, i) =>
+            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
+        );
+
+        const trace = {
+            x: xSteps,
+            y: result.data || xSteps.map(() => 0),
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Magnetic Energy',
+            line: { color: '#4facfe', width: 2 },
+            marker: { color: '#4facfe', size: markerSizes }
+        };
+
+        await Plotly.newPlot(container, [trace], {
+            margin: { l: 50, r: 10, t: 10, b: 40 },
+            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            yaxis: { title: 'Energy [J/m]' },
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('Energy time plot error:', error);
+        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+    }
 }
 
 // ===== Plotting Functions =====

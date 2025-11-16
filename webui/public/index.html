@@ -553,10 +553,25 @@
                 <div class="dashboard-canvas">
                     <div class="dashboard-controls">
                         <button class="btn-secondary" onclick="clearDashboard()">Clear All</button>
+                        <button class="btn-secondary" onclick="resetAllPlots()">Reset All Zoom</button>
                         <button class="btn-secondary" onclick="saveLayout()">Save Layout</button>
                         <div style="flex: 1;"></div>
-                        <label>Step: <input type="number" id="stepInput" value="1" min="1" style="width: 80px; padding: 5px;"></label>
-                        <button class="btn-primary" onclick="loadStep()">Load</button>
+
+                        <!-- Animation Controls -->
+                        <button id="playBtn" class="btn-primary" onclick="playAnimation()" style="min-width: 70px;">Play</button>
+                        <button id="pauseBtn" class="btn-secondary" onclick="pauseAnimation()" style="min-width: 70px; display: none;">Pause</button>
+                        <label style="margin-left: 10px;">Speed:
+                            <select id="animSpeed" style="padding: 5px; margin-left: 5px;">
+                                <option value="1000">Slow</option>
+                                <option value="500" selected>Normal</option>
+                                <option value="200">Fast</option>
+                                <option value="100">Very Fast</option>
+                            </select>
+                        </label>
+
+                        <!-- Step Slider -->
+                        <label style="margin-left: 15px;">Step: <span id="currentStep">1</span>/<span id="totalStepsDisplay">1</span></label>
+                        <input type="range" id="stepSlider" min="1" max="1" value="1" style="width: 200px; margin-left: 10px;" oninput="setStep(parseInt(this.value))">
                     </div>
                     <div class="grid-stack" id="dashboard-grid">
                         <div class="empty-canvas" id="emptyCanvas">
