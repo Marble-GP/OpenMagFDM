@@ -212,13 +212,11 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         // Matrices: (ntheta, nr) with indexing (theta_idx, r_idx)
         mu_map = Eigen::MatrixXd::Constant(ntheta, nr, MU_0);
         jz_map = Eigen::MatrixXd::Zero(ntheta, nr);
-        std::cout << "Material property matrices: (" << ntheta << " x " << nr << ") = (theta x r)" << std::endl;
     } else {  // vertical
         // Image is (nr, ntheta) = (rows, cols)
         // Matrices: (nr, ntheta) with indexing (r_idx, theta_idx)
         mu_map = Eigen::MatrixXd::Constant(nr, ntheta, MU_0);
         jz_map = Eigen::MatrixXd::Zero(nr, ntheta);
-        std::cout << "Material property matrices: (" << nr << " x " << ntheta << ") = (r x theta)" << std::endl;
     }
 }
 
@@ -249,7 +247,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         if (coordinate_system == "polar") {
             // For polar coordinates, flip image to match analysis coordinates
             // Convention: image bottom (row=ntheta-1) -> theta=0, image top (row=0) -> theta=theta_range
-            // This ensures theta increases upward (counterclockwise from x-axis, like standard y-axis)
+            // theta increases upward (counterclockwise from x-axis, like standard y-axis)
             cv::Mat image_flipped;
             cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
 
@@ -306,9 +304,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             case JzType::ARRAY: jz_type_str = "array"; break;
         }
 
-        std::cout << "Material '" << name << "': RGB(" << rgb[0] << "," << rgb[1] << "," << rgb[2]
-                  << ") -> mu_r=" << mu_r << ", Jz=" << jz << " A/m^2 (" << jz_type_str << ")" << std::endl;
-        std::cout << "  Matching pixels: " << count << std::endl;
+        std::cout << "Material '" << name << "': mu_r=" << mu_r << ", Jz=" << jz << " A/m^2, pixels=" << count << std::endl;
     }
 }
 
@@ -421,7 +417,7 @@ double MagneticFieldAnalyzer::muAtGrid(int i, int j) const {
 
 double MagneticFieldAnalyzer::getMuAtInterfaceSym(int i, int j, const std::string& direction) const {
     // Symmetric interface mu calculation using harmonic mean
-    // This ensures A(i,j) == A(j,i) in coefficient matrix
+    // A(i,j) == A(j,i) in coefficient matrix
 
     if (direction == "x+") {
         // Interface between (i,j) and (i+1,j)
@@ -657,10 +653,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystem() {
     // Build matrix using the separated method
     buildMatrix(A, rhs);
 
-    std::cout << "Matrix size: " << A.rows() << "x" << A.cols() << std::endl;
-    std::cout << "Non-zero elements: " << A.nonZeros() << std::endl;
-
-    // Check matrix symmetry (critical for numerical accuracy)
+    // Check matrix symmetry
     Eigen::SparseMatrix<double> A_T = A.transpose();
     double symmetry_error = (A - A_T).norm();
     double A_norm = A.norm();
@@ -1200,7 +1193,7 @@ inline double bilinearInterpolatePolar(
     double r_idx_cont = (r_phys - r_start) / dr;
 
     // FIX5: Normalize theta to [0, theta_range) in radians BEFORE converting to index
-    // CRITICAL: This handles sector models (theta_range < 2π) correctly
+    //  sector models (theta_range < 2π) correctly
     // Periodic boundary: theta = theta_range wraps to theta = 0
     double theta_norm = std::fmod(theta_phys, theta_range);
     if (theta_norm < 0.0) theta_norm += theta_range;
@@ -1251,7 +1244,7 @@ inline double bilinearInterpolatePolar(
 }
 
 // Sample B, μ, and coordinates at a physical point with consistent interpolation
-// CRITICAL: This ensures B and μ are evaluated at the SAME physical location
+//  B and μ are evaluated at the SAME physical location
 MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysicalPoint(double x_phys, double y_phys) {
     MagneticFieldAnalyzer::PolarSample sample;
     sample.x_phys = x_phys;
@@ -1316,7 +1309,7 @@ MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysical
 }
 
 // Polar coordinate version: directly use r_phys and theta_phys to avoid atan2 inconsistency
-// CRITICAL: This ensures exact consistency between boundary point and sample point calculations
+//  exact consistency between boundary point and sample point calculations
 MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPolarPoint(double r_phys, double theta_phys) {
     MagneticFieldAnalyzer::PolarSample sample;
 
@@ -1392,7 +1385,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     }
 
     // Calculate cumulative rotation angle offset for transient analysis
-    // CRITICAL: This offset is used for physical coordinate calculation (x_phys, y_phys)
+    //  This offset is used for physical coordinate calculation (x_phys, y_phys)
     // but must be REMOVED when sampling magnetic fields from image-based arrays
     double theta_offset = 0.0;
 
@@ -1467,7 +1460,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
         // First pass: calculate stress at boundary pixels and store in map
         std::map<std::pair<int,int>, BoundaryStressPoint> stress_map;
 
-        // FIX13: Determine loop range based on periodic boundary conditions
+        // Determine loop range based on periodic boundary conditions
         // For periodic BC, include image boundaries; otherwise skip them
         bool x_periodic_loop = false;
         bool y_periodic_loop = false;
@@ -1514,7 +1507,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 // fallback: 8-neighbor search to find adjacent background pixel
                 if (n_norm < EPS_NORMAL) {
                     bool found = false;
-                    // FIX13: Check which boundaries are periodic (handle polar coordinates)
+                    // Check which boundaries are periodic (handle polar coordinates)
                     bool x_periodic_fallback = false;
                     bool y_periodic_fallback = false;
 
@@ -1568,7 +1561,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 n_img_x /= n_norm;
                 n_img_y /= n_norm;
 
-                // FIX13: Ensure normal points to background (probe along normal)
+                // Ensure normal points to background (probe along normal)
                 // For periodic boundaries, use wrap instead of clamp
                 bool x_periodic = false;
                 bool y_periodic = false;
@@ -1663,7 +1656,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 double r_phys = 0.0, theta = 0.0;
                 int ir = 0, jt = 0;
 
-                // FIX14: Torque calculation coordinates (rotor frame, independent of theta_offset)
+                // Torque calculation coordinates (rotor frame, independent of theta_offset)
                 double x_torque = 0.0, y_torque = 0.0;
 
                 if (coordinate_system == "polar") {
@@ -1673,15 +1666,13 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     jt = std::clamp(jt, 0, ntheta-1);
                     r_phys = r_coords[ir];
 
-                    // CRITICAL: For field sampling and export, use stator frame (with theta_offset)
+                    //  For field sampling and export, use stator frame (with theta_offset)
                     // theta_offset accounts for cumulative rotation from image sliding
                     theta = jt * dtheta + theta_offset;
                     x_phys = r_phys * std::cos(theta);
                     y_phys = r_phys * std::sin(theta);
 
-                    // FIX14: For torque calculation, use rotor frame (without theta_offset)
-                    // Torque is independent of coordinate system rotation (Galilean invariance)
-                    // "Torque is the same regardless of where you twist the cylinder"
+                    // Torque calculation in rotor frame (Galilean invariance)
                     double theta_rotor = jt * dtheta;
                     x_torque = r_phys * std::cos(theta_rotor);
                     y_torque = r_phys * std::sin(theta_rotor);
@@ -1692,13 +1683,12 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     r_phys = std::sqrt(x_phys*x_phys + y_phys*y_phys);
                     theta = (r_phys > 0.0) ? std::atan2(y_phys, x_phys) : 0.0;
 
-                    // FIX14: For Cartesian, torque coordinates are same as physical coordinates
+                    // For Cartesian, torque coordinates are same as physical coordinates
                     x_torque = x_phys;
                     y_torque = y_phys;
                 }
 
-                // CRITICAL FIX: Convert image-space normal to physical-space normal with proper scaling
-                // GPT Review: "Sobel gradient needs physical scaling, especially in polar coordinates"
+                //  Convert image-space normal to physical-space normal with proper scaling
                 double n_phys_x, n_phys_y;
                 if (coordinate_system == "polar") {
                     // Polar coordinates: Scale by physical lengths (dr, r*dtheta)
@@ -1717,11 +1707,8 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                         n_theta = n_img_x / (r_phys * dtheta + 1e-12);
                     }
 
-                    // FIX14B: Convert polar normal to Cartesian using rotor frame angle
-                    // The normal vector is calculated from material boundary geometry (rotor frame)
-                    // Must use theta_rotor (without theta_offset), not theta (with theta_offset)
-                    // This ensures Maxwell stress force components are in rotor frame, matching torque coordinates
-                    double theta_rotor = jt * dtheta;  // Rotor frame angle
+                    // Convert polar normal to Cartesian using rotor frame angle (without theta_offset)
+                    double theta_rotor = jt * dtheta;
                     n_phys_x = n_r * std::cos(theta_rotor) - n_theta * std::sin(theta_rotor);
                     n_phys_y = n_r * std::sin(theta_rotor) + n_theta * std::cos(theta_rotor);
 
@@ -1744,8 +1731,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     }
                 }
 
-                // FIX14B: Basis vectors in rotor frame (consistent with normal vector and B field)
-                // Use theta_rotor for polar coordinates, theta for Cartesian (no rotation concept)
+                // Basis vectors in rotor frame for polar coordinates
                 double theta_for_basis = (coordinate_system == "polar") ? (jt * dtheta) : theta;
                 double er_x = std::cos(theta_for_basis), er_y = std::sin(theta_for_basis);
                 double et_x = -std::sin(theta_for_basis), et_y = std::cos(theta_for_basis);
@@ -1768,13 +1754,13 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 double ds = std::sqrt( (t_r * len_r)*(t_r * len_r) + (t_t * len_t)*(t_t * len_t) );
                 if (ds <= 0.0) ds = DS_MIN;
 
-                // CRITICAL FIX: Sample B and μ at SAME physical point using bilinear interpolation
+                //  Sample B and μ at SAME physical point using bilinear interpolation
                 // Calculate sample point in the SAME coordinate system to avoid atan2 inconsistency
                 MagneticFieldAnalyzer::PolarSample sample;
 
                 if (coordinate_system == "polar") {
                     // FIX7: Evaluate Maxwell stress ON the boundary, not offset by dr
-                    // Physical interpretation: Force is exerted by the material itself at its surface
+                    // Force is exerted by the material itself at its surface
                     // Therefore, evaluate B and H at the boundary position, using material properties
                     double sample_distance = 0.0;  // Changed from dr to 0 for on-boundary evaluation
 
@@ -1786,13 +1772,13 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     double r_sample = r_phys + sample_distance * n_r;
                     double theta_sample_phys = theta + (r_phys > 0.0 ? (sample_distance * n_theta / r_phys) : 0.0);
 
-                    // CRITICAL: Convert physical theta back to image theta for field sampling
+                    //  Convert physical theta back to image theta for field sampling
                     // Magnetic fields are stored in image coordinate system (without cumulative rotation)
                     // Subtract theta_offset to get image-based theta for correct field lookup
                     double theta_sample_image = theta_sample_phys - theta_offset;
 
                     // FIX2: Wrap theta to [0, theta_range) for image coordinate system
-                    // CRITICAL: Use theta_range (not 2π) to handle sector models correctly
+                    //  Use theta_range (not 2π) to handle sector models correctly
                     while (theta_sample_image < 0.0) theta_sample_image += theta_range;
                     while (theta_sample_image >= theta_range) theta_sample_image -= theta_range;
 
@@ -1809,7 +1795,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     sample = sampleFieldsAtPhysicalPoint(x_sample, y_sample);
                 }
 
-                // FIX11: Extract B and μ from boundary pixel directly (not interpolated)
+                // Extract B and μ from boundary pixel directly (not interpolated)
                 // Same reasoning as Fix8: boundary is material/air interface
                 // Interpolation mixes material and air values → use material side only
                 double bx_out = 0.0, by_out = 0.0;
@@ -1854,7 +1840,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 double mu_local = mu_boundary;
 
                 // Maxwell stress calculation: Use Cartesian coordinates for BOTH coordinate systems
-                // CRITICAL FIX: Avoid basis vector inconsistencies by always computing in Cartesian
+                //  Avoid basis vector inconsistencies by always computing in Cartesian
                 // For polar coordinates, bx_out and by_out have already been computed from Br, Btheta
                 // at lines 1484-1485, so we can use them directly.
 
@@ -1908,14 +1894,7 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 double dFx = fx * ds;
                 double dFy = fy * ds;
 
-                // FIX14: Torque calculation with Galilean invariance
-                // Use rotor frame coordinates (x_torque, y_torque) instead of stator frame (x_phys, y_phys)
-                // This ensures torque is independent of theta_offset (coordinate system rotation)
-                // Physical interpretation: "Torque is the same regardless of where you twist the cylinder"
-                //
-                // Cartesian formula: τ_z = x * F_y - y * F_x
-                // For polar coordinates: x_torque, y_torque are in rotor frame (no theta_offset)
-                // For Cartesian: x_torque = x_phys, y_torque = y_phys (no rotation concept)
+                // Torque: τ_z = x * F_y - y * F_x (using rotor frame coordinates)
                 result.torque_origin += x_torque * dFy - y_torque * dFx;
 
                 if (coordinate_system == "polar") {
@@ -2070,8 +2049,8 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
         std::cout << "    Boundary pixels: " << result.pixel_count << std::endl;
         std::cout << "    Radial force (outward): " << result.force_radial << " N/m (per unit depth)" << std::endl;
         std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
-        std::cout << "    Torque about origin: " << result.torque_origin << " N·m (per unit depth)" << std::endl;
-        std::cout << "    Torque about image center: " << result.torque_center << " N·m (per unit depth)" << std::endl;
+        std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
+        std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
         std::cout << "    Magnetic energy: " << result.magnetic_energy << " J/m (per unit depth)" << std::endl;
 
         force_results.push_back(result);
@@ -2158,7 +2137,7 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
             }
         }
 
-        std::cout << "  Grid size (r x θ): " << rows << " x " << cols << std::endl;
+        std::cout << "  Grid size (r x theta): " << rows << " x " << cols << std::endl;
         std::cout << "  Total energy: " << total_energy << " J/m (per unit depth)" << std::endl;
     }
 
@@ -2178,11 +2157,11 @@ void MagneticFieldAnalyzer::exportForcesToCSV(const std::string& output_path) co
     }
 
     // CSV header (include both torque measures and magnetic energy)
-    file << "Material,RGB_R,RGB_G,RGB_B,Force_X[N/m],Force_Y[N/m],Force_Magnitude[N/m],Force_Radial[N/m],Torque_Origin[N·m],Torque_Center[N·m],Magnetic_Energy[J/m],Boundary_Pixels\n";
+    file << "Material,RGB_R,RGB_G,RGB_B,Force_X[N/m],Force_Y[N/m],Force_Magnitude[N/m],Force_Radial[N/m],Torque_Origin[N*m],Torque_Center[N*m],Magnetic_Energy[J/m],Boundary_Pixels\n";
     file << "# Note: Forces and energies are per unit depth (2D analysis)\n";
     file << "# Torque_Origin: torque about origin (polar)\n";
     file << "# Torque_Center: torque about image center (x=center_x, y=center_y)\n";
-    file << "# Magnetic_Energy: magnetic potential energy W = ∫ B²/(2μ) dV\n";
+    file << "# Magnetic_Energy: magnetic potential energy W = integral(B^2/(2*mu) dV)\n";
 
     file << std::scientific << std::setprecision(6);
 
@@ -2322,13 +2301,13 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
         exportForcesToCSV(forces_path);
     }
 
-    // Export boundary stress vectors if available
-    if (!boundary_stress_vectors.empty()) {
-        std::string stress_vectors_folder = base_folder + "/StressVectors";
-        system(("mkdir -p \"" + stress_vectors_folder + "\"").c_str());
-        std::string stress_vectors_path = stress_vectors_folder + "/" + step_name + ".csv";
-        exportBoundaryStressVectors(stress_vectors_path);
-    }
+    // Export boundary stress vectors (commented out to reduce data size)
+    // if (!boundary_stress_vectors.empty()) {
+    //     std::string stress_vectors_folder = base_folder + "/StressVectors";
+    //     system(("mkdir -p \"" + stress_vectors_folder + "\"").c_str());
+    //     std::string stress_vectors_path = stress_vectors_folder + "/" + step_name + ".csv";
+    //     exportBoundaryStressVectors(stress_vectors_path);
+    // }
 
     // Export energy density distribution
     if (coordinate_system == "cartesian" && Bx.size() > 0 && By.size() > 0 && mu_map.size() > 0) {
@@ -2486,7 +2465,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             double mu_current = getMuPolar(mu_map, i, j, r_orientation);
 
             // Radial coefficients with r-weighting (divergence form)
-            // CRITICAL FIX: Use r-weighted formulation for symmetry
+            //  Use r-weighted formulation for symmetry
             // Multiply equation by r to get: ∂/∂r(r·(1/μ)·∂Az/∂r) + (1/r)·∂/∂θ((1/μ)·∂Az/∂θ) = -r·Jz
             // This makes the radial term symmetric
             double r_iph = r + 0.5 * dr;  // r_{i+1/2}
@@ -2578,14 +2557,14 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             bool theta_prev_is_dirichlet = (!is_periodic) && (j == 1);  // j_prev_idx = 0
             bool theta_next_is_dirichlet = (!is_periodic) && (j == ntheta - 2);  // j_next_idx = ntheta-1
 
-            // CRITICAL FIX: For periodic boundaries, also check if theta neighbor is on radial Dirichlet boundary
-            // This ensures symmetry when periodic wrap connects to Dirichlet points
+            //  For periodic boundaries, also check if theta neighbor is on radial Dirichlet boundary
+            // symmetry when periodic wrap connects to Dirichlet points
             if (is_periodic) {
                 int idx_theta_prev = i * ntheta + j_prev_idx;
                 int idx_theta_next = i * ntheta + j_next_idx;
 
                 // Check if wrapped theta neighbor is on radial Dirichlet boundary
-                // (This handles the case where j wraps around and i is on boundary)
+                // (the case where j wraps around and i is on boundary)
                 // For now, we don't have this case in our problem, but keep the structure consistent
                 // The key is to use the same harmonic mean calculation in both directions
             }
@@ -3628,7 +3607,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         }
 
         // 3. Calculate Maxwell stress (pass step number for field caching)
-        // CRITICAL: Use step (not step+1) to match theta_offset with actual image shift state
+        //  Use step (not step+1) to match theta_offset with actual image shift state
         // step=0: initial state (no shift) → theta_offset=0
         // step=1: 1-pixel shifted → theta_offset=1*dtheta
         calculateMaxwellStress(step);
