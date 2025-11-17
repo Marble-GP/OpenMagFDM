@@ -238,7 +238,7 @@ app.post('/api/config', async (req, res) => {
     }
 });
 
-// 画像ファイルのアップロード
+// 画像ファイルのアップロード（ユーザーIDを付与）
 app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     try {
         if (!req.file) {
@@ -248,10 +248,19 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
             });
         }
 
+        const userId = req.body.userId || 'default';
+        const originalFilename = req.file.filename;
+        const newFilename = `${userId}_${originalFilename}`;
+
+        // ファイル名を変更
+        const oldPath = path.join(UPLOAD_DIR, originalFilename);
+        const newPath = path.join(UPLOAD_DIR, newFilename);
+        await fs.rename(oldPath, newPath);
+
         res.json({
             success: true,
-            filename: req.file.filename,
-            path: req.file.path,
+            filename: newFilename,
+            path: `/uploads/${newFilename}`,
             originalName: req.file.originalname
         });
     } catch (error) {
@@ -262,15 +271,89 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     }
 });
 
-// アップロードされた画像の一覧
+// アップロードされた画像の一覧（ユーザーごと）
 app.get('/api/images', async (req, res) => {
     try {
+        const { userId } = req.query;
+        const userDir = getUserDir(userId || 'default');
+
+        // ユーザーディレクトリを初期化
+        await initializeUserDir(userId);
+
         const files = await fs.readdir(UPLOAD_DIR);
-        const imageFiles = files.filter(f => /\.(png|jpg|jpeg|bmp)$/i.test(f));
+        // ユーザーIDをファイル名に含む画像のみフィルター
+        const imageFiles = files.filter(f => {
+            const isImage = /\.(png|jpg|jpeg|bmp)$/i.test(f);
+            const belongsToUser = f.startsWith(userId + '_');
+            return isImage && belongsToUser;
+        });
 
         res.json({
             success: true,
             images: imageFiles
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// 画像ファイルの削除
+app.delete('/api/images/:filename', async (req, res) => {
+    try {
+        const { filename } = req.params;
+        const { userId } = req.query;
+
+        // セキュリティチェック：ファイル名がユーザーIDで始まっているか確認
+        if (!filename.startsWith(userId + '_')) {
+            return res.status(403).json({
+                success: false,
+                error: 'Permission denied'
+            });
+        }
+
+        const filePath = path.join(UPLOAD_DIR, filename);
+        await fs.unlink(filePath);
+
+        res.json({
+            success: true,
+            message: 'Image deleted successfully'
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Configファイルの削除
+app.delete('/api/config/:filename', async (req, res) => {
+    try {
+        const { filename } = req.params;
+        const { userId } = req.query;
+
+        const userDir = getUserDir(userId || 'default');
+        const filePath = path.join(userDir, filename);
+
+        await fs.unlink(filePath);
+
+        // 削除後、ファイルが残っているかチェック
+        const files = await fs.readdir(userDir);
+        const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
+
+        // ファイルがすべて削除された場合、デフォルトのsample_config.yamlをコピー
+        if (yamlFiles.length === 0) {
+            const defaultConfig = await fs.readFile(CONFIG_PATH, 'utf8');
+            const defaultConfigPath = path.join(userDir, 'sample_config.yaml');
+            await fs.writeFile(defaultConfigPath, defaultConfig, 'utf8');
+        }
+
+        res.json({
+            success: true,
+            message: 'Config deleted successfully'
         });
     } catch (error) {
         res.status(500).json({

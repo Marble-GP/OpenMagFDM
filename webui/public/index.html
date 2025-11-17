@@ -164,6 +164,21 @@
             background: #5a6268;
         }
 
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1rem;
+            transition: background 0.3s;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
         /* Run & Preview Tab */
         .run-section {
             max-width: 1400px;
@@ -425,6 +440,7 @@
         <header>
             <h1>OpenMagFDM - Integrated Environment</h1>
             <p>Finite Difference Method for 2D Magnetic Field Analysis</p>
+            <p style="font-size: 0.75rem; opacity: 0.7; margin-top: 5px;">User ID: <span id="userIdDisplay"></span></p>
         </header>
 
         <!-- Tabs Navigation -->
@@ -444,7 +460,7 @@
                             <option value="sample_config.yaml">sample_config.yaml</option>
                         </select>
                     </label>
-                    <button class="btn-secondary" onclick="refreshConfigList()">Refresh</button>
+                    <button class="btn-danger" onclick="deleteConfig()">Delete</button>
                     <button class="btn-primary" onclick="saveConfig()">Save</button>
                     <button class="btn-secondary" onclick="saveConfigAs()">Save As...</button>
                 </div>
@@ -459,8 +475,17 @@
                 <!-- Left Panel: Image Upload -->
                 <div class="panel">
                     <h3>Input Image</h3>
+                    <div style="margin-bottom: 10px;">
+                        <select id="imageSelect" style="width: 100%; padding: 8px; border: 1px solid #dee2e6; border-radius: 3px;">
+                            <option value="">Select uploaded image...</option>
+                        </select>
+                    </div>
+                    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
+                        <button class="btn-secondary" style="flex: 1;" onclick="loadSelectedImage()">Load</button>
+                        <button class="btn-danger" style="flex: 1;" onclick="deleteSelectedImage()">Delete</button>
+                    </div>
                     <div class="file-upload" onclick="document.getElementById('imageUpload').click()">
-                        <p>Click to upload material image</p>
+                        <p>Click to upload new image</p>
                         <p style="font-size: 0.8rem; color: #6c757d; margin-top: 10px;">PNG format recommended</p>
                     </div>
                     <input type="file" id="imageUpload" accept="image/*" style="display: none;" onchange="handleImageUpload(event)">
@@ -470,12 +495,21 @@
                 <!-- Right Panel: Solver Control -->
                 <div class="panel">
                     <h3>Solver Control</h3>
+                    <div style="margin-bottom: 10px;">
+                        <label>Result:</label>
+                        <select id="resultSelect" style="width: 100%; padding: 8px; margin-top: 5px; border: 1px solid #dee2e6; border-radius: 3px;">
+                            <option value="">Select result...</option>
+                        </select>
+                    </div>
                     <div class="button-group">
+                        <button class="btn-secondary" onclick="loadSelectedResult()">Load Selected Result</button>
+                        <button class="btn-secondary" onclick="refreshResultsList()">Refresh List</button>
+                    </div>
+                    <div class="button-group" style="margin-top: 15px;">
                         <button class="btn-primary" onclick="runSolver()" id="solverBtn">Run Solver</button>
-                        <button class="btn-secondary" onclick="loadResults()">Load Results</button>
                     </div>
                     <div id="solverStatus"></div>
-                    <div id="solverOutput" style="background: #f8f9fa; padding: 10px; margin-top: 15px; border-radius: 5px; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto;"></div>
+                    <div id="solverOutput" style="background: #f8f9fa; padding: 10px; margin-top: 15px; border-radius: 5px; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap;"></div>
                 </div>
 
                 <!-- Results Preview (Full Width) -->

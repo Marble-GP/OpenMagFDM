@@ -27,6 +27,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     initializeDashboard();
     await refreshConfigList();
     await loadConfig();
+    await refreshImageList();
+    await refreshResultsList();
 });
 
 // ===== Tab Management =====
@@ -70,6 +72,12 @@ function initializeUserId() {
     setCookie('magfdm_user_id', userId, 365);
     AppState.userId = userId;
     console.log('User ID:', userId);
+
+    // Display user ID in header
+    const userIdDisplay = document.getElementById('userIdDisplay');
+    if (userIdDisplay) {
+        userIdDisplay.textContent = userId;
+    }
 }
 
 function getCookie(name) {
@@ -605,6 +613,7 @@ async function handleImageUpload(event) {
     try {
         const formData = new FormData();
         formData.append('image', file);
+        formData.append('userId', AppState.userId);
 
         const response = await fetch('/api/upload-image', {
             method: 'POST',
@@ -616,8 +625,205 @@ async function handleImageUpload(event) {
         const result = await response.json();
         AppState.uploadedImageFilename = result.filename;
         showStatus('solverStatus', `Image uploaded: ${result.filename}`, 'success');
+
+        // Refresh image list
+        await refreshImageList();
     } catch (error) {
         showStatus('solverStatus', `Upload error: ${error.message}`, 'error');
+    }
+}
+
+async function refreshImageList() {
+    try {
+        const response = await fetch(`/api/images?userId=${AppState.userId}`);
+        if (!response.ok) throw new Error('Failed to load images');
+
+        const result = await response.json();
+        const select = document.getElementById('imageSelect');
+        const currentValue = select.value;
+
+        select.innerHTML = '<option value="">Select uploaded image...</option>';
+        result.images.forEach(img => {
+            const option = document.createElement('option');
+            option.value = img;
+            option.textContent = img;
+            select.appendChild(option);
+        });
+
+        if (result.images.includes(currentValue)) {
+            select.value = currentValue;
+        }
+    } catch (error) {
+        console.error('Error loading image list:', error);
+    }
+}
+
+function loadSelectedImage() {
+    const select = document.getElementById('imageSelect');
+    const filename = select.value;
+    if (!filename) {
+        showStatus('solverStatus', 'Please select an image', 'error');
+        return;
+    }
+
+    AppState.uploadedImageFilename = filename;
+    const img = document.getElementById('uploadedImage');
+    img.src = `/uploads/${filename}`;
+    img.classList.remove('hidden');
+    showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
+}
+
+async function deleteSelectedImage() {
+    const select = document.getElementById('imageSelect');
+    const filename = select.value;
+    if (!filename) {
+        showStatus('solverStatus', 'Please select an image to delete', 'error');
+        return;
+    }
+
+    if (!confirm(`Delete ${filename}?`)) return;
+
+    try {
+        const response = await fetch(`/api/images/${filename}?userId=${AppState.userId}`, {
+            method: 'DELETE'
+        });
+
+        if (!response.ok) throw new Error('Failed to delete image');
+
+        showStatus('solverStatus', 'Image deleted successfully', 'success');
+        await refreshImageList();
+
+        // Clear if this was the selected image
+        if (AppState.uploadedImageFilename === filename) {
+            AppState.uploadedImageFilename = null;
+            document.getElementById('uploadedImage').classList.add('hidden');
+        }
+    } catch (error) {
+        showStatus('solverStatus', `Delete error: ${error.message}`, 'error');
+    }
+}
+
+async function deleteConfig() {
+    const select = document.getElementById('configFileSelect');
+    const filename = select.value;
+    if (!filename) {
+        showStatus('configStatus', 'Please select a config to delete', 'error');
+        return;
+    }
+
+    if (!confirm(`Delete ${filename}?`)) return;
+
+    try {
+        const response = await fetch(`/api/config/${filename}?userId=${AppState.userId}`, {
+            method: 'DELETE'
+        });
+
+        if (!response.ok) throw new Error('Failed to delete config');
+
+        showStatus('configStatus', 'Config deleted successfully', 'success');
+        await refreshConfigList();
+        await loadConfig();
+    } catch (error) {
+        showStatus('configStatus', `Delete error: ${error.message}`, 'error');
+    }
+}
+
+// ===== Result Management =====
+async function refreshResultsList() {
+    try {
+        const response = await fetch('/api/results');
+        if (!response.ok) throw new Error('Failed to load results');
+
+        const result = await response.json();
+        const select = document.getElementById('resultSelect');
+        const currentValue = select.value;
+
+        select.innerHTML = '<option value="">Select result...</option>';
+        result.results.forEach(res => {
+            const option = document.createElement('option');
+            option.value = res.path;
+            option.textContent = `${res.name} (${res.steps} steps)`;
+            select.appendChild(option);
+        });
+
+        if (result.results.map(r => r.path).includes(currentValue)) {
+            select.value = currentValue;
+        }
+    } catch (error) {
+        console.error('Error loading results list:', error);
+    }
+}
+
+async function loadSelectedResult() {
+    const select = document.getElementById('resultSelect');
+    const resultPath = select.value;
+
+    if (!resultPath) {
+        showStatus('solverStatus', 'Please select a result to load', 'error');
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/detect-steps?result=${encodeURIComponent(resultPath)}`);
+        if (!response.ok) throw new Error('Failed to detect steps');
+
+        const data = await response.json();
+        AppState.totalSteps = data.steps || 1;
+        AppState.currentStep = 1;
+        AppState.resultsData.currentResult = resultPath;
+
+        // Update dashboard controls
+        const stepSlider = document.getElementById('stepSlider');
+        const totalStepsDisplay = document.getElementById('totalStepsDisplay');
+        const currentStepDisplay = document.getElementById('currentStep');
+
+        if (stepSlider) {
+            stepSlider.max = AppState.totalSteps;
+            stepSlider.value = 1;
+        }
+        if (totalStepsDisplay) {
+            totalStepsDisplay.textContent = AppState.totalSteps;
+        }
+        if (currentStepDisplay) {
+            currentStepDisplay.textContent = 1;
+        }
+
+        showStatus('solverStatus', `Loaded result: ${resultPath} (${AppState.totalSteps} steps)`, 'success');
+
+        // Load preview
+        await loadQuickPreviewFromResult(resultPath);
+    } catch (error) {
+        showStatus('solverStatus', `Error loading result: ${error.message}`, 'error');
+    }
+}
+
+async function loadQuickPreviewFromResult(resultPath) {
+    const step = 1; // Always show first step in preview
+
+    try {
+        // Load Az data
+        const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/step_0000.csv`);
+        if (azResponse.ok) {
+            const azData = await azResponse.json();
+            plotHeatmap('previewPlot1', azData.data, 'Az (Magnetic Vector Potential)');
+        }
+
+        // Load Mu data
+        const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/step_0000.csv`);
+        if (muResponse.ok) {
+            const muData = await muResponse.json();
+            plotHeatmap('previewPlot2', muData.data, 'μ (Permeability)');
+        }
+
+        // Load energy density
+        const energyResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=EnergyDensity/step_0000.csv`);
+        if (energyResponse.ok) {
+            const energyData = await energyResponse.json();
+            plotHeatmap('previewPlot3', energyData.data, 'Energy Density');
+        }
+
+    } catch (error) {
+        console.error('Preview error:', error);
     }
 }
 
@@ -655,7 +861,8 @@ async function runSolver() {
         }
 
         const result = await response.json();
-        outputDiv.textContent += result.stdout || 'Solver completed successfully\n';
+        // Use textContent to preserve line breaks
+        outputDiv.textContent += (result.stdout || 'Solver completed successfully') + '\n';
 
         showStatus('solverStatus', 'Solver completed successfully', 'success');
 
@@ -673,32 +880,26 @@ async function runSolver() {
 
 async function loadResults() {
     try {
-        const response = await fetch('/api/detect-steps');
-        if (!response.ok) throw new Error('Failed to detect steps');
+        // Refresh results list to get the latest results
+        await refreshResultsList();
 
-        const data = await response.json();
-        AppState.totalSteps = data.totalSteps || 1;
-        AppState.currentStep = 1;
+        // Get the results list
+        const response = await fetch('/api/results');
+        if (!response.ok) throw new Error('Failed to load results');
 
-        // Update dashboard controls
-        const stepSlider = document.getElementById('stepSlider');
-        const totalStepsDisplay = document.getElementById('totalStepsDisplay');
-        const currentStepDisplay = document.getElementById('currentStep');
-
-        if (stepSlider) {
-            stepSlider.max = AppState.totalSteps;
-            stepSlider.value = 1;
-        }
-        if (totalStepsDisplay) {
-            totalStepsDisplay.textContent = AppState.totalSteps;
-        }
-        if (currentStepDisplay) {
-            currentStepDisplay.textContent = 1;
+        const result = await response.json();
+        if (result.results.length === 0) {
+            showStatus('solverStatus', 'No results found', 'error');
+            return;
         }
 
-        showStatus('solverStatus', `Found ${AppState.totalSteps} steps`, 'info');
+        // Select the newest result (first in the list)
+        const newestResult = result.results[0];
+        const select = document.getElementById('resultSelect');
+        select.value = newestResult.path;
 
-        await loadQuickPreview();
+        // Load the selected result
+        await loadSelectedResult();
     } catch (error) {
         showStatus('solverStatus', `Error loading results: ${error.message}`, 'error');
     }
@@ -1036,51 +1237,82 @@ function saveLayout() {
 }
 
 // ===== Plot Rendering Functions =====
+// Helper function to get current result path
+function getCurrentResultPath() {
+    return AppState.resultsData.currentResult || '';
+}
+
+// Helper function to format step filename
+function formatStepFilename(step) {
+    return `step_${String(step - 1).padStart(4, '0')}.csv`;
+}
+
 // Placeholder implementations - these will call actual data loading and plotting
 async function renderAzContour(containerId, step) {
-    const response = await fetch(`/api/load-csv?type=Az&step=${step}`);
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
     if (!response.ok) throw new Error('Failed to load Az data');
     const result = await response.json();
     plotContour(containerId, result.data, 'Az (Magnetic Vector Potential)');
 }
 
 async function renderAzHeatmap(containerId, step) {
-    const response = await fetch(`/api/load-csv?type=Az&step=${step}`);
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
     if (!response.ok) throw new Error('Failed to load Az data');
     const result = await response.json();
     plotHeatmap(containerId, result.data, 'Az Heatmap');
 }
 
 async function renderJzDistribution(containerId, step) {
-    const response = await fetch(`/api/load-csv?type=Jz&step=${step}`);
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Jz/${formatStepFilename(step)}`);
     if (!response.ok) throw new Error('Failed to load Jz data');
     const result = await response.json();
     plotHeatmap(containerId, result.data, 'Jz (Current Density)');
 }
 
 async function renderBMagnitude(containerId, step) {
-    const response = await fetch(`/api/load-csv?type=B&step=${step}`);
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=B/${formatStepFilename(step)}`);
     if (!response.ok) throw new Error('Failed to load B data');
     const result = await response.json();
     plotHeatmap(containerId, result.data, '|B| Distribution');
 }
 
 async function renderHMagnitude(containerId, step) {
-    const response = await fetch(`/api/load-csv?type=H&step=${step}`);
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=H/${formatStepFilename(step)}`);
     if (!response.ok) throw new Error('Failed to load H data');
     const result = await response.json();
     plotHeatmap(containerId, result.data, '|H| Distribution');
 }
 
 async function renderMuDistribution(containerId, step) {
-    const response = await fetch(`/api/load-csv?type=Mu&step=${step}`);
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/${formatStepFilename(step)}`);
     if (!response.ok) throw new Error('Failed to load Mu data');
     const result = await response.json();
     plotHeatmap(containerId, result.data, 'Permeability Distribution');
 }
 
 async function renderEnergyDensity(containerId, step) {
-    const response = await fetch(`/api/load-csv?type=EnergyDensity&step=${step}`);
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=EnergyDensity/${formatStepFilename(step)}`);
     if (!response.ok) throw new Error('Failed to load energy data');
     const result = await response.json();
     plotHeatmap(containerId, result.data, 'Energy Density');
@@ -1098,24 +1330,37 @@ async function renderStepInputImage(containerId, step) {
     document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Step Input Image visualization coming soon</p>';
 }
 
-async function renderForceXTime(containerId, step) {
+async function renderForceXTime(containerId) {
     try {
-        // Load force data for all steps
-        const response = await fetch(`/api/load-csv?type=ForceX&step=all`);
-        if (!response.ok) throw new Error('Failed to load force data');
-        const result = await response.json();
+        const resultPath = getCurrentResultPath();
+        if (!resultPath) throw new Error('No result selected');
+
+        // Load force summary data
+        const forceData = [];
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
+            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
+            if (response.ok) {
+                const text = await response.text();
+                const lines = text.trim().split('\n');
+                // Parse CSV: assume Force_X is in a specific column
+                if (lines.length > 1) {
+                    const dataLine = lines[1].split(',');
+                    forceData.push(parseFloat(dataLine[1]) || 0); // Assuming Force_X is column 1
+                }
+            }
+        }
 
         const container = document.getElementById(containerId);
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        // Create marker sizes array - highlight current step
-        const markerSizes = xSteps.map((s, i) =>
+        const markerSizes = xSteps.map((s) =>
             (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
         );
 
         const trace = {
             x: xSteps,
-            y: result.data || xSteps.map(() => 0),
+            y: forceData.length > 0 ? forceData : xSteps.map(() => 0),
             type: 'scatter',
             mode: 'lines+markers',
             name: 'Force X',
@@ -1135,22 +1380,35 @@ async function renderForceXTime(containerId, step) {
     }
 }
 
-async function renderForceYTime(containerId, step) {
+async function renderForceYTime(containerId) {
     try {
-        const response = await fetch(`/api/load-csv?type=ForceY&step=all`);
-        if (!response.ok) throw new Error('Failed to load force data');
-        const result = await response.json();
+        const resultPath = getCurrentResultPath();
+        if (!resultPath) throw new Error('No result selected');
+
+        const forceData = [];
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
+            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
+            if (response.ok) {
+                const text = await response.text();
+                const lines = text.trim().split('\n');
+                if (lines.length > 1) {
+                    const dataLine = lines[1].split(',');
+                    forceData.push(parseFloat(dataLine[2]) || 0); // Assuming Force_Y is column 2
+                }
+            }
+        }
 
         const container = document.getElementById(containerId);
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        const markerSizes = xSteps.map((s, i) =>
+        const markerSizes = xSteps.map((s) =>
             (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
         );
 
         const trace = {
             x: xSteps,
-            y: result.data || xSteps.map(() => 0),
+            y: forceData.length > 0 ? forceData : xSteps.map(() => 0),
             type: 'scatter',
             mode: 'lines+markers',
             name: 'Force Y',
@@ -1170,22 +1428,35 @@ async function renderForceYTime(containerId, step) {
     }
 }
 
-async function renderTorqueTime(containerId, step) {
+async function renderTorqueTime(containerId) {
     try {
-        const response = await fetch(`/api/load-csv?type=Torque&step=all`);
-        if (!response.ok) throw new Error('Failed to load torque data');
-        const result = await response.json();
+        const resultPath = getCurrentResultPath();
+        if (!resultPath) throw new Error('No result selected');
+
+        const torqueData = [];
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
+            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
+            if (response.ok) {
+                const text = await response.text();
+                const lines = text.trim().split('\n');
+                if (lines.length > 1) {
+                    const dataLine = lines[1].split(',');
+                    torqueData.push(parseFloat(dataLine[3]) || 0); // Assuming Torque is column 3
+                }
+            }
+        }
 
         const container = document.getElementById(containerId);
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        const markerSizes = xSteps.map((s, i) =>
+        const markerSizes = xSteps.map((s) =>
             (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
         );
 
         const trace = {
             x: xSteps,
-            y: result.data || xSteps.map(() => 0),
+            y: torqueData.length > 0 ? torqueData : xSteps.map(() => 0),
             type: 'scatter',
             mode: 'lines+markers',
             name: 'Torque',
@@ -1205,22 +1476,35 @@ async function renderTorqueTime(containerId, step) {
     }
 }
 
-async function renderEnergyTime(containerId, step) {
+async function renderEnergyTime(containerId) {
     try {
-        const response = await fetch(`/api/load-csv?type=Energy&step=all`);
-        if (!response.ok) throw new Error('Failed to load energy data');
-        const result = await response.json();
+        const resultPath = getCurrentResultPath();
+        if (!resultPath) throw new Error('No result selected');
+
+        const energyData = [];
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
+            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
+            if (response.ok) {
+                const text = await response.text();
+                const lines = text.trim().split('\n');
+                if (lines.length > 1) {
+                    const dataLine = lines[1].split(',');
+                    energyData.push(parseFloat(dataLine[4]) || 0); // Assuming Energy is column 4
+                }
+            }
+        }
 
         const container = document.getElementById(containerId);
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        const markerSizes = xSteps.map((s, i) =>
+        const markerSizes = xSteps.map((s) =>
             (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
         );
 
         const trace = {
             x: xSteps,
-            y: result.data || xSteps.map(() => 0),
+            y: energyData.length > 0 ? energyData : xSteps.map(() => 0),
             type: 'scatter',
             mode: 'lines+markers',
             name: 'Magnetic Energy',
