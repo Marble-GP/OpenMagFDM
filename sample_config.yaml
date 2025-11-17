@@ -13,7 +13,7 @@ polar_domain:
   r_start: 0.2  # 内半径 [m] (0 < r_start < r_end)
   r_end: 0.3    # 外半径 [m]
   r_orientation: horizontal  # r方向: horizontal (列方向) or vertical (行方向)
-  theta_range: 1.0471975512  # θ方向の範囲 [rad] (2*pi for full periodic domain)
+  theta_range: 0.52359877559  # θ方向の範囲 [rad] (2*pi for full periodic domain)
   # θ方向は r_orientation と垂直な方向で 0 ~ theta_range
 
 # 極座標境界条件
@@ -49,6 +49,7 @@ materials:
     rgb: [255, 255, 255]  # 白
     mu_r: 1.0  # 比透磁率
     jz: 0.0  # 電流密度 [A/m²]
+    calc_force: false
   
   iron_stator:
     rgb: [128, 128, 128]  # グレー（実際の画像の色）

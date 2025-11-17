@@ -825,39 +825,130 @@ async function loadResultLog(resultPath) {
     }
 }
 
+// Helper: Calculate magnetic fields from Az and Mu
+function calculateFields(Az, Mu, dx, dy) {
+    const rows = Az.length;
+    const cols = Az[0].length;
+
+    const Bx = Array(rows).fill(0).map(() => Array(cols).fill(0));
+    const By = Array(rows).fill(0).map(() => Array(cols).fill(0));
+
+    for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+            // Bx = ∂Az/∂y
+            if (j === 0) {
+                Bx[j][i] = (Az[1][i] - Az[0][i]) / dy;
+            } else if (j === rows - 1) {
+                Bx[j][i] = (Az[rows-1][i] - Az[rows-2][i]) / dy;
+            } else {
+                Bx[j][i] = (Az[j+1][i] - Az[j-1][i]) / (2 * dy);
+            }
+
+            // By = -∂Az/∂x
+            if (i === 0) {
+                By[j][i] = -(Az[j][1] - Az[j][0]) / dx;
+            } else if (i === cols - 1) {
+                By[j][i] = -(Az[j][cols-1] - Az[j][cols-2]) / dx;
+            } else {
+                By[j][i] = -(Az[j][i+1] - Az[j][i-1]) / (2 * dx);
+            }
+        }
+    }
+
+    // H = B / μ
+    const Hx = Array(rows).fill(0).map(() => Array(cols).fill(0));
+    const Hy = Array(rows).fill(0).map(() => Array(cols).fill(0));
+
+    for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+            Hx[j][i] = Bx[j][i] / Mu[j][i];
+            Hy[j][i] = By[j][i] / Mu[j][i];
+        }
+    }
+
+    return { Bx, By, Hx, Hy };
+}
+
+// Helper: Calculate magnitude from vector components
+function calculateMagnitude(Fx, Fy) {
+    const rows = Fx.length;
+    const cols = Fx[0].length;
+    const magnitude = Array(rows).fill(0).map(() => Array(cols).fill(0));
+
+    for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+            magnitude[j][i] = Math.sqrt(Fx[j][i]**2 + Fy[j][i]**2);
+        }
+    }
+
+    return magnitude;
+}
+
 async function loadQuickPreviewFromResult(resultPath) {
     const step = 1; // Always show first step in preview
 
     try {
-        // Load Input Image (step_0000.png from InputImg folder)
+        // Load Input Image (step_0001.png from InputImg folder)
         const inputImgContainer = document.getElementById('previewPlot1');
         inputImgContainer.innerHTML = `
             <h4 style="text-align: center; margin-bottom: 10px;">Input Image (Step 1)</h4>
-            <img src="/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=0"
+            <img src="/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=1"
                  style="max-width: 100%; height: auto; display: block; margin: 0 auto;"
                  onerror="this.parentElement.innerHTML='<p style=\\'text-align:center; padding:20px;\\'>Input image not available</p>'">
         `;
 
-        // Load |B| distribution
-        const bResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=B/step_0000.csv`);
-        if (bResponse.ok) {
-            const bData = await bResponse.json();
-            plotHeatmap('previewPlot2', bData.data, '|B| Distribution (Step 1)');
-        } else {
-            document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">|B| data not available</p>';
+        // Load conditions.json to get grid spacing
+        const condResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
+        let dx = 0.001, dy = 0.001; // Default values
+
+        if (condResponse.ok) {
+            const conditions = await condResponse.json();
+            // Use dr and dtheta for polar, or dx/dy for Cartesian
+            dx = conditions.dr || conditions.dx || 0.001;
+            dy = conditions.dtheta || conditions.dy || 0.001;
         }
 
-        // Load |H| distribution
-        const hResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=H/step_0000.csv`);
-        if (hResponse.ok) {
-            const hData = await hResponse.json();
-            plotHeatmap('previewPlot3', hData.data, '|H| Distribution (Step 1)');
+        // Load Az and Mu data
+        const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/step_0001.csv`);
+        const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/step_0001.csv`);
+
+        if (azResponse.ok && muResponse.ok) {
+            const azData = await azResponse.json();
+            const muData = await muResponse.json();
+
+            if (azData.success && muData.success) {
+                console.log('Az data dimensions:', azData.data.length, 'x', azData.data[0]?.length);
+                console.log('Mu data dimensions:', muData.data.length, 'x', muData.data[0]?.length);
+                console.log('Grid spacing: dx =', dx, ', dy =', dy);
+
+                // Calculate B and H fields
+                const { Bx, By, Hx, Hy } = calculateFields(azData.data, muData.data, dx, dy);
+                console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
+
+                const B_magnitude = calculateMagnitude(Bx, By);
+                const H_magnitude = calculateMagnitude(Hx, Hy);
+
+                console.log('B magnitude dimensions:', B_magnitude.length, 'x', B_magnitude[0]?.length);
+                console.log('H magnitude dimensions:', H_magnitude.length, 'x', H_magnitude[0]?.length);
+                console.log('B magnitude sample values:', B_magnitude[0]?.slice(0, 3));
+
+                // Plot |B| and |H|
+                plotHeatmap('previewPlot2', B_magnitude, '|B| Distribution (Step 1)');
+                plotHeatmap('previewPlot3', H_magnitude, '|H| Distribution (Step 1)');
+            } else {
+                console.error('Az/Mu data loading failed:', { azSuccess: azData.success, muSuccess: muData.success });
+                document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
+                document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
+            }
         } else {
-            document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">|H| data not available</p>';
+            document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
+            document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
         }
 
     } catch (error) {
         console.error('Preview error:', error);
+        document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Error loading preview</p>';
+        document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Error loading preview</p>';
     }
 }
 
@@ -1255,7 +1346,7 @@ function getCurrentResultPath() {
 
 // Helper function to format step filename
 function formatStepFilename(step) {
-    return `step_${String(step - 1).padStart(4, '0')}.csv`;
+    return `step_${String(step).padStart(4, '0')}.csv`;
 }
 
 // Placeholder implementations - these will call actual data loading and plotting
@@ -1293,20 +1384,56 @@ async function renderBMagnitude(containerId, step) {
     const resultPath = getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
 
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=B/${formatStepFilename(step)}`);
-    if (!response.ok) throw new Error('Failed to load B data');
-    const result = await response.json();
-    plotHeatmap(containerId, result.data, '|B| Distribution');
+    // Load conditions to get grid spacing
+    const condResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
+    let dx = 0.001, dy = 0.001;
+    if (condResponse.ok) {
+        const conditions = await condResponse.json();
+        dx = conditions.dr || conditions.dx || 0.001;
+        dy = conditions.dtheta || conditions.dy || 0.001;
+    }
+
+    // Load Az and Mu, then calculate B
+    const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
+    const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/${formatStepFilename(step)}`);
+
+    if (!azResponse.ok || !muResponse.ok) throw new Error('Failed to load Az/Mu data');
+
+    const azData = await azResponse.json();
+    const muData = await muResponse.json();
+
+    const { Bx, By } = calculateFields(azData.data, muData.data, dx, dy);
+    const B_magnitude = calculateMagnitude(Bx, By);
+
+    plotHeatmap(containerId, B_magnitude, '|B| Distribution');
 }
 
 async function renderHMagnitude(containerId, step) {
     const resultPath = getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
 
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=H/${formatStepFilename(step)}`);
-    if (!response.ok) throw new Error('Failed to load H data');
-    const result = await response.json();
-    plotHeatmap(containerId, result.data, '|H| Distribution');
+    // Load conditions to get grid spacing
+    const condResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
+    let dx = 0.001, dy = 0.001;
+    if (condResponse.ok) {
+        const conditions = await condResponse.json();
+        dx = conditions.dr || conditions.dx || 0.001;
+        dy = conditions.dtheta || conditions.dy || 0.001;
+    }
+
+    // Load Az and Mu, then calculate H
+    const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
+    const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/${formatStepFilename(step)}`);
+
+    if (!azResponse.ok || !muResponse.ok) throw new Error('Failed to load Az/Mu data');
+
+    const azData = await azResponse.json();
+    const muData = await muResponse.json();
+
+    const { Hx, Hy } = calculateFields(azData.data, muData.data, dx, dy);
+    const H_magnitude = calculateMagnitude(Hx, Hy);
+
+    plotHeatmap(containerId, H_magnitude, '|H| Distribution');
 }
 
 async function renderMuDistribution(containerId, step) {
@@ -1348,16 +1475,20 @@ async function renderForceXTime(containerId) {
 
         // Load force summary data
         const forceData = [];
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 1; i <= AppState.totalSteps; i++) {
             const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
             const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
             if (response.ok) {
                 const text = await response.text();
                 const lines = text.trim().split('\n');
-                // Parse CSV: assume Force_X is in a specific column
-                if (lines.length > 1) {
-                    const dataLine = lines[1].split(',');
-                    forceData.push(parseFloat(dataLine[1]) || 0); // Assuming Force_X is column 1
+                // Parse CSV: skip header and comment lines, find first data line
+                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+                    const line = lines[lineIdx].trim();
+                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
+                        const dataLine = line.split(',');
+                        forceData.push(parseFloat(dataLine[4]) || 0); // Force_X is column 4
+                        break;
+                    }
                 }
             }
         }
@@ -1397,15 +1528,20 @@ async function renderForceYTime(containerId) {
         if (!resultPath) throw new Error('No result selected');
 
         const forceData = [];
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 1; i <= AppState.totalSteps; i++) {
             const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
             const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
             if (response.ok) {
                 const text = await response.text();
                 const lines = text.trim().split('\n');
-                if (lines.length > 1) {
-                    const dataLine = lines[1].split(',');
-                    forceData.push(parseFloat(dataLine[2]) || 0); // Assuming Force_Y is column 2
+                // Parse CSV: skip header and comment lines, find first data line
+                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+                    const line = lines[lineIdx].trim();
+                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
+                        const dataLine = line.split(',');
+                        forceData.push(parseFloat(dataLine[5]) || 0); // Force_Y is column 5
+                        break;
+                    }
                 }
             }
         }
@@ -1445,15 +1581,20 @@ async function renderTorqueTime(containerId) {
         if (!resultPath) throw new Error('No result selected');
 
         const torqueData = [];
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 1; i <= AppState.totalSteps; i++) {
             const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
             const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
             if (response.ok) {
                 const text = await response.text();
                 const lines = text.trim().split('\n');
-                if (lines.length > 1) {
-                    const dataLine = lines[1].split(',');
-                    torqueData.push(parseFloat(dataLine[3]) || 0); // Assuming Torque is column 3
+                // Parse CSV: skip header and comment lines, find first data line
+                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+                    const line = lines[lineIdx].trim();
+                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
+                        const dataLine = line.split(',');
+                        torqueData.push(parseFloat(dataLine[8]) || 0); // Torque_Origin is column 8
+                        break;
+                    }
                 }
             }
         }
@@ -1493,15 +1634,20 @@ async function renderEnergyTime(containerId) {
         if (!resultPath) throw new Error('No result selected');
 
         const energyData = [];
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 1; i <= AppState.totalSteps; i++) {
             const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
             const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
             if (response.ok) {
                 const text = await response.text();
                 const lines = text.trim().split('\n');
-                if (lines.length > 1) {
-                    const dataLine = lines[1].split(',');
-                    energyData.push(parseFloat(dataLine[4]) || 0); // Assuming Energy is column 4
+                // Parse CSV: skip header and comment lines, find first data line
+                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+                    const line = lines[lineIdx].trim();
+                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
+                        const dataLine = line.split(',');
+                        energyData.push(parseFloat(dataLine[10]) || 0); // Magnetic_Energy is column 10
+                        break;
+                    }
                 }
             }
         }

@@ -1,7 +1,7 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs').promises;
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const yaml = require('js-yaml');
 
@@ -800,5 +800,27 @@ app.get('/api/get-log', async (req, res) => {
         res.type('text/plain').send(content);
     } catch (error) {
         res.status(404).send(`Log file not found: ${error.message}`);
+    }
+});
+
+// Get conditions.json for a result
+app.get('/api/get-conditions', async (req, res) => {
+    try {
+        const resultPath = req.query.result;
+
+        if (!resultPath) {
+            return res.status(400).send('Missing result parameter');
+        }
+
+        const conditionsPath = path.join(__dirname, '..', resultPath, 'conditions.json');
+
+        // Check if file exists
+        await fs.access(conditionsPath);
+
+        // Read and send conditions file
+        const content = await fs.readFile(conditionsPath, 'utf8');
+        res.type('application/json').send(content);
+    } catch (error) {
+        res.status(404).send(`Conditions file not found: ${error.message}`);
     }
 });
