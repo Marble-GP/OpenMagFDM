@@ -620,7 +620,10 @@ async function handleImageUpload(event) {
             body: formData
         });
 
-        if (!response.ok) throw new Error('Failed to upload image');
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error || 'Failed to upload image');
+        }
 
         const result = await response.json();
         AppState.uploadedImageFilename = result.filename;
@@ -668,7 +671,7 @@ function loadSelectedImage() {
 
     AppState.uploadedImageFilename = filename;
     const img = document.getElementById('uploadedImage');
-    img.src = `/uploads/${filename}`;
+    img.src = `/uploads/${AppState.userId}/${filename}`;
     img.classList.remove('hidden');
     showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
 }
@@ -792,8 +795,33 @@ async function loadSelectedResult() {
 
         // Load preview
         await loadQuickPreviewFromResult(resultPath);
+
+        // Load and display log.txt
+        await loadResultLog(resultPath);
     } catch (error) {
         showStatus('solverStatus', `Error loading result: ${error.message}`, 'error');
+    }
+}
+
+async function loadResultLog(resultPath) {
+    try {
+        const response = await fetch(`/api/get-log?result=${encodeURIComponent(resultPath)}`);
+        if (response.ok) {
+            const logContent = await response.text();
+            const logOutput = document.getElementById('logOutput');
+            const logPanel = document.getElementById('logPanel');
+
+            logOutput.textContent = logContent;
+            logPanel.style.display = 'block';
+        } else {
+            // Log file not found, hide panel
+            const logPanel = document.getElementById('logPanel');
+            logPanel.style.display = 'none';
+        }
+    } catch (error) {
+        console.error('Error loading log:', error);
+        const logPanel = document.getElementById('logPanel');
+        logPanel.style.display = 'none';
     }
 }
 
@@ -801,25 +829,31 @@ async function loadQuickPreviewFromResult(resultPath) {
     const step = 1; // Always show first step in preview
 
     try {
-        // Load Az data
-        const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/step_0000.csv`);
-        if (azResponse.ok) {
-            const azData = await azResponse.json();
-            plotHeatmap('previewPlot1', azData.data, 'Az (Magnetic Vector Potential)');
+        // Load Input Image (step_0000.png from InputImg folder)
+        const inputImgContainer = document.getElementById('previewPlot1');
+        inputImgContainer.innerHTML = `
+            <h4 style="text-align: center; margin-bottom: 10px;">Input Image (Step 1)</h4>
+            <img src="/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=0"
+                 style="max-width: 100%; height: auto; display: block; margin: 0 auto;"
+                 onerror="this.parentElement.innerHTML='<p style=\\'text-align:center; padding:20px;\\'>Input image not available</p>'">
+        `;
+
+        // Load |B| distribution
+        const bResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=B/step_0000.csv`);
+        if (bResponse.ok) {
+            const bData = await bResponse.json();
+            plotHeatmap('previewPlot2', bData.data, '|B| Distribution (Step 1)');
+        } else {
+            document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">|B| data not available</p>';
         }
 
-        // Load Mu data
-        const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/step_0000.csv`);
-        if (muResponse.ok) {
-            const muData = await muResponse.json();
-            plotHeatmap('previewPlot2', muData.data, 'μ (Permeability)');
-        }
-
-        // Load energy density
-        const energyResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=EnergyDensity/step_0000.csv`);
-        if (energyResponse.ok) {
-            const energyData = await energyResponse.json();
-            plotHeatmap('previewPlot3', energyData.data, 'Energy Density');
+        // Load |H| distribution
+        const hResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=H/step_0000.csv`);
+        if (hResponse.ok) {
+            const hData = await hResponse.json();
+            plotHeatmap('previewPlot3', hData.data, '|H| Distribution (Step 1)');
+        } else {
+            document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">|H| data not available</p>';
         }
 
     } catch (error) {
@@ -905,34 +939,11 @@ async function loadResults() {
     }
 }
 
+// Deprecated: This function is replaced by loadQuickPreviewFromResult
+// Kept for backward compatibility but not used
 async function loadQuickPreview() {
-    const step = 1; // Always show first step in preview
-
-    try {
-        // Load Az data
-        const azResponse = await fetch(`/api/load-csv?type=Az&step=${step}`);
-        if (azResponse.ok) {
-            const azData = await azResponse.json();
-            plotHeatmap('previewPlot1', azData.data, 'Az (Magnetic Vector Potential)');
-        }
-
-        // Load Mu data
-        const muResponse = await fetch(`/api/load-csv?type=Mu&step=${step}`);
-        if (muResponse.ok) {
-            const muData = await muResponse.json();
-            plotHeatmap('previewPlot2', muData.data, 'μ (Permeability)');
-        }
-
-        // Load energy density
-        const energyResponse = await fetch(`/api/load-csv?type=EnergyDensity&step=${step}`);
-        if (energyResponse.ok) {
-            const energyData = await energyResponse.json();
-            plotHeatmap('previewPlot3', energyData.data, 'Energy Density');
-        }
-
-    } catch (error) {
-        console.error('Preview error:', error);
-    }
+    // This function is no longer used - loadResults() handles preview display
+    console.warn('loadQuickPreview() is deprecated, use loadResults() instead');
 }
 
 // ===== Dashboard (Tab 3) =====

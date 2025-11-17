@@ -18,6 +18,10 @@ const USER_CONFIGS_DIR = path.join(__dirname, '..', 'configs');
 fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(console.error);
 fs.mkdir(USER_CONFIGS_DIR, { recursive: true }).catch(console.error);
 
+// Image management constants
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_IMAGES_PER_USER = 20;
+
 // Multerの設定（ファイルアップロード用）
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
@@ -41,6 +45,9 @@ app.use('/icon', express.static(path.join(__dirname, 'icon')));
 // 親ディレクトリのCSVファイルへのアクセス
 app.use('/data', express.static(path.join(__dirname, '..')));
 
+// ユーザーごとのアップロード画像へのアクセス
+app.use('/uploads', express.static(UPLOAD_DIR));
+
 // ===== API エンドポイント =====
 
 // Constants for security
@@ -48,11 +55,17 @@ const MAX_FILE_SIZE = 100 * 1024; // 100KB
 const MAX_FILES_PER_USER = 20;
 const USER_EXPIRY_DAYS = 366;
 
-// Helper: Get user directory
+// Helper: Get user config directory
 function getUserDir(userId) {
     // Sanitize user ID to prevent directory traversal
     const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
     return path.join(USER_CONFIGS_DIR, safeUserId);
+}
+
+// Helper: Get user uploads directory
+function getUserUploadsDir(userId) {
+    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
+    return path.join(UPLOAD_DIR, safeUserId);
 }
 
 // Helper: Get user-specific config file path
@@ -112,20 +125,68 @@ async function enforceFileLimit(userId) {
     }
 }
 
+// Helper: Enforce image count limit for user (LRU - delete oldest)
+async function enforceImageLimit(userId) {
+    const userUploadDir = getUserUploadsDir(userId);
+    try {
+        await fs.access(userUploadDir);
+        const files = await fs.readdir(userUploadDir);
+        const imageFiles = files.filter(f => /\.(png|jpg|jpeg|bmp)$/i.test(f));
+
+        if (imageFiles.length > MAX_IMAGES_PER_USER) {
+            // Get file stats with modification times
+            const fileStats = await Promise.all(
+                imageFiles.map(async (file) => {
+                    const filePath = path.join(userUploadDir, file);
+                    const stats = await fs.stat(filePath);
+                    return { file, mtime: stats.mtime };
+                })
+            );
+
+            // Sort by modification time (oldest first)
+            fileStats.sort((a, b) => a.mtime - b.mtime);
+
+            // Delete oldest files
+            const filesToDelete = fileStats.slice(0, imageFiles.length - MAX_IMAGES_PER_USER);
+            for (const { file } of filesToDelete) {
+                await fs.unlink(path.join(userUploadDir, file));
+                console.log(`Deleted old image: ${userId}/${file}`);
+            }
+        }
+    } catch (error) {
+        // Directory doesn't exist yet, ignore
+        if (error.code !== 'ENOENT') {
+            console.error(`Error enforcing image limit for ${userId}:`, error);
+        }
+    }
+}
+
 // Helper: Clean up expired user directories (run on server start)
 async function cleanupExpiredUsers() {
     try {
-        const users = await fs.readdir(USER_CONFIGS_DIR);
         const expiryTime = Date.now() - (USER_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
 
-        for (const user of users) {
+        // Clean up config directories
+        const configUsers = await fs.readdir(USER_CONFIGS_DIR);
+        for (const user of configUsers) {
             const userDir = path.join(USER_CONFIGS_DIR, user);
             const stats = await fs.stat(userDir);
 
             if (stats.isDirectory() && stats.mtime < expiryTime) {
-                // Directory is older than expiry time
                 await fs.rm(userDir, { recursive: true, force: true });
-                console.log(`Cleaned up expired user directory: ${user}`);
+                console.log(`Cleaned up expired user config directory: ${user}`);
+            }
+        }
+
+        // Clean up upload directories
+        const uploadUsers = await fs.readdir(UPLOAD_DIR);
+        for (const user of uploadUsers) {
+            const userUploadDir = path.join(UPLOAD_DIR, user);
+            const stats = await fs.stat(userUploadDir);
+
+            if (stats.isDirectory() && stats.mtime < expiryTime) {
+                await fs.rm(userUploadDir, { recursive: true, force: true });
+                console.log(`Cleaned up expired user upload directory: ${user}`);
             }
         }
     } catch (error) {
@@ -238,7 +299,7 @@ app.post('/api/config', async (req, res) => {
     }
 });
 
-// 画像ファイルのアップロード（ユーザーIDを付与）
+// 画像ファイルのアップロード（ユーザーごとのディレクトリ）
 app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     try {
         if (!req.file) {
@@ -248,19 +309,36 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
             });
         }
 
-        const userId = req.body.userId || 'default';
-        const originalFilename = req.file.filename;
-        const newFilename = `${userId}_${originalFilename}`;
+        // Check file size
+        if (req.file.size > MAX_IMAGE_SIZE) {
+            await fs.unlink(req.file.path);
+            return res.status(400).json({
+                success: false,
+                error: `File size (${(req.file.size / 1024 / 1024).toFixed(1)}MB) exceeds maximum allowed size (${MAX_IMAGE_SIZE / 1024 / 1024}MB)`
+            });
+        }
 
-        // ファイル名を変更
-        const oldPath = path.join(UPLOAD_DIR, originalFilename);
-        const newPath = path.join(UPLOAD_DIR, newFilename);
+        const userId = req.body.userId || 'default';
+        const userUploadDir = getUserUploadsDir(userId);
+
+        // Create user upload directory if it doesn't exist
+        await fs.mkdir(userUploadDir, { recursive: true });
+
+        // Enforce image limit before upload
+        await enforceImageLimit(userId);
+
+        // Use original filename
+        const filename = req.file.originalname;
+        const oldPath = req.file.path;
+        const newPath = path.join(userUploadDir, filename);
+
+        // Move file to user directory
         await fs.rename(oldPath, newPath);
 
         res.json({
             success: true,
-            filename: newFilename,
-            path: `/uploads/${newFilename}`,
+            filename: filename,
+            path: `/uploads/${userId}/${filename}`,
             originalName: req.file.originalname
         });
     } catch (error) {
@@ -275,18 +353,22 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
 app.get('/api/images', async (req, res) => {
     try {
         const { userId } = req.query;
-        const userDir = getUserDir(userId || 'default');
+        const userUploadDir = getUserUploadsDir(userId || 'default');
 
-        // ユーザーディレクトリを初期化
-        await initializeUserDir(userId);
+        // Check if directory exists
+        try {
+            await fs.access(userUploadDir);
+        } catch {
+            // Directory doesn't exist, return empty list
+            return res.json({
+                success: true,
+                images: []
+            });
+        }
 
-        const files = await fs.readdir(UPLOAD_DIR);
-        // ユーザーIDをファイル名に含む画像のみフィルター
-        const imageFiles = files.filter(f => {
-            const isImage = /\.(png|jpg|jpeg|bmp)$/i.test(f);
-            const belongsToUser = f.startsWith(userId + '_');
-            return isImage && belongsToUser;
-        });
+        const files = await fs.readdir(userUploadDir);
+        // Filter only image files
+        const imageFiles = files.filter(f => /\.(png|jpg|jpeg|bmp)$/i.test(f));
 
         res.json({
             success: true,
@@ -306,15 +388,11 @@ app.delete('/api/images/:filename', async (req, res) => {
         const { filename } = req.params;
         const { userId } = req.query;
 
-        // セキュリティチェック：ファイル名がユーザーIDで始まっているか確認
-        if (!filename.startsWith(userId + '_')) {
-            return res.status(403).json({
-                success: false,
-                error: 'Permission denied'
-            });
-        }
+        // Sanitize filename to prevent directory traversal
+        const safeFilename = path.basename(filename);
+        const userUploadDir = getUserUploadsDir(userId || 'default');
+        const filePath = path.join(userUploadDir, safeFilename);
 
-        const filePath = path.join(UPLOAD_DIR, filename);
         await fs.unlink(filePath);
 
         res.json({
@@ -379,7 +457,9 @@ app.post('/api/solve', async (req, res) => {
             configPath = CONFIG_PATH;
         }
 
-        const imagePath = path.join(UPLOAD_DIR, imageFile);
+        // Get image path from user upload directory
+        const userUploadDir = getUserUploadsDir(userId || 'default');
+        const imagePath = path.join(userUploadDir, imageFile);
 
         // ファイルの存在確認
         await fs.access(configPath);
@@ -698,5 +778,27 @@ app.get('/api/get-step-input-image', async (req, res) => {
         res.sendFile(imagePath);
     } catch (error) {
         res.status(404).send(`Step input image not found: ${error.message}`);
+    }
+});
+
+// Get log.txt from result directory
+app.get('/api/get-log', async (req, res) => {
+    try {
+        const resultPath = req.query.result;
+
+        if (!resultPath) {
+            return res.status(400).send('Missing result parameter');
+        }
+
+        const logPath = path.join(__dirname, '..', resultPath, 'log.txt');
+
+        // Check if file exists
+        await fs.access(logPath);
+
+        // Read and send log file
+        const content = await fs.readFile(logPath, 'utf8');
+        res.type('text/plain').send(content);
+    } catch (error) {
+        res.status(404).send(`Log file not found: ${error.message}`);
     }
 });
