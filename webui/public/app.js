@@ -16,8 +16,25 @@ const AppState = {
     yamlSchema: null,  // YAML schema for autocomplete
     userId: null,  // User identifier (from cookie)
     animationTimer: null,  // Animation interval timer
-    isAnimating: false  // Animation state flag
+    isAnimating: false,  // Animation state flag
+    analysisConditions: null,  // Analysis conditions from conditions.json
+    dataCache: {},  // Data cache for preloaded steps: { 'resultPath:Az:step': data, ... }
+    maxCacheEntries: 500  // Maximum cache entries to prevent memory leak (500 * ~2MB = ~1GB max)
 };
+
+// ===== Utility Functions =====
+/**
+ * Flip 2D array vertically (convert from analysis coordinate system y-up to image coordinate system y-down)
+ * @param {Array<Array<number>>} data - 2D array
+ * @returns {Array<Array<number>>} - Flipped 2D array
+ */
+function flipVertical(data) {
+    if (!data || !Array.isArray(data) || data.length === 0) {
+        return data;
+    }
+    // Clone and reverse array (do not modify original data)
+    return data.slice().reverse();
+}
 
 // ===== Initialization =====
 document.addEventListener('DOMContentLoaded', async () => {
@@ -29,6 +46,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadConfig();
     await refreshImageList();
     await refreshResultsList();
+
+    // Setup step slider event handler
+    const stepSlider = document.getElementById('stepSlider');
+    if (stepSlider) {
+        stepSlider.addEventListener('input', onStepChange);
+    }
 });
 
 // ===== Tab Management =====
@@ -773,7 +796,31 @@ async function loadSelectedResult() {
         const data = await response.json();
         AppState.totalSteps = data.steps || 1;
         AppState.currentStep = 1;
+
+        // Clear cache when switching to a different result (BEFORE updating currentResult)
+        const previousResult = AppState.resultsData.currentResult;
+        if (previousResult && previousResult !== resultPath) {
+            const cacheSize = Object.keys(AppState.dataCache).length;
+            console.log(`Switching from ${previousResult} to ${resultPath}, clearing ${cacheSize} cached entries`);
+            AppState.dataCache = {};  // Complete cache clear
+        }
+
         AppState.resultsData.currentResult = resultPath;
+
+        // Load analysis conditions from conditions.json
+        try {
+            const conditionsResponse = await fetch(`/api/load-conditions?result=${encodeURIComponent(resultPath)}`);
+            if (conditionsResponse.ok) {
+                AppState.analysisConditions = await conditionsResponse.json();
+                console.log('Analysis conditions loaded:', AppState.analysisConditions);
+            } else {
+                console.warn('conditions.json not found, assuming default (cartesian)');
+                AppState.analysisConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
+            }
+        } catch (error) {
+            console.warn('Failed to load conditions.json:', error);
+            AppState.analysisConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
+        }
 
         // Update dashboard controls
         const stepSlider = document.getElementById('stepSlider');
@@ -825,48 +872,147 @@ async function loadResultLog(resultPath) {
     }
 }
 
-// Helper: Calculate magnetic fields from Az and Mu
-function calculateFields(Az, Mu, dx, dy) {
+// Helper: Calculate magnetic fields from Az and Mu (supports both polar and Cartesian coordinates)
+function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
     const rows = Az.length;
     const cols = Az[0].length;
 
     const Bx = Array(rows).fill(0).map(() => Array(cols).fill(0));
     const By = Array(rows).fill(0).map(() => Array(cols).fill(0));
 
-    for (let j = 0; j < rows; j++) {
-        for (let i = 0; i < cols; i++) {
-            // Bx = ∂Az/∂y
-            if (j === 0) {
-                Bx[j][i] = (Az[1][i] - Az[0][i]) / dy;
-            } else if (j === rows - 1) {
-                Bx[j][i] = (Az[rows-1][i] - Az[rows-2][i]) / dy;
-            } else {
-                Bx[j][i] = (Az[j+1][i] - Az[j-1][i]) / (2 * dy);
-            }
+    // Determine coordinate system (if analysisConditions is loaded)
+    const coordSystem = AppState.analysisConditions ? AppState.analysisConditions.coordinate_system : 'cartesian';
 
-            // By = -∂Az/∂x
-            if (i === 0) {
-                By[j][i] = -(Az[j][1] - Az[j][0]) / dx;
-            } else if (i === cols - 1) {
-                By[j][i] = -(Az[j][cols-1] - Az[j][cols-2]) / dx;
-            } else {
-                By[j][i] = -(Az[j][i+1] - Az[j][i-1]) / (2 * dx);
+    if (coordSystem === 'polar') {
+        // Polar coordinate magnetic field calculation
+        const polar = AppState.analysisConditions.polar;
+        if (!polar || !polar.r_start || !polar.r_end || !polar.theta_range) {
+            console.error('Polar coordinate parameters missing in analysisConditions:', AppState.analysisConditions);
+            throw new Error('Polar coordinate parameters not found in conditions.json');
+        }
+        const r_start = polar.r_start;
+        const r_end = polar.r_end;
+        const nr = cols;
+        const ntheta = rows;
+
+        // Calculate dr, dtheta (use from conditions.json if available, otherwise calculate)
+        const dr = AppState.analysisConditions.dr || (r_end - r_start) / (nr - 1);
+        const dtheta = AppState.analysisConditions.dtheta || polar.theta_range / (ntheta - 1);
+
+        // Generate r coordinate array
+        const r_coords = Array(nr).fill(0).map((_, ir) => r_start + ir * dr);
+
+        // Calculate magnetic field in polar coordinates: Br, Bθ
+        const Br = Array(rows).fill(0).map(() => Array(cols).fill(0));
+        const Btheta = Array(rows).fill(0).map(() => Array(cols).fill(0));
+
+        // Polar coordinates are ALWAYS periodic in theta direction
+        for (let jt = 0; jt < ntheta; jt++) {
+            for (let ir = 0; ir < nr; ir++) {
+                const r = r_coords[ir];
+                const safe_r = Math.max(r, 1e-15);
+
+                // Br = (1/r) * ∂Az/∂θ
+                // IMPORTANT: Use periodic boundary in theta direction
+                const jt_next = (jt + 1) % ntheta;
+                const jt_prev = (jt - 1 + ntheta) % ntheta;
+                const dAz_dtheta = (Az[jt_next][ir] - Az[jt_prev][ir]) / (2 * dtheta);
+                Br[jt][ir] = dAz_dtheta / safe_r;
+
+                // Bθ = -∂Az/∂r
+                let dAz_dr = 0;
+                if (ir === 0) {
+                    dAz_dr = (Az[jt][1] - Az[jt][0]) / dr;
+                } else if (ir === nr - 1) {
+                    dAz_dr = (Az[jt][nr-1] - Az[jt][nr-2]) / dr;
+                } else {
+                    dAz_dr = (Az[jt][ir+1] - Az[jt][ir-1]) / (2 * dr);
+                }
+                Btheta[jt][ir] = -dAz_dr;
+            }
+        }
+
+        // Polar → Cartesian transformation (for visualization)
+        // If r_orientation is horizontal: i = r direction, j = θ direction
+        // Physical coordinates: x = r*cos(θ), y = r*sin(θ)
+        // Field transformation: Bx = Br*cos(θ) - Bθ*sin(θ), By = Br*sin(θ) + Bθ*cos(θ)
+        for (let jt = 0; jt < ntheta; jt++) {
+            const theta = jt * dtheta;
+            const cos_theta = Math.cos(theta);
+            const sin_theta = Math.sin(theta);
+
+            for (let ir = 0; ir < nr; ir++) {
+                Bx[jt][ir] = Br[jt][ir] * cos_theta - Btheta[jt][ir] * sin_theta;
+                By[jt][ir] = Br[jt][ir] * sin_theta + Btheta[jt][ir] * cos_theta;
+            }
+        }
+    } else {
+        // Cartesian coordinate magnetic field calculation
+        // Determine periodic boundary conditions
+        const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
+        const x_periodic = bc && bc.left && bc.right &&
+                          bc.left.type === 'periodic' && bc.right.type === 'periodic';
+        const y_periodic = bc && bc.bottom && bc.top &&
+                          bc.bottom.type === 'periodic' && bc.top.type === 'periodic';
+
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                // Bx = ∂Az/∂y
+                if (j === 0) {
+                    if (y_periodic) {
+                        // Periodic boundary: use central difference with wrap
+                        Bx[j][i] = (Az[1][i] - Az[rows-1][i]) / (2 * dy);
+                    } else {
+                        // Forward difference
+                        Bx[j][i] = (Az[1][i] - Az[0][i]) / dy;
+                    }
+                } else if (j === rows - 1) {
+                    if (y_periodic) {
+                        // Periodic boundary: use central difference with wrap
+                        Bx[j][i] = (Az[0][i] - Az[rows-2][i]) / (2 * dy);
+                    } else {
+                        // Backward difference
+                        Bx[j][i] = (Az[rows-1][i] - Az[rows-2][i]) / dy;
+                    }
+                } else {
+                    // Central difference
+                    Bx[j][i] = (Az[j+1][i] - Az[j-1][i]) / (2 * dy);
+                }
+
+                // By = -∂Az/∂x
+                if (i === 0) {
+                    if (x_periodic) {
+                        // Periodic boundary: use central difference with wrap
+                        By[j][i] = -(Az[j][1] - Az[j][cols-1]) / (2 * dx);
+                    } else {
+                        // Forward difference
+                        By[j][i] = -(Az[j][1] - Az[j][0]) / dx;
+                    }
+                } else if (i === cols - 1) {
+                    if (x_periodic) {
+                        // Periodic boundary: use central difference with wrap
+                        By[j][i] = -(Az[j][0] - Az[j][cols-2]) / (2 * dx);
+                    } else {
+                        // Backward difference
+                        By[j][i] = -(Az[j][cols-1] - Az[j][cols-2]) / dx;
+                    }
+                } else {
+                    // Central difference
+                    By[j][i] = -(Az[j][i+1] - Az[j][i-1]) / (2 * dx);
+                }
             }
         }
     }
 
     // H = B / μ
-    const Hx = Array(rows).fill(0).map(() => Array(cols).fill(0));
-    const Hy = Array(rows).fill(0).map(() => Array(cols).fill(0));
+    const Hx = Bx.map((row, j) => row.map((val, i) => val / Mu[j][i]));
+    const Hy = By.map((row, j) => row.map((val, i) => val / Mu[j][i]));
 
-    for (let j = 0; j < rows; j++) {
-        for (let i = 0; i < cols; i++) {
-            Hx[j][i] = Bx[j][i] / Mu[j][i];
-            Hy[j][i] = By[j][i] / Mu[j][i];
-        }
-    }
+    // Magnitude
+    const B = Bx.map((row, j) => row.map((val, i) => Math.sqrt(val**2 + By[j][i]**2)));
+    const H = Hx.map((row, j) => row.map((val, i) => Math.sqrt(val**2 + Hy[j][i]**2)));
 
-    return { Bx, By, Hx, Hy };
+    return { Bx, By, B, Hx, Hy, H };
 }
 
 // Helper: Calculate magnitude from vector components
@@ -893,20 +1039,16 @@ async function loadQuickPreviewFromResult(resultPath) {
         inputImgContainer.innerHTML = `
             <h4 style="text-align: center; margin-bottom: 10px;">Input Image (Step 1)</h4>
             <img src="/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=1"
-                 style="max-width: 100%; height: auto; display: block; margin: 0 auto;"
+                 style="max-width: 100%; max-height: calc(100% - 50px); object-fit: contain; display: block; margin: 0 auto;"
                  onerror="this.parentElement.innerHTML='<p style=\\'text-align:center; padding:20px;\\'>Input image not available</p>'">
         `;
 
-        // Load conditions.json to get grid spacing
-        const condResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
-        let dx = 0.001, dy = 0.001; // Default values
-
-        if (condResponse.ok) {
-            const conditions = await condResponse.json();
-            // Use dr and dtheta for polar, or dx/dy for Cartesian
-            dx = conditions.dr || conditions.dx || 0.001;
-            dy = conditions.dtheta || conditions.dy || 0.001;
-        }
+        // Use grid spacing from analysis conditions
+        // For polar coordinates: use dr/dtheta, for Cartesian: use dx/dy
+        const dx = AppState.analysisConditions ?
+            (AppState.analysisConditions.dx || AppState.analysisConditions.dr || 0.001) : 0.001;
+        const dy = AppState.analysisConditions ?
+            (AppState.analysisConditions.dy || AppState.analysisConditions.dtheta || 0.001) : 0.001;
 
         // Load Az and Mu data
         const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/step_0001.csv`);
@@ -917,24 +1059,24 @@ async function loadQuickPreviewFromResult(resultPath) {
             const muData = await muResponse.json();
 
             if (azData.success && muData.success) {
-                console.log('Az data dimensions:', azData.data.length, 'x', azData.data[0]?.length);
-                console.log('Mu data dimensions:', muData.data.length, 'x', muData.data[0]?.length);
+                // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
+                const azFlipped = flipVertical(azData.data);
+                const muFlipped = flipVertical(muData.data);
+
+                console.log('Az data dimensions:', azFlipped.length, 'x', azFlipped[0]?.length);
+                console.log('Mu data dimensions:', muFlipped.length, 'x', muFlipped[0]?.length);
                 console.log('Grid spacing: dx =', dx, ', dy =', dy);
 
                 // Calculate B and H fields
-                const { Bx, By, Hx, Hy } = calculateFields(azData.data, muData.data, dx, dy);
+                const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
                 console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
-
-                const B_magnitude = calculateMagnitude(Bx, By);
-                const H_magnitude = calculateMagnitude(Hx, Hy);
-
-                console.log('B magnitude dimensions:', B_magnitude.length, 'x', B_magnitude[0]?.length);
-                console.log('H magnitude dimensions:', H_magnitude.length, 'x', H_magnitude[0]?.length);
-                console.log('B magnitude sample values:', B_magnitude[0]?.slice(0, 3));
+                console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
+                console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
+                console.log('B magnitude sample values:', B[0]?.slice(0, 3));
 
                 // Plot |B| and |H|
-                plotHeatmap('previewPlot2', B_magnitude, '|B| Distribution (Step 1)');
-                plotHeatmap('previewPlot3', H_magnitude, '|H| Distribution (Step 1)');
+                plotHeatmap('previewPlot2', B, '|B| [T/m]', true);
+                plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
             } else {
                 console.error('Az/Mu data loading failed:', { azSuccess: azData.success, muSuccess: muData.success });
                 document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
@@ -958,7 +1100,16 @@ async function runSolver() {
     btn.textContent = 'Running...';
 
     const outputDiv = document.getElementById('solverOutput');
-    outputDiv.textContent = 'Starting solver...\n';
+    const progressContainer = document.getElementById('solverProgressContainer');
+    const progressBar = document.getElementById('solverProgressBar');
+    const progressText = document.getElementById('solverProgressText');
+    const progressPercent = document.getElementById('solverProgressPercent');
+
+    outputDiv.textContent = '';
+    progressContainer.style.display = 'block';
+    progressBar.style.width = '0%';
+    progressText.textContent = 'Initializing...';
+    progressPercent.textContent = '0%';
 
     try {
         // Check if image is uploaded
@@ -970,7 +1121,8 @@ async function runSolver() {
         const configSelect = document.getElementById('configFileSelect');
         const configFile = configSelect ? configSelect.value : 'sample_config.yaml';
 
-        const response = await fetch('/api/solve', {
+        // Use fetch to POST the request body, then manually handle SSE
+        const response = await fetch('/api/solve-stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -981,25 +1133,80 @@ async function runSolver() {
         });
 
         if (!response.ok) {
-            const errorData = await response.json();
+            const errorData = await response.json().catch(() => ({ error: 'Solver execution failed' }));
             throw new Error(errorData.error || 'Solver execution failed');
         }
 
-        const result = await response.json();
-        // Use textContent to preserve line breaks
-        outputDiv.textContent += (result.stdout || 'Solver completed successfully') + '\n';
+        // Process SSE stream
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
 
-        showStatus('solverStatus', 'Solver completed successfully', 'success');
+        while (true) {
+            const { done, value } = await reader.read();
 
-        // Load results and update dashboard
-        await loadResults();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+
+            // Process complete SSE messages
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = JSON.parse(line.substring(6));
+
+                    // Update output log
+                    if (data.message) {
+                        outputDiv.textContent += data.message + '\n';
+                        outputDiv.scrollTop = outputDiv.scrollHeight;
+                    }
+
+                    // Update progress bar
+                    if (data.type === 'progress') {
+                        const percentage = data.percentage || 0;
+                        progressBar.style.width = percentage + '%';
+                        progressPercent.textContent = percentage + '%';
+                        progressText.textContent = `Step ${data.step} / ${data.total}`;
+                    } else if (data.type === 'status') {
+                        progressText.textContent = data.message || 'Processing...';
+                    } else if (data.type === 'complete') {
+                        progressBar.style.width = '100%';
+                        progressPercent.textContent = '100%';
+                        progressText.textContent = 'Completed successfully';
+                    } else if (data.type === 'done') {
+                        if (data.success) {
+                            showStatus('solverStatus', 'Solver completed successfully', 'success');
+                            // Load results and update dashboard
+                            await loadResults();
+                        } else {
+                            throw new Error(data.message || 'Solver failed');
+                        }
+                    } else if (data.type === 'error') {
+                        // Don't throw - stderr messages (including WARNINGs) are just logged
+                        // Actual errors are determined by the exit code in 'done' event
+                        // Message is already logged to outputDiv above
+                    }
+                }
+            }
+        }
 
     } catch (error) {
         showStatus('solverStatus', `Solver error: ${error.message}`, 'error');
         outputDiv.textContent += `\nError: ${error.message}`;
+        progressBar.style.background = 'linear-gradient(90deg, #dc3545 0%, #c82333 100%)';
+        progressText.textContent = 'Error occurred';
     } finally {
         btn.disabled = false;
         btn.textContent = 'Run Solver';
+
+        // Hide progress bar after 3 seconds if completed successfully
+        setTimeout(() => {
+            if (progressText.textContent === 'Completed successfully') {
+                progressContainer.style.display = 'none';
+            }
+        }, 3000);
     }
 }
 
@@ -1048,7 +1255,6 @@ const plotDefinitions = {
     mu_distribution: { name: 'Permeability', render: renderMuDistribution },
     energy_density: { name: 'Energy Density', render: renderEnergyDensity },
     az_boundary: { name: 'Field Lines + Boundary', render: renderAzBoundary },
-    material_image: { name: 'Material Image', render: renderMaterialImage },
     step_input_image: { name: 'Step Input Image', render: renderStepInputImage },
     force_x_time: { name: 'Force X-axis', render: renderForceXTime },
     force_y_time: { name: 'Force Y-axis', render: renderForceYTime },
@@ -1132,22 +1338,24 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
 
     // Create widget content with control buttons and SVG icons
     const content = `
-        <div class="plot-header">
-            <span>${plotDef.name}</span>
-            <div class="plot-controls">
-                <button class="interaction-mode-btn" data-plot-id="${plotId}" data-container-id="${containerId}" data-mode="disabled" title="Mode: Move" onclick="toggleInteractionMode('${plotId}', '${containerId}', this)">
-                    <img src="/icon/window.svg" alt="Move" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
-                </button>
-                <button class="reset-zoom-btn" title="Reset Zoom" onclick="resetPlotZoom('${containerId}')">
-                    <img src="/icon/reset.svg" alt="Reset" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
-                </button>
-                <button class="remove-plot-btn" title="Remove" onclick="removePlot('${plotId}')">
-                    <img src="/icon/remove.svg" alt="Remove" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
-                </button>
+        <div class="grid-stack-item-content" data-plot-type="${plotType}" data-container-id="${containerId}">
+            <div class="plot-header">
+                <span>${plotDef.name}</span>
+                <div class="plot-controls">
+                    <button class="interaction-mode-btn" data-plot-id="${plotId}" data-container-id="${containerId}" data-mode="disabled" title="Mode: Move" onclick="toggleInteractionMode('${plotId}', '${containerId}', this)">
+                        <img src="/icon/window.svg" alt="Move" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
+                    </button>
+                    <button class="reset-zoom-btn" title="Reset Zoom" onclick="resetPlotZoom('${containerId}')">
+                        <img src="/icon/reset.svg" alt="Reset" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
+                    </button>
+                    <button class="remove-plot-btn" title="Remove" onclick="removePlot('${plotId}')">
+                        <img src="/icon/remove.svg" alt="Remove" style="width: 14px; height: 14px; vertical-align: middle; filter: brightness(0) invert(1);">
+                    </button>
+                </div>
             </div>
-        </div>
-        <div class="plot-container" id="${containerId}" data-plot-type="${plotType}">
-            <div style="text-align: center; padding: 20px; color: #999;">Loading...</div>
+            <div class="plot-container" id="${containerId}">
+                <div style="text-align: center; padding: 20px; color: #999;">Loading...</div>
+            </div>
         </div>
     `;
 
@@ -1161,13 +1369,57 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
         id: plotId
     });
 
-    // Render plot
+    // Set initial tile movability (default is move mode, so movable is true)
+    if (widget && AppState.gridStack) {
+        AppState.gridStack.movable(widget, true);
+        console.log(`Widget ${plotId} added with tile movable: true`);
+    }
+
+    // Check if result is selected
+    if (!AppState.resultsData.currentResult) {
+        console.error('addPlotWidget: No result selected');
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = '<p style="color:red; padding:20px;">Please select a result first</p>';
+        }
+        return;
+    }
+
+    // Render plot after GridStack layout is complete
     setTimeout(async () => {
+        const container = document.getElementById(containerId);
+        if (!container) {
+            console.error(`addPlotWidget: Container not found: ${containerId}`);
+            return;
+        }
+
+        const rect = container.getBoundingClientRect();
+        console.log(`addPlotWidget: Container size: ${rect.width}x${rect.height}`);
+
+        if (rect.width < 50 || rect.height < 50) {
+            console.warn(`addPlotWidget: Container size too small, retrying...`);
+            setTimeout(async () => {
+                try {
+                    console.log(`addPlotWidget: Rendering ${plotType} in ${containerId} for step ${AppState.currentStep}`);
+                    await plotDef.render(containerId, AppState.currentStep);
+                    console.log(`addPlotWidget: Successfully rendered ${plotType}`);
+                } catch (error) {
+                    console.error(`Error rendering ${plotType}:`, error);
+                    console.error('Error stack:', error.stack);
+                    container.innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
+                }
+            }, 200);
+            return;
+        }
+
         try {
+            console.log(`addPlotWidget: Rendering ${plotType} in ${containerId} for step ${AppState.currentStep}`);
             await plotDef.render(containerId, AppState.currentStep);
+            console.log(`addPlotWidget: Successfully rendered ${plotType}`);
         } catch (error) {
             console.error(`Error rendering ${plotType}:`, error);
-            document.getElementById(containerId).innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
+            console.error('Error stack:', error.stack);
+            container.innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
         }
     }, 100);
 }
@@ -1267,18 +1519,39 @@ function resetAllPlots() {
 
 // ===== Update All Plots =====
 async function updateAllPlots() {
-    const containers = document.querySelectorAll('.plot-container[data-plot-type]');
+    if (!AppState.resultsData.currentResult) {
+        console.log('updateAllPlots: No result selected');
+        return;
+    }
 
-    for (const container of containers) {
-        const plotType = container.dataset.plotType;
-        const plotDef = plotDefinitions[plotType];
+    // Get all plot containers from GridStack items
+    const contentElements = document.querySelectorAll('.grid-stack-item-content[data-plot-type]');
+    console.log(`updateAllPlots: Found ${contentElements.length} plots, currentStep=${AppState.currentStep}`);
 
-        if (plotDef) {
-            try {
-                await plotDef.render(container.id, AppState.currentStep);
-            } catch (error) {
-                console.error(`Error updating ${plotType}:`, error);
-            }
+    for (const contentElement of contentElements) {
+        const plotType = contentElement.dataset.plotType;
+        const containerId = contentElement.dataset.containerId;
+        const container = document.getElementById(containerId);
+
+        // Skip invalid plot types
+        if (!plotDefinitions[plotType]) {
+            console.warn(`updateAllPlots: Skipping invalid plot type: ${plotType}`);
+            continue;
+        }
+
+        if (!container) {
+            console.warn(`updateAllPlots: Container not found: ${containerId}`);
+            continue;
+        }
+
+        try {
+            console.log(`updateAllPlots: Rendering ${plotType} in ${containerId} for step ${AppState.currentStep}`);
+            await plotDefinitions[plotType].render(containerId, AppState.currentStep);
+            console.log(`updateAllPlots: Successfully rendered ${plotType}`);
+        } catch (error) {
+            console.error(`Error updating ${plotType}:`, error);
+            console.error('Error stack:', error.stack);
+            container.innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
         }
     }
 }
@@ -1317,6 +1590,111 @@ function pauseAnimation() {
     document.getElementById('pauseBtn').style.display = 'none';
 }
 
+async function preloadAllSteps() {
+    const currentResult = AppState.resultsData.currentResult;
+    if (!currentResult || AppState.totalSteps <= 0) {
+        alert('Please select analysis results first');
+        return;
+    }
+
+    const btn = document.getElementById('preloadBtn');
+    if (!btn) return;
+
+    btn.disabled = true;
+    const originalText = btn.textContent;
+
+    try {
+        // Check if preload would exceed cache limit (Az + Mu = 2 entries per step)
+        const estimatedCacheEntries = AppState.totalSteps * 2;
+        if (estimatedCacheEntries > AppState.maxCacheEntries) {
+            const proceed = confirm(
+                `Warning: Preloading ${AppState.totalSteps} steps (${estimatedCacheEntries} cache entries) ` +
+                `exceeds the limit of ${AppState.maxCacheEntries}.\n\n` +
+                `This may consume ~${Math.round(estimatedCacheEntries * 2)}MB of memory.\n\n` +
+                `Continue anyway? (Cache will be cleared if limit is reached)`
+            );
+            if (!proceed) {
+                btn.disabled = false;
+                return;
+            }
+        }
+
+        console.log(`Starting preload of ${AppState.totalSteps} steps (estimated ${estimatedCacheEntries} entries)`);
+
+        for (let step = 1; step <= AppState.totalSteps; step++) {
+            btn.textContent = `Loading ${step}/${AppState.totalSteps}`;
+
+            // Preload Az and Mu data
+            const azFile = `Az/step_${String(step).padStart(4, '0')}.csv`;
+            const muFile = `Mu/step_${String(step).padStart(4, '0')}.csv`;
+
+            const [azResponse, muResponse] = await Promise.all([
+                fetch(`/api/load-csv?result=${encodeURIComponent(currentResult)}&file=${azFile}`),
+                fetch(`/api/load-csv?result=${encodeURIComponent(currentResult)}&file=${muFile}`)
+            ]);
+
+            // Save to cache with size check
+            const currentCacheSize = Object.keys(AppState.dataCache).length;
+            if (currentCacheSize >= AppState.maxCacheEntries) {
+                console.warn(`Cache limit reached during preload at step ${step}/${AppState.totalSteps}, stopping`);
+                btn.textContent = `Stopped at ${step}/${AppState.totalSteps}`;
+                setTimeout(() => { btn.textContent = originalText; }, 3000);
+                break;
+            }
+
+            if (azResponse.ok) {
+                const azData = await azResponse.json();
+                if (azData.success) {
+                    const cacheKey = `${currentResult}:Az:${step}`;
+                    AppState.dataCache[cacheKey] = azData.data;
+                }
+            }
+
+            if (muResponse.ok) {
+                const muData = await muResponse.json();
+                if (muData.success) {
+                    const cacheKey = `${currentResult}:Mu:${step}`;
+                    AppState.dataCache[cacheKey] = muData.data;
+                }
+            }
+
+            // Preload force data if available
+            const forceData = await loadForceData(step);
+            if (forceData) {
+                const cacheKey = `${currentResult}:Force:${step}`;
+                AppState.dataCache[cacheKey] = forceData;
+            }
+
+            // Small delay to prevent overwhelming the server
+            if (step < AppState.totalSteps) {
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+        }
+
+        const cacheSize = Object.keys(AppState.dataCache).length;
+        console.log(`Preload complete: ${AppState.totalSteps} steps cached (${cacheSize} entries)`);
+        btn.textContent = 'Preloaded ✓';
+        setTimeout(() => {
+            btn.textContent = originalText;
+        }, 2000);
+
+    } catch (error) {
+        console.error('Preload error:', error);
+        alert(`Preload failed: ${error.message}`);
+        btn.textContent = originalText;
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function onStepChange() {
+    AppState.currentStep = parseInt(document.getElementById('stepSlider').value);
+    document.getElementById('currentStep').textContent = AppState.currentStep;
+
+    // Update all plots
+    await updateAllPlots();
+}
+
 function setStep(step) {
     pauseAnimation();
     AppState.currentStep = step;
@@ -1349,344 +1727,947 @@ function formatStepFilename(step) {
     return `step_${String(step).padStart(4, '0')}.csv`;
 }
 
-// Placeholder implementations - these will call actual data loading and plotting
-async function renderAzContour(containerId, step) {
+// Helper function to load CSV data with caching
+async function loadCsvData(dataType, step) {
     const resultPath = getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
 
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
-    if (!response.ok) throw new Error('Failed to load Az data');
+    // Check cache first
+    const cacheKey = `${resultPath}:${dataType}:${step}`;
+    if (AppState.dataCache[cacheKey]) {
+        console.log(`Cache hit: ${cacheKey}`);
+        return AppState.dataCache[cacheKey];
+    }
+
+    // Cache miss - fetch from server
+    const file = `${dataType}/${formatStepFilename(step)}`;
+    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=${file}`);
+    if (!response.ok) throw new Error(`Failed to load ${dataType} data`);
+
     const result = await response.json();
-    plotContour(containerId, result.data, 'Az (Magnetic Vector Potential)');
+    if (!result.success) throw new Error(`Failed to parse ${dataType} data`);
+
+    // Store in cache with size limit check
+    const currentCacheSize = Object.keys(AppState.dataCache).length;
+    if (currentCacheSize >= AppState.maxCacheEntries) {
+        console.warn(`Cache full (${currentCacheSize}/${AppState.maxCacheEntries}), clearing cache to prevent memory leak`);
+        AppState.dataCache = {};
+    }
+    AppState.dataCache[cacheKey] = result.data;
+    return result.data;
+}
+
+// Placeholder implementations - these will call actual data loading and plotting
+async function renderAzContour(containerId, step) {
+    const data = await loadCsvData('Az', step);
+    const flipped = flipVertical(data);
+    plotContour(containerId, flipped, 'Az [Wb/m]', true);
 }
 
 async function renderAzHeatmap(containerId, step) {
-    const resultPath = getCurrentResultPath();
-    if (!resultPath) throw new Error('No result selected');
-
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
-    if (!response.ok) throw new Error('Failed to load Az data');
-    const result = await response.json();
-    plotHeatmap(containerId, result.data, 'Az Heatmap');
+    const data = await loadCsvData('Az', step);
+    const flipped = flipVertical(data);
+    plotHeatmap(containerId, flipped, 'Az [Wb/m]', true);
 }
 
 async function renderJzDistribution(containerId, step) {
-    const resultPath = getCurrentResultPath();
-    if (!resultPath) throw new Error('No result selected');
-
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Jz/${formatStepFilename(step)}`);
-    if (!response.ok) throw new Error('Failed to load Jz data');
-    const result = await response.json();
-    plotHeatmap(containerId, result.data, 'Jz (Current Density)');
+    const data = await loadCsvData('Jz', step);
+    const flipped = flipVertical(data);
+    plotHeatmap(containerId, flipped, 'Jz [A/m²]', true);
 }
 
 async function renderBMagnitude(containerId, step) {
-    const resultPath = getCurrentResultPath();
-    if (!resultPath) throw new Error('No result selected');
+    // Use grid spacing from analysis conditions
+    const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
+    const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
 
-    // Load conditions to get grid spacing
-    const condResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
-    let dx = 0.001, dy = 0.001;
-    if (condResponse.ok) {
-        const conditions = await condResponse.json();
-        dx = conditions.dr || conditions.dx || 0.001;
-        dy = conditions.dtheta || conditions.dy || 0.001;
-    }
+    // Load Az and Mu with caching
+    const azData = await loadCsvData('Az', step);
+    const muData = await loadCsvData('Mu', step);
 
-    // Load Az and Mu, then calculate B
-    const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
-    const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/${formatStepFilename(step)}`);
+    // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
+    const azFlipped = flipVertical(azData);
+    const muFlipped = flipVertical(muData);
 
-    if (!azResponse.ok || !muResponse.ok) throw new Error('Failed to load Az/Mu data');
+    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
 
-    const azData = await azResponse.json();
-    const muData = await muResponse.json();
-
-    const { Bx, By } = calculateFields(azData.data, muData.data, dx, dy);
-    const B_magnitude = calculateMagnitude(Bx, By);
-
-    plotHeatmap(containerId, B_magnitude, '|B| Distribution');
+    plotHeatmap(containerId, B, '|B| [T/m]', true);
 }
 
 async function renderHMagnitude(containerId, step) {
-    const resultPath = getCurrentResultPath();
-    if (!resultPath) throw new Error('No result selected');
+    // Use grid spacing from analysis conditions
+    const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
+    const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
 
-    // Load conditions to get grid spacing
-    const condResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
-    let dx = 0.001, dy = 0.001;
-    if (condResponse.ok) {
-        const conditions = await condResponse.json();
-        dx = conditions.dr || conditions.dx || 0.001;
-        dy = conditions.dtheta || conditions.dy || 0.001;
-    }
+    // Load Az and Mu with caching
+    const azData = await loadCsvData('Az', step);
+    const muData = await loadCsvData('Mu', step);
 
-    // Load Az and Mu, then calculate H
-    const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/${formatStepFilename(step)}`);
-    const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/${formatStepFilename(step)}`);
+    // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
+    const azFlipped = flipVertical(azData);
+    const muFlipped = flipVertical(muData);
 
-    if (!azResponse.ok || !muResponse.ok) throw new Error('Failed to load Az/Mu data');
+    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
 
-    const azData = await azResponse.json();
-    const muData = await muResponse.json();
-
-    const { Hx, Hy } = calculateFields(azData.data, muData.data, dx, dy);
-    const H_magnitude = calculateMagnitude(Hx, Hy);
-
-    plotHeatmap(containerId, H_magnitude, '|H| Distribution');
+    plotHeatmap(containerId, H, '|H| [A/m]', true);
 }
 
 async function renderMuDistribution(containerId, step) {
-    const resultPath = getCurrentResultPath();
-    if (!resultPath) throw new Error('No result selected');
-
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/${formatStepFilename(step)}`);
-    if (!response.ok) throw new Error('Failed to load Mu data');
-    const result = await response.json();
-    plotHeatmap(containerId, result.data, 'Permeability Distribution');
+    const data = await loadCsvData('Mu', step);
+    const flipped = flipVertical(data);
+    plotHeatmap(containerId, flipped, 'μ [H/m]', true);
 }
 
 async function renderEnergyDensity(containerId, step) {
-    const resultPath = getCurrentResultPath();
-    if (!resultPath) throw new Error('No result selected');
+    const data = await loadCsvData('EnergyDensity', step);
+    const flipped = flipVertical(data);
+    plotHeatmap(containerId, flipped, 'Energy [J/m³]', true);
+}
 
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=EnergyDensity/${formatStepFilename(step)}`);
-    if (!response.ok) throw new Error('Failed to load energy data');
-    const result = await response.json();
-    plotHeatmap(containerId, result.data, 'Energy Density');
+// Helper: Convert black pixels in image to transparent
+async function makeBlackTransparent(url, threshold = 30) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'Anonymous';
+
+        img.onload = function() {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+
+            // Draw image
+            ctx.drawImage(img, 0, 0);
+
+            // Get pixel data
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const pixels = imageData.data;
+
+            // Convert black pixels (RGB values below threshold) to transparent
+            for (let i = 0; i < pixels.length; i += 4) {
+                const r = pixels[i];
+                const g = pixels[i + 1];
+                const b = pixels[i + 2];
+
+                // If RGB sum is below threshold, make transparent
+                if (r + g + b <= threshold * 3) {
+                    pixels[i + 3] = 0;  // Set alpha channel to 0 (transparent)
+                }
+            }
+
+            // Put modified pixel data back
+            ctx.putImageData(imageData, 0, 0);
+
+            // Return as Data URL
+            resolve(canvas.toDataURL('image/png'));
+        };
+
+        img.onerror = function() {
+            reject(new Error('Failed to load boundary image for transparency conversion'));
+        };
+
+        img.src = url;
+    });
 }
 
 async function renderAzBoundary(containerId, step) {
-    document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Field Lines + Boundary visualization coming soon</p>';
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    try {
+        // Load Az data with caching
+        const azData = await loadCsvData('Az', step);
+        const azFlipped = flipVertical(azData);
+
+        // Get boundary image URL
+        const boundaryImgUrl = `/api/get-boundary-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+
+        // Load boundary image and convert black to transparent
+        const transparentBoundaryUrl = await makeBlackTransparent(boundaryImgUrl);
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        const rows = azFlipped.length;
+        const cols = azFlipped[0].length;
+
+        // Generate physical coordinates if available
+        let xVals, yVals, xTitle, yTitle, xMin, xMax, yMin, yMax;
+        if (AppState.analysisConditions) {
+            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+            if (coordSys === 'polar') {
+                const theta_start = AppState.analysisConditions.theta_start || 0;
+                const dr = AppState.analysisConditions.dr || 0.001;
+                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                xVals = Array.from({ length: cols }, (_, i) => i * dr * 1000);
+                yVals = Array.from({ length: rows }, (_, i) => theta_start + i * dtheta);
+                xTitle = 'r - r_start [mm]';
+                yTitle = 'θ [rad]';
+                xMin = 0;
+                xMax = (cols - 1) * dr * 1000;
+                yMin = theta_start;
+                yMax = theta_start + (rows - 1) * dtheta;
+            } else {
+                const dx = AppState.analysisConditions.dx || 0.001;
+                const dy = AppState.analysisConditions.dy || 0.001;
+                xVals = Array.from({ length: cols }, (_, i) => i * dx * 1000);
+                yVals = Array.from({ length: rows }, (_, i) => i * dy * 1000);
+                xTitle = 'X [mm]';
+                yTitle = 'Y [mm]';
+                xMin = 0;
+                xMax = (cols - 1) * dx * 1000;
+                yMin = 0;
+                yMax = (rows - 1) * dy * 1000;
+            }
+        } else {
+            xVals = Array.from({ length: cols }, (_, i) => i);
+            yVals = Array.from({ length: rows }, (_, i) => i);
+            xTitle = 'X [pixels]';
+            yTitle = 'Y [pixels]';
+            xMin = 0;
+            xMax = cols - 1;
+            yMin = 0;
+            yMax = rows - 1;
+        }
+
+        // Az contour trace
+        const traces = [
+            {
+                z: azFlipped,
+                x: xVals,
+                y: yVals,
+                type: 'contour',
+                colorscale: 'Viridis',
+                contours: { coloring: 'lines' },
+                showscale: false,
+                name: 'Az'
+            }
+        ];
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 35, r: 10, t: 10, b: 35 },
+            xaxis: {
+                title: xTitle,
+                range: [xMin, xMax]
+            },
+            yaxis: {
+                title: yTitle,
+                range: [yMin, yMax]
+            },
+            images: [
+                {
+                    source: transparentBoundaryUrl,
+                    xref: 'x',
+                    yref: 'y',
+                    x: xMin,
+                    y: yMax,
+                    sizex: xMax - xMin,
+                    sizey: yMax - yMin,
+                    sizing: 'stretch',
+                    opacity: 1.0,
+                    layer: 'above'
+                }
+            ],
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('Az+Boundary render error:', error);
+        container.innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+    }
 }
 
 async function renderMaterialImage(containerId, step) {
-    document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Material Image visualization coming soon</p>';
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    try {
+        // Get step input image (from InputImage folder)
+        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+
+        // Get or create canvas (keep existing canvas to prevent flickering)
+        let canvas = container.querySelector('canvas');
+        if (!canvas) {
+            container.innerHTML = '<canvas style="width: 100%; height: 100%;"></canvas>';
+            canvas = container.querySelector('canvas');
+        }
+        const ctx = canvas.getContext('2d');
+
+        // Preload image (draw only after fully loaded to prevent flickering)
+        const img = new Image();
+        img.onload = function() {
+            // Set canvas size
+            const containerRect = container.getBoundingClientRect();
+            const scale = Math.min(containerRect.width / img.width, containerRect.height / img.height);
+
+            canvas.width = img.width * scale;
+            canvas.height = img.height * scale;
+
+            // Draw image (image is fully loaded at this point)
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        };
+
+        img.onerror = function() {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">Failed to load material image</div>';
+        };
+
+        img.src = imgUrl;
+    } catch (error) {
+        console.error('Material image load error:', error);
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading material image</div>';
+    }
 }
 
 async function renderStepInputImage(containerId, step) {
-    document.getElementById(containerId).innerHTML = '<p style="padding:20px;">Step Input Image visualization coming soon</p>';
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    try {
+        // Get step input image
+        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // Load image to get dimensions
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = reject;
+            img.src = imgUrl;
+        });
+
+        const rows = img.height;
+        const cols = img.width;
+
+        // Generate physical coordinates if available
+        let xTitle, yTitle, xMin, xMax, yMin, yMax;
+        if (AppState.analysisConditions) {
+            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+            if (coordSys === 'polar') {
+                const theta_start = AppState.analysisConditions.theta_start || 0;
+                const dr = AppState.analysisConditions.dr || 0.001;
+                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                xTitle = 'r - r_start [mm]';
+                yTitle = 'θ [rad]';
+                xMin = 0;
+                xMax = (cols - 1) * dr * 1000;
+                yMin = theta_start;
+                yMax = theta_start + (rows - 1) * dtheta;
+            } else {
+                const dx = AppState.analysisConditions.dx || 0.001;
+                const dy = AppState.analysisConditions.dy || 0.001;
+                xTitle = 'X [mm]';
+                yTitle = 'Y [mm]';
+                xMin = 0;
+                xMax = (cols - 1) * dx * 1000;
+                yMin = 0;
+                yMax = (rows - 1) * dy * 1000;
+            }
+        } else {
+            xTitle = 'X [pixels]';
+            yTitle = 'Y [pixels]';
+            xMin = 0;
+            xMax = cols - 1;
+            yMin = 0;
+            yMax = rows - 1;
+        }
+
+        // Display image using Plotly
+        await Plotly.newPlot(container, [], {
+            width: size.width,
+            height: size.height,
+            margin: { l: 35, r: 10, t: 10, b: 35 },
+            xaxis: {
+                title: xTitle,
+                range: [xMin, xMax],
+                showgrid: false
+            },
+            yaxis: {
+                title: yTitle,
+                range: [yMin, yMax],
+                showgrid: false
+            },
+            images: [
+                {
+                    source: imgUrl,
+                    xref: 'x',
+                    yref: 'y',
+                    x: xMin,
+                    y: yMax,
+                    sizex: xMax - xMin,
+                    sizey: yMax - yMin,
+                    sizing: 'stretch',
+                    opacity: 1.0,
+                    layer: 'below'
+                }
+            ],
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('Step input image load error:', error);
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading image</div>';
+    }
+}
+
+// Helper: Load force data for a specific step
+async function loadForceData(step) {
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) return null;
+
+    try {
+        const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/step_${String(step).padStart(4, '0')}.csv`);
+
+        if (!response.ok) {
+            console.warn(`Forces data not found for step ${step}`);
+            return null;
+        }
+
+        const textData = await response.text();
+
+        if (!textData || textData.trim().length === 0) {
+            console.warn(`Empty forces data for step ${step}`);
+            return null;
+        }
+
+        // Parse Forces CSV
+        // Format: Material,RGB_R,RGB_G,RGB_B,Force_X[N/m],Force_Y[N/m],Force_Magnitude[N/m],Torque[N],Boundary_Pixels
+        const lines = textData.trim().split('\n');
+
+        // Find header line
+        let headerIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].startsWith('Material,')) {
+                headerIdx = i;
+                break;
+            }
+        }
+
+        if (headerIdx === -1) {
+            console.error(`No header line found in forces file for step ${step}`);
+            return null;
+        }
+
+        const headers = lines[headerIdx].split(',');
+
+        // Get column indices
+        const materialIdx = headers.findIndex(h => h && h.trim() === 'Material');
+        const rgbRIdx = headers.findIndex(h => h && h.includes('RGB_R'));
+        const rgbGIdx = headers.findIndex(h => h && h.includes('RGB_G'));
+        const rgbBIdx = headers.findIndex(h => h && h.includes('RGB_B'));
+        const forceXIdx = headers.findIndex(h => h && h.includes('Force_X'));
+        const forceYIdx = headers.findIndex(h => h && h.trim().startsWith('Force_Y'));
+        const torqueOriginIdx = headers.findIndex(h => h && h.includes('Torque_Origin'));
+        const torqueCenterIdx = headers.findIndex(h => h && h.includes('Torque_Center'));
+        const energyIdx = headers.findIndex(h => h && h.includes('Magnetic_Energy'));
+
+        // Fallback: old format (Torque only)
+        const torqueIdx = torqueOriginIdx !== -1 ? torqueOriginIdx :
+                         headers.findIndex(h => h && h.includes('Torque'));
+
+        if (forceXIdx === -1 || forceYIdx === -1 || torqueIdx === -1) {
+            console.error(`Missing force columns in step ${step}`);
+            return null;
+        }
+
+        // Material data and totals
+        const materials = [];
+        let totalForceX = 0;
+        let totalForceY = 0;
+        let totalTorque = 0;
+        let dataRowCount = 0;
+
+        for (let i = headerIdx + 1; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line.startsWith('#') || line.length === 0) continue;
+
+            const values = line.split(',');
+            if (values.length > Math.max(forceXIdx, forceYIdx, torqueIdx)) {
+                const materialName = materialIdx !== -1 ? values[materialIdx].trim() : `Material_${dataRowCount}`;
+                const forceX = parseFloat(values[forceXIdx]) || 0;
+                const forceY = parseFloat(values[forceYIdx]) || 0;
+                const torque = parseFloat(values[torqueIdx]) || 0;
+                const energy = energyIdx !== -1 ? (parseFloat(values[energyIdx]) || 0) : 0;
+
+                // Get RGB values (for color code creation)
+                const r = rgbRIdx !== -1 ? parseInt(values[rgbRIdx]) || 0 : 0;
+                const g = rgbGIdx !== -1 ? parseInt(values[rgbGIdx]) || 0 : 0;
+                const b = rgbBIdx !== -1 ? parseInt(values[rgbBIdx]) || 0 : 0;
+                const color = `rgb(${r}, ${g}, ${b})`;
+
+                materials.push({
+                    name: materialName,
+                    color: color,
+                    force_x: forceX,
+                    force_y: forceY,
+                    torque: torque,
+                    energy: energy
+                });
+
+                totalForceX += forceX;
+                totalForceY += forceY;
+                totalTorque += torque;
+                dataRowCount++;
+            }
+        }
+
+        if (dataRowCount === 0) {
+            console.log(`No valid data rows found in forces file for step ${step}`);
+        }
+
+        return {
+            total: {
+                force_x: totalForceX,
+                force_y: totalForceY,
+                torque: totalTorque
+            },
+            materials: materials
+        };
+    } catch (error) {
+        console.error(`Force data load error for step ${step}:`, error);
+        return null;
+    }
 }
 
 async function renderForceXTime(containerId) {
     try {
-        const resultPath = getCurrentResultPath();
-        if (!resultPath) throw new Error('No result selected');
+        const container = document.getElementById(containerId);
+        if (!container) return;
 
-        // Load force summary data
-        const forceData = [];
-        for (let i = 1; i <= AppState.totalSteps; i++) {
-            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
-            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
-            if (response.ok) {
-                const text = await response.text();
-                const lines = text.trim().split('\n');
-                // Parse CSV: skip header and comment lines, find first data line
-                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-                    const line = lines[lineIdx].trim();
-                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
-                        const dataLine = line.split(',');
-                        forceData.push(parseFloat(dataLine[4]) || 0); // Force_X is column 4
-                        break;
-                    }
-                }
-            }
+        // Load all steps data
+        const allStepsData = [];
+        let hasData = false;
+
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const data = await loadForceData(i + 1);
+            allStepsData.push(data || null);
+            if (data) hasData = true;
         }
 
-        const container = document.getElementById(containerId);
+        if (!hasData) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // x-axis values: 1..totalSteps array (1-based)
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        const markerSizes = xSteps.map((s) =>
-            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
-        );
+        // Get list of material names (from first step)
+        const materialNames = new Set();
+        allStepsData.forEach(data => {
+            if (data && data.materials) {
+                data.materials.forEach(mat => materialNames.add(mat.name));
+            }
+        });
 
-        const trace = {
-            x: xSteps,
-            y: forceData.length > 0 ? forceData : xSteps.map(() => 0),
-            type: 'scatter',
-            mode: 'lines+markers',
-            name: 'Force X',
-            line: { color: '#667eea', width: 2 },
-            marker: { color: '#667eea', size: markerSizes }
+        // Create traces per material
+        const traces = [];
+
+        // Calculate marker sizes (always return array)
+        const getMarkerSizes = (baseSize, highlightSize) => {
+            return Array.from({ length: AppState.totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            });
         };
 
-        await Plotly.newPlot(container, [trace], {
-            margin: { l: 50, r: 10, t: 10, b: 40 },
+        // Trace per material
+        materialNames.forEach(matName => {
+            const forceData = [];
+            let matColor = null;
+
+            for (let i = 0; i < AppState.totalSteps; i++) {
+                const stepData = allStepsData[i];
+                if (stepData && stepData.materials) {
+                    const mat = stepData.materials.find(m => m.name === matName);
+                    if (mat) {
+                        forceData.push(mat.force_x);
+                        if (!matColor) matColor = mat.color;
+                    } else {
+                        forceData.push(0);
+                    }
+                } else {
+                    forceData.push(0);
+                }
+            }
+
+            traces.push({
+                x: xSteps,
+                y: forceData,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: matName,
+                line: { color: matColor, width: 2 },
+                marker: { color: matColor, size: getMarkerSizes(6, 14) }
+            });
+        });
+
+        // Get data range
+        const allForces = traces.flatMap(t => t.y);
+        const maxForce = Math.max(...allForces.map(Math.abs));
+        const yrange = maxForce > 1e-10 ? undefined : [-0.1, 0.1];
+
+        // Legend position: inside plot if traces <= 3, outside otherwise
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 45, r: 10, t: 10, b: 35 },
             xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
-            yaxis: { title: 'Force X [N/m]' },
+            yaxis: { title: 'Force X [N/m]', range: yrange },
+            showlegend: true,
+            legend: legendConfig,
             dragmode: false
         }, { responsive: true, displayModeBar: false });
     } catch (error) {
         console.error('Force X time plot error:', error);
-        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
     }
 }
 
 async function renderForceYTime(containerId) {
     try {
-        const resultPath = getCurrentResultPath();
-        if (!resultPath) throw new Error('No result selected');
+        const container = document.getElementById(containerId);
+        if (!container) return;
 
-        const forceData = [];
-        for (let i = 1; i <= AppState.totalSteps; i++) {
-            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
-            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
-            if (response.ok) {
-                const text = await response.text();
-                const lines = text.trim().split('\n');
-                // Parse CSV: skip header and comment lines, find first data line
-                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-                    const line = lines[lineIdx].trim();
-                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
-                        const dataLine = line.split(',');
-                        forceData.push(parseFloat(dataLine[5]) || 0); // Force_Y is column 5
-                        break;
-                    }
-                }
-            }
+        // Load all steps data
+        const allStepsData = [];
+        let hasData = false;
+
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const data = await loadForceData(i + 1);
+            allStepsData.push(data || null);
+            if (data) hasData = true;
         }
 
-        const container = document.getElementById(containerId);
+        if (!hasData) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        const markerSizes = xSteps.map((s) =>
-            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
-        );
+        const materialNames = new Set();
+        allStepsData.forEach(data => {
+            if (data && data.materials) {
+                data.materials.forEach(mat => materialNames.add(mat.name));
+            }
+        });
 
-        const trace = {
-            x: xSteps,
-            y: forceData.length > 0 ? forceData : xSteps.map(() => 0),
-            type: 'scatter',
-            mode: 'lines+markers',
-            name: 'Force Y',
-            line: { color: '#764ba2', width: 2 },
-            marker: { color: '#764ba2', size: markerSizes }
+        const traces = [];
+
+        const getMarkerSizes = (baseSize, highlightSize) => {
+            return Array.from({ length: AppState.totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            });
         };
 
-        await Plotly.newPlot(container, [trace], {
-            margin: { l: 50, r: 10, t: 10, b: 40 },
+        materialNames.forEach(matName => {
+            const forceData = [];
+            let matColor = null;
+
+            for (let i = 0; i < AppState.totalSteps; i++) {
+                const stepData = allStepsData[i];
+                if (stepData && stepData.materials) {
+                    const mat = stepData.materials.find(m => m.name === matName);
+                    if (mat) {
+                        forceData.push(mat.force_y);
+                        if (!matColor) matColor = mat.color;
+                    } else {
+                        forceData.push(0);
+                    }
+                } else {
+                    forceData.push(0);
+                }
+            }
+
+            traces.push({
+                x: xSteps,
+                y: forceData,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: matName,
+                line: { color: matColor, width: 2 },
+                marker: { color: matColor, size: getMarkerSizes(6, 14) }
+            });
+        });
+
+        const allForces = traces.flatMap(t => t.y);
+        const maxForce = Math.max(...allForces.map(Math.abs));
+        const yrange = maxForce > 1e-10 ? undefined : [-0.1, 0.1];
+
+        // Legend position: inside plot if traces <= 3, outside otherwise
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 45, r: 10, t: 10, b: 35 },
             xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
-            yaxis: { title: 'Force Y [N/m]' },
+            yaxis: { title: 'Force Y [N/m]', range: yrange },
+            showlegend: true,
+            legend: legendConfig,
             dragmode: false
         }, { responsive: true, displayModeBar: false });
     } catch (error) {
         console.error('Force Y time plot error:', error);
-        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
     }
 }
 
 async function renderTorqueTime(containerId) {
     try {
-        const resultPath = getCurrentResultPath();
-        if (!resultPath) throw new Error('No result selected');
+        const container = document.getElementById(containerId);
+        if (!container) return;
 
-        const torqueData = [];
-        for (let i = 1; i <= AppState.totalSteps; i++) {
-            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
-            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
-            if (response.ok) {
-                const text = await response.text();
-                const lines = text.trim().split('\n');
-                // Parse CSV: skip header and comment lines, find first data line
-                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-                    const line = lines[lineIdx].trim();
-                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
-                        const dataLine = line.split(',');
-                        torqueData.push(parseFloat(dataLine[8]) || 0); // Torque_Origin is column 8
-                        break;
-                    }
-                }
-            }
+        // Load all steps data
+        const allStepsData = [];
+        let hasData = false;
+
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const data = await loadForceData(i + 1);
+            allStepsData.push(data || null);
+            if (data) hasData = true;
         }
 
-        const container = document.getElementById(containerId);
+        if (!hasData) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        const markerSizes = xSteps.map((s) =>
-            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
-        );
+        const materialNames = new Set();
+        allStepsData.forEach(data => {
+            if (data && data.materials) {
+                data.materials.forEach(mat => materialNames.add(mat.name));
+            }
+        });
 
-        const trace = {
-            x: xSteps,
-            y: torqueData.length > 0 ? torqueData : xSteps.map(() => 0),
-            type: 'scatter',
-            mode: 'lines+markers',
-            name: 'Torque',
-            line: { color: '#f093fb', width: 2 },
-            marker: { color: '#f093fb', size: markerSizes }
+        const traces = [];
+
+        const getMarkerSizes = (baseSize, highlightSize) => {
+            return Array.from({ length: AppState.totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            });
         };
 
-        await Plotly.newPlot(container, [trace], {
-            margin: { l: 50, r: 10, t: 10, b: 40 },
+        materialNames.forEach(matName => {
+            const torqueData = [];
+            let matColor = null;
+
+            for (let i = 0; i < AppState.totalSteps; i++) {
+                const stepData = allStepsData[i];
+                if (stepData && stepData.materials) {
+                    const mat = stepData.materials.find(m => m.name === matName);
+                    if (mat) {
+                        torqueData.push(mat.torque);
+                        if (!matColor) matColor = mat.color;
+                    } else {
+                        torqueData.push(0);
+                    }
+                } else {
+                    torqueData.push(0);
+                }
+            }
+
+            traces.push({
+                x: xSteps,
+                y: torqueData,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: matName,
+                line: { color: matColor, width: 2 },
+                marker: { color: matColor, size: getMarkerSizes(6, 14) }
+            });
+        });
+
+        const allTorques = traces.flatMap(t => t.y);
+        const maxTorque = Math.max(...allTorques.map(Math.abs));
+        const yrange = maxTorque > 1e-10 ? undefined : [-0.1, 0.1];
+
+        // Legend position: inside plot if traces <= 3, outside otherwise
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 45, r: 10, t: 10, b: 35 },
             xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
-            yaxis: { title: 'Torque [Nm/m]' },
+            yaxis: { title: 'Torque [Nm/m]', range: yrange },
+            showlegend: true,
+            legend: legendConfig,
             dragmode: false
         }, { responsive: true, displayModeBar: false });
     } catch (error) {
         console.error('Torque time plot error:', error);
-        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
     }
 }
 
 async function renderEnergyTime(containerId) {
     try {
-        const resultPath = getCurrentResultPath();
-        if (!resultPath) throw new Error('No result selected');
+        const container = document.getElementById(containerId);
+        if (!container) return;
 
-        const energyData = [];
-        for (let i = 1; i <= AppState.totalSteps; i++) {
-            const stepFile = `step_${String(i).padStart(4, '0')}.csv`;
-            const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/${stepFile}`);
-            if (response.ok) {
-                const text = await response.text();
-                const lines = text.trim().split('\n');
-                // Parse CSV: skip header and comment lines, find first data line
-                for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-                    const line = lines[lineIdx].trim();
-                    if (line && !line.startsWith('#') && !line.startsWith('Material,')) {
-                        const dataLine = line.split(',');
-                        energyData.push(parseFloat(dataLine[10]) || 0); // Magnetic_Energy is column 10
-                        break;
-                    }
-                }
-            }
+        // Load all steps data
+        const allStepsData = [];
+        let hasData = false;
+
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const data = await loadForceData(i + 1);
+            allStepsData.push(data || null);
+            if (data) hasData = true;
         }
 
-        const container = document.getElementById(containerId);
+        if (!hasData) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Energy data available</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
         const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
 
-        const markerSizes = xSteps.map((s) =>
-            (AppState.isAnimating && s === AppState.currentStep) ? 12 : 6
-        );
+        const materialNames = new Set();
+        allStepsData.forEach(data => {
+            if (data && data.materials) {
+                data.materials.forEach(mat => materialNames.add(mat.name));
+            }
+        });
 
-        const trace = {
-            x: xSteps,
-            y: energyData.length > 0 ? energyData : xSteps.map(() => 0),
-            type: 'scatter',
-            mode: 'lines+markers',
-            name: 'Magnetic Energy',
-            line: { color: '#4facfe', width: 2 },
-            marker: { color: '#4facfe', size: markerSizes }
+        const traces = [];
+
+        const getMarkerSizes = (baseSize, highlightSize) => {
+            return Array.from({ length: AppState.totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            });
         };
 
-        await Plotly.newPlot(container, [trace], {
-            margin: { l: 50, r: 10, t: 10, b: 40 },
+        materialNames.forEach(matName => {
+            const energyData = [];
+            let matColor = null;
+
+            for (let i = 0; i < AppState.totalSteps; i++) {
+                const stepData = allStepsData[i];
+                if (stepData && stepData.materials) {
+                    const mat = stepData.materials.find(m => m.name === matName);
+                    if (mat) {
+                        energyData.push(mat.energy);
+                        if (!matColor) matColor = mat.color;
+                    } else {
+                        energyData.push(0);
+                    }
+                } else {
+                    energyData.push(0);
+                }
+            }
+
+            traces.push({
+                x: xSteps,
+                y: energyData,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: matName,
+                line: { color: matColor, width: 2 },
+                marker: { color: matColor, size: getMarkerSizes(6, 14) }
+            });
+        });
+
+        // Legend position: inside plot if traces <= 3, outside otherwise
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 45, r: 10, t: 10, b: 35 },
             xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
             yaxis: { title: 'Energy [J/m]' },
+            showlegend: true,
+            legend: legendConfig,
             dragmode: false
         }, { responsive: true, displayModeBar: false });
     } catch (error) {
         console.error('Energy time plot error:', error);
-        document.getElementById(containerId).innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
     }
 }
 
+// ===== Plotting Helper Functions =====
+function getContainerSize(container) {
+    const rect = container.getBoundingClientRect();
+    console.log(`Container rect: ${rect.width}x${rect.height}`);
+
+    // Account for padding: 10px * 2 sides = 20px
+    // Don't use default if size is too small (before initialization)
+    const padding = 20;
+    return {
+        width: rect.width > 50 ? Math.max(rect.width - padding, 100) : 400,
+        height: rect.height > 50 ? Math.max(rect.height - padding, 100) : 400
+    };
+}
+
 // ===== Plotting Functions =====
-function plotContour(elementId, data, title) {
-    if (!data || data.length === 0) {
-        document.getElementById(elementId).innerHTML = '<p>No data available</p>';
+function plotContour(elementId, data, title, usePhysicalAxes = false) {
+    const container = document.getElementById(elementId);
+    if (!container) {
+        console.error(`plotContour: Container not found: ${elementId}`);
         return;
     }
+
+    if (!data || data.length === 0) {
+        container.innerHTML = '<p>No data available</p>';
+        return;
+    }
+
+    // Clear container before plotting
+    container.innerHTML = '';
+
+    // Get container size
+    const size = getContainerSize(container);
+
+    // Colorbar width should be 10% of total width (9:1 ratio)
+    const colorbarThickness = Math.floor(size.width * 0.1);
 
     const trace = {
         z: data,
@@ -1696,44 +2677,145 @@ function plotContour(elementId, data, title) {
             coloring: 'heatmap'
         },
         colorbar: {
-            title: title
+            title: title,
+            thickness: colorbarThickness,
+            len: 1.0
         }
     };
 
+    // Generate physical axes if requested and conditions are available
+    let xaxis, yaxis;
+    if (usePhysicalAxes && AppState.analysisConditions) {
+        const rows = data.length;
+        const cols = data[0]?.length || 0;
+        const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+
+        if (coordSys === 'polar') {
+            const theta_start = AppState.analysisConditions.theta_start || 0;
+            const dr = AppState.analysisConditions.dr || 0.001;
+            const dtheta = AppState.analysisConditions.dtheta || 0.001;
+
+            // r: mm (from 0), theta: radians
+            const rVals = Array.from({ length: cols }, (_, i) => i * dr * 1000);
+            const thetaVals = Array.from({ length: rows }, (_, i) => theta_start + i * dtheta);
+
+            trace.x = rVals;
+            trace.y = thetaVals;
+            xaxis = { title: 'r - r_start [mm]' };
+            yaxis = { title: 'θ [rad]' };
+        } else {
+            const dx = AppState.analysisConditions.dx || 0.001;
+            const dy = AppState.analysisConditions.dy || 0.001;
+
+            // Cartesian: both in mm
+            const xVals = Array.from({ length: cols }, (_, i) => i * dx * 1000);
+            const yVals = Array.from({ length: rows }, (_, i) => i * dy * 1000);
+
+            trace.x = xVals;
+            trace.y = yVals;
+            xaxis = { title: 'X [mm]' };
+            yaxis = { title: 'Y [mm]' };
+        }
+    } else {
+        xaxis = { title: 'X [pixels]' };
+        yaxis = { title: 'Y [pixels]' };
+    }
+
     const layout = {
+        width: size.width,
+        height: size.height,
         title: title,
-        xaxis: { title: 'X' },
-        yaxis: { title: 'Y' },
-        margin: { t: 40, r: 20, b: 40, l: 60 }
+        xaxis: xaxis,
+        yaxis: yaxis,
+        margin: { t: 40, r: colorbarThickness + 15, b: 40, l: 60 },
+        dragmode: false
     };
 
-    Plotly.newPlot(elementId, [trace], layout, { responsive: true });
+    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false });
 }
 
 // ===== Plotting Functions =====
-function plotHeatmap(elementId, data, title) {
-    if (!data || data.length === 0) {
-        document.getElementById(elementId).innerHTML = '<p>No data available</p>';
+function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
+    const container = document.getElementById(elementId);
+    if (!container) {
+        console.error(`plotHeatmap: Container not found: ${elementId}`);
         return;
     }
+
+    if (!data || data.length === 0) {
+        container.innerHTML = '<p>No data available</p>';
+        return;
+    }
+
+    // Clear container before plotting
+    container.innerHTML = '';
+
+    // Get container size
+    const size = getContainerSize(container);
+
+    // Colorbar width should be 10% of total width (9:1 ratio)
+    const colorbarThickness = Math.floor(size.width * 0.1);
 
     const trace = {
         z: data,
         type: 'heatmap',
         colorscale: 'Viridis',
         colorbar: {
-            title: title
+            title: title,
+            thickness: colorbarThickness,
+            len: 1.0
         }
     };
 
+    // Generate physical axes if requested and conditions are available
+    let xaxis, yaxis;
+    if (usePhysicalAxes && AppState.analysisConditions) {
+        const rows = data.length;
+        const cols = data[0]?.length || 0;
+        const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+
+        if (coordSys === 'polar') {
+            const theta_start = AppState.analysisConditions.theta_start || 0;
+            const dr = AppState.analysisConditions.dr || 0.001;
+            const dtheta = AppState.analysisConditions.dtheta || 0.001;
+
+            // r: mm (from 0), theta: radians
+            const rVals = Array.from({ length: cols }, (_, i) => i * dr * 1000);
+            const thetaVals = Array.from({ length: rows }, (_, i) => theta_start + i * dtheta);
+
+            trace.x = rVals;
+            trace.y = thetaVals;
+            xaxis = { title: 'r - r_start [mm]' };
+            yaxis = { title: 'θ [rad]' };
+        } else {
+            const dx = AppState.analysisConditions.dx || 0.001;
+            const dy = AppState.analysisConditions.dy || 0.001;
+
+            // Cartesian: both in mm
+            const xVals = Array.from({ length: cols }, (_, i) => i * dx * 1000);
+            const yVals = Array.from({ length: rows }, (_, i) => i * dy * 1000);
+
+            trace.x = xVals;
+            trace.y = yVals;
+            xaxis = { title: 'X [mm]' };
+            yaxis = { title: 'Y [mm]' };
+        }
+    } else {
+        xaxis = { title: 'X [pixels]' };
+        yaxis = { title: 'Y [pixels]' };
+    }
+
     const layout = {
+        width: size.width,
+        height: size.height,
         title: title,
-        xaxis: { title: 'Columns' },
-        yaxis: { title: 'Rows' },
-        margin: { t: 40, r: 20, b: 40, l: 60 }
+        xaxis: xaxis,
+        yaxis: yaxis,
+        margin: { t: 40, r: colorbarThickness + 15, b: 40, l: 60 },
+        dragmode: false
     };
 
-    Plotly.newPlot(elementId, [trace], layout, { responsive: true });
+    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false });
 }
 
 function plotForceGraph(elementId, data, title) {

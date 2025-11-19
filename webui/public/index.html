@@ -234,6 +234,9 @@
             padding: 10px;
             border-radius: 5px;
             border: 1px solid #dee2e6;
+            height: 400px;
+            min-height: 300px;
+            max-height: 50vh;
         }
 
         /* Dashboard Tab */
@@ -509,6 +512,16 @@
                         <button class="btn-primary" onclick="runSolver()" id="solverBtn">Run Solver</button>
                     </div>
                     <div id="solverStatus"></div>
+                    <!-- Progress Bar -->
+                    <div id="solverProgressContainer" style="display: none; margin-top: 15px;">
+                        <div style="margin-bottom: 5px; display: flex; justify-content: space-between; align-items: center;">
+                            <span id="solverProgressText" style="font-size: 0.9rem; color: #666;">Initializing...</span>
+                            <span id="solverProgressPercent" style="font-size: 0.9rem; font-weight: 600; color: #667eea;">0%</span>
+                        </div>
+                        <div style="background: #e0e0e0; border-radius: 10px; overflow: hidden; height: 20px;">
+                            <div id="solverProgressBar" style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); height: 100%; width: 0%; transition: width 0.3s ease;"></div>
+                        </div>
+                    </div>
                     <div id="solverOutput" style="background: #f8f9fa; padding: 10px; margin-top: 15px; border-radius: 5px; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap;"></div>
                 </div>
 
@@ -564,11 +577,8 @@
                         <div class="palette-item" draggable="true" data-plot-type="az_boundary">
                             <span class="palette-name">Field Lines + Boundary</span>
                         </div>
-                        <div class="palette-item" draggable="true" data-plot-type="material_image">
-                            <span class="palette-name">Material Image</span>
-                        </div>
                         <div class="palette-item" draggable="true" data-plot-type="step_input_image">
-                            <span class="palette-name">Step Input Image</span>
+                            <span class="palette-name">Input Image</span>
                         </div>
                     </div>
 
@@ -608,6 +618,7 @@
                                 <option value="100">Very Fast</option>
                             </select>
                         </label>
+                        <button id="preloadBtn" class="btn-secondary" onclick="preloadAllSteps()" style="min-width: 100px; margin-left: 10px;">Preload All</button>
 
                         <!-- Step Slider -->
                         <label style="margin-left: 15px;">Step: <span id="currentStep">1</span>/<span id="totalStepsDisplay">1</span></label>

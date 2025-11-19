@@ -140,12 +140,10 @@ void exportConditionsJSON(const std::string& output_path,
         int ntheta = image.rows;
         double dr = (r_end - r_start) / (nr - 1);
 
-        double theta_range_deg = polar_section["theta_range"]
-            ? polar_section["theta_range"].as<double>() : 360.0;
-        double theta_range_rad = theta_range_deg * M_PI / 180.0;
+        double theta_range = polar_section["theta_range"].as<double>();
         // CRITICAL FIX: Periodic boundary condition requires dtheta = theta_range / ntheta
         // NOT theta_range / (ntheta-1) which is for non-periodic grids
-        double dtheta = theta_range_rad / static_cast<double>(ntheta);
+        double dtheta = theta_range / static_cast<double>(ntheta);
 
         json_file << "  \"dr\": " << dr << ",\n";
         json_file << "  \"dtheta\": " << dtheta << ",\n";
@@ -154,7 +152,7 @@ void exportConditionsJSON(const std::string& output_path,
         json_file << "  \"polar\": {\n";
         json_file << "    \"r_start\": " << r_start << ",\n";
         json_file << "    \"r_end\": " << r_end << ",\n";
-        json_file << "    \"theta_range\": " << theta_range_rad << ",\n";
+        json_file << "    \"theta_range\": " << theta_range << ",\n";
         std::string r_orientation = polar_section["r_orientation"]
             ? polar_section["r_orientation"].as<std::string>() : "horizontal";
         json_file << "    \"r_orientation\": \"" << r_orientation << "\"\n";

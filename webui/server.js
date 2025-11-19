@@ -441,7 +441,7 @@ app.delete('/api/config/:filename', async (req, res) => {
     }
 });
 
-// ソルバーの実行
+// ソルバーの実行（ストリーミングなし）
 app.post('/api/solve', async (req, res) => {
     try {
         const { configFile, imageFile, userId } = req.body;
@@ -501,6 +501,161 @@ app.post('/api/solve', async (req, res) => {
             success: false,
             error: error.message
         });
+    }
+});
+
+// ソルバーの実行（プログレス付きSSEストリーミング）
+app.post('/api/solve-stream', async (req, res) => {
+    try {
+        const { configFile, imageFile, userId } = req.body;
+
+        // パスの構築
+        let configPath;
+        if (configFile) {
+            // User-specific config file
+            const userDir = getUserDir(userId || 'default');
+            configPath = path.join(userDir, configFile);
+        } else {
+            // Default config
+            configPath = CONFIG_PATH;
+        }
+
+        // Get image path from user upload directory
+        const userUploadDir = getUserUploadsDir(userId || 'default');
+        const imagePath = path.join(userUploadDir, imageFile);
+
+        // ファイルの存在確認
+        await fs.access(configPath);
+        await fs.access(imagePath);
+        await fs.access(SOLVER_PATH);
+
+        // SSEヘッダーの設定
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+
+        console.log('Executing solver with streaming:', SOLVER_PATH);
+
+        // spawnを使用してリアルタイムで出力を取得
+        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath], {
+            cwd: path.join(__dirname, '..'),
+        });
+
+        let outputBuffer = '';
+        let errorBuffer = '';
+
+        // 標準出力の処理
+        solverProcess.stdout.on('data', (data) => {
+            const text = data.toString();
+            outputBuffer += text;
+
+            // 行ごとに処理
+            const lines = outputBuffer.split('\n');
+            outputBuffer = lines.pop() || ''; // 最後の不完全な行を保持
+
+            for (const line of lines) {
+                if (!line.trim()) continue;
+
+                // プログレス情報を抽出
+                let progressData = { type: 'log', message: line };
+
+                // "--- Step X / Y ---" の形式をパース
+                const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
+                if (stepMatch) {
+                    const current = parseInt(stepMatch[1]);
+                    const total = parseInt(stepMatch[2]);
+                    progressData = {
+                        type: 'progress',
+                        step: current,
+                        total: total,
+                        percentage: Math.round((current / total) * 100),
+                        message: line
+                    };
+                }
+
+                // 他の重要なメッセージ
+                if (line.includes('Solving linear system') ||
+                    line.includes('Using AMGCL') ||
+                    line.includes('Using direct solver')) {
+                    progressData.type = 'status';
+                }
+
+                if (line.includes('completed successfully')) {
+                    progressData.type = 'complete';
+                }
+
+                // SSEフォーマットで送信
+                res.write(`data: ${JSON.stringify(progressData)}\n\n`);
+            }
+        });
+
+        // 標準エラー出力の処理
+        solverProcess.stderr.on('data', (data) => {
+            const text = data.toString();
+            errorBuffer += text;
+
+            const lines = text.split('\n');
+            for (const line of lines) {
+                if (!line.trim()) continue;
+
+                const errorData = {
+                    type: 'error',
+                    message: line
+                };
+
+                res.write(`data: ${JSON.stringify(errorData)}\n\n`);
+            }
+        });
+
+        // プロセス終了時の処理
+        solverProcess.on('close', (code) => {
+            console.log(`Solver process exited with code ${code}`);
+
+            // 最後のバッファを送信
+            if (outputBuffer.trim()) {
+                res.write(`data: ${JSON.stringify({ type: 'log', message: outputBuffer.trim() })}\n\n`);
+            }
+
+            // 完了メッセージ
+            const finalData = {
+                type: code === 0 ? 'done' : 'error',
+                success: code === 0,
+                exitCode: code,
+                message: code === 0 ? 'Solver completed successfully' : 'Solver failed'
+            };
+
+            res.write(`data: ${JSON.stringify(finalData)}\n\n`);
+            res.end();
+        });
+
+        // エラー時の処理
+        solverProcess.on('error', (error) => {
+            console.error('Solver process error:', error);
+            const errorData = {
+                type: 'error',
+                success: false,
+                error: error.message
+            };
+            res.write(`data: ${JSON.stringify(errorData)}\n\n`);
+            res.end();
+        });
+
+        // クライアントが接続を切断した場合
+        req.on('close', () => {
+            console.log('Client disconnected, terminating solver process');
+            solverProcess.kill();
+        });
+
+    } catch (error) {
+        console.error('Error starting solver:', error);
+        const errorData = {
+            type: 'error',
+            success: false,
+            error: error.message
+        };
+        res.write(`data: ${JSON.stringify(errorData)}\n\n`);
+        res.end();
     }
 });
 
