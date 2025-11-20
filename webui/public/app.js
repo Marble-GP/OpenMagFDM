@@ -1111,6 +1111,29 @@ async function runSolver() {
     progressText.textContent = 'Initializing...';
     progressPercent.textContent = '0%';
 
+    // Performance optimization: Buffer output updates
+    let outputBuffer = [];
+    let lastUpdateTime = 0;
+    const UPDATE_INTERVAL = 100; // Update DOM every 100ms
+    const MAX_LOG_LINES = 1000; // Keep only last 1000 lines
+
+    function flushOutputBuffer() {
+        if (outputBuffer.length === 0) return;
+
+        const lines = outputDiv.textContent.split('\n');
+        const newLines = lines.concat(outputBuffer);
+
+        // Keep only last MAX_LOG_LINES
+        if (newLines.length > MAX_LOG_LINES) {
+            const excess = newLines.length - MAX_LOG_LINES;
+            newLines.splice(0, excess);
+        }
+
+        outputDiv.textContent = newLines.join('\n');
+        outputBuffer = [];
+        outputDiv.scrollTop = outputDiv.scrollHeight;
+    }
+
     try {
         // Check if image is uploaded
         if (!AppState.uploadedImageFilename) {
@@ -1157,13 +1180,19 @@ async function runSolver() {
                 if (line.startsWith('data: ')) {
                     const data = JSON.parse(line.substring(6));
 
-                    // Update output log
+                    // Buffer output log (performance optimization)
                     if (data.message) {
-                        outputDiv.textContent += data.message + '\n';
-                        outputDiv.scrollTop = outputDiv.scrollHeight;
+                        outputBuffer.push(data.message);
+
+                        // Throttle DOM updates - flush every UPDATE_INTERVAL ms
+                        const now = Date.now();
+                        if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+                            flushOutputBuffer();
+                            lastUpdateTime = now;
+                        }
                     }
 
-                    // Update progress bar
+                    // Update progress bar (lightweight DOM updates)
                     if (data.type === 'progress') {
                         const percentage = data.percentage || 0;
                         progressBar.style.width = percentage + '%';
@@ -1176,6 +1205,9 @@ async function runSolver() {
                         progressPercent.textContent = '100%';
                         progressText.textContent = 'Completed successfully';
                     } else if (data.type === 'done') {
+                        // Flush remaining buffer
+                        flushOutputBuffer();
+
                         if (data.success) {
                             showStatus('solverStatus', 'Solver completed successfully', 'success');
                             // Load results and update dashboard
@@ -1186,18 +1218,25 @@ async function runSolver() {
                     } else if (data.type === 'error') {
                         // Don't throw - stderr messages (including WARNINGs) are just logged
                         // Actual errors are determined by the exit code in 'done' event
-                        // Message is already logged to outputDiv above
+                        // Message is already buffered above
                     }
                 }
             }
         }
 
     } catch (error) {
+        // Flush buffer before showing error
+        flushOutputBuffer();
+
         showStatus('solverStatus', `Solver error: ${error.message}`, 'error');
-        outputDiv.textContent += `\nError: ${error.message}`;
+        outputBuffer.push(`\nError: ${error.message}`);
+        flushOutputBuffer();
         progressBar.style.background = 'linear-gradient(90deg, #dc3545 0%, #c82333 100%)';
         progressText.textContent = 'Error occurred';
     } finally {
+        // Ensure all buffered messages are displayed
+        flushOutputBuffer();
+
         btn.disabled = false;
         btn.textContent = 'Run Solver';
 

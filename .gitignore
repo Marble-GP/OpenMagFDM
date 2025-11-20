@@ -38,6 +38,7 @@ Thumbs.db
 .backup
 .claude
 .script
+.bak
 
 # qtcreator generated files
 *.pro.user*

@@ -13,7 +13,8 @@ polar_domain:
   r_start: 0.2  # 内半径 [m] (0 < r_start < r_end)
   r_end: 0.3    # 外半径 [m]
   r_orientation: horizontal  # r方向: horizontal (列方向) or vertical (行方向)
-  theta_range: 0.52359877559  # θ方向の範囲 [rad] (2*pi for full periodic domain)
+  theta_range: pi/6  # θ方向の範囲 [rad] (2*pi for full periodic domain)
+  # 数式対応: pi/2, pi/3, 2*pi/3, 3*pi/4, pi*3/4, 3/4*pi など任意の M*pi/N 形式が使用可能
   # θ方向は r_orientation と垂直な方向で 0 ~ theta_range
 
 # 極座標境界条件

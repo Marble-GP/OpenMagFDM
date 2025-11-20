@@ -140,7 +140,34 @@ void exportConditionsJSON(const std::string& output_path,
         int ntheta = image.rows;
         double dr = (r_end - r_start) / (nr - 1);
 
-        double theta_range = polar_section["theta_range"].as<double>();
+        // Parse theta_range (supports tinyexpr formula like "pi/2", "pi/3", or numeric values)
+        double theta_range;
+        if (polar_section["theta_range"]) {
+            std::string theta_str;
+            try {
+                // Try to read as string first (for formulas like "pi/2", "2*pi/12")
+                theta_str = polar_section["theta_range"].as<std::string>();
+            } catch (...) {
+                // If that fails, try to read as double and convert to string
+                try {
+                    double val = polar_section["theta_range"].as<double>();
+                    theta_str = std::to_string(val);
+                } catch (...) {
+                    std::cerr << "Warning: Failed to read theta_range, using default 2*pi" << std::endl;
+                    theta_str = "2*pi";
+                }
+            }
+            te_parser parser;
+            theta_range = parser.evaluate(theta_str);
+            if (std::isnan(theta_range)) {
+                std::cerr << "Warning: Failed to parse theta_range '" << theta_str
+                          << "', using default 2*pi" << std::endl;
+                theta_range = 2.0 * M_PI;
+            }
+        } else {
+            theta_range = 2.0 * M_PI;
+        }
+
         // CRITICAL FIX: Periodic boundary condition requires dtheta = theta_range / ntheta
         // NOT theta_range / (ntheta-1) which is for non-periodic grids
         double dtheta = theta_range / static_cast<double>(ntheta);
