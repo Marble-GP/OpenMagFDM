@@ -119,9 +119,10 @@
       "children": ["enabled", "enable_sliding", "total_steps", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"]
     },
     "enabled": {
-      "description": "Enable transient analysis (true/false)",
+      "description": "Enable feature (true/false)",
       "type": "boolean",
-      "example": "enabled: true"
+      "example": "enabled: true",
+      "validParents": ["transient", "nonlinear_solver"]
     },
     "enable_sliding": {
       "description": "Enable image sliding for rotor motion simulation (true/false)",
@@ -152,6 +153,94 @@
       "description": "Movement per step [pixels] (circular shift amount)",
       "type": "integer",
       "example": "slide_pixels_per_step: 1"
+    },
+    "nonlinear_solver": {
+      "description": "Nonlinear solver configuration for materials with field-dependent permeability μ(H)",
+      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson_depth", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence"]
+    },
+    "solver_type": {
+      "description": "Nonlinear solver algorithm: 'picard' (basic), 'anderson' (accelerated), 'newton-krylov' (recommended for fast convergence)",
+      "values": ["picard", "anderson", "newton-krylov"],
+      "example": "solver_type: newton-krylov",
+      "validParents": ["nonlinear_solver"]
+    },
+    "max_iterations": {
+      "description": "Maximum number of nonlinear iterations",
+      "type": "integer",
+      "example": "max_iterations: 50",
+      "validParents": ["nonlinear_solver"]
+    },
+    "tolerance": {
+      "description": "Convergence tolerance (relative residual norm)",
+      "type": "number",
+      "example": "tolerance: 1.0e-5",
+      "validParents": ["nonlinear_solver"]
+    },
+    "relaxation": {
+      "description": "Relaxation factor for Picard/Anderson methods (0.5 ~ 0.8, lower = more stable)",
+      "type": "number",
+      "example": "relaxation: 0.7",
+      "validParents": ["nonlinear_solver"]
+    },
+    "anderson_depth": {
+      "description": "Anderson acceleration depth (0 = disabled, typically 5-10)",
+      "type": "integer",
+      "example": "anderson_depth: 5",
+      "validParents": ["nonlinear_solver"]
+    },
+    "gmres_restart": {
+      "description": "GMRES restart parameter for Krylov subspace (Newton-Krylov only, typically 30)",
+      "type": "integer",
+      "example": "gmres_restart: 30",
+      "validParents": ["nonlinear_solver"]
+    },
+    "line_search_c": {
+      "description": "Armijo parameter for sufficient decrease condition (Newton-Krylov only, typically 1e-4)",
+      "type": "number",
+      "example": "line_search_c: 1.0e-4",
+      "validParents": ["nonlinear_solver"]
+    },
+    "line_search_alpha_init": {
+      "description": "Initial step length (Newton-Krylov only, 1.0 = full Newton step)",
+      "type": "number",
+      "example": "line_search_alpha_init: 1.0",
+      "validParents": ["nonlinear_solver"]
+    },
+    "line_search_alpha_min": {
+      "description": "Minimum step length safety bound (Newton-Krylov only)",
+      "type": "number",
+      "example": "line_search_alpha_min: 1.0e-4",
+      "validParents": ["nonlinear_solver"]
+    },
+    "line_search_rho": {
+      "description": "Backtracking factor (Newton-Krylov only, 0 < rho < 1, default 0.5, higher = more aggressive)",
+      "type": "number",
+      "example": "line_search_rho: 0.5",
+      "validParents": ["nonlinear_solver"]
+    },
+    "line_search_max_trials": {
+      "description": "Maximum number of backtracking trials (Newton-Krylov only)",
+      "type": "integer",
+      "example": "line_search_max_trials: 100",
+      "validParents": ["nonlinear_solver"]
+    },
+    "line_search_adaptive": {
+      "description": "Enable adaptive initial step length (Newton-Krylov only, recommended for better convergence)",
+      "type": "boolean",
+      "example": "line_search_adaptive: true",
+      "validParents": ["nonlinear_solver"]
+    },
+    "verbose": {
+      "description": "Print detailed solver iteration information (true/false)",
+      "type": "boolean",
+      "example": "verbose: false",
+      "validParents": ["nonlinear_solver"]
+    },
+    "export_convergence": {
+      "description": "Export convergence history to CSV file (true/false)",
+      "type": "boolean",
+      "example": "export_convergence: true",
+      "validParents": ["nonlinear_solver"]
     }
   },
   "snippets": {
@@ -179,6 +268,21 @@
       "name": "Transient Analysis Template",
       "trigger": "transient",
       "snippet": "enabled: true\nenable_sliding: true\ntotal_steps: 1\nslide_direction: vertical\nslide_region_start: 0\nslide_region_end: 1\nslide_pixels_per_step: 1"
+    },
+    "nonlinear_picard": {
+      "name": "Nonlinear Solver - Picard Method",
+      "trigger": "nonlinear_solver",
+      "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 50\ntolerance: 1.0e-5\nrelaxation: 0.7\nverbose: false\nexport_convergence: true"
+    },
+    "nonlinear_anderson": {
+      "name": "Nonlinear Solver - Anderson Acceleration",
+      "trigger": "nonlinear_solver",
+      "snippet": "enabled: true\nsolver_type: anderson\nmax_iterations: 50\ntolerance: 1.0e-5\nrelaxation: 0.7\nanderson_depth: 5\nverbose: false\nexport_convergence: true"
+    },
+    "nonlinear_newton_krylov": {
+      "name": "Nonlinear Solver - Newton-Krylov (Recommended)",
+      "trigger": "nonlinear_solver",
+      "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 50\ntolerance: 1.0e-5\ngmres_restart: 30\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
     }
   },
   "templates": {
