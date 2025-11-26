@@ -81,9 +81,15 @@ CMakeLists.txt.user*
 build/
 CMakeCache.txt
 CMakeFiles/
+compile_commands.json
 
-# Output directories
+# Executables
+MagFDMsolver
+
+# Output directories and generated files
 output_*/
+*_convergence.csv
+*.log
 
 # prototype scripts
 scripts/

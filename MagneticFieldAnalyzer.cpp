@@ -13,6 +13,39 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
     loadConfig(config_path);
     loadImage(image_path);
 
+    // Initialize flags BEFORE setup methods
+    // Transient analysis optimization flags
+    transient_solver_initialized = false;
+    transient_matrix_nnz = 0;
+    boundary_cache_valid = false;
+    use_iterative_solver = false;
+
+    // Magnetic field step tracking
+    current_field_step = -1;  // Not calculated yet
+
+    // Nonlinear solver flags (MUST be initialized before setupMaterialProperties)
+    has_nonlinear_materials = false;
+    nonlinear_config = NonlinearSolverConfig();  // Default config
+
+    // Load nonlinear solver configuration from YAML (if present)
+    if (config["nonlinear_solver"]) {
+        auto nl_config = config["nonlinear_solver"];
+        if (nl_config["solver_type"]) nonlinear_config.solver_type = nl_config["solver_type"].as<std::string>();
+        if (nl_config["max_iterations"]) nonlinear_config.max_iterations = nl_config["max_iterations"].as<int>();
+        if (nl_config["tolerance"]) nonlinear_config.tolerance = nl_config["tolerance"].as<double>();
+        if (nl_config["relaxation"]) nonlinear_config.relaxation = nl_config["relaxation"].as<double>();
+        if (nl_config["anderson_depth"]) nonlinear_config.anderson_depth = nl_config["anderson_depth"].as<int>();
+        if (nl_config["gmres_restart"]) nonlinear_config.gmres_restart = nl_config["gmres_restart"].as<int>();
+        if (nl_config["line_search_c"]) nonlinear_config.line_search_c = nl_config["line_search_c"].as<double>();
+        if (nl_config["line_search_alpha_init"]) nonlinear_config.line_search_alpha_init = nl_config["line_search_alpha_init"].as<double>();
+        if (nl_config["line_search_alpha_min"]) nonlinear_config.line_search_alpha_min = nl_config["line_search_alpha_min"].as<double>();
+        if (nl_config["line_search_rho"]) nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>();
+        if (nl_config["line_search_max_trials"]) nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>();
+        if (nl_config["line_search_adaptive"]) nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>();
+        if (nl_config["verbose"]) nonlinear_config.verbose = nl_config["verbose"].as<bool>();
+        if (nl_config["export_convergence"]) nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>();
+    }
+
     // Determine coordinate system
     coordinate_system = config["coordinate_system"].as<std::string>("cartesian");
     std::cout << "Coordinate system: " << coordinate_system << std::endl;
@@ -23,17 +56,8 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         setupCartesianSystem();
     }
 
-    setupMaterialProperties();
+    setupMaterialProperties();  // This may set has_nonlinear_materials = true
     validateBoundaryConditions();
-
-    // Initialize transient analysis optimization flags
-    transient_solver_initialized = false;
-    transient_matrix_nnz = 0;
-    boundary_cache_valid = false;
-    use_iterative_solver = false;
-
-    // Initialize magnetic field step tracking
-    current_field_step = -1;  // Not calculated yet
 }
 
 void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
@@ -232,7 +256,27 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
-        double mu_r = props["mu_r"].as<double>(1.0);
+
+        // Parse mu_r value (static, formula, or table) - NEW: Nonlinear support
+        MuValue mu_value = parseMuValue(props["mu_r"]);
+        material_mu[name] = mu_value;
+
+        // Check if this material is nonlinear
+        if (mu_value.type != MuType::STATIC) {
+            has_nonlinear_materials = true;
+            std::cout << "Nonlinear material detected: " << name << std::endl;
+
+            // Validate table if present
+            if (mu_value.type == MuType::TABLE) {
+                validateMuTable(mu_value.H_table, mu_value.mu_table, name);
+            }
+
+            // Generate B-H table for nonlinear materials
+            generateBHTable(name, mu_value);
+        }
+
+        // Evaluate mu_r for initial state (H=0)
+        double mu_r = evaluateMu(mu_value, 0.0);
 
         // Parse Jz value (static, formula, or array)
         JzValue jz_value = parseJzValue(props["jz"]);
@@ -456,10 +500,27 @@ double MagneticFieldAnalyzer::getMuAtInterfaceSym(int i, int j, const std::strin
 }
 
 void MagneticFieldAnalyzer::solve() {
-    if (coordinate_system == "polar") {
-        buildAndSolveSystemPolar();
+    // Check if nonlinear solver is needed
+    if (has_nonlinear_materials) {
+        std::cout << "\n=== Nonlinear materials detected ===" << std::endl;
+        std::cout << "Using nonlinear solver: " << nonlinear_config.solver_type << std::endl;
+
+        // Choose solver based on configuration
+        if (nonlinear_config.solver_type == "newton-krylov") {
+            solveNonlinearNewtonKrylov();
+        } else if (nonlinear_config.solver_type == "anderson") {
+            solveNonlinearWithAnderson();
+        } else {
+            // Default: Picard iteration
+            solveNonlinear();
+        }
     } else {
-        buildAndSolveSystem();
+        // Standard linear solver
+        if (coordinate_system == "polar") {
+            buildAndSolveSystemPolar();
+        } else {
+            buildAndSolveSystem();
+        }
     }
 }
 

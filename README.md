@@ -1,7 +1,7 @@
-# OpemMagFDM
+# OpenMagFDM
 
 OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対して磁界計算を行うツール群です。
-コアは C++ で書かれた数値ソルバー(MagFDMsolver)と、結果の可視化や操作を行う Node.js ベースの WebUI から構成されています。  
+コアは C++ で書かれた数値ソルバー(MagFDMsolver)と、結果の可視化や操作を行う Node.js ベースの WebUI から構成されています。
 
 ## 概要
 本プロジェクトは上記の二つの主要コンポーネント（C++ ソルバーと WebUI）で構成されています。
@@ -11,10 +11,9 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 - 同梱ライブラリ: `tinyexpr`、`amgcl`（ソースをリポジトリ内に含む）
 - Web UI: Node.js サーバを起動してブラウザから `http://localhost:3000/integrated.html` にアクセス
 
-
-
 ## 特徴
 - 画像からメッシュを生成して有限差分（FDM）法で磁界解析を行う
+- **非線形透磁率材料対応**（Newton-Krylov法による高速収束）
 - 高速な反復ソルバーに `amgcl` を利用
 - 軽量数式評価に `tinyexpr` を利用
 - WebUI によるインタラクティブな結果確認（ローカルホストで起動）
@@ -62,6 +61,29 @@ node server.js # または package.json に start スクリプトがあれば np
 ## 設定ファイル
 - サンプル設定ファイル: `sample_config.yaml`
 	- 実行時のメッシュ・境界条件・解析設定などを記述します。
+- 非線形材料テスト: `test_nonlinear.yaml`
+	- 非線形透磁率材料の設定例とNewton-Krylov法のパラメータ設定
+
+## 非線形材料対応
+OpenMagFDM は、磁界強度依存の非線形透磁率 μ(H) をサポートしています。
+
+### 定義方法
+```yaml
+materials:
+  core_nonlinear:
+    mu_r: 1 + 4999 * exp(-$H*$H / 2 / 1e8)  # 数式で定義
+    # または
+    # mu_r: [[H値列], [μ_r値列]]  # テーブルで定義
+```
+
+### ソルバー
+- **Picard法**: 固定点反復（基本手法）
+- **Anderson加速**: Picard法の高速化
+- **Newton-Krylov法**: Quasi-Newton + Backtracking line search（推奨）
+  - 適応的ステップ長調整で安定収束
+  - YAMLで詳細なパラメータ調整が可能
+
+詳細は `nonlinear_material_spec.yaml` を参照してください。
 
 ## 同梱ライブラリ
 - `amgcl/` — 高性能な多重格子前処理器（ソースを同梱）
@@ -81,16 +103,19 @@ node server.js # または package.json に start スクリプトがあれば np
 ## 貢献・バグ報告
 - バグや機能要望は Issue を立ててください。
 
-#### 既知の不具合など（2025-11-3）
-- [] Jzマップ表示
-- [] 磁気マクスウェル応力の評価
+#### 実装済み機能（2024-11-26更新）
+- ✅ 非線形透磁率材料の計算対応（Newton-Krylov法）
+- ✅ 磁気マクスウェル応力の評価
+
+#### 既知の不具合など
+- [ ] Jzマップ表示の改善
 
 #### 将来検討中の機能
-- [] 非線形透磁率材料の計算対応
-- [] 非空気界面上のマクスウェル応力線積分の除外
-- [] 表示UIの改良（integrated.htmlとdashboard.html, 計算のプログレスバー）
-- [] YAML-Lint、キーワード補完
-- [] 入力画像の設計支援ツールの統合
+- [ ] 真のJacobian-free GMRES（Arnoldi iteration）実装
+- [ ] 非空気界面上のマクスウェル応力線積分の除外
+- [ ] 表示UIの改良（integrated.htmlとdashboard.html, 計算のプログレスバー）
+- [ ] YAML-Lint、キーワード補完
+- [ ] 入力画像の設計支援ツールの統合
 
 
 ## 連絡先

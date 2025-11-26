@@ -125,6 +125,51 @@ public:
         double mu;                   // Permeability at this point
     };
 
+    // Nonlinear permeability representation (public for Newton-Krylov access)
+    enum class MuType {
+        STATIC,   // Constant mu_r value (linear material)
+        FORMULA,  // Mathematical expression with $H variable (|H| in A/m)
+        TABLE     // Table [H_values, mu_r_values] with linear interpolation
+    };
+
+    struct MuValue {
+        MuType type;
+        double static_value;           // For STATIC type (mu_r)
+        std::string formula;           // For FORMULA type (mu_r as function of $H)
+        std::vector<double> H_table;   // For TABLE type: |H| values [A/m] (must be monotonically increasing)
+        std::vector<double> mu_table;  // For TABLE type: mu_r values (recommended monotonically decreasing)
+
+        MuValue() : type(MuType::STATIC), static_value(1.0) {}
+    };
+
+    // B-H relationship tables (generated from mu_r(H))
+    struct BHTable {
+        std::vector<double> H_values;   // |H| [A/m]
+        std::vector<double> B_values;   // |B| [T]
+        std::vector<double> mu_values;  // μ [H/m] = μ_r * μ_0
+
+        // Cached for fast interpolation
+        bool is_valid;
+
+        BHTable() : is_valid(false) {}
+    };
+
+    /**
+     * @brief Evaluate relative permeability μ_r at given |H| magnitude
+     * @param mu_val Nonlinear permeability specification
+     * @param H_magnitude Magnetic field intensity |H| [A/m]
+     * @return Relative permeability μ_r (dimensionless)
+     */
+    double evaluateMu(const MuValue& mu_val, double H_magnitude);
+
+    /**
+     * @brief Evaluate derivative dμ_r/dH at given |H| magnitude
+     * @param mu_val Nonlinear permeability specification
+     * @param H_magnitude Magnetic field intensity |H| [A/m]
+     * @return Derivative dμ_r/dH [m/A] (needed for Newton-Krylov Jacobian)
+     */
+    double evaluateMuDerivative(const MuValue& mu_val, double H_magnitude);
+
 private:
     // Dynamic current density representation
     enum class JzType {
@@ -140,6 +185,32 @@ private:
         std::vector<double> array;     // For ARRAY type
 
         JzValue() : type(JzType::STATIC), static_value(0.0) {}
+    };
+
+    // Nonlinear solver configuration
+    struct NonlinearSolverConfig {
+        bool enabled;               // Enable nonlinear solver (auto-detect if any nonlinear material)
+        std::string solver_type;    // Solver type: "picard", "anderson", "newton-krylov"
+        int max_iterations;         // Maximum nonlinear iterations
+        double tolerance;           // Convergence tolerance (relative)
+        double relaxation;          // Relaxation factor (0.5 ~ 0.8) - for Picard/Anderson
+        int anderson_depth;         // Anderson acceleration depth (0 = disabled) - for Anderson
+        int gmres_restart;          // GMRES restart parameter (default: 30) - for Newton-Krylov
+        double line_search_c;       // Line search Armijo parameter (default: 1e-4) - for Newton-Krylov
+        double line_search_alpha_init;    // Initial step length (default: 1.0) - for Newton-Krylov
+        double line_search_alpha_min;     // Minimum step length (default: 1e-4) - for Newton-Krylov
+        double line_search_rho;           // Backtracking factor (default: 0.5) - for Newton-Krylov
+        int line_search_max_trials;       // Maximum line search trials (default: 10) - for Newton-Krylov
+        bool line_search_adaptive;        // Use adaptive initial step length (default: true) - for Newton-Krylov
+        bool verbose;               // Print iteration details
+        bool export_convergence;    // Export convergence history
+
+        NonlinearSolverConfig() :
+            enabled(false), solver_type("picard"), max_iterations(50), tolerance(1e-5),
+            relaxation(0.7), anderson_depth(5), gmres_restart(30), line_search_c(1e-4),
+            line_search_alpha_init(1.0), line_search_alpha_min(1e-4), line_search_rho(0.5),
+            line_search_max_trials(10), line_search_adaptive(true),
+            verbose(true), export_convergence(false) {}
     };
 
     // Maxwell stress and force calculation
@@ -228,9 +299,16 @@ private:
     TransientConfig transient_config;
 
     // Material properties
-    Eigen::MatrixXd mu_map;   // Permeability distribution
+    Eigen::MatrixXd mu_map;   // Permeability distribution (updated during nonlinear iteration)
     Eigen::MatrixXd jz_map;   // Current density distribution
     std::map<std::string, JzValue> material_jz;  // Dynamic Jz values per material
+    std::map<std::string, MuValue> material_mu;  // Nonlinear permeability values per material
+    std::map<std::string, BHTable> material_bh_tables;  // B-H tables per nonlinear material
+
+    // Nonlinear solver
+    NonlinearSolverConfig nonlinear_config;
+    bool has_nonlinear_materials;  // Flag to enable nonlinear solver
+    Eigen::MatrixXd H_map;  // Magnetic field intensity |H| [A/m] (for nonlinear iteration)
 
     // Solution
     Eigen::MatrixXd Az;       // Vector potential (z-component)
@@ -261,6 +339,20 @@ private:
     // Dynamic Jz evaluation
     JzValue parseJzValue(const YAML::Node& jz_node);
     double evaluateJz(const JzValue& jz_val, int step);
+
+    // Nonlinear permeability methods
+    MuValue parseMuValue(const YAML::Node& mu_node);
+    // Note: evaluateMu() and evaluateMuDerivative() are now public (needed for Newton-Krylov)
+    void generateBHTable(const std::string& material_name, const MuValue& mu_val);
+    void validateMuTable(const std::vector<double>& H_vals, const std::vector<double>& mu_vals, const std::string& material_name);
+    double interpolateH_from_B(const BHTable& table, double B_magnitude);
+    void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
+    void updateMuDistribution();  // Update mu_map based on current H_map
+
+    // Nonlinear solver methods
+    void solveNonlinear();  // Main nonlinear Picard iteration solver
+    void solveNonlinearWithAnderson();  // Picard with Anderson acceleration
+    void solveNonlinearNewtonKrylov();  // Newton-Krylov (Jacobian-free GMRES)
 
     // Unified mu accessors (coordinate-system aware)
     double muAtGrid(int i, int j) const;  // i=col, j=row

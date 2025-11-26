@@ -8,6 +8,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_executable(MagFDMsolver
     MagFDMsolver.cpp
     MagneticFieldAnalyzer.cpp
+    MagneticFieldAnalyzer_nonlinear.cpp
+    MagneticFieldAnalyzer_nonlinear_newton.cpp
     MagneticFieldAnalyzer.h
     tinyexpr/tinyexpr.cpp
     tinyexpr/tinyexpr.h
