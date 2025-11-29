@@ -882,7 +882,7 @@ app.get('/api/user-outputs', async (req, res) => {
 
         // Sanitize userId to prevent directory traversal
         const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const userOutputDir = path.join(OUTPUTS_DIR, `${safeUserId}`);
+        const userOutputDir = path.join(OUTPUTS_DIR, `user_${safeUserId}`);
 
         // Check if user output directory exists
         try {

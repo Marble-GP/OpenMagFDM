@@ -19,7 +19,14 @@ const AppState = {
     isAnimating: false,  // Animation state flag
     analysisConditions: null,  // Analysis conditions from conditions.json
     dataCache: {},  // Data cache for preloaded steps: { 'resultPath:Az:step': data, ... }
-    maxCacheEntries: 500  // Maximum cache entries to prevent memory leak (500 * ~2MB = ~1GB max)
+    maxCacheEntries: 500,  // Maximum cache entries to prevent memory leak (500 * ~2MB = ~1GB max)
+    // Polar coordinate transform options
+    isPolarCoordinates: false,  // True if current result uses polar coordinates
+    polarCartesianTransform: false,  // Apply cartesian transform (arc/donut view)
+    polarFullModel: false,  // Expand to full model
+    polarFullModelMultiplier: 1,  // Multiplier for full model (N in 2π/N)
+    // Plot zoom state preservation
+    plotZoomStates: {}  // { containerId: { xaxis: { range: [min, max] }, yaxis: { range: [min, max] } } }
 };
 
 // ===== Utility Functions =====
@@ -778,8 +785,12 @@ async function refreshResultsList() {
         if (result.results.map(r => r.path).includes(currentValue)) {
             select.value = currentValue;
         }
+
+        // Return the results for use in loadResults()
+        return result.results;
     } catch (error) {
         console.error('Error loading results list:', error);
+        return [];
     }
 }
 
@@ -824,6 +835,9 @@ async function loadSelectedResult() {
             console.warn('Failed to load conditions.json:', error);
             AppState.analysisConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
         }
+
+        // Update polar coordinate controls
+        updatePolarControls();
 
         // Update dashboard controls
         const stepSlider = document.getElementById('stepSlider');
@@ -1078,7 +1092,7 @@ async function loadQuickPreviewFromResult(resultPath) {
                 console.log('B magnitude sample values:', B[0]?.slice(0, 3));
 
                 // Plot |B| and |H|
-                plotHeatmap('previewPlot2', B, '|B| [T/m]', true);
+                plotHeatmap('previewPlot2', B, '|B| [T]', true);
                 plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
             } else {
                 console.error('Az/Mu data loading failed:', { azSuccess: azData.success, muSuccess: muData.success });
@@ -1305,20 +1319,16 @@ async function stopSolver() {
 async function loadResults() {
     try {
         // Refresh results list to get the latest results
-        await refreshResultsList();
+        const results = await refreshResultsList();
 
-        // Get the results list
-        const response = await fetch('/api/results');
-        if (!response.ok) throw new Error('Failed to load results');
-
-        const result = await response.json();
-        if (result.results.length === 0) {
+        // Check if we have any results
+        if (results.length === 0) {
             showStatus('solverStatus', 'No results found', 'error');
             return;
         }
 
         // Select the newest result (first in the list)
-        const newestResult = result.results[0];
+        const newestResult = results[0];
         const select = document.getElementById('resultSelect');
         select.value = newestResult.path;
 
@@ -1369,6 +1379,27 @@ function initializeDashboard() {
     }, '#dashboard-grid');
 
     AppState.gridStack = grid;
+
+    // Setup resize event handler for Plotly plots
+    grid.on('resizestop', (_event, element) => {
+        // Find the plot container inside the resized widget
+        const plotContainer = element.querySelector('.plot-container');
+        if (plotContainer && plotContainer._fullLayout) {
+            // Get new container size
+            const newSize = getContainerSize(plotContainer);
+
+            // Update Plotly layout with new dimensions
+            try {
+                Plotly.relayout(plotContainer, {
+                    width: newSize.width,
+                    height: newSize.height
+                });
+                console.log(`Resized plot ${plotContainer.id} to ${newSize.width}x${newSize.height}`);
+            } catch (error) {
+                console.error('Error resizing plot:', error);
+            }
+        }
+    });
 
     // Setup palette drag and drop
     setupPaletteDragDrop();
@@ -1573,9 +1604,12 @@ function toggleInteractionMode(plotId, containerId, button) {
     });
 
     // Update GridStack tile movability
-    const widgetEl = document.getElementById(plotId);
+    // Find the grid-stack-item element that contains this plot
+    const containerEl = document.getElementById(containerId);
+    const widgetEl = containerEl ? containerEl.closest('.grid-stack-item') : null;
     if (widgetEl && AppState.gridStack) {
         AppState.gridStack.movable(widgetEl, tileMovable);
+        console.log(`Tile movability for ${plotId}: ${tileMovable}`);
     }
 }
 
@@ -1852,20 +1886,23 @@ async function loadCsvData(dataType, step) {
 // Placeholder implementations - these will call actual data loading and plotting
 async function renderAzContour(containerId, step) {
     const data = await loadCsvData('Az', step);
+    // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotContour(containerId, data, 'Az [Wb/m]', true);
+    plotContour(containerId, flipped, 'Az [Wb/m]', true);
 }
 
 async function renderAzHeatmap(containerId, step) {
     const data = await loadCsvData('Az', step);
+    // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, data, 'Az [Wb/m]', true);
+    plotHeatmap(containerId, flipped, 'Az [Wb/m]', true);
 }
 
 async function renderJzDistribution(containerId, step) {
     const data = await loadCsvData('Jz', step);
+    // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, data, 'Jz [A/m²]', true);
+    plotHeatmap(containerId, flipped, 'Jz [A/m²]', true);
 }
 
 async function renderBMagnitude(containerId, step) {
@@ -1881,9 +1918,9 @@ async function renderBMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    const { B } = calculateMagneticField(azData, muData, dx, dy);
+    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
 
-    plotHeatmap(containerId, B, '|B| [T/m]', true);
+    plotHeatmap(containerId, B, '|B| [T]', true);
 }
 
 async function renderHMagnitude(containerId, step) {
@@ -1895,8 +1932,9 @@ async function renderHMagnitude(containerId, step) {
         // For nonlinear materials: load H directly from solver output (H.csv)
         try {
             const hData = await loadCsvData('H', step);
+            // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
             const hFlipped = flipVertical(hData);
-            plotHeatmap(containerId, hData, '|H| [A/m] (solver)', true);
+            plotHeatmap(containerId, hFlipped, '|H| [A/m] (solver)', true);
             return;
         } catch (error) {
             console.warn('H.csv not found, falling back to calculation from Az and Mu:', error);
@@ -1915,21 +1953,23 @@ async function renderHMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    const { H } = calculateMagneticField(azData, muData, dx, dy);
+    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
 
     plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true);
 }
 
 async function renderMuDistribution(containerId, step) {
     const data = await loadCsvData('Mu', step);
+    // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, data, 'μ [H/m]', true);
+    plotHeatmap(containerId, flipped, 'μ [H/m]', true);
 }
 
 async function renderEnergyDensity(containerId, step) {
     const data = await loadCsvData('EnergyDensity', step);
+    // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, data, 'Energy [J/m³]', true);
+    plotHeatmap(containerId, flipped, 'Energy [J/m³]', true);
 }
 
 // Helper: Convert black pixels in image to transparent
@@ -1978,6 +2018,379 @@ async function makeBlackTransparent(url, threshold = 30) {
     });
 }
 
+/**
+ * Calculate appropriate number of contour lines based on image size
+ * @param {number} width - Image width
+ * @param {number} height - Image height
+ * @returns {number} - Number of contour lines
+ */
+function calculateContourLineCount(width, height) {
+    // Target: approximately one line per 20-30 pixels (diagonal)
+    const diagonal = Math.sqrt(width * width + height * height);
+    const lineCount = Math.floor(diagonal / 25);
+    // Clamp between 10 and 40 lines
+    return Math.max(10, Math.min(40, lineCount));
+}
+
+/**
+ * Draw contour lines to canvas from 2D data
+ * @param {Array<Array<number>>} data - 2D array of values (analysis coordinate: y-up)
+ * @param {number} numLines - Number of contour lines (if not provided, auto-calculate)
+ * @returns {HTMLCanvasElement} - Canvas with contour lines (image coordinate: y-down, black background, white lines)
+ */
+function drawContourToCanvas(data, numLines = null) {
+    const rows = data.length;
+    const cols = data[0].length;
+
+    // Auto-calculate number of contour lines if not specified
+    if (numLines === null) {
+        numLines = calculateContourLineCount(cols, rows);
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = cols;
+    canvas.height = rows;
+    const ctx = canvas.getContext('2d');
+
+    // Fill black background (will be converted to transparent later)
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, cols, rows);
+
+    // Find min/max for contour levels
+    let minVal = Infinity, maxVal = -Infinity;
+    for (let i = 0; i < rows; i++) {
+        for (let j = 0; j < cols; j++) {
+            const val = data[i][j];
+            if (val < minVal) minVal = val;
+            if (val > maxVal) maxVal = val;
+        }
+    }
+
+    // Draw contour lines with WHITE color (black background will become transparent)
+    ctx.fillStyle = 'white';
+
+    console.log(`Drawing ${numLines} contour lines for ${cols}x${rows} image`);
+
+    for (let k = 0; k < numLines; k++) {
+        const level = minVal + (maxVal - minVal) * k / (numLines - 1);
+
+        // Simple threshold-based contour (approximate)
+        // Note: data is in analysis coordinate (y-up), but canvas is image coordinate (y-down)
+        for (let i = 0; i < rows - 1; i++) {
+            for (let j = 0; j < cols - 1; j++) {
+                const v00 = data[i][j];
+                const v10 = data[i][j + 1];
+                const v01 = data[i + 1][j];
+                const v11 = data[i + 1][j + 1];
+
+                // Check if contour passes through this cell
+                const minV = Math.min(v00, v10, v01, v11);
+                const maxV = Math.max(v00, v10, v01, v11);
+
+                if (level >= minV && level <= maxV) {
+                    // Draw white line segment
+                    ctx.fillRect(j, i, 1, 1);
+                }
+            }
+        }
+    }
+
+    return canvas;
+}
+
+/**
+ * Transform polar coordinate image to cartesian
+ * @param {HTMLCanvasElement} polarCanvas - Canvas with polar image (image coordinate: y-down)
+ * @param {object} conditions - Analysis conditions
+ * @param {boolean} fullModel - If true, expand to full model
+ * @param {boolean} preserveColors - If true, preserve original colors (for boundary images); if false, convert black to transparent (for contour lines)
+ * @returns {HTMLCanvasElement} - Canvas with cartesian image (image coordinate: y-down, black→transparent)
+ */
+function transformPolarImageToCartesian(polarCanvas, conditions, fullModel = false, preserveColors = false) {
+    const r_i = conditions.polar?.r_start || conditions.r_i || 0;
+    const r_o = conditions.polar?.r_end || conditions.r_o || 1;
+    const thetaRange = conditions.polar?.theta_range || conditions.theta_range || 0;
+
+    const polarWidth = polarCanvas.width;
+    const polarHeight = polarCanvas.height;
+
+    // Determine repetitions for full model
+    const N = fullModel ? AppState.polarFullModelMultiplier : 1;
+
+    // Create output canvas
+    const resolution = Math.max(polarWidth, polarHeight) * 2;
+    const outputCanvas = document.createElement('canvas');
+    outputCanvas.width = resolution;
+    outputCanvas.height = resolution;
+    const ctx = outputCanvas.getContext('2d');
+
+    // Fill black background (will be converted to transparent)
+    ctx.fillStyle = 'black';
+    ctx.fillRect(0, 0, resolution, resolution);
+
+    // Get polar image data
+    const polarCtx = polarCanvas.getContext('2d');
+    const polarImageData = polarCtx.getImageData(0, 0, polarWidth, polarHeight);
+    const polarPixels = polarImageData.data;
+
+    // Create output image data
+    const outputImageData = ctx.createImageData(resolution, resolution);
+    const outputPixels = outputImageData.data;
+
+    // Initialize with black (transparent background)
+    for (let i = 0; i < outputPixels.length; i += 4) {
+        outputPixels[i] = 0;
+        outputPixels[i + 1] = 0;
+        outputPixels[i + 2] = 0;
+        outputPixels[i + 3] = 255;
+    }
+
+    // Transform: for each output pixel, find corresponding polar pixel
+    const centerX = resolution / 2;
+    const centerY = resolution / 2;
+    const scale = resolution / (2 * r_o);
+
+    for (let y = 0; y < resolution; y++) {
+        for (let x = 0; x < resolution; x++) {
+            // Convert image coordinate (y-down) to physical coordinate (y-up)
+            // Image: y=0 is top, y=resolution is bottom
+            // Physical: py>0 is up, py<0 is down
+            const px = (x - centerX) / scale;
+            const py = (centerY - y) / scale;  // Y-axis flip: image y-down → physical y-up
+
+            // Convert to polar
+            const r = Math.sqrt(px * px + py * py);
+            let theta = Math.atan2(py, px);
+            if (theta < 0) theta += 2 * Math.PI;
+
+            // Check if within valid range
+            if (r < r_i || r > r_o) {
+                // Outside domain - keep black (transparent)
+                continue;
+            }
+
+            // Map theta to sector for full model
+            if (fullModel) {
+                const sectorAngle = 2 * Math.PI / N;
+                theta = theta % sectorAngle;
+            } else {
+                if (theta > thetaRange) {
+                    // Outside sector - keep black (transparent)
+                    continue;
+                }
+            }
+
+            // Map to polar image coordinates
+            const polarX = Math.floor((r - r_i) / (r_o - r_i) * (polarWidth - 1));
+            const polarY = Math.floor(theta / thetaRange * (polarHeight - 1));
+
+            if (polarX >= 0 && polarX < polarWidth && polarY >= 0 && polarY < polarHeight) {
+                const polarIdx = (polarY * polarWidth + polarX) * 4;
+                const outIdx = (y * resolution + x) * 4;
+
+                outputPixels[outIdx] = polarPixels[polarIdx];
+                outputPixels[outIdx + 1] = polarPixels[polarIdx + 1];
+                outputPixels[outIdx + 2] = polarPixels[polarIdx + 2];
+                outputPixels[outIdx + 3] = polarPixels[polarIdx + 3];
+            }
+        }
+    }
+
+    ctx.putImageData(outputImageData, 0, 0);
+
+    // Convert black pixels to transparent (preserve colors if requested)
+    const finalImageData = ctx.getImageData(0, 0, resolution, resolution);
+    const finalPixels = finalImageData.data;
+    const threshold = 30;  // Black threshold
+
+    if (preserveColors) {
+        // For boundary images: preserve original colors, only make black transparent
+        for (let i = 0; i < finalPixels.length; i += 4) {
+            const r = finalPixels[i];
+            const g = finalPixels[i + 1];
+            const b = finalPixels[i + 2];
+
+            // If RGB sum is below threshold (black background), make transparent
+            if (r + g + b <= threshold * 3) {
+                finalPixels[i + 3] = 0;  // Set alpha to transparent
+            }
+            // Otherwise keep original color and alpha
+        }
+    } else {
+        // For contour lines: convert all black to transparent
+        for (let i = 0; i < finalPixels.length; i += 4) {
+            const r = finalPixels[i];
+            const g = finalPixels[i + 1];
+            const b = finalPixels[i + 2];
+
+            // If RGB sum is below threshold, make transparent
+            if (r + g + b <= threshold * 3) {
+                finalPixels[i + 3] = 0;  // Set alpha to transparent
+            }
+        }
+    }
+
+    ctx.putImageData(finalImageData, 0, 0);
+    return outputCanvas;
+}
+
+/**
+ * Dilate image (8-connectivity morphological dilation)
+ * @param {HTMLCanvasElement} canvas - Input canvas (white lines on black background)
+ * @param {number} iterations - Number of dilation iterations
+ * @returns {HTMLCanvasElement} - Dilated canvas
+ */
+function dilateImage(canvas, iterations = 1) {
+    const width = canvas.width;
+    const height = canvas.height;
+    const ctx = canvas.getContext('2d');
+
+    for (let iter = 0; iter < iterations; iter++) {
+        const imageData = ctx.getImageData(0, 0, width, height);
+        const pixels = imageData.data;
+        const output = new Uint8ClampedArray(pixels);
+
+        for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+                const idx = (y * width + x) * 4;
+
+                // Check if current pixel is WHITE (contour line)
+                if (pixels[idx] > 128) {
+                    // Dilate white to 8 neighbors
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dx = -1; dx <= 1; dx++) {
+                            const nIdx = ((y + dy) * width + (x + dx)) * 4;
+                            output[nIdx] = 255;
+                            output[nIdx + 1] = 255;
+                            output[nIdx + 2] = 255;
+                            output[nIdx + 3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (let i = 0; i < pixels.length; i++) {
+            pixels[i] = output[i];
+        }
+        ctx.putImageData(imageData, 0, 0);
+    }
+
+    return canvas;
+}
+
+/**
+ * Merge two images (overlay contour lines on boundary)
+ * @param {HTMLCanvasElement} contourCanvas - Contour lines canvas (white lines on black/transparent background)
+ * @param {HTMLCanvasElement} boundaryCanvas - Boundary image canvas (after transformation, black→transparent)
+ * @returns {HTMLCanvasElement} - Merged canvas (white background, black contour and boundary lines)
+ */
+function mergeImages(contourCanvas, boundaryCanvas) {
+    const width = Math.max(contourCanvas.width, boundaryCanvas.width);
+    const height = Math.max(contourCanvas.height, boundaryCanvas.height);
+
+    const outputCanvas = document.createElement('canvas');
+    outputCanvas.width = width;
+    outputCanvas.height = height;
+    const ctx = outputCanvas.getContext('2d');
+
+    // Fill white background for final output
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, width, height);
+
+    // Get boundary image data
+    const boundaryCtx = boundaryCanvas.getContext('2d');
+    const boundaryData = boundaryCtx.getImageData(0, 0, boundaryCanvas.width, boundaryCanvas.height);
+    const boundaryPixels = boundaryData.data;
+
+    // Get contour image data
+    const contourCtx = contourCanvas.getContext('2d');
+    const contourData = contourCtx.getImageData(0, 0, contourCanvas.width, contourCanvas.height);
+    const contourPixels = contourData.data;
+
+    // Create output image with both images merged
+    const outputData = ctx.createImageData(width, height);
+    const outputPixels = outputData.data;
+
+    // Initialize with white background
+    for (let i = 0; i < outputPixels.length; i += 4) {
+        outputPixels[i] = 255;
+        outputPixels[i + 1] = 255;
+        outputPixels[i + 2] = 255;
+        outputPixels[i + 3] = 255;
+    }
+
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+            const outIdx = (y * width + x) * 4;
+
+            // Get corresponding boundary pixel (scale if needed)
+            const boundaryX = Math.floor(x * boundaryCanvas.width / width);
+            const boundaryY = Math.floor(y * boundaryCanvas.height / height);
+
+            if (boundaryX < boundaryCanvas.width && boundaryY < boundaryCanvas.height) {
+                const boundaryIdx = (boundaryY * boundaryCanvas.width + boundaryX) * 4;
+                const boundaryAlpha = boundaryPixels[boundaryIdx + 3];
+
+                // If boundary pixel is NOT transparent, draw it with original color
+                if (boundaryAlpha > 128) {
+                    outputPixels[outIdx] = boundaryPixels[boundaryIdx];
+                    outputPixels[outIdx + 1] = boundaryPixels[boundaryIdx + 1];
+                    outputPixels[outIdx + 2] = boundaryPixels[boundaryIdx + 2];
+                    outputPixels[outIdx + 3] = 255;
+                }
+            }
+
+            // Get corresponding contour pixel (scale if needed)
+            const contourX = Math.floor(x * contourCanvas.width / width);
+            const contourY = Math.floor(y * contourCanvas.height / height);
+
+            if (contourX < contourCanvas.width && contourY < contourCanvas.height) {
+                const contourIdx = (contourY * contourCanvas.width + contourX) * 4;
+                const isWhite = contourPixels[contourIdx] > 128;
+
+                if (isWhite) {
+                    // Draw contour line as BLACK
+                    outputPixels[outIdx] = 0;
+                    outputPixels[outIdx + 1] = 0;
+                    outputPixels[outIdx + 2] = 0;
+                    outputPixels[outIdx + 3] = 255;
+                }
+            }
+        }
+    }
+
+    ctx.putImageData(outputData, 0, 0);
+    return outputCanvas;
+}
+
+/**
+ * Load image to canvas
+ * @param {string} url - Image URL
+ * @returns {Promise<HTMLCanvasElement>} - Canvas with loaded image
+ */
+async function loadImageToCanvas(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'Anonymous';
+
+        img.onload = function() {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            resolve(canvas);
+        };
+
+        img.onerror = function() {
+            reject(new Error(`Failed to load image: ${url}`));
+        };
+
+        img.src = url;
+    });
+}
+
 async function renderAzBoundary(containerId, step) {
     const resultPath = getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
@@ -1988,63 +2401,145 @@ async function renderAzBoundary(containerId, step) {
     try {
         // Load Az data with caching
         const azData = await loadCsvData('Az', step);
-        const azFlipped = flipVertical(azData);
 
         // Get boundary image URL
         const boundaryImgUrl = `/api/get-boundary-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
-        // Load boundary image and convert black to transparent
-        const transparentBoundaryUrl = await makeBlackTransparent(boundaryImgUrl);
-
         container.innerHTML = '';
         const size = getContainerSize(container);
 
-        const rows = azFlipped.length;
-        const cols = azFlipped[0].length;
+        const coordSys = AppState.analysisConditions?.coordinate_system || 'cartesian';
 
-        // Generate physical coordinates if available
-        let xVals, yVals, xTitle, yTitle, xMin, xMax, yMin, yMax;
-        if (AppState.analysisConditions) {
-            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+        // Check if polar coordinate transformation is enabled
+        if (coordSys === 'polar' && AppState.polarCartesianTransform) {
+            // Image-based approach for polar transformation
+            console.log('Using image-based approach for polar coordinate transformation');
+
+            // Step 1: Draw contour lines to canvas (in polar coordinates)
+            // numLines is auto-calculated based on image size
+            const contourCanvas = drawContourToCanvas(azData);
+
+            // Step 2: Apply dilation to thicken lines (prevent breakage during transformation)
+            dilateImage(contourCanvas, 1);
+
+            // Step 3: Load boundary image to canvas
+            const boundaryCanvas = await loadImageToCanvas(boundaryImgUrl);
+
+            // Step 4: Transform both images to cartesian coordinates
+            // For contour: preserveColors=false (convert black to transparent)
+            const contourCartesian = transformPolarImageToCartesian(
+                contourCanvas,
+                AppState.analysisConditions,
+                AppState.polarFullModel,
+                false
+            );
+
+            // For boundary: preserveColors=true (keep original colors, only black becomes transparent)
+            const boundaryCartesian = transformPolarImageToCartesian(
+                boundaryCanvas,
+                AppState.analysisConditions,
+                AppState.polarFullModel,
+                true
+            );
+
+            // Step 5: Merge images (overlay contour lines on boundary)
+            const mergedCanvas = mergeImages(contourCartesian, boundaryCartesian);
+
+            // Step 6: Display as image in Plotly
+            const mergedImageUrl = mergedCanvas.toDataURL('image/png');
+
+            const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
+            const xMin = -r_o * 1000;
+            const xMax = r_o * 1000;
+            const yMin = -r_o * 1000;
+            const yMax = r_o * 1000;
+
+            let layout = {
+                width: size.width,
+                height: size.height,
+                margin: { l: 35, r: 10, t: 10, b: 35 },
+                xaxis: {
+                    title: 'X [mm]',
+                    range: [xMin, xMax],
+                    scaleanchor: 'y',
+                    scaleratio: 1
+                },
+                yaxis: {
+                    title: 'Y [mm]',
+                    range: [yMin, yMax]
+                },
+                images: [{
+                    source: mergedImageUrl,
+                    xref: 'x',
+                    yref: 'y',
+                    x: xMin,
+                    y: yMax,
+                    sizex: xMax - xMin,
+                    sizey: yMax - yMin,
+                    sizing: 'stretch',
+                    opacity: 1.0,
+                    layer: 'above'
+                }],
+                dragmode: false
+            };
+
+            // Restore saved zoom state if exists
+            layout = restoreZoomState(containerId, layout);
+
+            await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: false });
+            setupZoomTracking(containerId);
+
+        } else {
+            // Original Plotly contour approach for non-transformed coordinates
+            const azFlipped = flipVertical(azData);
+            const transparentBoundaryUrl = await makeBlackTransparent(boundaryImgUrl);
+
+            const rows = azFlipped.length;
+            const cols = azFlipped[0].length;
+
+            let xVals, yVals, zVals, xTitle, yTitle, xMin, xMax, yMin, yMax;
+
             if (coordSys === 'polar') {
+                // Original polar view (r vs theta)
                 const theta_start = AppState.analysisConditions.theta_start || 0;
                 const dr = AppState.analysisConditions.dr || 0.001;
                 const dtheta = AppState.analysisConditions.dtheta || 0.001;
                 xVals = Array.from({ length: cols }, (_, i) => i * dr * 1000);
                 yVals = Array.from({ length: rows }, (_, i) => theta_start + i * dtheta);
+                zVals = azFlipped;
                 xTitle = 'r - r_start [mm]';
                 yTitle = 'θ [rad]';
                 xMin = 0;
                 xMax = (cols - 1) * dr * 1000;
                 yMin = theta_start;
                 yMax = theta_start + (rows - 1) * dtheta;
-            } else {
+            } else if (AppState.analysisConditions) {
+                // Cartesian coordinates
                 const dx = AppState.analysisConditions.dx || 0.001;
                 const dy = AppState.analysisConditions.dy || 0.001;
                 xVals = Array.from({ length: cols }, (_, i) => i * dx * 1000);
                 yVals = Array.from({ length: rows }, (_, i) => i * dy * 1000);
+                zVals = azFlipped;
                 xTitle = 'X [mm]';
                 yTitle = 'Y [mm]';
                 xMin = 0;
                 xMax = (cols - 1) * dx * 1000;
                 yMin = 0;
                 yMax = (rows - 1) * dy * 1000;
+            } else {
+                xVals = Array.from({ length: cols }, (_, i) => i);
+                yVals = Array.from({ length: rows }, (_, i) => i);
+                zVals = azFlipped;
+                xTitle = 'X [pixels]';
+                yTitle = 'Y [pixels]';
+                xMin = 0;
+                xMax = cols - 1;
+                yMin = 0;
+                yMax = rows - 1;
             }
-        } else {
-            xVals = Array.from({ length: cols }, (_, i) => i);
-            yVals = Array.from({ length: rows }, (_, i) => i);
-            xTitle = 'X [pixels]';
-            yTitle = 'Y [pixels]';
-            xMin = 0;
-            xMax = cols - 1;
-            yMin = 0;
-            yMax = rows - 1;
-        }
 
-        // Az contour trace
-        const traces = [
-            {
-                z: azData,
+            const traces = [{
+                z: zVals,
                 x: xVals,
                 y: yVals,
                 type: 'contour',
@@ -2052,23 +2547,21 @@ async function renderAzBoundary(containerId, step) {
                 contours: { coloring: 'lines' },
                 showscale: false,
                 name: 'Az'
-            }
-        ];
+            }];
 
-        await Plotly.newPlot(container, traces, {
-            width: size.width,
-            height: size.height,
-            margin: { l: 35, r: 10, t: 10, b: 35 },
-            xaxis: {
-                title: xTitle,
-                range: [xMin, xMax]
-            },
-            yaxis: {
-                title: yTitle,
-                range: [yMin, yMax]
-            },
-            images: [
-                {
+            let layout = {
+                width: size.width,
+                height: size.height,
+                margin: { l: 35, r: 10, t: 10, b: 35 },
+                xaxis: {
+                    title: xTitle,
+                    range: [xMin, xMax]
+                },
+                yaxis: {
+                    title: yTitle,
+                    range: [yMin, yMax]
+                },
+                images: [{
                     source: transparentBoundaryUrl,
                     xref: 'x',
                     yref: 'y',
@@ -2079,10 +2572,16 @@ async function renderAzBoundary(containerId, step) {
                     sizing: 'stretch',
                     opacity: 1.0,
                     layer: 'above'
-                }
-            ],
-            dragmode: false
-        }, { responsive: true, displayModeBar: false });
+                }],
+                dragmode: false
+            };
+
+            // Restore saved zoom state if exists
+            layout = restoreZoomState(containerId, layout);
+
+            await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: false });
+            setupZoomTracking(containerId);
+        }
     } catch (error) {
         console.error('Az+Boundary render error:', error);
         container.innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
@@ -2100,33 +2599,90 @@ async function renderMaterialImage(containerId, step) {
         // Get step input image (from InputImage folder)
         const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
-        // Get or create canvas (keep existing canvas to prevent flickering)
-        let canvas = container.querySelector('canvas');
-        if (!canvas) {
-            container.innerHTML = '<canvas style="width: 100%; height: 100%;"></canvas>';
-            canvas = container.querySelector('canvas');
-        }
-        const ctx = canvas.getContext('2d');
+        container.innerHTML = '';
+        const size = getContainerSize(container);
 
-        // Preload image (draw only after fully loaded to prevent flickering)
+        // Load image to get dimensions
         const img = new Image();
-        img.onload = function() {
-            // Set canvas size
-            const containerRect = container.getBoundingClientRect();
-            const scale = Math.min(containerRect.width / img.width, containerRect.height / img.height);
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = reject;
+            img.src = imgUrl;
+        });
 
-            canvas.width = img.width * scale;
-            canvas.height = img.height * scale;
+        const rows = img.height;
+        const cols = img.width;
 
-            // Draw image (image is fully loaded at this point)
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        // Generate physical coordinates if available
+        let xTitle, yTitle, xMin, xMax, yMin, yMax;
+        if (AppState.analysisConditions) {
+            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+            if (coordSys === 'polar') {
+                const theta_start = AppState.analysisConditions.theta_start || 0;
+                const dr = AppState.analysisConditions.dr || 0.001;
+                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                xTitle = 'r - r_start [mm]';
+                yTitle = 'θ [rad]';
+                xMin = 0;
+                xMax = (cols - 1) * dr * 1000;
+                yMin = theta_start;
+                yMax = theta_start + (rows - 1) * dtheta;
+            } else {
+                const dx = AppState.analysisConditions.dx || 0.001;
+                const dy = AppState.analysisConditions.dy || 0.001;
+                xTitle = 'X [mm]';
+                yTitle = 'Y [mm]';
+                xMin = 0;
+                xMax = (cols - 1) * dx * 1000;
+                yMin = 0;
+                yMax = (rows - 1) * dy * 1000;
+            }
+        } else {
+            xTitle = 'X [pixels]';
+            yTitle = 'Y [pixels]';
+            xMin = 0;
+            xMax = cols - 1;
+            yMin = 0;
+            yMax = rows - 1;
+        }
+
+        // Display image using Plotly
+        let layout = {
+            width: size.width,
+            height: size.height,
+            margin: { l: 35, r: 10, t: 10, b: 35 },
+            xaxis: {
+                title: xTitle,
+                range: [xMin, xMax],
+                showgrid: false
+            },
+            yaxis: {
+                title: yTitle,
+                range: [yMin, yMax],
+                showgrid: false
+            },
+            images: [
+                {
+                    source: imgUrl,
+                    xref: 'x',
+                    yref: 'y',
+                    x: xMin,
+                    y: yMax,
+                    sizex: xMax - xMin,
+                    sizey: yMax - yMin,
+                    sizing: 'stretch',
+                    opacity: 1.0,
+                    layer: 'below'
+                }
+            ],
+            dragmode: false
         };
 
-        img.onerror = function() {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">Failed to load material image</div>';
-        };
+        // Restore saved zoom state if exists
+        layout = restoreZoomState(containerId, layout);
 
-        img.src = imgUrl;
+        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: false });
+        setupZoomTracking(containerId);
     } catch (error) {
         console.error('Material image load error:', error);
         container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading material image</div>';
@@ -2192,7 +2748,7 @@ async function renderStepInputImage(containerId, step) {
         }
 
         // Display image using Plotly
-        await Plotly.newPlot(container, [], {
+        let layout = {
             width: size.width,
             height: size.height,
             margin: { l: 35, r: 10, t: 10, b: 35 },
@@ -2221,7 +2777,13 @@ async function renderStepInputImage(containerId, step) {
                 }
             ],
             dragmode: false
-        }, { responsive: true, displayModeBar: false });
+        };
+
+        // Restore saved zoom state if exists
+        layout = restoreZoomState(containerId, layout);
+
+        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: false });
+        setupZoomTracking(containerId);
     } catch (error) {
         console.error('Step input image load error:', error);
         container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading image</div>';
@@ -2391,6 +2953,11 @@ async function renderForceXTime(containerId) {
             });
         };
 
+        // Full model multiplier for polar coordinates
+        const forceMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
+            ? AppState.polarFullModelMultiplier
+            : 1;
+
         // Trace per material
         materialNames.forEach(matName => {
             const forceData = [];
@@ -2401,7 +2968,7 @@ async function renderForceXTime(containerId) {
                 if (stepData && stepData.materials) {
                     const mat = stepData.materials.find(m => m.name === matName);
                     if (mat) {
-                        forceData.push(mat.force_x);
+                        forceData.push(mat.force_x * forceMultiplier);
                         if (!matColor) matColor = mat.color;
                     } else {
                         forceData.push(0);
@@ -2432,12 +2999,16 @@ async function renderForceXTime(containerId) {
             ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
             : { x: 1.02, y: 1, xanchor: 'left' };
 
+        const yaxisTitle = forceMultiplier > 1
+            ? `Force X [N/m] (×${forceMultiplier})`
+            : 'Force X [N/m]';
+
         await Plotly.newPlot(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
             xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
-            yaxis: { title: 'Force X [N/m]', range: yrange },
+            yaxis: { title: yaxisTitle, range: yrange },
             showlegend: true,
             legend: legendConfig,
             dragmode: false
@@ -2491,6 +3062,11 @@ async function renderForceYTime(containerId) {
             });
         };
 
+        // Full model multiplier for polar coordinates
+        const forceMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
+            ? AppState.polarFullModelMultiplier
+            : 1;
+
         materialNames.forEach(matName => {
             const forceData = [];
             let matColor = null;
@@ -2500,7 +3076,7 @@ async function renderForceYTime(containerId) {
                 if (stepData && stepData.materials) {
                     const mat = stepData.materials.find(m => m.name === matName);
                     if (mat) {
-                        forceData.push(mat.force_y);
+                        forceData.push(mat.force_y * forceMultiplier);
                         if (!matColor) matColor = mat.color;
                     } else {
                         forceData.push(0);
@@ -2530,12 +3106,16 @@ async function renderForceYTime(containerId) {
             ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
             : { x: 1.02, y: 1, xanchor: 'left' };
 
+        const yaxisTitle = forceMultiplier > 1
+            ? `Force Y [N/m] (×${forceMultiplier})`
+            : 'Force Y [N/m]';
+
         await Plotly.newPlot(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
             xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
-            yaxis: { title: 'Force Y [N/m]', range: yrange },
+            yaxis: { title: yaxisTitle, range: yrange },
             showlegend: true,
             legend: legendConfig,
             dragmode: false
@@ -2589,6 +3169,11 @@ async function renderTorqueTime(containerId) {
             });
         };
 
+        // Full model multiplier for polar coordinates
+        const torqueMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
+            ? AppState.polarFullModelMultiplier
+            : 1;
+
         materialNames.forEach(matName => {
             const torqueData = [];
             let matColor = null;
@@ -2598,7 +3183,7 @@ async function renderTorqueTime(containerId) {
                 if (stepData && stepData.materials) {
                     const mat = stepData.materials.find(m => m.name === matName);
                     if (mat) {
-                        torqueData.push(mat.torque);
+                        torqueData.push(mat.torque * torqueMultiplier);
                         if (!matColor) matColor = mat.color;
                     } else {
                         torqueData.push(0);
@@ -2628,12 +3213,16 @@ async function renderTorqueTime(containerId) {
             ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
             : { x: 1.02, y: 1, xanchor: 'left' };
 
+        const yaxisTitle = torqueMultiplier > 1
+            ? `Torque [Nm/m] (×${torqueMultiplier})`
+            : 'Torque [Nm/m]';
+
         await Plotly.newPlot(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
             xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
-            yaxis: { title: 'Torque [Nm/m]', range: yrange },
+            yaxis: { title: yaxisTitle, range: yrange },
             showlegend: true,
             legend: legendConfig,
             dragmode: false
@@ -2842,6 +3431,55 @@ function plotContour(elementId, data, title, usePhysicalAxes = false) {
     Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false });
 }
 
+// ===== Plot Zoom State Management =====
+/**
+ * Save current zoom state of a plot
+ * @param {string} containerId - Plot container ID
+ * @param {object} layout - Plotly layout object with xaxis and yaxis
+ */
+function saveZoomState(containerId, layout) {
+    if (layout && layout.xaxis && layout.yaxis) {
+        AppState.plotZoomStates[containerId] = {
+            xaxis: { range: layout.xaxis.range },
+            yaxis: { range: layout.yaxis.range }
+        };
+    }
+}
+
+/**
+ * Restore saved zoom state to a plot layout
+ * @param {string} containerId - Plot container ID
+ * @param {object} layout - Plotly layout object to modify
+ * @returns {object} - Modified layout with restored zoom state
+ */
+function restoreZoomState(containerId, layout) {
+    const savedState = AppState.plotZoomStates[containerId];
+    if (savedState && savedState.xaxis && savedState.yaxis) {
+        if (!layout.xaxis) layout.xaxis = {};
+        if (!layout.yaxis) layout.yaxis = {};
+        layout.xaxis.range = savedState.xaxis.range;
+        layout.yaxis.range = savedState.yaxis.range;
+    }
+    return layout;
+}
+
+/**
+ * Setup zoom state tracking for a Plotly container
+ * @param {string} containerId - Plot container ID
+ */
+function setupZoomTracking(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    container.on('plotly_relayout', (eventData) => {
+        // Save zoom state when user zooms/pans
+        if (eventData['xaxis.range[0]'] !== undefined || eventData['xaxis.range'] !== undefined) {
+            const layout = container.layout;
+            saveZoomState(containerId, layout);
+        }
+    });
+}
+
 // ===== Plotting Functions =====
 function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
     const container = document.getElementById(elementId);
@@ -2864,12 +3502,22 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
     // Colorbar width should be 10% of total width (9:1 ratio)
     const colorbarThickness = Math.floor(size.width * 0.1);
 
+    // Separate title into graph title and colorbar title (unit)
+    // Expected format: "Physical Quantity [Unit]" or just "Title"
+    let graphTitle = title;
+    let colorbarTitle = '';
+    const unitMatch = title.match(/^(.+?)\s+(\[.+?\])(.*)$/);
+    if (unitMatch) {
+        graphTitle = unitMatch[1] + (unitMatch[3] || ''); // Physical quantity + any suffix
+        colorbarTitle = unitMatch[2]; // [Unit]
+    }
+
     const trace = {
         z: data,
         type: 'heatmap',
         colorscale: 'Viridis',
         colorbar: {
-            title: title,
+            title: colorbarTitle,
             thickness: colorbarThickness,
             len: 1.0
         }
@@ -2882,7 +3530,31 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
         const cols = data[0]?.length || 0;
         const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
 
-        if (coordSys === 'polar') {
+        if (coordSys === 'polar' && AppState.polarCartesianTransform) {
+            // Apply polar to cartesian transformation
+            const transformedData = transformPolarToCartesian(
+                data,
+                AppState.analysisConditions,
+                AppState.polarFullModel
+            );
+
+            trace.x = transformedData.x;
+            trace.y = transformedData.y;
+            trace.z = transformedData.z;
+
+            const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
+            xaxis = {
+                title: 'X [mm]',
+                range: [-r_o * 1000, r_o * 1000],
+                scaleanchor: 'y',
+                scaleratio: 1
+            };
+            yaxis = {
+                title: 'Y [mm]',
+                range: [-r_o * 1000, r_o * 1000]
+            };
+        } else if (coordSys === 'polar') {
+            // Original polar view (r vs theta)
             const theta_start = AppState.analysisConditions.theta_start || 0;
             const dr = AppState.analysisConditions.dr || 0.001;
             const dtheta = AppState.analysisConditions.dtheta || 0.001;
@@ -2896,6 +3568,7 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
             xaxis = { title: 'r - r_start [mm]' };
             yaxis = { title: 'θ [rad]' };
         } else {
+            // Cartesian coordinates
             const dx = AppState.analysisConditions.dx || 0.001;
             const dy = AppState.analysisConditions.dy || 0.001;
 
@@ -2913,17 +3586,27 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
         yaxis = { title: 'Y [pixels]' };
     }
 
-    const layout = {
+    // Update title for full model
+    if (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1) {
+        graphTitle += ` (Full Model ×${AppState.polarFullModelMultiplier})`;
+    }
+
+    let layout = {
         width: size.width,
         height: size.height,
-        title: title,
+        title: graphTitle,
         xaxis: xaxis,
         yaxis: yaxis,
         margin: { t: 40, r: colorbarThickness + 15, b: 40, l: 60 },
         dragmode: false
     };
 
-    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false });
+    // Restore saved zoom state if exists
+    layout = restoreZoomState(elementId, layout);
+
+    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false }).then(() => {
+        setupZoomTracking(elementId);
+    });
 }
 
 function plotForceGraph(elementId, data, title) {
@@ -2945,14 +3628,20 @@ function plotForceGraph(elementId, data, title) {
         name: 'Force'
     };
 
-    const layout = {
+    let layout = {
         title: title,
         xaxis: { title: 'Index' },
         yaxis: { title: 'Force [N/m]' },
-        margin: { t: 40, r: 20, b: 40, l: 60 }
+        margin: { t: 40, r: 20, b: 40, l: 60 },
+        dragmode: false
     };
 
-    Plotly.newPlot(elementId, [trace], layout, { responsive: true });
+    // Restore saved zoom state if exists
+    layout = restoreZoomState(elementId, layout);
+
+    Plotly.newPlot(elementId, [trace], layout, { responsive: true, displayModeBar: false }).then(() => {
+        setupZoomTracking(elementId);
+    });
 }
 
 // ===== Utility Functions =====
@@ -3096,5 +3785,243 @@ async function deleteOutput(folderName) {
     } catch (error) {
         console.error('Error deleting output:', error);
         alert(`Error: ${error.message}`);
+    }
+}
+
+// ===== Polar Coordinate Transform Functions =====
+
+/**
+ * Update polar controls visibility and info based on loaded conditions
+ */
+function updatePolarControls() {
+    const polarControls = document.getElementById('polarControls');
+    const polarInfo = document.getElementById('polarInfo');
+    const fullModelMultiplier = document.getElementById('fullModelMultiplier');
+
+    if (!AppState.analysisConditions) {
+        polarControls.style.display = 'none';
+        return;
+    }
+
+    const isPolar = AppState.analysisConditions.coordinate_system === 'polar';
+    AppState.isPolarCoordinates = isPolar;
+
+    if (!isPolar) {
+        polarControls.style.display = 'none';
+        return;
+    }
+
+    // Show polar controls
+    polarControls.style.display = 'block';
+
+    // Calculate full model multiplier from theta_range
+    // Check both locations: top-level theta_range and polar.theta_range
+    const thetaRange = AppState.analysisConditions.polar?.theta_range
+        || AppState.analysisConditions.theta_range
+        || 0;
+    const multiplier = calculateFullModelMultiplier(thetaRange);
+    AppState.polarFullModelMultiplier = multiplier;
+
+    if (multiplier > 1) {
+        fullModelMultiplier.textContent = multiplier;
+        polarInfo.textContent = `θ range: ${(thetaRange * 180 / Math.PI).toFixed(1)}° ≈ 2π/${multiplier} → Full model available`;
+    } else {
+        fullModelMultiplier.textContent = 'N';
+        polarInfo.textContent = `θ range: ${(thetaRange * 180 / Math.PI).toFixed(1)}° → Full model not available`;
+        // Disable full model checkbox if not available
+        document.getElementById('polarFullModel').disabled = (multiplier === 1);
+    }
+}
+
+/**
+ * Calculate full model multiplier N from theta_range
+ * Returns N if theta_range ≈ 2π/N, otherwise returns 1
+ * @param {number} thetaRange - Theta range in radians
+ * @returns {number} - Multiplier N (1 if not applicable)
+ */
+function calculateFullModelMultiplier(thetaRange) {
+    const TWO_PI = 2 * Math.PI;
+    const TOLERANCE = 0.02; // 2% tolerance
+
+    // Check for common divisors: 2, 3, 4, 5, 6, 8, 10, 12, 16, 18, 20, 24, 30, 36, 40, 60, 72, 120
+    const commonDivisors = [2, 3, 4, 5, 6, 8, 10, 12, 16, 18, 20, 24, 30, 36, 40, 60, 72, 120];
+
+    for (const N of commonDivisors) {
+        const expectedAngle = TWO_PI / N;
+        const relativeError = Math.abs(thetaRange - expectedAngle) / expectedAngle;
+
+        if (relativeError < TOLERANCE) {
+            return N;
+        }
+    }
+
+    return 1; // Not a clean divisor of 2π
+}
+
+/**
+ * Toggle cartesian transform for polar coordinates
+ */
+function toggleCartesianTransform() {
+    const checkbox = document.getElementById('polarCartesianTransform');
+    AppState.polarCartesianTransform = checkbox.checked;
+
+    // Refresh all plots
+    refreshAllPlots();
+}
+
+/**
+ * Toggle full model expansion for polar coordinates
+ */
+function toggleFullModel() {
+    const checkbox = document.getElementById('polarFullModel');
+    AppState.polarFullModel = checkbox.checked;
+
+    // If full model is enabled, cartesian transform should also be enabled
+    if (AppState.polarFullModel && !AppState.polarCartesianTransform) {
+        document.getElementById('polarCartesianTransform').checked = true;
+        AppState.polarCartesianTransform = true;
+    }
+
+    // Refresh all plots
+    refreshAllPlots();
+}
+
+/**
+ * Transform polar coordinate data to cartesian (arc or full donut)
+ * @param {Array<Array<number>>} polarData - 2D array in polar coordinates [ntheta][nr]
+ * @param {object} conditions - Analysis conditions containing r_i, r_o, theta_range
+ * @param {boolean} fullModel - If true, replicate to full 360 degrees
+ * @returns {object} - {x: Array, y: Array, z: Array} for Plotly heatmap
+ */
+function transformPolarToCartesian(polarData, conditions, fullModel = false) {
+    // Extract polar parameters (check both nested and top-level locations)
+    const r_i = conditions.polar?.r_start || conditions.r_i || 0;
+    const r_o = conditions.polar?.r_end || conditions.r_o || 1;
+    const thetaRange = conditions.polar?.theta_range || conditions.theta_range || 0;
+
+    const ntheta = polarData.length;
+    const nr = polarData[0].length;
+
+    // Determine number of repetitions
+    const N = fullModel ? AppState.polarFullModelMultiplier : 1;
+
+    // Create output grid
+    const resolution = Math.max(nr, ntheta) * 2; // Higher resolution for interpolation
+    const gridSize = 2 * r_o;
+    const dx = gridSize / resolution;
+    const dy = gridSize / resolution;
+
+    // Create 1D arrays for x and y coordinates (in mm)
+    const x = Array.from({ length: resolution }, (_, j) => (-r_o + j * dx) * 1000);
+    const y = Array.from({ length: resolution }, (_, i) => (-r_o + i * dy) * 1000);
+    const z = [];
+
+    for (let i = 0; i < resolution; i++) {
+        const row_z = [];
+        const py = -r_o + i * dy; // in meters
+
+        for (let j = 0; j < resolution; j++) {
+            const px = -r_o + j * dx; // in meters
+
+            // Convert to polar
+            const r = Math.sqrt(px * px + py * py);
+            let theta = Math.atan2(py, px);
+            if (theta < 0) theta += 2 * Math.PI;
+
+            // Check if within valid range
+            if (r < r_i || r > r_o) {
+                row_z.push(null); // Outside domain
+                continue;
+            }
+
+            // Map theta to sector
+            if (fullModel) {
+                // Map theta to original sector [0, thetaRange]
+                const sectorAngle = 2 * Math.PI / N;
+                theta = theta % sectorAngle;
+            } else {
+                // Single arc
+                if (theta > thetaRange) {
+                    row_z.push(null);
+                    continue;
+                }
+            }
+
+            // Interpolate from polar data
+            const r_idx = (r - r_i) / (r_o - r_i) * (nr - 1);
+            const theta_idx = theta / thetaRange * (ntheta - 1);
+
+            // Bilinear interpolation
+            const value = bilinearInterpolate(polarData, theta_idx, r_idx);
+            row_z.push(value);
+        }
+
+        z.push(row_z);
+    }
+
+    return { x, y, z };
+}
+
+/**
+ * Bilinear interpolation for 2D array
+ * @param {Array<Array<number>>} data - 2D array [ntheta][nr]
+ * @param {number} theta_idx - Theta index (fractional)
+ * @param {number} r_idx - R index (fractional)
+ * @returns {number} - Interpolated value
+ */
+function bilinearInterpolate(data, theta_idx, r_idx) {
+    // Safety checks
+    if (!data || data.length === 0 || !data[0] || data[0].length === 0) {
+        return 0;
+    }
+
+    const ntheta = data.length;
+    const nr = data[0].length;
+
+    // Clamp indices to valid range
+    theta_idx = Math.max(0, Math.min(ntheta - 1.001, theta_idx));
+    r_idx = Math.max(0, Math.min(nr - 1.001, r_idx));
+
+    const i0 = Math.floor(theta_idx);
+    const i1 = Math.min(i0 + 1, ntheta - 1);
+    const j0 = Math.floor(r_idx);
+    const j1 = Math.min(j0 + 1, nr - 1);
+
+    const dt = theta_idx - i0;
+    const dr = r_idx - j0;
+
+    // Get corner values with safety checks
+    const v00 = (data[i0] && data[i0][j0] !== undefined) ? data[i0][j0] : 0;
+    const v01 = (data[i0] && data[i0][j1] !== undefined) ? data[i0][j1] : 0;
+    const v10 = (data[i1] && data[i1][j0] !== undefined) ? data[i1][j0] : 0;
+    const v11 = (data[i1] && data[i1][j1] !== undefined) ? data[i1][j1] : 0;
+
+    // Interpolate
+    const v0 = v00 * (1 - dr) + v01 * dr;
+    const v1 = v10 * (1 - dr) + v11 * dr;
+
+    return v0 * (1 - dt) + v1 * dt;
+}
+
+/**
+ * Refresh all plots in the dashboard (for when polar transform settings change)
+ */
+function refreshAllPlots() {
+    // Refresh all gridstack items
+    if (AppState.gridStack) {
+        const items = AppState.gridStack.getGridItems();
+        items.forEach(item => {
+            const plotId = item.getAttribute('data-plot-id');
+            const plotType = item.getAttribute('data-plot-type');
+
+            if (plotId && plotType) {
+                // Find the plot div inside the item
+                const plotDiv = item.querySelector('[id^="plot-"]');
+                if (plotDiv) {
+                    // Re-render the plot
+                    renderPlot(plotDiv.id, plotType);
+                }
+            }
+        });
     }
 }

@@ -962,7 +962,7 @@ void MagneticFieldAnalyzer::calculateMagneticField() {
         }
     }
 
-    std::cout << "Magnetic field calculated" << std::endl;
+    // std::cout << "Magnetic field calculated" << std::endl;
 }
 
 // ===== Helper methods for periodic boundary-aware filtering =====

@@ -567,6 +567,25 @@
                         <button class="btn-secondary" onclick="loadSelectedResult()">Load Selected Result</button>
                         <button class="btn-secondary" onclick="refreshResultsList()">Refresh List</button>
                     </div>
+
+                    <!-- Polar Coordinate Controls -->
+                    <div id="polarControls" style="margin-top: 15px; padding: 10px; background: #f0f4ff; border-radius: 5px; display: none;">
+                        <h4 style="margin: 0 0 10px 0; font-size: 0.9rem; color: #667eea;">Polar Coordinate Options</h4>
+                        <div style="margin-bottom: 8px;">
+                            <label style="display: flex; align-items: center; cursor: pointer;">
+                                <input type="checkbox" id="polarCartesianTransform" onchange="toggleCartesianTransform()" style="margin-right: 8px;">
+                                <span style="font-size: 0.85rem;">Cartesian Transform (Arc/Donut view)</span>
+                            </label>
+                        </div>
+                        <div style="margin-bottom: 8px;">
+                            <label style="display: flex; align-items: center; cursor: pointer;">
+                                <input type="checkbox" id="polarFullModel" onchange="toggleFullModel()" style="margin-right: 8px;">
+                                <span style="font-size: 0.85rem;">Full Model (×<span id="fullModelMultiplier">N</span>)</span>
+                            </label>
+                        </div>
+                        <div id="polarInfo" style="font-size: 0.75rem; color: #666; margin-top: 8px;"></div>
+                    </div>
+
                     <div class="button-group" style="margin-top: 15px;">
                         <button class="btn-primary" onclick="runSolver()" id="solverBtn">Run Solver</button>
                         <button class="btn-danger" onclick="stopSolver()" id="stopBtn" style="display: none;">Stop Calculation</button>
