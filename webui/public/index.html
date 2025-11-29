@@ -435,6 +435,64 @@
             color: #0c5460;
             border: 1px solid #bee5eb;
         }
+
+        /* File Manager Styles */
+        .output-item {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            transition: all 0.2s ease;
+        }
+
+        .output-item:hover {
+            background: #e9ecef;
+            border-color: #667eea;
+        }
+
+        .output-info {
+            flex: 1;
+        }
+
+        .output-name {
+            font-weight: 600;
+            color: #333;
+            font-size: 1rem;
+            margin-bottom: 5px;
+        }
+
+        .output-details {
+            font-size: 0.85rem;
+            color: #666;
+        }
+
+        .output-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn-delete {
+            background: #dc3545;
+            color: white;
+            border: none;
+            padding: 8px 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            transition: all 0.2s ease;
+        }
+
+        .btn-delete:hover {
+            background: #c82333;
+        }
+
+        .btn-delete:active {
+            background: #bd2130;
+        }
     </style>
 </head>
 <body>
@@ -451,6 +509,7 @@
             <button class="tab active" data-tab="config">Config Editor</button>
             <button class="tab" data-tab="run">Run & Preview</button>
             <button class="tab" data-tab="dashboard">Dashboard</button>
+            <button class="tab" data-tab="files">File Manager</button>
         </div>
 
         <!-- Tab 1: Config Editor -->
@@ -510,6 +569,7 @@
                     </div>
                     <div class="button-group" style="margin-top: 15px;">
                         <button class="btn-primary" onclick="runSolver()" id="solverBtn">Run Solver</button>
+                        <button class="btn-danger" onclick="stopSolver()" id="stopBtn" style="display: none;">Stop Calculation</button>
                     </div>
                     <div id="solverStatus"></div>
                     <!-- Progress Bar -->
@@ -630,6 +690,24 @@
                             <div class="empty-canvas-hint">Select analysis results first, then add plots</div>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 4: File Manager -->
+        <div class="tab-content" id="tab-files">
+            <div class="config-section">
+                <h2>Output File Manager</h2>
+                <p style="color: #666; margin-bottom: 20px;">
+                    Manage analysis results for user: <strong id="fileManagerUserId"></strong>
+                </p>
+
+                <div class="button-group" style="margin-bottom: 20px;">
+                    <button class="btn-primary" onclick="refreshOutputsList()">Refresh List</button>
+                </div>
+
+                <div id="outputsList" style="margin-top: 20px;">
+                    <p style="color: #666;">Loading...</p>
                 </div>
             </div>
         </div>

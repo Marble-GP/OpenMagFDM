@@ -267,6 +267,58 @@ void exportConditionsJSON(const std::string& output_path,
     } else {
         json_file << "    \"enabled\": false\n";
     }
+    json_file << "  },\n";
+
+    // Nonlinear materials detection
+    bool has_nonlinear_materials = false;
+    if (config["materials"]) {
+        for (const auto& material : config["materials"]) {
+            const auto& props = material.second;
+            if (!props["mu_r"]) continue;
+
+            // Check if mu_r is nonlinear (formula or table)
+            if (props["mu_r"].IsScalar()) {
+                std::string mu_str = props["mu_r"].as<std::string>();
+                // Check for formula characters
+                if (mu_str.find('$') != std::string::npos ||
+                    mu_str.find('*') != std::string::npos ||
+                    mu_str.find('/') != std::string::npos ||
+                    mu_str.find('+') != std::string::npos ||
+                    mu_str.find('(') != std::string::npos ||
+                    mu_str.find("exp") != std::string::npos ||
+                    mu_str.find("tanh") != std::string::npos) {
+                    has_nonlinear_materials = true;
+                    break;
+                }
+            } else if (props["mu_r"].IsSequence() && props["mu_r"].size() == 2) {
+                // B-H table format
+                has_nonlinear_materials = true;
+                break;
+            }
+        }
+    }
+
+    // Nonlinear solver configuration
+    json_file << "  \"nonlinear_solver\": {\n";
+    json_file << "    \"has_nonlinear_materials\": " << (has_nonlinear_materials ? "true" : "false");
+
+    if (config["nonlinear_solver"]) {
+        bool nl_enabled = false;
+        std::string solver_type = "picard";
+
+        if (config["nonlinear_solver"]["enabled"]) {
+            nl_enabled = config["nonlinear_solver"]["enabled"].as<bool>();
+        }
+        if (config["nonlinear_solver"]["solver_type"]) {
+            solver_type = config["nonlinear_solver"]["solver_type"].as<std::string>();
+        }
+
+        json_file << ",\n";
+        json_file << "    \"enabled\": " << (nl_enabled ? "true" : "false") << ",\n";
+        json_file << "    \"solver_type\": \"" << solver_type << "\"\n";
+    } else {
+        json_file << "\n";
+    }
     json_file << "  }\n";
 
     json_file << "}\n";

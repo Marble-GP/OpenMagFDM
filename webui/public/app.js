@@ -82,6 +82,9 @@ function switchTab(tabName) {
     if (tabName === 'dashboard' && !AppState.gridStack) {
         initializeDashboard();
     }
+    if (tabName === 'files') {
+        initializeFileManager();
+    }
 }
 
 // ===== User Management =====
@@ -757,7 +760,7 @@ async function deleteConfig() {
 // ===== Result Management =====
 async function refreshResultsList() {
     try {
-        const response = await fetch('/api/results');
+        const response = await fetch(`/api/results?userId=${AppState.userId}`);
         if (!response.ok) throw new Error('Failed to load results');
 
         const result = await response.json();
@@ -1096,8 +1099,11 @@ async function loadQuickPreviewFromResult(resultPath) {
 
 async function runSolver() {
     const btn = document.getElementById('solverBtn');
+    const stopBtn = document.getElementById('stopBtn');
+
     btn.disabled = true;
     btn.textContent = 'Running...';
+    stopBtn.style.display = 'inline-block';
 
     const outputDiv = document.getElementById('solverOutput');
     const progressContainer = document.getElementById('solverProgressContainer');
@@ -1239,6 +1245,7 @@ async function runSolver() {
 
         btn.disabled = false;
         btn.textContent = 'Run Solver';
+        stopBtn.style.display = 'none';
 
         // Hide progress bar after 3 seconds if completed successfully
         setTimeout(() => {
@@ -1246,6 +1253,52 @@ async function runSolver() {
                 progressContainer.style.display = 'none';
             }
         }, 3000);
+    }
+}
+
+async function stopSolver() {
+    // Show confirmation dialog
+    if (!confirm('解析を停止しますか？\n\nAre you sure you want to stop the calculation?')) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/stop-solver', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId
+            })
+        });
+
+        const result = await response.json();
+
+        if (response.ok && result.success) {
+            showStatus('solverStatus', 'Solver stopped by user', 'warning');
+
+            const outputDiv = document.getElementById('solverOutput');
+            outputDiv.textContent += '\n\n=== Solver stopped by user ===\n';
+            outputDiv.scrollTop = outputDiv.scrollHeight;
+
+            const progressText = document.getElementById('solverProgressText');
+            progressText.textContent = 'Stopped by user';
+
+            const progressBar = document.getElementById('solverProgressBar');
+            progressBar.style.background = 'linear-gradient(90deg, #ffc107 0%, #ff9800 100%)';
+        } else {
+            throw new Error(result.error || 'Failed to stop solver');
+        }
+    } catch (error) {
+        console.error('Error stopping solver:', error);
+        showStatus('solverStatus', `Error stopping solver: ${error.message}`, 'error');
+    } finally {
+        // Reset button states
+        const btn = document.getElementById('solverBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        btn.disabled = false;
+        btn.textContent = 'Run Solver';
+        stopBtn.style.display = 'none';
     }
 }
 
@@ -1800,19 +1853,19 @@ async function loadCsvData(dataType, step) {
 async function renderAzContour(containerId, step) {
     const data = await loadCsvData('Az', step);
     const flipped = flipVertical(data);
-    plotContour(containerId, flipped, 'Az [Wb/m]', true);
+    plotContour(containerId, data, 'Az [Wb/m]', true);
 }
 
 async function renderAzHeatmap(containerId, step) {
     const data = await loadCsvData('Az', step);
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, flipped, 'Az [Wb/m]', true);
+    plotHeatmap(containerId, data, 'Az [Wb/m]', true);
 }
 
 async function renderJzDistribution(containerId, step) {
     const data = await loadCsvData('Jz', step);
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, flipped, 'Jz [A/m²]', true);
+    plotHeatmap(containerId, data, 'Jz [A/m²]', true);
 }
 
 async function renderBMagnitude(containerId, step) {
@@ -1828,13 +1881,29 @@ async function renderBMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+    const { B } = calculateMagneticField(azData, muData, dx, dy);
 
     plotHeatmap(containerId, B, '|B| [T/m]', true);
 }
 
 async function renderHMagnitude(containerId, step) {
-    // Use grid spacing from analysis conditions
+    // Check if nonlinear materials are present and enabled
+    const hasNonlinear = AppState.analysisConditions?.nonlinear_solver?.has_nonlinear_materials;
+    const nlEnabled = AppState.analysisConditions?.nonlinear_solver?.enabled;
+
+    if (hasNonlinear && nlEnabled) {
+        // For nonlinear materials: load H directly from solver output (H.csv)
+        try {
+            const hData = await loadCsvData('H', step);
+            const hFlipped = flipVertical(hData);
+            plotHeatmap(containerId, hData, '|H| [A/m] (solver)', true);
+            return;
+        } catch (error) {
+            console.warn('H.csv not found, falling back to calculation from Az and Mu:', error);
+        }
+    }
+
+    // For linear materials: calculate H from Az and Mu
     const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
     const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
 
@@ -1846,21 +1915,21 @@ async function renderHMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+    const { H } = calculateMagneticField(azData, muData, dx, dy);
 
-    plotHeatmap(containerId, H, '|H| [A/m]', true);
+    plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true);
 }
 
 async function renderMuDistribution(containerId, step) {
     const data = await loadCsvData('Mu', step);
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, flipped, 'μ [H/m]', true);
+    plotHeatmap(containerId, data, 'μ [H/m]', true);
 }
 
 async function renderEnergyDensity(containerId, step) {
     const data = await loadCsvData('EnergyDensity', step);
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, flipped, 'Energy [J/m³]', true);
+    plotHeatmap(containerId, data, 'Energy [J/m³]', true);
 }
 
 // Helper: Convert black pixels in image to transparent
@@ -1975,7 +2044,7 @@ async function renderAzBoundary(containerId, step) {
         // Az contour trace
         const traces = [
             {
-                z: azFlipped,
+                z: azData,
                 x: xVals,
                 y: yVals,
                 type: 'contour',
@@ -2921,4 +2990,111 @@ async function parseCSV(file) {
         reader.onerror = () => reject(new Error('Failed to read file'));
         reader.readAsText(file);
     });
+}
+
+// ===== File Manager Functions =====
+
+/**
+ * Initialize file manager tab
+ */
+function initializeFileManager() {
+    // Update user ID display
+    const userIdDisplay = document.getElementById('fileManagerUserId');
+    if (userIdDisplay) {
+        userIdDisplay.textContent = AppState.userId;
+    }
+
+    // Load outputs list
+    refreshOutputsList();
+}
+
+/**
+ * Refresh the list of output folders
+ */
+async function refreshOutputsList() {
+    const outputsList = document.getElementById('outputsList');
+    if (!outputsList) return;
+
+    try {
+        outputsList.innerHTML = '<p style="color: #666;">Loading...</p>';
+
+        const response = await fetch(`/api/user-outputs?userId=${AppState.userId}`);
+
+        if (!response.ok) {
+            throw new Error('Failed to load outputs');
+        }
+
+        const result = await response.json();
+
+        if (!result.success) {
+            throw new Error(result.error || 'Failed to load outputs');
+        }
+
+        if (result.outputs.length === 0) {
+            outputsList.innerHTML = '<p style="color: #666;">No analysis results found.</p>';
+            return;
+        }
+
+        // Build output list HTML
+        let html = '';
+        for (const output of result.outputs) {
+            const date = new Date(output.created).toLocaleString('ja-JP');
+
+            html += `
+                <div class="output-item">
+                    <div class="output-info">
+                        <div class="output-name">${output.name}</div>
+                        <div class="output-details">
+                            Created: ${date} | Size: ${output.sizeFormatted} | Steps: ${output.steps}
+                        </div>
+                    </div>
+                    <div class="output-actions">
+                        <button class="btn-delete" onclick="deleteOutput('${output.name}')">
+                            Delete
+                        </button>
+                    </div>
+                </div>
+            `;
+        }
+
+        outputsList.innerHTML = html;
+
+    } catch (error) {
+        console.error('Error loading outputs:', error);
+        outputsList.innerHTML = `<p style="color: #dc3545;">Error: ${error.message}</p>`;
+    }
+}
+
+/**
+ * Delete an output folder
+ * @param {string} folderName - Name of the folder to delete
+ */
+async function deleteOutput(folderName) {
+    // Confirmation dialog
+    const confirmMsg = `Delete output folder: ${folderName}?\n\nThis action cannot be undone.`;
+    if (!confirm(confirmMsg)) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`/api/user-outputs/${folderName}?userId=${AppState.userId}`, {
+            method: 'DELETE'
+        });
+
+        const result = await response.json();
+
+        if (!response.ok || !result.success) {
+            throw new Error(result.error || 'Failed to delete output folder');
+        }
+
+        // Show success message
+        alert('Output folder deleted successfully');
+
+        // Refresh the list
+        refreshOutputsList();
+
+    } catch (error) {
+        console.error('Error deleting output:', error);
+        alert(`Error: ${error.message}`);
+    }
 }

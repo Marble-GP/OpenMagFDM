@@ -68,6 +68,13 @@ public:
     void exportMuToCSV(const std::string& output_path) const;
 
     /**
+     * @brief Export magnetic field intensity |H| distribution to CSV file
+     * @param output_path Output CSV file path
+     * @note Only available after nonlinear solve (H_map is populated)
+     */
+    void exportHToCSV(const std::string& output_path) const;
+
+    /**
      * @brief Export current density distribution to CSV file
      * @param output_path Output CSV file path
      */
@@ -189,28 +196,28 @@ private:
 
     // Nonlinear solver configuration
     struct NonlinearSolverConfig {
-        bool enabled;               // Enable nonlinear solver (auto-detect if any nonlinear material)
-        std::string solver_type;    // Solver type: "picard", "anderson", "newton-krylov"
-        int max_iterations;         // Maximum nonlinear iterations
-        double tolerance;           // Convergence tolerance (relative)
-        double relaxation;          // Relaxation factor (0.5 ~ 0.8) - for Picard/Anderson
-        int anderson_depth;         // Anderson acceleration depth (0 = disabled) - for Anderson
+        bool enabled;               // Enable nonlinear solver (default: true, used with has_nonlinear_materials)
+        std::string solver_type;    // Solver type: "picard", "anderson", "newton-krylov" (default: "newton-krylov")
+        int max_iterations;         // Maximum nonlinear iterations (default: 50)
+        double tolerance;           // Convergence tolerance (relative) (default: 5e-4)
+        double relaxation;          // Relaxation factor (0.5 ~ 0.8) (default: 0.7) - for Picard/Anderson
+        int anderson_depth;         // Anderson acceleration depth (default: 5) - for Anderson
         int gmres_restart;          // GMRES restart parameter (default: 30) - for Newton-Krylov
         double line_search_c;       // Line search Armijo parameter (default: 1e-4) - for Newton-Krylov
         double line_search_alpha_init;    // Initial step length (default: 1.0) - for Newton-Krylov
-        double line_search_alpha_min;     // Minimum step length (default: 1e-4) - for Newton-Krylov
-        double line_search_rho;           // Backtracking factor (default: 0.5) - for Newton-Krylov
-        int line_search_max_trials;       // Maximum line search trials (default: 10) - for Newton-Krylov
+        double line_search_alpha_min;     // Minimum step length (default: 1e-3) - for Newton-Krylov
+        double line_search_rho;           // Backtracking factor (default: 0.65) - for Newton-Krylov
+        int line_search_max_trials;       // Maximum line search trials (default: 50) - for Newton-Krylov
         bool line_search_adaptive;        // Use adaptive initial step length (default: true) - for Newton-Krylov
-        bool verbose;               // Print iteration details
-        bool export_convergence;    // Export convergence history
+        bool verbose;               // Print iteration details (default: false)
+        bool export_convergence;    // Export convergence history (default: false)
 
         NonlinearSolverConfig() :
-            enabled(false), solver_type("picard"), max_iterations(50), tolerance(1e-5),
+            enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
             relaxation(0.7), anderson_depth(5), gmres_restart(30), line_search_c(1e-4),
-            line_search_alpha_init(1.0), line_search_alpha_min(1e-4), line_search_rho(0.5),
-            line_search_max_trials(10), line_search_adaptive(true),
-            verbose(true), export_convergence(false) {}
+            line_search_alpha_init(1.0), line_search_alpha_min(1e-3), line_search_rho(0.65),
+            line_search_max_trials(50), line_search_adaptive(true),
+            verbose(false), export_convergence(false) {}
     };
 
     // Maxwell stress and force calculation

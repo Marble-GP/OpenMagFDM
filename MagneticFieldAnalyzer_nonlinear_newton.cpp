@@ -312,19 +312,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         return;
     }
 
-    if (coordinate_system != "cartesian") {
-        std::cerr << "WARNING: Newton-Krylov currently only supports Cartesian coordinates" << std::endl;
-        std::cerr << "Falling back to Picard iteration" << std::endl;
-        solveNonlinear();
-        return;
-    }
-
     const int MAX_ITER = nonlinear_config.max_iterations;
     const double TOL = nonlinear_config.tolerance;
     const bool VERBOSE = nonlinear_config.verbose;
+    const bool is_polar = (coordinate_system != "cartesian");
 
     if (VERBOSE) {
         std::cout << "\n=== Newton-Krylov Solver (Jacobian-free + AMGCL) ===" << std::endl;
+        std::cout << "Coordinate system: " << coordinate_system << std::endl;
         std::cout << "Max outer iterations: " << MAX_ITER << std::endl;
         std::cout << "Tolerance: " << TOL << std::endl;
     }
@@ -336,11 +331,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     if (VERBOSE) {
         std::cout << "Computing initial guess..." << std::endl;
     }
-    buildAndSolveSystem();
+    if (is_polar) {
+        buildAndSolveSystemPolar();
+    } else {
+        buildAndSolveSystem();
+    }
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
         // ===== Step 1: Calculate B and H fields =====
-        calculateMagneticField();
+        if (is_polar) {
+            calculateMagneticFieldPolar();
+        } else {
+            calculateMagneticField();
+        }
         calculateHField();
 
         // ===== Step 2: Update μ based on current B and H =====
@@ -349,7 +352,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // ===== Step 3: Build residual and system matrix with current μ =====
         Eigen::SparseMatrix<double> A_matrix;
         Eigen::VectorXd b_vec;
-        buildMatrix(A_matrix, b_vec);
+        if (is_polar) {
+            buildMatrixPolar(A_matrix, b_vec);
+        } else {
+            buildMatrix(A_matrix, b_vec);
+        }
 
         Eigen::VectorXd Az_vec = Eigen::Map<Eigen::VectorXd>(Az.data(), Az.size());
         Eigen::VectorXd residual = A_matrix * Az_vec - b_vec;
@@ -439,18 +446,31 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         for (int ls = 0; ls < max_line_search; ls++) {
             // Trial step: A_trial = A + α·δA
             Eigen::VectorXd Az_trial = Az_vec_0 + alpha * delta_A;
-            Eigen::MatrixXd Az_trial_mat = Eigen::Map<Eigen::MatrixXd>(Az_trial.data(), ny, nx);
+            Eigen::MatrixXd Az_trial_mat;
+            if (is_polar) {
+                Az_trial_mat = Eigen::Map<Eigen::MatrixXd>(Az_trial.data(), ntheta, nr);
+            } else {
+                Az_trial_mat = Eigen::Map<Eigen::MatrixXd>(Az_trial.data(), ny, nx);
+            }
 
             // Calculate B and H for trial point
             Az = Az_trial_mat;
-            calculateMagneticField();
+            if (is_polar) {
+                calculateMagneticFieldPolar();
+            } else {
+                calculateMagneticField();
+            }
             calculateHField();
             updateMuDistribution();
 
             // Build matrix and compute residual at trial point
             Eigen::SparseMatrix<double> A_trial;
             Eigen::VectorXd b_trial;
-            buildMatrix(A_trial, b_trial);
+            if (is_polar) {
+                buildMatrixPolar(A_trial, b_trial);
+            } else {
+                buildMatrix(A_trial, b_trial);
+            }
             Eigen::VectorXd residual_trial = A_trial * Az_trial - b_trial;
             double residual_trial_norm = residual_trial.norm();
 
@@ -471,7 +491,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             if (ls == max_line_search - 1) {
                 // Line search failed, accept minimal step
                 Az_vec = Az_vec_0 + alpha_min * delta_A;
-                Az = Eigen::Map<Eigen::MatrixXd>(Az_vec.data(), ny, nx);
+                if (is_polar) {
+                    Az = Eigen::Map<Eigen::MatrixXd>(Az_vec.data(), ntheta, nr);
+                } else {
+                    Az = Eigen::Map<Eigen::MatrixXd>(Az_vec.data(), ny, nx);
+                }
                 if (VERBOSE) {
                     std::cout << " [LS failed, using α=" << alpha_min << "]";
                 }

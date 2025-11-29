@@ -13,14 +13,54 @@ const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
 const SOLVER_PATH = path.join(__dirname, '..', 'build', 'MagFDMsolver');
 const CONFIG_PATH = path.join(__dirname, '..', 'sample_config.yaml');
 const USER_CONFIGS_DIR = path.join(__dirname, '..', 'configs');
+const OUTPUTS_DIR = path.join(__dirname, '..', 'outputs');
 
 // ディレクトリの作成
 fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(console.error);
 fs.mkdir(USER_CONFIGS_DIR, { recursive: true }).catch(console.error);
+fs.mkdir(OUTPUTS_DIR, { recursive: true }).catch(console.error);
 
 // Image management constants
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
 const MAX_IMAGES_PER_USER = 20;
+
+// Running solver processes (userId -> process)
+const runningProcesses = new Map();
+
+/**
+ * Generate timestamp-based output folder name
+ * @returns {string} Folder name in format: output_YYYYMMDD_HHMMSS
+ */
+function generateTimestampFolderName() {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hour = String(now.getHours()).padStart(2, '0');
+    const minute = String(now.getMinutes()).padStart(2, '0');
+    const second = String(now.getSeconds()).padStart(2, '0');
+
+    return `output_${year}${month}${day}_${hour}${minute}${second}`;
+}
+
+/**
+ * Get or create user-specific output directory
+ * @param {string} userId - User ID
+ * @returns {Promise<string>} Full path to user's output directory for this run
+ */
+async function prepareUserOutputDirectory(userId) {
+    const userIdKey = userId || 'default';
+    const userOutputBase = path.join(OUTPUTS_DIR, `user_${userIdKey}`);
+
+    // Create user's output base directory if it doesn't exist
+    await fs.mkdir(userOutputBase, { recursive: true });
+
+    // Generate timestamped folder for this run
+    const timestampFolder = generateTimestampFolderName();
+    const fullOutputPath = path.join(userOutputBase, timestampFolder);
+
+    return fullOutputPath;
+}
 
 // Multerの設定（ファイルアップロード用）
 const storage = multer.diskStorage({
@@ -537,10 +577,20 @@ app.post('/api/solve-stream', async (req, res) => {
 
         console.log('Executing solver with streaming:', SOLVER_PATH);
 
-        // spawnを使用してリアルタイムで出力を取得
-        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath], {
+        const userIdKey = userId || 'default';
+
+        // Prepare user-specific output directory
+        const outputPath = await prepareUserOutputDirectory(userId);
+        console.log(`Output directory for user ${userIdKey}: ${outputPath}`);
+
+        // spawnを使用してリアルタイムで出力を取得（第3引数に出力パスを追加）
+        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], {
             cwd: path.join(__dirname, '..'),
         });
+
+        // プロセスをマップに登録
+        runningProcesses.set(userIdKey, solverProcess);
+        console.log(`Registered solver process for user: ${userIdKey}`);
 
         let outputBuffer = '';
         let errorBuffer = '';
@@ -612,6 +662,10 @@ app.post('/api/solve-stream', async (req, res) => {
         solverProcess.on('close', (code) => {
             console.log(`Solver process exited with code ${code}`);
 
+            // プロセスをマップから削除
+            runningProcesses.delete(userIdKey);
+            console.log(`Removed solver process for user: ${userIdKey}`);
+
             // 最後のバッファを送信
             if (outputBuffer.trim()) {
                 res.write(`data: ${JSON.stringify({ type: 'log', message: outputBuffer.trim() })}\n\n`);
@@ -622,7 +676,7 @@ app.post('/api/solve-stream', async (req, res) => {
                 type: code === 0 ? 'done' : 'error',
                 success: code === 0,
                 exitCode: code,
-                message: code === 0 ? 'Solver completed successfully' : 'Solver failed'
+                message: code === 0 ? 'Solver completed successfully' : (code === null ? 'Solver was stopped by user' : 'Solver failed')
             };
 
             res.write(`data: ${JSON.stringify(finalData)}\n\n`);
@@ -632,6 +686,10 @@ app.post('/api/solve-stream', async (req, res) => {
         // エラー時の処理
         solverProcess.on('error', (error) => {
             console.error('Solver process error:', error);
+
+            // プロセスをマップから削除
+            runningProcesses.delete(userIdKey);
+
             const errorData = {
                 type: 'error',
                 success: false,
@@ -659,21 +717,79 @@ app.post('/api/solve-stream', async (req, res) => {
     }
 });
 
+// ソルバーの停止
+app.post('/api/stop-solver', async (req, res) => {
+    try {
+        const { userId } = req.body;
+        const userIdKey = userId || 'default';
+
+        const solverProcess = runningProcesses.get(userIdKey);
+
+        if (!solverProcess) {
+            return res.status(404).json({
+                success: false,
+                error: 'No running solver process found for this user'
+            });
+        }
+
+        console.log(`Stopping solver process for user: ${userIdKey}`);
+
+        // プロセスを強制終了
+        solverProcess.kill('SIGTERM');
+
+        // プロセスがすぐに終了しない場合のタイムアウト
+        setTimeout(() => {
+            if (!solverProcess.killed) {
+                console.log(`Force killing solver process for user: ${userIdKey}`);
+                solverProcess.kill('SIGKILL');
+            }
+        }, 5000);
+
+        res.json({
+            success: true,
+            message: 'Solver process stopped successfully'
+        });
+
+    } catch (error) {
+        console.error('Error stopping solver:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // 出力ファイルの一覧
 app.get('/api/results', async (req, res) => {
     try {
-        const parentDir = path.join(__dirname, '..');
-        const files = await fs.readdir(parentDir, { withFileTypes: true });
+        const { userId } = req.query;
+        const userIdKey = userId || 'default';
 
-        // output_* または transient_output などのフォルダを検出
+        // User-specific output directory
+        const userOutputDir = path.join(OUTPUTS_DIR, `user_${userIdKey}`);
+
+        // Check if user output directory exists
+        try {
+            await fs.access(userOutputDir);
+        } catch {
+            // No outputs for this user yet
+            return res.json({
+                success: true,
+                results: []
+            });
+        }
+
+        const files = await fs.readdir(userOutputDir, { withFileTypes: true });
+
+        // output_* フォルダを検出
         const resultFolders = [];
 
         for (const file of files) {
             if (file.isDirectory()) {
                 const folderName = file.name;
-                // output_で始まる、またはtransient_outputなど
-                if (folderName.startsWith('output_') || folderName === 'transient_output') {
-                    const folderPath = path.join(parentDir, folderName);
+                // output_で始まるフォルダ
+                if (folderName.startsWith('output_')) {
+                    const folderPath = path.join(userOutputDir, folderName);
 
                     // Azフォルダの存在確認
                     try {
@@ -686,7 +802,7 @@ app.get('/api/results', async (req, res) => {
 
                         resultFolders.push({
                             name: folderName,
-                            path: folderName,
+                            path: `outputs/user_${userIdKey}/${folderName}`,
                             timestamp: folderName.replace('output_', ''),
                             steps: stepFiles.length
                         });
@@ -706,6 +822,189 @@ app.get('/api/results', async (req, res) => {
             results: resultFolders
         });
     } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ===== Output File Management API =====
+
+/**
+ * Calculate directory size recursively
+ * @param {string} dirPath - Directory path
+ * @returns {Promise<number>} Size in bytes
+ */
+async function getDirectorySize(dirPath) {
+    let totalSize = 0;
+
+    try {
+        const items = await fs.readdir(dirPath, { withFileTypes: true });
+
+        for (const item of items) {
+            const itemPath = path.join(dirPath, item.name);
+
+            if (item.isDirectory()) {
+                totalSize += await getDirectorySize(itemPath);
+            } else if (item.isFile()) {
+                const stats = await fs.stat(itemPath);
+                totalSize += stats.size;
+            }
+        }
+    } catch (error) {
+        console.error(`Error calculating size for ${dirPath}:`, error);
+    }
+
+    return totalSize;
+}
+
+/**
+ * Format bytes to human readable format
+ * @param {number} bytes - Size in bytes
+ * @returns {string} Formatted size string
+ */
+function formatBytes(bytes) {
+    if (bytes === 0) return '0 Bytes';
+
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+}
+
+// Get list of user output folders with details
+app.get('/api/user-outputs', async (req, res) => {
+    try {
+        const { userId } = req.query;
+        const userIdKey = userId || 'default';
+
+        // Sanitize userId to prevent directory traversal
+        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
+        const userOutputDir = path.join(OUTPUTS_DIR, `${safeUserId}`);
+
+        // Check if user output directory exists
+        try {
+            await fs.access(userOutputDir);
+        } catch {
+            return res.json({
+                success: true,
+                outputs: []
+            });
+        }
+
+        const items = await fs.readdir(userOutputDir, { withFileTypes: true });
+        const outputFolders = [];
+
+        for (const item of items) {
+            if (item.isDirectory() && item.name.startsWith('output_')) {
+                const folderPath = path.join(userOutputDir, item.name);
+
+                try {
+                    // Get folder stats
+                    const stats = await fs.stat(folderPath);
+
+                    // Calculate folder size
+                    const size = await getDirectorySize(folderPath);
+
+                    // Count steps
+                    let stepCount = 0;
+                    try {
+                        const azFolder = path.join(folderPath, 'Az');
+                        const azFiles = await fs.readdir(azFolder);
+                        stepCount = azFiles.filter(f => /^step_\d{4}\.csv$/.test(f)).length;
+                    } catch {
+                        // Az folder might not exist
+                        stepCount = 0;
+                    }
+
+                    outputFolders.push({
+                        name: item.name,
+                        timestamp: item.name.replace('output_', ''),
+                        created: stats.birthtime.toISOString(),
+                        size: size,
+                        sizeFormatted: formatBytes(size),
+                        steps: stepCount
+                    });
+                } catch (error) {
+                    console.error(`Error processing folder ${item.name}:`, error);
+                }
+            }
+        }
+
+        // Sort by timestamp (newest first)
+        outputFolders.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
+        res.json({
+            success: true,
+            outputs: outputFolders
+        });
+
+    } catch (error) {
+        console.error('Error listing user outputs:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Delete a specific output folder
+app.delete('/api/user-outputs/:folderName', async (req, res) => {
+    try {
+        const { folderName } = req.params;
+        const { userId } = req.query;
+        const userIdKey = userId || 'default';
+
+        // Sanitize inputs to prevent directory traversal
+        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeFolderName = path.basename(folderName); // Prevent path traversal
+
+        // Validate folder name format
+        if (!safeFolderName.startsWith('output_')) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid folder name format'
+            });
+        }
+
+        const userOutputDir = path.join(OUTPUTS_DIR, `user_${safeUserId}`);
+        const folderPath = path.join(userOutputDir, safeFolderName);
+
+        // Security check: ensure the resolved path is within user's output directory
+        const resolvedFolderPath = path.resolve(folderPath);
+        const resolvedUserOutputDir = path.resolve(userOutputDir);
+
+        if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
+            return res.status(403).json({
+                success: false,
+                error: 'Access denied: Path traversal detected'
+            });
+        }
+
+        // Check if folder exists
+        try {
+            await fs.access(folderPath);
+        } catch {
+            return res.status(404).json({
+                success: false,
+                error: 'Output folder not found'
+            });
+        }
+
+        // Delete the folder recursively
+        await fs.rm(folderPath, { recursive: true, force: true });
+
+        console.log(`Deleted output folder: ${safeUserId}/${safeFolderName}`);
+
+        res.json({
+            success: true,
+            message: 'Output folder deleted successfully'
+        });
+
+    } catch (error) {
+        console.error('Error deleting output folder:', error);
         res.status(500).json({
             success: false,
             error: error.message

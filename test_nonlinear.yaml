@@ -58,7 +58,7 @@ nonlinear_solver:
   line_search_alpha_init: 1.0     # Initial step length (default: 1.0 = full Newton step)
   line_search_alpha_min: 1.0e-4   # Minimum step length (safety lower bound)
   line_search_rho: 0.5            # Backtracking factor (0 < rho < 1, default: 0.5, higher = more aggressive)
-  line_search_max_trials: 10      # Maximum backtracking trials
+  line_search_max_trials: 100      # Maximum backtracking trials
   line_search_adaptive: true      # Enable adaptive initial step length (recommended)
 
   verbose: false

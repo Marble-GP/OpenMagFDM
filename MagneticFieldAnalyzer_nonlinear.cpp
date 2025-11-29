@@ -393,7 +393,7 @@ void MagneticFieldAnalyzer::calculateHField() {
         H_map.resize(ntheta, nr);
     }
 
-    // Calculate H from B and current mu_map
+    // Calculate H from B using proper inverse B-H relationship
     for (int j = 0; j < H_map.rows(); j++) {
         for (int i = 0; i < H_map.cols(); i++) {
             double Bx_val, By_val;
@@ -407,12 +407,45 @@ void MagneticFieldAnalyzer::calculateHField() {
             }
 
             double B_mag = std::sqrt(Bx_val * Bx_val + By_val * By_val);
-            double mu = mu_map(j, i);
 
-            if (mu > 1e-20) {
-                H_map(j, i) = B_mag / mu;
+            // For nonlinear materials, use inverse B-H interpolation
+            // For linear materials, use H = B/μ
+            cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
+            cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
+
+            // Find material for this pixel
+            std::string material_name = "";
+            for (const auto& mat : config["materials"]) {
+                std::string name = mat.first.as<std::string>();
+                YAML::Node props = mat.second;
+                if (!props["rgb"]) continue;
+
+                auto yaml_rgb = props["rgb"];
+                cv::Scalar mat_rgb(
+                    yaml_rgb[0].as<int>(),
+                    yaml_rgb[1].as<int>(),
+                    yaml_rgb[2].as<int>()
+                );
+
+                if (rgb == mat_rgb) {
+                    material_name = name;
+                    break;
+                }
+            }
+
+            // Check if this material has a B-H table (nonlinear)
+            auto bh_it = material_bh_tables.find(material_name);
+            if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                // Nonlinear material: use inverse B-H interpolation
+                H_map(j, i) = interpolateH_from_B(bh_it->second, B_mag);
             } else {
-                H_map(j, i) = 0.0;
+                // Linear material: use H = B/μ
+                double mu = mu_map(j, i);
+                if (mu > 1e-20) {
+                    H_map(j, i) = B_mag / mu;
+                } else {
+                    H_map(j, i) = 0.0;
+                }
             }
         }
     }
@@ -548,22 +581,31 @@ void MagneticFieldAnalyzer::solveNonlinear() {
 
         // Step 5: Check convergence
         Eigen::VectorXd Az_new = Eigen::Map<Eigen::VectorXd>(Az.data(), Az.size());
-        double Az_residual = (Az_new - Az_old).norm() / Az_new.norm();
+        double Az_diff_norm = (Az_new - Az_old).norm();
+        double Az_norm = Az_new.norm();
 
-        double max_mu_change = (mu_map - mu_old).cwiseAbs().maxCoeff();
+        // Avoid division by zero: use relative residual if ||Az|| is large, absolute otherwise
+        double Az_residual = (Az_norm > 1e-12) ? (Az_diff_norm / Az_norm) : Az_diff_norm;
+
+        // Calculate relative mu change
+        Eigen::VectorXd mu_old_vec = Eigen::Map<Eigen::VectorXd>(mu_old.data(), mu_old.size());
+        Eigen::VectorXd mu_new_vec = Eigen::Map<Eigen::VectorXd>(mu_map.data(), mu_map.size());
+        double mu_change_norm = (mu_new_vec - mu_old_vec).norm();
+        double mu_old_norm = mu_old_vec.norm();
+        double mu_change_rel = (mu_old_norm > 1e-20) ? (mu_change_norm / mu_old_norm) : mu_change_norm;
 
         residual_history.push_back(Az_residual);
-        mu_change_history.push_back(max_mu_change);
+        mu_change_history.push_back(mu_change_rel);
 
         if (nonlinear_config.verbose) {
             std::cout << "NL iter " << std::setw(3) << iter + 1
                       << ": ||ΔAz|| = " << std::scientific << std::setprecision(4) << Az_residual
-                      << ",  max Δμ = " << max_mu_change << " H/m"
+                      << ",  ||Δμ||/||μ|| = " << mu_change_rel
                       << std::endl;
         }
 
-        // Convergence check
-        if (Az_residual < TOL && max_mu_change < TOL * 4e-7 * M_PI) {  // μ_0 scale
+        // Convergence check (both Az and mu must converge)
+        if (Az_residual < TOL && mu_change_rel < TOL) {
             std::cout << "Nonlinear solver converged in " << iter + 1 << " iterations" << std::endl;
 
             // Export convergence history if requested
@@ -701,15 +743,21 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
 
         // Convergence check
         Eigen::VectorXd Az_new = Eigen::Map<Eigen::VectorXd>(Az.data(), Az.size());
-        double Az_res = (Az_new - Az_old).norm() / Az_new.norm();
-        double mu_res = residual.norm() / mu_new.norm();
+        double Az_diff = (Az_new - Az_old).norm();
+        double Az_norm = Az_new.norm();
+        double mu_diff = residual.norm();
+        double mu_old_norm = mu_old.norm();
+
+        // Avoid division by zero: use relative residual if norm is large, absolute otherwise
+        double Az_res = (Az_norm > 1e-12) ? (Az_diff / Az_norm) : Az_diff;
+        double mu_res = (mu_old_norm > 1e-12) ? (mu_diff / mu_old_norm) : mu_diff;
 
         Az_residual_history.push_back(Az_res);
 
         if (nonlinear_config.verbose) {
             std::cout << "AA iter " << std::setw(3) << iter + 1
                       << ": ||ΔAz|| = " << std::scientific << std::setprecision(4) << Az_res
-                      << ",  ||Δμ|| = " << mu_res
+                      << ",  ||Δμ||/||μ|| = " << mu_res
                       << std::endl;
         }
 

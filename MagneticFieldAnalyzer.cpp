@@ -30,20 +30,42 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
     // Load nonlinear solver configuration from YAML (if present)
     if (config["nonlinear_solver"]) {
         auto nl_config = config["nonlinear_solver"];
-        if (nl_config["solver_type"]) nonlinear_config.solver_type = nl_config["solver_type"].as<std::string>();
-        if (nl_config["max_iterations"]) nonlinear_config.max_iterations = nl_config["max_iterations"].as<int>();
-        if (nl_config["tolerance"]) nonlinear_config.tolerance = nl_config["tolerance"].as<double>();
-        if (nl_config["relaxation"]) nonlinear_config.relaxation = nl_config["relaxation"].as<double>();
-        if (nl_config["anderson_depth"]) nonlinear_config.anderson_depth = nl_config["anderson_depth"].as<int>();
-        if (nl_config["gmres_restart"]) nonlinear_config.gmres_restart = nl_config["gmres_restart"].as<int>();
-        if (nl_config["line_search_c"]) nonlinear_config.line_search_c = nl_config["line_search_c"].as<double>();
-        if (nl_config["line_search_alpha_init"]) nonlinear_config.line_search_alpha_init = nl_config["line_search_alpha_init"].as<double>();
-        if (nl_config["line_search_alpha_min"]) nonlinear_config.line_search_alpha_min = nl_config["line_search_alpha_min"].as<double>();
-        if (nl_config["line_search_rho"]) nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>();
-        if (nl_config["line_search_max_trials"]) nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>();
-        if (nl_config["line_search_adaptive"]) nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>();
-        if (nl_config["verbose"]) nonlinear_config.verbose = nl_config["verbose"].as<bool>();
-        if (nl_config["export_convergence"]) nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>();
+
+        // Basic settings
+        if (nl_config["enabled"])
+            nonlinear_config.enabled = nl_config["enabled"].as<bool>(true);
+        if (nl_config["solver_type"])
+            nonlinear_config.solver_type = nl_config["solver_type"].as<std::string>("newton-krylov");
+        if (nl_config["max_iterations"])
+            nonlinear_config.max_iterations = nl_config["max_iterations"].as<int>(50);
+        if (nl_config["tolerance"])
+            nonlinear_config.tolerance = nl_config["tolerance"].as<double>(5e-4);
+        if (nl_config["verbose"])
+            nonlinear_config.verbose = nl_config["verbose"].as<bool>(false);
+        if (nl_config["export_convergence"])
+            nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>(false);
+
+        // Picard/Anderson specific settings
+        if (nl_config["relaxation"])
+            nonlinear_config.relaxation = nl_config["relaxation"].as<double>(0.7);
+        if (nl_config["anderson_depth"])
+            nonlinear_config.anderson_depth = nl_config["anderson_depth"].as<int>(5);
+
+        // Newton-Krylov specific settings
+        if (nl_config["gmres_restart"])
+            nonlinear_config.gmres_restart = nl_config["gmres_restart"].as<int>(30);
+        if (nl_config["line_search_c"])
+            nonlinear_config.line_search_c = nl_config["line_search_c"].as<double>(1e-4);
+        if (nl_config["line_search_alpha_init"])
+            nonlinear_config.line_search_alpha_init = nl_config["line_search_alpha_init"].as<double>(1.0);
+        if (nl_config["line_search_alpha_min"])
+            nonlinear_config.line_search_alpha_min = nl_config["line_search_alpha_min"].as<double>(1e-3);
+        if (nl_config["line_search_rho"])
+            nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>(0.65);
+        if (nl_config["line_search_max_trials"])
+            nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>(50);
+        if (nl_config["line_search_adaptive"])
+            nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
     }
 
     // Determine coordinate system
@@ -501,7 +523,7 @@ double MagneticFieldAnalyzer::getMuAtInterfaceSym(int i, int j, const std::strin
 
 void MagneticFieldAnalyzer::solve() {
     // Check if nonlinear solver is needed
-    if (has_nonlinear_materials) {
+    if (has_nonlinear_materials && nonlinear_config.enabled) {
         std::cout << "\n=== Nonlinear materials detected ===" << std::endl;
         std::cout << "Using nonlinear solver: " << nonlinear_config.solver_type << std::endl;
 
@@ -814,6 +836,37 @@ void MagneticFieldAnalyzer::exportMuToCSV(const std::string& output_path) const 
 
     file.close();
     std::cout << "Permeability distribution exported to: " << output_path << std::endl;
+    std::cout << "Array size: " << rows << " rows x " << cols << " columns" << std::endl;
+}
+
+void MagneticFieldAnalyzer::exportHToCSV(const std::string& output_path) const {
+    if (H_map.size() == 0) {
+        std::cerr << "Warning: No H-field data to export (H_map is empty). Skipping H export." << std::endl;
+        return;
+    }
+
+    std::ofstream file(output_path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open output file: " + output_path);
+    }
+
+    file << std::scientific << std::setprecision(16);
+
+    int rows = H_map.rows();
+    int cols = H_map.cols();
+
+    for (int j = 0; j < rows; j++) {
+        for (int i = 0; i < cols; i++) {
+            file << H_map(j, i);
+            if (i < cols - 1) {
+                file << ",";
+            }
+        }
+        file << "\n";
+    }
+
+    file.close();
+    std::cout << "Magnetic field intensity |H| exported to: " << output_path << std::endl;
     std::cout << "Array size: " << rows << " rows x " << cols << " columns" << std::endl;
 }
 
@@ -2310,6 +2363,7 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     // Create subfolders
     std::string az_folder = base_folder + "/Az";
     std::string mu_folder = base_folder + "/Mu";
+    std::string h_folder = base_folder + "/H";  // Magnetic field intensity |H| [A/m]
     std::string jz_folder = base_folder + "/Jz";
     std::string boundary_folder = base_folder + "/BoundaryImg";
     std::string forces_folder = base_folder + "/Forces";
@@ -2318,6 +2372,7 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
 
     system(("mkdir -p \"" + az_folder + "\"").c_str());
     system(("mkdir -p \"" + mu_folder + "\"").c_str());
+    system(("mkdir -p \"" + h_folder + "\"").c_str());
     system(("mkdir -p \"" + jz_folder + "\"").c_str());
     system(("mkdir -p \"" + boundary_folder + "\"").c_str());
     system(("mkdir -p \"" + forces_folder + "\"").c_str());
@@ -2337,6 +2392,10 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     // Export Mu
     std::string mu_path = mu_folder + "/" + step_name + ".csv";
     exportMuToCSV(mu_path);
+
+    // Export H (magnetic field intensity magnitude) if available
+    std::string h_path = h_folder + "/" + step_name + ".csv";
+    exportHToCSV(h_path);
 
     // Export Jz
     std::string jz_path = jz_folder + "/" + step_name + ".csv";
@@ -2695,8 +2754,13 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
     double symmetry_error = (A - A_T).norm();
     double A_norm = A.norm();
     double relative_symmetry_error = (A_norm > 1e-12) ? (symmetry_error / A_norm) : symmetry_error;
-    std::cout << "Matrix symmetry: ||A - A^T|| = " << symmetry_error
-              << ", relative error = " << relative_symmetry_error << std::endl;
+
+    // Only show symmetry check in verbose mode, unless there's a problem
+    if (nonlinear_config.verbose) {
+        std::cout << "Matrix symmetry: ||A - A^T|| = " << symmetry_error
+                  << ", relative error = " << relative_symmetry_error << std::endl;
+    }
+
     if (relative_symmetry_error > 1e-8) {
         std::cerr << "Warning: Matrix is not symmetric! Relative error = " << relative_symmetry_error << std::endl;
         std::cerr << "This may indicate incorrect discretization or boundary conditions." << std::endl;
@@ -2713,12 +2777,14 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
 
     Eigen::VectorXd Az_flat = solver.solve(rhs);
 
-    // Check residual
-    Eigen::VectorXd res = A * Az_flat - rhs;
-    double res_norm = res.norm();
-    double rhs_norm = rhs.norm();
-    std::cout << "[DBG] Residual norm ||A x - b|| = " << res_norm
-            << ", relative = " << (rhs_norm>0 ? res_norm / rhs_norm : res_norm) << std::endl;
+    // Check residual (debug output only if verbose)
+    if (nonlinear_config.verbose) {
+        Eigen::VectorXd res = A * Az_flat - rhs;
+        double res_norm = res.norm();
+        double rhs_norm = rhs.norm();
+        std::cout << "[DBG] Residual norm ||A x - b|| = " << res_norm
+                << ", relative = " << (rhs_norm>0 ? res_norm / rhs_norm : res_norm) << std::endl;
+    }
 
         if (solver.info() != Eigen::Success) {
             throw std::runtime_error("Linear system solve failed!");
@@ -2757,7 +2823,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
 }
 
 void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
-    std::cout << "Calculating magnetic field (polar coordinates)" << std::endl;
+    // Removed verbose output - called frequently in nonlinear iterations
 
     // Allocate field arrays in image-compatible format
     if (r_orientation == "horizontal") {
@@ -2856,9 +2922,10 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
         if (mag > bmax) bmax = mag;
     }
     }
-    std::cout << "[DBG] Max |B| = " << bmax << std::endl;
-
-    std::cout << "Magnetic field calculated" << std::endl;
+    // Debug output removed - called frequently in nonlinear iterations
+    // if (nonlinear_config.verbose) {
+    //     std::cout << "[DBG] Max |B| = " << bmax << std::endl;
+    // }
 }
 
 // ============================================================================
@@ -3096,11 +3163,44 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // 1. Update material properties (Jz) for this step
         setupMaterialPropertiesForStep(step);
 
-        // 2. Solve FDM system (optimized for transient analysis)
+        // 2. Solve FDM system
         auto solve_start = std::chrono::high_resolution_clock::now();
 
-        if (use_optimized_solver) {
-            // Optimized path for both coordinate systems
+        // Check if nonlinear solver is needed for this step
+        if (has_nonlinear_materials && nonlinear_config.enabled) {
+            // For nonlinear materials, use standard solve() which includes nonlinear iteration
+            // This ensures mu_map is updated based on actual H-field at each transient step
+            solve();
+
+            // Update previous_solution for warm start in next step
+            int n = (coordinate_system == "cartesian") ? (nx * ny) : (nr * ntheta);
+            previous_solution.resize(n);
+
+            if (coordinate_system == "cartesian") {
+                for (int j = 0; j < ny; j++) {
+                    for (int i = 0; i < nx; i++) {
+                        previous_solution[j * nx + i] = Az(j, i);
+                    }
+                }
+            } else {  // polar
+                if (r_orientation == "horizontal") {
+                    // Az(θ, r) → flat[r * ntheta + θ]
+                    for (int i = 0; i < nr; i++) {
+                        for (int j = 0; j < ntheta; j++) {
+                            previous_solution[i * ntheta + j] = Az(j, i);  // Transpose
+                        }
+                    }
+                } else {  // vertical
+                    // Az(r, θ) → flat[r * ntheta + θ]
+                    for (int i = 0; i < nr; i++) {
+                        for (int j = 0; j < ntheta; j++) {
+                            previous_solution[i * ntheta + j] = Az(i, j);
+                        }
+                    }
+                }
+            }
+        } else if (use_optimized_solver) {
+            // Optimized linear path for transient analysis (when no nonlinear materials)
             Eigen::SparseMatrix<double> A;
             Eigen::VectorXd rhs;
             int n;

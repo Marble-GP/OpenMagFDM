@@ -85,6 +85,42 @@ materials:
 
 詳細は `nonlinear_material_spec.yaml` を参照してください。
 
+### 非線形材料の可視化
+非線形材料を含む解析では、出力に以下のファイルが含まれます：
+
+- **Az/**: 磁気ベクトルポテンシャル A_z [Wb/m]
+- **Mu/**: 透磁率 μ [H/m] （各位置でμ_r(H)を評価した結果）
+- **H/**: 磁界強度 |H| [A/m] （Newton-Krylov収束後の値）
+- **conditions.json**: 解析条件（`has_nonlinear_materials`フラグを含む）
+
+#### B-H関係の計算
+```
+線形材料の場合:
+  B = ∇×Az, H = B/(μ₀*μ_r), μ_rは定数
+
+非線形材料の場合（μ_rは微分透磁率 dB/dH として定義）:
+  B = ∇×Az  （常に正確、ソルバーが直接計算）
+  H = H.csvから読み込み （Newton-Krylov収束後の値）
+
+  B-H関係式: B(H) = μ₀ ∫₀^H μ_r(H') dH'
+  　　　　　（μ_r(H)は微分透磁率なので積分が必要）
+
+  実効透磁率: μ_eff(x,y) = B(x,y)/(μ₀*H(x,y))
+  　　　　　（各点での平均的な透磁率）
+```
+
+**重要**:
+1. YAMLで定義する `mu_r: 1 + 5000 / (1 + ($H / 5e4)^2)` は**微分透磁率** dB/dH です
+2. ソルバーはB-H曲線を `B = μ₀ ∫μ_r(H)dH` で計算します（[MagneticFieldAnalyzer_nonlinear.cpp:317](MagneticFieldAnalyzer_nonlinear.cpp#L317)参照）
+3. WebUIでは、`conditions.json` の `has_nonlinear_materials` フラグを確認し、
+   `true` の場合は `H/` フォルダから磁界強度分布を読み込んでください
+4. B-Hプロット作成時は、エクスポートされたBとH値を直接使用してください（積分不要）
+
+#### 座標系の注意点
+画像座標系（y下向き）と解析座標系（y上向き）では上下反転しています。
+WebUIで可視化する際は、csvデータを垂直反転（flip）すると元の画像と同じ向きになります。
+詳細は「Field Lines + Boundary」の可視化結果を参照してください。
+
 ## 同梱ライブラリ
 - `amgcl/` — 高性能な多重格子前処理器（ソースを同梱）
 - `tinyexpr/` — 軽量な数式評価ライブラリ（ソースを同梱）
