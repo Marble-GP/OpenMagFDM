@@ -6,6 +6,9 @@
 #include <iomanip>
 #include <sstream>
 #include <yaml-cpp/yaml.h>
+#include "json.hpp"
+
+using json = nlohmann::json;
 
 /**
  * @brief Custom streambuf that writes to both console and file (tee functionality)
@@ -91,22 +94,17 @@ void exportConditionsJSON(const std::string& output_path,
         throw std::runtime_error("Failed to load image: " + image_path);
     }
 
-    // Open output file
-    std::ofstream json_file(output_path);
-    if (!json_file.is_open()) {
-        throw std::runtime_error("Failed to create JSON file: " + output_path);
-    }
-
-    json_file << "{\n";
+    // Create JSON object
+    json j;
 
     // Coordinate system
     std::string coord_system = config["coordinate_system"]
         ? config["coordinate_system"].as<std::string>() : "cartesian";
-    json_file << "  \"coordinate_system\": \"" << coord_system << "\",\n";
+    j["coordinate_system"] = coord_system;
 
     // Image dimensions
-    json_file << "  \"image_width\": " << image.cols << ",\n";
-    json_file << "  \"image_height\": " << image.rows << ",\n";
+    j["image_width"] = image.cols;
+    j["image_height"] = image.rows;
 
     // Mesh spacing
     if (coord_system == "cartesian") {
@@ -123,8 +121,8 @@ void exportConditionsJSON(const std::string& output_path,
         } else if (config["dy"]) {
             dy = config["dy"].as<double>();
         }
-        json_file << "  \"dx\": " << dx << ",\n";
-        json_file << "  \"dy\": " << dy << ",\n";
+        j["dx"] = dx;
+        j["dy"] = dy;
     } else if (coord_system == "polar") {
         // Try polar_domain first, then polar
         YAML::Node polar_section;
@@ -172,32 +170,29 @@ void exportConditionsJSON(const std::string& output_path,
         // NOT theta_range / (ntheta-1) which is for non-periodic grids
         double dtheta = theta_range / static_cast<double>(ntheta);
 
-        json_file << "  \"dr\": " << dr << ",\n";
-        json_file << "  \"dtheta\": " << dtheta << ",\n";
+        j["dr"] = dr;
+        j["dtheta"] = dtheta;
 
         // Polar parameters
-        json_file << "  \"polar\": {\n";
-        json_file << "    \"r_start\": " << r_start << ",\n";
-        json_file << "    \"r_end\": " << r_end << ",\n";
-        json_file << "    \"theta_range\": " << theta_range << ",\n";
         std::string r_orientation = polar_section["r_orientation"]
             ? polar_section["r_orientation"].as<std::string>() : "horizontal";
-        json_file << "    \"r_orientation\": \"" << r_orientation << "\"\n";
-        json_file << "  },\n";
+        j["polar"] = {
+            {"r_start", r_start},
+            {"r_end", r_end},
+            {"theta_range", theta_range},
+            {"r_orientation", r_orientation}
+        };
     }
 
     // Boundary conditions
-    json_file << "  \"boundary_conditions\": {\n";
-
-    auto writeBoundary = [&](const std::string& name, const YAML::Node& bc_node) {
+    auto getBoundary = [](const YAML::Node& bc_node) -> json {
         std::string type = "dirichlet";
         double value = 0.0;
         if (bc_node) {
             if (bc_node["type"]) type = bc_node["type"].as<std::string>();
             if (bc_node["value"]) value = bc_node["value"].as<double>();
         }
-        json_file << "    \"" << name << "\": {\"type\": \"" << type
-                  << "\", \"value\": " << value << "}";
+        return {{"type", type}, {"value", value}};
     };
 
     // Try boundary_conditions first, then boundary
@@ -209,14 +204,12 @@ void exportConditionsJSON(const std::string& output_path,
     }
 
     if (coord_system == "cartesian") {
-        writeBoundary("left", bc_section["left"]);
-        json_file << ",\n";
-        writeBoundary("right", bc_section["right"]);
-        json_file << ",\n";
-        writeBoundary("bottom", bc_section["bottom"]);
-        json_file << ",\n";
-        writeBoundary("top", bc_section["top"]);
-        json_file << "\n";
+        j["boundary_conditions"] = {
+            {"left", getBoundary(bc_section["left"])},
+            {"right", getBoundary(bc_section["right"])},
+            {"bottom", getBoundary(bc_section["bottom"])},
+            {"top", getBoundary(bc_section["top"])}
+        };
     } else if (coord_system == "polar") {
         // Try polar_boundary_conditions first, then boundary
         YAML::Node polar_bc_section;
@@ -226,31 +219,27 @@ void exportConditionsJSON(const std::string& output_path,
             polar_bc_section = config["boundary"];
         }
 
-        writeBoundary("inner", polar_bc_section["inner"]);
-        json_file << ",\n";
-        writeBoundary("outer", polar_bc_section["outer"]);
-        json_file << ",\n";
-        writeBoundary("theta_min", polar_bc_section["theta_min"]);
-        json_file << ",\n";
-        writeBoundary("theta_max", polar_bc_section["theta_max"]);
-        json_file << "\n";
+        j["boundary_conditions"] = {
+            {"inner", getBoundary(polar_bc_section["inner"])},
+            {"outer", getBoundary(polar_bc_section["outer"])},
+            {"theta_min", getBoundary(polar_bc_section["theta_min"])},
+            {"theta_max", getBoundary(polar_bc_section["theta_max"])}
+        };
     }
 
-    json_file << "  },\n";
-
     // Transient configuration
-    json_file << "  \"transient\": {\n";
+    j["transient"] = json::object();
     if (config["transient"] && config["transient"]["enabled"]) {
         bool enabled = config["transient"]["enabled"].as<bool>();
-        json_file << "    \"enabled\": " << (enabled ? "true" : "false") << ",\n";
+        j["transient"]["enabled"] = enabled;
 
         if (enabled) {
             bool enable_sliding = config["transient"]["enable_sliding"]
                 ? config["transient"]["enable_sliding"].as<bool>() : true;
             int total_steps = config["transient"]["total_steps"].as<int>();
 
-            json_file << "    \"enable_sliding\": " << (enable_sliding ? "true" : "false") << ",\n";
-            json_file << "    \"total_steps\": " << total_steps << ",\n";
+            j["transient"]["enable_sliding"] = enable_sliding;
+            j["transient"]["total_steps"] = total_steps;
 
             if (enable_sliding) {
                 std::string slide_direction = config["transient"]["slide_direction"].as<std::string>();
@@ -258,16 +247,15 @@ void exportConditionsJSON(const std::string& output_path,
                 int slide_region_end = config["transient"]["slide_region_end"].as<int>();
                 int slide_pixels_per_step = config["transient"]["slide_pixels_per_step"].as<int>();
 
-                json_file << "    \"slide_direction\": \"" << slide_direction << "\",\n";
-                json_file << "    \"slide_region_start\": " << slide_region_start << ",\n";
-                json_file << "    \"slide_region_end\": " << slide_region_end << ",\n";
-                json_file << "    \"slide_pixels_per_step\": " << slide_pixels_per_step << "\n";
+                j["transient"]["slide_direction"] = slide_direction;
+                j["transient"]["slide_region_start"] = slide_region_start;
+                j["transient"]["slide_region_end"] = slide_region_end;
+                j["transient"]["slide_pixels_per_step"] = slide_pixels_per_step;
             }
         }
     } else {
-        json_file << "    \"enabled\": false\n";
+        j["transient"]["enabled"] = false;
     }
-    json_file << "  },\n";
 
     // Nonlinear materials detection
     bool has_nonlinear_materials = false;
@@ -299,8 +287,8 @@ void exportConditionsJSON(const std::string& output_path,
     }
 
     // Nonlinear solver configuration
-    json_file << "  \"nonlinear_solver\": {\n";
-    json_file << "    \"has_nonlinear_materials\": " << (has_nonlinear_materials ? "true" : "false");
+    j["nonlinear_solver"] = json::object();
+    j["nonlinear_solver"]["has_nonlinear_materials"] = has_nonlinear_materials;
 
     if (config["nonlinear_solver"]) {
         bool nl_enabled = false;
@@ -313,15 +301,16 @@ void exportConditionsJSON(const std::string& output_path,
             solver_type = config["nonlinear_solver"]["solver_type"].as<std::string>();
         }
 
-        json_file << ",\n";
-        json_file << "    \"enabled\": " << (nl_enabled ? "true" : "false") << ",\n";
-        json_file << "    \"solver_type\": \"" << solver_type << "\"\n";
-    } else {
-        json_file << "\n";
+        j["nonlinear_solver"]["enabled"] = nl_enabled;
+        j["nonlinear_solver"]["solver_type"] = solver_type;
     }
-    json_file << "  }\n";
 
-    json_file << "}\n";
+    // Write to file with proper indentation
+    std::ofstream json_file(output_path);
+    if (!json_file.is_open()) {
+        throw std::runtime_error("Failed to create JSON file: " + output_path);
+    }
+    json_file << j.dump(2) << std::endl;  // indent with 2 spaces
     json_file.close();
 }
 
