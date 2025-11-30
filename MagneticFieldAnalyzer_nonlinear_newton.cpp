@@ -358,12 +358,46 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             buildMatrix(A_matrix, b_vec);
         }
 
-        Eigen::VectorXd Az_vec = Eigen::Map<Eigen::VectorXd>(Az.data(), Az.size());
+        // CRITICAL: buildMatrixPolar uses row-major indexing (idx = r_idx * ntheta + theta_idx)
+        // but Eigen Az.data() is column-major. Must convert to row-major order.
+        Eigen::VectorXd Az_vec(Az.size());
+        if (is_polar) {
+            // Convert Az to row-major order to match buildMatrixPolar indexing
+            for (int i = 0; i < nr; i++) {
+                for (int j = 0; j < ntheta; j++) {
+                    int idx = i * ntheta + j;  // Row-major index
+                    if (r_orientation == "horizontal") {
+                        Az_vec(idx) = Az(j, i);  // Az is (ntheta, nr), so Az(theta, r)
+                    } else {  // vertical
+                        Az_vec(idx) = Az(i, j);  // Az is (nr, ntheta), so Az(r, theta)
+                    }
+                }
+            }
+        } else {
+            // Cartesian: row-major is natural for (ny, nx) with idx = j * nx + i
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    int idx = j * nx + i;
+                    Az_vec(idx) = Az(j, i);
+                }
+            }
+        }
+
         Eigen::VectorXd residual = A_matrix * Az_vec - b_vec;
         double residual_norm = residual.norm();
-        double residual_rel = residual_norm / (b_vec.norm() + 1e-12);
+        double b_vec_norm = b_vec.norm();
+        double residual_rel = residual_norm / (b_vec_norm + 1e-12);
 
         residual_history.push_back(residual_rel);
+
+        // DEBUG: Print norms for first iteration to diagnose polar vs cartesian scaling
+        if (VERBOSE && iter == 0) {
+            double A_norm = A_matrix.norm();
+            std::cout << "DEBUG: ||A|| = " << A_norm
+                      << ", ||Az|| = " << Az_vec.norm()
+                      << ", ||b|| = " << b_vec_norm
+                      << ", ||R||_abs = " << residual_norm << std::endl;
+        }
 
         if (VERBOSE) {
             std::cout << "NK iter " << std::setw(3) << iter + 1
@@ -393,6 +427,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // ===== Step 5: Compute Newton step δA by solving L·δA = -R =====
         // Use Quasi-Newton approximation: J ≈ L (linearized matrix)
         // TODO: Implement proper Jacobian-free GMRES (Arnoldi) when Richardson is stabilized
+        //
+        // PERFORMANCE NOTE: Polar coordinates converge slower due to:
+        // 1. Quasi-Newton approximation J ≈ L neglects dμ/dH terms
+        // 2. r-weighting amplifies nonlinearity
+        // 3. Variable mesh size (r*dθ varies by 50% from inner to outer)
 
         Eigen::VectorXd delta_A;
 
@@ -430,8 +469,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 alpha_init = alpha_prev;
             }
         } else {
-            // Use configured initial value
-            alpha_init = nonlinear_config.line_search_alpha_init;
+            // Use configured initial value, but consider previous success
+            // CRITICAL FIX: If previous step was small, don't be too aggressive
+            if (iter > 0 && alpha_prev < 0.5) {
+                // Previous step was conservative → start from slightly larger value
+                alpha_init = std::min(nonlinear_config.line_search_alpha_init, alpha_prev * 1.5);
+            } else {
+                alpha_init = nonlinear_config.line_search_alpha_init;
+            }
         }
 
         double alpha = alpha_init;
@@ -446,11 +491,38 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         for (int ls = 0; ls < max_line_search; ls++) {
             // Trial step: A_trial = A + α·δA
             Eigen::VectorXd Az_trial = Az_vec_0 + alpha * delta_A;
+
+            // Convert Az_trial (row-major vector) back to matrix form
             Eigen::MatrixXd Az_trial_mat;
             if (is_polar) {
-                Az_trial_mat = Eigen::Map<Eigen::MatrixXd>(Az_trial.data(), ntheta, nr);
+                // CRITICAL: buildMatrixPolar uses row-major indexing (idx = r_idx * ntheta + theta_idx)
+                // Convert from row-major vector to matrix
+                if (r_orientation == "horizontal") {
+                    Az_trial_mat.resize(ntheta, nr);
+                    for (int i = 0; i < nr; i++) {
+                        for (int j = 0; j < ntheta; j++) {
+                            int idx = i * ntheta + j;
+                            Az_trial_mat(j, i) = Az_trial(idx);  // Az(theta, r)
+                        }
+                    }
+                } else {  // vertical
+                    Az_trial_mat.resize(nr, ntheta);
+                    for (int i = 0; i < nr; i++) {
+                        for (int j = 0; j < ntheta; j++) {
+                            int idx = i * ntheta + j;
+                            Az_trial_mat(i, j) = Az_trial(idx);  // Az(r, theta)
+                        }
+                    }
+                }
             } else {
-                Az_trial_mat = Eigen::Map<Eigen::MatrixXd>(Az_trial.data(), ny, nx);
+                // Cartesian: Convert from row-major vector (idx = j * nx + i) to matrix
+                Az_trial_mat.resize(ny, nx);
+                for (int j = 0; j < ny; j++) {
+                    for (int i = 0; i < nx; i++) {
+                        int idx = j * nx + i;
+                        Az_trial_mat(j, i) = Az_trial(idx);
+                    }
+                }
             }
 
             // Calculate B and H for trial point
@@ -491,10 +563,34 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             if (ls == max_line_search - 1) {
                 // Line search failed, accept minimal step
                 Az_vec = Az_vec_0 + alpha_min * delta_A;
+
+                // Convert Az_vec (row-major) back to matrix form
                 if (is_polar) {
-                    Az = Eigen::Map<Eigen::MatrixXd>(Az_vec.data(), ntheta, nr);
+                    if (r_orientation == "horizontal") {
+                        Az.resize(ntheta, nr);
+                        for (int i = 0; i < nr; i++) {
+                            for (int j = 0; j < ntheta; j++) {
+                                int idx = i * ntheta + j;
+                                Az(j, i) = Az_vec(idx);
+                            }
+                        }
+                    } else {  // vertical
+                        Az.resize(nr, ntheta);
+                        for (int i = 0; i < nr; i++) {
+                            for (int j = 0; j < ntheta; j++) {
+                                int idx = i * ntheta + j;
+                                Az(i, j) = Az_vec(idx);
+                            }
+                        }
+                    }
                 } else {
-                    Az = Eigen::Map<Eigen::MatrixXd>(Az_vec.data(), ny, nx);
+                    Az.resize(ny, nx);
+                    for (int j = 0; j < ny; j++) {
+                        for (int i = 0; i < nx; i++) {
+                            int idx = j * nx + i;
+                            Az(j, i) = Az_vec(idx);
+                        }
+                    }
                 }
                 if (VERBOSE) {
                     std::cout << " [LS failed, using α=" << alpha_min << "]";

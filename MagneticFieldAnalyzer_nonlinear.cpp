@@ -386,12 +386,22 @@ double MagneticFieldAnalyzer::interpolateH_from_B(const BHTable& table, double B
 void MagneticFieldAnalyzer::calculateHField() {
     const double MU_0 = 4.0 * M_PI * 1e-7;
 
-    // Ensure H_map has correct size
+    // Ensure H_map has correct size (must match mu_map shape)
     if (coordinate_system == "cartesian") {
         H_map.resize(ny, nx);
     } else {  // polar
-        H_map.resize(ntheta, nr);
+        // CRITICAL: H_map shape must match mu_map shape, which depends on r_orientation
+        if (r_orientation == "horizontal") {
+            H_map.resize(ntheta, nr);  // (theta, r) - theta is rows, r is cols
+        } else {  // vertical
+            H_map.resize(nr, ntheta);  // (r, theta) - r is rows, theta is cols
+        }
     }
+
+    // IMPORTANT: Match the image orientation used in setupMaterialProperties()
+    // setupMaterialProperties() always flips the image vertically for BOTH cartesian and polar
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // Flip vertically: y down -> y up
 
     // Calculate H from B using proper inverse B-H relationship
     for (int j = 0; j < H_map.rows(); j++) {
@@ -410,7 +420,8 @@ void MagneticFieldAnalyzer::calculateHField() {
 
             // For nonlinear materials, use inverse B-H interpolation
             // For linear materials, use H = B/μ
-            cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
+            // Use image_to_use (flipped) to match setupMaterialProperties()
+            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
             cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
 
             // Find material for this pixel
@@ -461,10 +472,16 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
         return;
     }
 
+    // IMPORTANT: Match the image orientation used in setupMaterialProperties()
+    // setupMaterialProperties() always flips the image vertically for BOTH cartesian and polar
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // Flip vertically: y down -> y up
+
     // For each pixel, look up material and update mu
-    for (int j = 0; j < image.rows; j++) {
-        for (int i = 0; i < image.cols; i++) {
-            cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
+    for (int j = 0; j < image_to_use.rows; j++) {
+        for (int i = 0; i < image_to_use.cols; i++) {
+            // Use image_to_use (flipped) to match setupMaterialProperties()
+            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
             cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
 
             // Find matching material

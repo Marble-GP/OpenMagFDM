@@ -36,36 +36,23 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
             nonlinear_config.enabled = nl_config["enabled"].as<bool>(true);
         if (nl_config["solver_type"])
             nonlinear_config.solver_type = nl_config["solver_type"].as<std::string>("newton-krylov");
-        if (nl_config["max_iterations"])
-            nonlinear_config.max_iterations = nl_config["max_iterations"].as<int>(50);
-        if (nl_config["tolerance"])
-            nonlinear_config.tolerance = nl_config["tolerance"].as<double>(5e-4);
-        if (nl_config["verbose"])
-            nonlinear_config.verbose = nl_config["verbose"].as<bool>(false);
-        if (nl_config["export_convergence"])
-            nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>(false);
+        nonlinear_config.max_iterations = nl_config["max_iterations"].as<int>(50);
+        nonlinear_config.tolerance = nl_config["tolerance"].as<double>(5e-4);
+        nonlinear_config.verbose = nl_config["verbose"].as<bool>(false);
+        nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>(false);
 
         // Picard/Anderson specific settings
-        if (nl_config["relaxation"])
-            nonlinear_config.relaxation = nl_config["relaxation"].as<double>(0.7);
-        if (nl_config["anderson_depth"])
-            nonlinear_config.anderson_depth = nl_config["anderson_depth"].as<int>(5);
+        nonlinear_config.relaxation = nl_config["relaxation"].as<double>(0.7);
+        nonlinear_config.anderson_depth = nl_config["anderson_depth"].as<int>(5);
 
         // Newton-Krylov specific settings
-        if (nl_config["gmres_restart"])
-            nonlinear_config.gmres_restart = nl_config["gmres_restart"].as<int>(30);
-        if (nl_config["line_search_c"])
-            nonlinear_config.line_search_c = nl_config["line_search_c"].as<double>(1e-4);
-        if (nl_config["line_search_alpha_init"])
-            nonlinear_config.line_search_alpha_init = nl_config["line_search_alpha_init"].as<double>(1.0);
-        if (nl_config["line_search_alpha_min"])
-            nonlinear_config.line_search_alpha_min = nl_config["line_search_alpha_min"].as<double>(1e-3);
-        if (nl_config["line_search_rho"])
-            nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>(0.65);
-        if (nl_config["line_search_max_trials"])
-            nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>(50);
-        if (nl_config["line_search_adaptive"])
-            nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
+        nonlinear_config.gmres_restart = nl_config["gmres_restart"].as<int>(30);
+        nonlinear_config.line_search_c = nl_config["line_search_c"].as<double>(1e-4);
+        nonlinear_config.line_search_alpha_init = nl_config["line_search_alpha_init"].as<double>(1.0);
+        nonlinear_config.line_search_alpha_min = nl_config["line_search_alpha_min"].as<double>(1e-3);
+        nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>(0.65);
+        nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>(50);
+        nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
     }
 
     // Determine coordinate system
@@ -209,14 +196,24 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
 
     // Calculate mesh spacing
     dr = (r_end - r_start) / (nr - 1);
-    // Angular spacing: In polar coordinates, θ is always periodic
-    // θ=0 and θ=theta_range represent the same radial line
-    // Therefore, we divide theta_range by ntheta (NOT ntheta-1)
-    dtheta = theta_range / static_cast<double>(ntheta);  // Periodic sampling: [0, theta_range)
+    // Angular spacing: For full rotation (theta_range == 2*pi), θ is periodic
+    // θ=0 and θ=2*pi represent the same radial line, so divide by ntheta (NOT ntheta-1)
+    // For sector domains (theta_range < 2*pi), θ=0 and θ=theta_range are boundaries (Dirichlet)
+    // Still use ntheta division for consistency (boundary points at j=0 and j=ntheta-1)
+    dtheta = theta_range / static_cast<double>(ntheta);  // θ sampling: [0, theta_range)
 
     std::cout << "Polar domain: r = [" << r_start << ", " << r_end << "] m, theta = [0, "
               << theta_range << "] rad (" << (theta_range * 180.0 / M_PI) << " deg)" << std::endl;
     std::cout << "Mesh spacing: dr=" << dr << ", dtheta=" << dtheta << " rad" << std::endl;
+
+    // Check if full rotation or sector domain
+    const double TWO_PI = 2.0 * M_PI;
+    if (std::abs(theta_range - TWO_PI) < 1e-6) {
+        std::cout << "Angular domain: Full rotation (periodic boundary in θ direction)" << std::endl;
+    } else {
+        std::cout << "Angular domain: Sector (" << (theta_range * 180.0 / M_PI)
+                  << " degrees, Dirichlet BC at θ=0 and θ=" << theta_range << ")" << std::endl;
+    }
 
     // Validate mesh spacing for Neumann boundary stability
     // For ghost-elimination at inner boundary (i=0), we need r_{i-1/2} = r_start - 0.5*dr > 0
@@ -2532,9 +2529,10 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
     triplets.reserve(n * 7);  // Estimate: 7 non-zeros per row
 
     // Determine boundary condition type (move outside loop for efficiency)
-    // IMPORTANT: In polar coordinates, θ direction is ALWAYS periodic by physical definition
-    // θ=0 and θ=theta_range represent the same radial line
-    bool is_periodic = true;  // Always periodic in polar coordinates
+    // IMPORTANT: θ direction is periodic ONLY if theta_range == 2*pi (full rotation)
+    // For sector domains (theta_range < 2*pi), use Dirichlet BC at θ=0 and θ=theta_range
+    const double TWO_PI = 2.0 * M_PI;
+    bool is_periodic = (std::abs(theta_range - TWO_PI) < 1e-6);  // Check if full rotation
 
     // Build equation for each grid point
     for (int i = 0; i < nr; i++) {  // Radial direction
@@ -2834,9 +2832,10 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
         Btheta = Eigen::MatrixXd::Zero(nr, ntheta);
     }
 
-    // IMPORTANT: In polar coordinates, θ direction is ALWAYS periodic by physical definition
-    // θ=0 and θ=theta_range represent the same radial line
-    bool is_periodic = true;  // Always periodic in polar coordinates
+    // IMPORTANT: θ direction is periodic ONLY if theta_range == 2*pi (full rotation)
+    // For sector domains (theta_range < 2*pi), NOT periodic
+    const double TWO_PI = 2.0 * M_PI;
+    bool is_periodic = (std::abs(theta_range - TWO_PI) < 1e-6);  // Check if full rotation
 
     // Calculate field components: Br = (1/r)∂Az/∂θ, Btheta = -∂Az/∂r
     for (int i = 0; i < nr; i++) {
