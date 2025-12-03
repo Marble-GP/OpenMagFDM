@@ -557,12 +557,13 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
     bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    if (x_periodic) {
-        std::cout << "Periodic boundary detected in X direction (left-right)" << std::endl;
-    }
-    if (y_periodic) {
-        std::cout << "Periodic boundary detected in Y direction (bottom-top)" << std::endl;
-    }
+    // Periodic boundary detection messages (commented out to reduce log verbosity)
+    // if (x_periodic) {
+    //     std::cout << "Periodic boundary detected in X direction (left-right)" << std::endl;
+    // }
+    // if (y_periodic) {
+    //     std::cout << "Periodic boundary detected in Y direction (bottom-top)" << std::endl;
+    // }
 
     // Build equation for each grid point
     for (int j = 0; j < ny; j++) {

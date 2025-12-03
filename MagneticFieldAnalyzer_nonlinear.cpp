@@ -224,6 +224,66 @@ double MagneticFieldAnalyzer::evaluateMuDerivative(const MuValue& mu_val, double
 }
 
 /**
+ * @brief Compute differential permeability dB/dH analytically from effective permeability
+ *
+ * HYBRID APPROACH: This function bridges the gap between user-friendly input format
+ * (effective permeability μ_eff = B/H from catalog data) and the accurate gradient
+ * information needed for Newton-Krylov convergence (differential permeability dB/dH).
+ *
+ * Mathematical Foundation:
+ * ========================
+ * Given effective permeability μ_eff(H) = B(H)/H from YAML input, we need dB/dH
+ * for the Jacobian correction in the Newton-Krylov solver.
+ *
+ * Starting from the relationship:
+ *   B(H) = μ_eff(H) · μ₀ · H
+ *
+ * Differentiate both sides with respect to H (product rule):
+ *   dB/dH = d/dH[μ_eff(H) · μ₀ · H]
+ *        = μ₀ · d/dH[μ_eff(H) · H]
+ *        = μ₀ · [dμ_eff/dH · H + μ_eff(H) · 1]
+ *        = μ₀ · (μ_eff + H · dμ_eff/dH)
+ *
+ * Key Insight:
+ * -----------
+ * For TABLE type mu_val, evaluateMuDerivative() returns the *analytical* slope
+ * dμ_eff/dH from the linear interpolation segments (no numerical differentiation!).
+ * This gives us exact gradient information, avoiding the epsilon-related errors
+ * that plagued the previous numerical differentiation approach.
+ *
+ * Physical Constraints:
+ * --------------------
+ * - In vacuum/air: dB/dH = μ₀ (minimum value)
+ * - In saturation: dB/dH → μ₀ (approaches vacuum permeability)
+ * - In linear region: dB/dH = μ_eff · μ₀ (when dμ_eff/dH ≈ 0)
+ *
+ * @param mu_val Effective permeability specification (μ_eff = B/H from YAML)
+ * @param H_magnitude Magnetic field intensity |H| [A/m]
+ * @return Differential permeability dB/dH [H/m] (absolute permeability units)
+ */
+double MagneticFieldAnalyzer::computeDifferentialPermeability(
+    const MuValue& mu_val, double H_magnitude)
+{
+    const double MU_0 = 4.0 * M_PI * 1e-7;  // Vacuum permeability [H/m]
+
+    // Step 1: Get effective permeability μ_eff(H) = B/H
+    double mu_eff = evaluateMu(mu_val, H_magnitude);
+
+    // Step 2: Get dμ_eff/dH analytically (for TABLE: exact slope from linear segments)
+    double dmu_eff_dH = evaluateMuDerivative(mu_val, H_magnitude);
+
+    // Step 3: Apply the product rule formula
+    // dB/dH = μ₀ · (μ_eff + H · dμ_eff/dH)
+    double dB_dH = MU_0 * (mu_eff + H_magnitude * dmu_eff_dH);
+
+    // Step 4: Enforce physical constraint (dB/dH cannot be less than vacuum)
+    // This handles numerical edge cases and ensures physical validity
+    dB_dH = std::max(dB_dH, MU_0);
+
+    return dB_dH;
+}
+
+/**
  * @brief Validate mu_r table data
  */
 void MagneticFieldAnalyzer::validateMuTable(const std::vector<double>& H_vals,
@@ -300,26 +360,18 @@ void MagneticFieldAnalyzer::generateBHTable(const std::string& material_name, co
         H_samples.push_back(std::pow(10.0, log_H));
     }
 
-    // Numerical integration using trapezoidal rule: B(H_i) = B(H_{i-1}) + μ(H_i) * ΔH
-    double B_current = 0.0;
+    // Direct calculation using effective permeability: B(H) = μ_eff(H) * μ₀ * H
+    // IMPORTANT: mu_r in YAML is the effective permeability μ_eff = B/H
+    // This is standard catalog data format (not differential permeability dB/dH)
     for (size_t i = 0; i < H_samples.size(); i++) {
         double H = H_samples[i];
-        double mu_r = evaluateMu(mu_val, H);
-        double mu = mu_r * MU_0;
-
-        if (i > 0) {
-            double H_prev = H_samples[i-1];
-            double mu_r_prev = evaluateMu(mu_val, H_prev);
-            double mu_prev = mu_r_prev * MU_0;
-
-            // Trapezoidal integration
-            double dH = H - H_prev;
-            B_current += 0.5 * (mu + mu_prev) * dH;
-        }
+        double mu_eff = evaluateMu(mu_val, H);  // μ_eff = B/H from catalog
+        double mu = mu_eff * MU_0;  // Absolute permeability [H/m]
+        double B = mu * H;  // Direct calculation: B = μ * H (no integration!)
 
         table.H_values.push_back(H);
-        table.B_values.push_back(B_current);
-        table.mu_values.push_back(mu);
+        table.B_values.push_back(B);
+        table.mu_values.push_back(mu);  // Store μ = μ_eff * μ₀
     }
 
     table.is_valid = true;
@@ -378,6 +430,52 @@ double MagneticFieldAnalyzer::interpolateH_from_B(const BHTable& table, double B
     double H = H0 + alpha * (H1 - H0);
 
     return H;
+}
+
+/**
+ * @brief Interpolate |B| from |H| using B-H table
+ */
+double MagneticFieldAnalyzer::interpolateB_from_H(const BHTable& table, double H_magnitude) {
+    if (!table.is_valid || table.H_values.empty()) {
+        std::cerr << "ERROR: B-H table is not valid" << std::endl;
+        return 0.0;
+    }
+
+    const auto& H_tab = table.H_values;
+    const auto& B_tab = table.B_values;
+
+    // Handle out-of-range
+    if (H_magnitude <= H_tab.front()) {
+        // Linear extrapolation: B = μ(0) * H
+        return table.mu_values.front() * H_magnitude;
+    }
+
+    if (H_magnitude >= H_tab.back()) {
+        // Linear extrapolation using last segment slope (dB/dH at saturation ≈ μ₀)
+        size_t n = H_tab.size();
+        double dB = B_tab[n-1] - B_tab[n-2];
+        double dH = H_tab[n-1] - H_tab[n-2];
+        if (std::abs(dH) > 1e-20) {
+            double slope = dB / dH;  // dB/dH (differential permeability)
+            return B_tab[n-1] + slope * (H_magnitude - H_tab[n-1]);
+        }
+        return B_tab[n-1];
+    }
+
+    // Find interpolation interval (binary search)
+    auto it = std::upper_bound(H_tab.begin(), H_tab.end(), H_magnitude);
+    size_t idx = std::distance(H_tab.begin(), it) - 1;
+
+    // Linear interpolation
+    double H0 = H_tab[idx];
+    double H1 = H_tab[idx + 1];
+    double B0 = B_tab[idx];
+    double B1 = B_tab[idx + 1];
+
+    double alpha = (H_magnitude - H0) / (H1 - H0);
+    double B = B0 + alpha * (B1 - B0);
+
+    return B;
 }
 
 /**
@@ -501,13 +599,15 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
                 if (rgb == mat_rgb) {
                     // Found matching material
                     double H_mag = H_map(j, i);
-                    double mu_r = 1.0;
+                    double mu_r = 1.0;  // Default to 1 (air)
 
                     auto it = material_mu.find(name);
                     if (it != material_mu.end()) {
+                        // Nonlinear material: interpolate μ_eff(H) from YAML table
+                        // IMPORTANT: mu_r in YAML is effective permeability μ_eff = B/H
                         mu_r = evaluateMu(it->second, H_mag);
                     } else if (props["mu_r"]) {
-                        // Fallback: parse inline (for static mu_r)
+                        // Linear material: use constant mu_r from YAML
                         try {
                             mu_r = props["mu_r"].as<double>();
                         } catch (...) {

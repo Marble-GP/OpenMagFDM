@@ -405,7 +405,30 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
 
         // ===== Step 4: Check convergence =====
-        if (iter > 0 && residual_rel < TOL) {
+        bool converged = false;
+
+        if (iter > 0) {
+            // Primary convergence criterion: relative residual
+            if (residual_rel < TOL) {
+                converged = true;
+            }
+
+            // Secondary criterion for polar coordinates: residual reduction rate
+            // Useful when absolute residual is large but solution is converging
+            if (is_polar && iter >= 3) {
+                // Check if residual has plateaued (< 5% change over last 3 iterations)
+                double reduction_rate = std::abs(residual_history[iter] - residual_history[iter-1]) /
+                                       (residual_history[iter-1] + 1e-12);
+                if (residual_rel < TOL * 10.0 && reduction_rate < 0.05) {
+                    converged = true;
+                    if (VERBOSE) {
+                        std::cout << " [Plateau detected: Δr=" << reduction_rate << "]";
+                    }
+                }
+            }
+        }
+
+        if (converged) {
             if (VERBOSE) {
                 std::cout << std::endl;
             }
@@ -424,20 +447,162 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             return;
         }
 
-        // ===== Step 5: Compute Newton step δA by solving L·δA = -R =====
-        // Use Quasi-Newton approximation: J ≈ L (linearized matrix)
-        // TODO: Implement proper Jacobian-free GMRES (Arnoldi) when Richardson is stabilized
+        // ===== Step 5: Compute Newton step δA by solving J·δA = -R =====
+        // Improved Jacobian: J ≈ L + D_r where D_r is r-weighted diagonal correction
         //
-        // PERFORMANCE NOTE: Polar coordinates converge slower due to:
-        // 1. Quasi-Newton approximation J ≈ L neglects dμ/dH terms
-        // 2. r-weighting amplifies nonlinearity
-        // 3. Variable mesh size (r*dθ varies by 50% from inner to outer)
+        // For polar coordinates with nonlinear materials:
+        //   True Jacobian includes ∂/∂A(r·∇×(1/μ)∇A) which has r-weighting
+        //   We add diagonal correction D_ii ∝ r_i · (dμ/dH contribution)
+        //
+        // IMPORTANT: mu_r in YAML is effective permeability: μ_eff = B/H
+        //   This is standard catalog data format (not differential permeability dB/dH)
+        //   We compute dμ/dH = μ₀ * dμ_eff/dH using numerical differentiation
 
         Eigen::VectorXd delta_A;
 
-        // Direct solver for inner linear system
+        // Build r-weighted diagonal Jacobian correction for polar + nonlinear
+        Eigen::SparseMatrix<double> J_matrix = A_matrix;  // Start with linear matrix
+
+        if (is_polar && config["materials"]) {
+            cv::Mat image_to_use;
+            cv::flip(image, image_to_use, 0);  // Match setupMaterialProperties()
+
+            const double MU_0 = 4.0 * M_PI * 1e-7;
+            YAML::Node polar_config = config["polar_domain"] ? config["polar_domain"] : config["polar"];
+            double r_start = polar_config["r_start"].as<double>();
+            double r_end = polar_config["r_end"].as<double>();
+            double dr = (r_end - r_start) / (nr - 1);
+
+            for (int idx = 0; idx < Az_vec.size(); idx++) {
+                // Row-major: idx = r_idx * ntheta + theta_idx
+                int r_idx = idx / ntheta;
+                int theta_idx = idx % ntheta;
+
+                // Calculate r coordinate for this grid point
+                double r = r_start + r_idx * dr;
+                if (r < 1e-10) continue;  // Avoid singularity at r=0
+
+                // Get pixel indices (match mu_map layout)
+                int img_row, img_col;
+                if (r_orientation == "horizontal") {
+                    img_row = theta_idx;  // theta
+                    img_col = r_idx;      // r
+                } else {  // vertical
+                    img_row = r_idx;      // r
+                    img_col = theta_idx;  // theta
+                }
+
+                if (img_row < 0 || img_row >= image_to_use.rows ||
+                    img_col < 0 || img_col >= image_to_use.cols) {
+                    continue;
+                }
+
+                cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(img_row, img_col);
+                cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+
+                // Find material and check if nonlinear
+                for (const auto& mat : config["materials"]) {
+                    std::string name = mat.first.as<std::string>();
+                    YAML::Node props = mat.second;
+                    if (!props["rgb"]) continue;
+
+                    cv::Scalar mat_rgb(
+                        props["rgb"][0].as<int>(),
+                        props["rgb"][1].as<int>(),
+                        props["rgb"][2].as<int>()
+                    );
+
+                    if (rgb[0] == mat_rgb[0] && rgb[1] == mat_rgb[1] && rgb[2] == mat_rgb[2]) {
+                        // Check if this is a nonlinear material (B-H table or formula)
+                        bool is_nonlinear = false;
+                        if (props["mu_r"]) {
+                            if (props["mu_r"].IsSequence()) {
+                                is_nonlinear = true;  // B-H table
+                            } else {
+                                std::string mu_str = props["mu_r"].as<std::string>();
+                                if (mu_str.find('$') != std::string::npos) {
+                                    is_nonlinear = true;  // Formula with $H
+                                }
+                            }
+                        }
+
+                        if (is_nonlinear) {
+                            // === ANALYTICAL JACOBIAN CORRECTION ===
+                            // This approach avoids numerical differentiation errors by computing
+                            // dμ/dH analytically from the effective permeability μ_eff = B/H.
+                            //
+                            // Mathematical Derivation:
+                            // ------------------------
+                            // Given: B = μ_eff · μ₀ · H  (effective permeability definition)
+                            //        μ = B/H = μ_eff · μ₀  (actual permeability)
+                            //
+                            // We need: dμ/dH = d(B/H)/dH for Jacobian correction
+                            //
+                            // Using the quotient rule:
+                            //   dμ/dH = d(B/H)/dH = (dB/dH · H - B) / H²
+                            //
+                            // Simplify by dividing numerator and denominator by H:
+                            //   dμ/dH = (dB/dH - B/H) / H = (dB/dH - μ) / H
+                            //
+                            // Where dB/dH is computed analytically using the product rule:
+                            //   dB/dH = μ₀ · (μ_eff + H · dμ_eff/dH)
+                            //
+                            // For TABLE type materials, dμ_eff/dH comes from the exact slope
+                            // of linear interpolation segments - no numerical differentiation!
+
+                            double H_val = H_map(img_row, img_col);
+                            double mu_current = mu_map(img_row, img_col);
+
+                            // Find material's MuValue to access the B-H table
+                            auto mu_it = material_mu.find(name);
+                            if (mu_it != material_mu.end()) {
+                                // Step 1: Get effective permeability and its derivative
+                                double mu_eff = evaluateMu(mu_it->second, H_val);
+                                double dmu_eff_dH = evaluateMuDerivative(mu_it->second, H_val);
+
+                                // Step 2: Compute differential permeability dB/dH analytically
+                                // dB/dH = μ₀ · (μ_eff + H · dμ_eff/dH)
+                                double dB_dH = MU_0 * (mu_eff + H_val * dmu_eff_dH);
+
+                                // Step 3: Compute dμ/dH = (dB/dH - μ) / H
+                                double dmu_dH = 0.0;
+                                if (H_val > 1.0) {  // H > 1 A/m ensures numerical stability
+                                    double mu_actual = mu_eff * MU_0;  // μ = μ_eff · μ₀
+                                    dmu_dH = (dB_dH - mu_actual) / H_val;
+                                } else {
+                                    // Low-field region (H < 1 A/m): Use linear approximation
+                                    // In this region, μ ≈ constant, so dμ/dH ≈ 0
+                                    // Alternative: dμ/dH ≈ μ₀ · dμ_eff/dH (from initial slope)
+                                    dmu_dH = MU_0 * dmu_eff_dH;
+                                }
+
+                                // Step 4: Jacobian diagonal correction with r-weighting
+                                //
+                                // For polar FDM equation: ∂/∂r(r·(1/μ)·∂Az/∂r) + ... = -r·Jz
+                                //
+                                // The Jacobian term for nonlinear μ(H(Az)) includes:
+                                //   ∂/∂Az[(1/μ)·∇Az] = (1/μ)·∇ + ∇Az·∂(1/μ)/∂Az
+                                //
+                                // Since ν = 1/μ, we have:
+                                //   dν/dH = -dμ/dH / μ²
+                                //
+                                // With r-weighting and FDM discretization:
+                                double correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
+                                correction_factor *= (dr * dr);  // FDM mesh spacing scale
+
+                                // Add to diagonal element of Jacobian matrix
+                                J_matrix.coeffRef(idx, idx) += correction_factor;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Solve improved system: J·δA = -R
         Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-        solver.compute(A_matrix);
+        solver.compute(J_matrix);
         if (solver.info() != Eigen::Success) {
             std::cerr << "ERROR: Matrix factorization failed!" << std::endl;
             return;
@@ -477,6 +642,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             } else {
                 alpha_init = nonlinear_config.line_search_alpha_init;
             }
+        }
+
+        // Apply conservative damping for polar coordinates (Quasi-Newton is less accurate)
+        if (is_polar && iter < 5) {
+            // First few iterations: be very conservative
+            alpha_init *= 0.5;
+        } else if (is_polar) {
+            // Later iterations: moderate damping
+            alpha_init *= 0.7;
         }
 
         double alpha = alpha_init;

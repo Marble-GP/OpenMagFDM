@@ -50,7 +50,7 @@ function generateTimestampFolderName() {
  */
 async function prepareUserOutputDirectory(userId) {
     const userIdKey = userId || 'default';
-    const userOutputBase = path.join(OUTPUTS_DIR, `user_${userIdKey}`);
+    const userOutputBase = path.join(OUTPUTS_DIR, `${userIdKey}`);
 
     // Create user's output base directory if it doesn't exist
     await fs.mkdir(userOutputBase, { recursive: true });
@@ -766,7 +766,7 @@ app.get('/api/results', async (req, res) => {
         const userIdKey = userId || 'default';
 
         // User-specific output directory
-        const userOutputDir = path.join(OUTPUTS_DIR, `user_${userIdKey}`);
+        const userOutputDir = path.join(OUTPUTS_DIR, `${userIdKey}`);
 
         // Check if user output directory exists
         try {
@@ -802,7 +802,7 @@ app.get('/api/results', async (req, res) => {
 
                         resultFolders.push({
                             name: folderName,
-                            path: `outputs/user_${userIdKey}/${folderName}`,
+                            path: `outputs/${userIdKey}/${folderName}`,
                             timestamp: folderName.replace('output_', ''),
                             steps: stepFiles.length
                         });
@@ -882,7 +882,7 @@ app.get('/api/user-outputs', async (req, res) => {
 
         // Sanitize userId to prevent directory traversal
         const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const userOutputDir = path.join(OUTPUTS_DIR, `user_${safeUserId}`);
+        const userOutputDir = path.join(OUTPUTS_DIR, `${safeUserId}`);
 
         // Check if user output directory exists
         try {
@@ -969,7 +969,7 @@ app.delete('/api/user-outputs/:folderName', async (req, res) => {
             });
         }
 
-        const userOutputDir = path.join(OUTPUTS_DIR, `user_${safeUserId}`);
+        const userOutputDir = path.join(OUTPUTS_DIR, `${safeUserId}`);
         const folderPath = path.join(userOutputDir, safeFolderName);
 
         // Security check: ensure the resolved path is within user's output directory

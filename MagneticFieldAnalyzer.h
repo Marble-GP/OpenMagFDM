@@ -162,10 +162,10 @@ public:
     };
 
     /**
-     * @brief Evaluate relative permeability μ_r at given |H| magnitude
-     * @param mu_val Nonlinear permeability specification
+     * @brief Evaluate effective permeability μ_eff = B/H at given |H| magnitude
+     * @param mu_val Nonlinear permeability specification (μ_eff table from catalog)
      * @param H_magnitude Magnetic field intensity |H| [A/m]
-     * @return Relative permeability μ_r (dimensionless)
+     * @return Effective permeability μ_eff = B/H (dimensionless)
      */
     double evaluateMu(const MuValue& mu_val, double H_magnitude);
 
@@ -176,6 +176,26 @@ public:
      * @return Derivative dμ_r/dH [m/A] (needed for Newton-Krylov Jacobian)
      */
     double evaluateMuDerivative(const MuValue& mu_val, double H_magnitude);
+
+    /**
+     * @brief Compute differential permeability dB/dH analytically from effective permeability
+     *
+     * This function converts effective permeability μ_eff = B/H (catalog data format)
+     * to differential permeability dB/dH (needed for accurate Jacobian in Newton-Krylov).
+     *
+     * Mathematical derivation:
+     *   Given: B(H) = μ_eff(H) · μ₀ · H
+     *   Then:  dB/dH = d/dH[μ_eff(H) · μ₀ · H]
+     *               = μ₀ · [dμ_eff/dH · H + μ_eff · 1]
+     *               = μ₀ · (μ_eff + H · dμ_eff/dH)
+     *
+     * This avoids numerical differentiation errors that plague the naive approach.
+     *
+     * @param mu_val Effective permeability specification (μ_eff = B/H from YAML)
+     * @param H_magnitude Magnetic field intensity |H| [A/m]
+     * @return Differential permeability dB/dH [H/m] (absolute permeability units)
+     */
+    double computeDifferentialPermeability(const MuValue& mu_val, double H_magnitude);
 
 private:
     // Dynamic current density representation
@@ -353,6 +373,7 @@ private:
     void generateBHTable(const std::string& material_name, const MuValue& mu_val);
     void validateMuTable(const std::vector<double>& H_vals, const std::vector<double>& mu_vals, const std::string& material_name);
     double interpolateH_from_B(const BHTable& table, double B_magnitude);
+    double interpolateB_from_H(const BHTable& table, double H_magnitude);
     void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
     void updateMuDistribution();  // Update mu_map based on current H_map
 
