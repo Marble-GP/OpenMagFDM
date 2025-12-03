@@ -71,10 +71,12 @@ OpenMagFDM は、磁界強度依存の非線形透磁率 μ(H) をサポート�
 ```yaml
 materials:
   core_nonlinear:
-    mu_r: 1 + 4999 * exp(-$H*$H / 2 / 1e8)  # 数式で定義
+    mu_r: 5000 / (1 + ($H / 5e4)^2)  # 実効透磁率 μ_eff = B/H を数式で定義
     # または
-    # mu_r: [[H値列], [μ_r値列]]  # テーブルで定義
+    # mu_r: [[H値列], [μ_eff値列]]  # テーブルで定義（カタログデータ形式）
 ```
+
+**重要**: YAMLで定義する `mu_r` は**実効透磁率** μ_eff = B/H です（カタログで提供される形式）。ソルバーは内部で解析的に微分透磁率に変換します。
 
 ### ソルバー
 - **Picard法**: 固定点反復（基本手法）
@@ -98,23 +100,24 @@ materials:
 線形材料の場合:
   B = ∇×Az, H = B/(μ₀*μ_r), μ_rは定数
 
-非線形材料の場合（μ_rは微分透磁率 dB/dH として定義）:
+非線形材料の場合（μ_rは実効透磁率 μ_eff = B/H として定義）:
   B = ∇×Az  （常に正確、ソルバーが直接計算）
   H = H.csvから読み込み （Newton-Krylov収束後の値）
 
-  B-H関係式: B(H) = μ₀ ∫₀^H μ_r(H') dH'
-  　　　　　（μ_r(H)は微分透磁率なので積分が必要）
+  B-H関係式: B(H) = μ_eff(H) * μ₀ * H
+  　　　　　（μ_effはカタログで提供される実効透磁率）
 
-  実効透磁率: μ_eff(x,y) = B(x,y)/(μ₀*H(x,y))
-  　　　　　（各点での平均的な透磁率）
+  微分透磁率: dB/dH = μ₀ * (μ_eff + H * dμ_eff/dH)
+  　　　　　（Jacobian計算用に内部で解析的に変換）
 ```
 
 **重要**:
-1. YAMLで定義する `mu_r: 1 + 5000 / (1 + ($H / 5e4)^2)` は**微分透磁率** dB/dH です
-2. ソルバーはB-H曲線を `B = μ₀ ∫μ_r(H)dH` で計算します（[MagneticFieldAnalyzer_nonlinear.cpp:317](MagneticFieldAnalyzer_nonlinear.cpp#L317)参照）
-3. WebUIでは、`conditions.json` の `has_nonlinear_materials` フラグを確認し、
+1. YAMLで定義する `mu_r` は**実効透磁率 μ_eff = B/H** です（カタログデータ形式）
+2. ソルバーはB-H曲線を `B = μ_eff * μ₀ * H` で直接計算します（[MagneticFieldAnalyzer_nonlinear.cpp](MagneticFieldAnalyzer_nonlinear.cpp#L310)参照）
+3. Newton-Krylov法のJacobian計算では、解析的に微分透磁率 dB/dH に変換します（[MagneticFieldAnalyzer.h](MagneticFieldAnalyzer.h#L180-L198)参照）
+4. WebUIでは、`conditions.json` の `has_nonlinear_materials` フラグを確認し、
    `true` の場合は `H/` フォルダから磁界強度分布を読み込んでください
-4. B-Hプロット作成時は、エクスポートされたBとH値を直接使用してください（積分不要）
+5. B-Hプロット作成時は、エクスポートされたBとH値を直接使用してください
 
 #### 座標系の注意点
 画像座標系（y下向き）と解析座標系（y上向き）では上下反転しています。
