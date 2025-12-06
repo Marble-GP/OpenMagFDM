@@ -10,6 +10,7 @@
  */
 
 #include "MagneticFieldAnalyzer.h"
+#include "tinyexpr/tinyexpr.h"
 #include <iostream>
 #include <algorithm>
 #include <iomanip>
@@ -198,9 +199,35 @@ double MagneticFieldAnalyzer::evaluateMuDerivative(const MuValue& mu_val, double
             const auto& H_tab = mu_val.H_table;
             const auto& mu_tab = mu_val.mu_table;
 
-            // Handle out-of-range (derivative = 0 at boundaries)
+            // Handle out-of-range with user-defined extrapolation
             if (H_magnitude <= H_tab.front() || H_magnitude >= H_tab.back()) {
-                return 0.0;
+                // Use extrapolation function if specified
+                if (mu_val.has_dmu_extrapolation) {
+                    if (!mu_val.dmu_r_extrap_formula.empty()) {
+                        // Evaluate formula-based extrapolation
+                        te_parser parser;
+                        te_variable H_var;
+                        H_var.m_name = "H";
+                        H_var.m_value = H_magnitude;
+
+                        std::set<te_variable> vars = {H_var};
+                        parser.set_variables_and_functions(vars);
+
+                        double result = parser.evaluate(mu_val.dmu_r_extrap_formula);
+                        if (!parser.success()) {
+                            std::cerr << "WARNING: Failed to evaluate dmu_r extrapolation formula at H="
+                                      << H_magnitude << ", using constant fallback" << std::endl;
+                            return mu_val.dmu_r_extrap_const;
+                        }
+                        return result;
+                    } else {
+                        // Use constant extrapolation
+                        return mu_val.dmu_r_extrap_const;
+                    }
+                } else {
+                    // Default: dμ_r/dH = 1.0 (equivalent to vacuum permeability)
+                    return 1.0;
+                }
             }
 
             // Find interpolation interval
@@ -374,13 +401,87 @@ void MagneticFieldAnalyzer::generateBHTable(const std::string& material_name, co
         table.mu_values.push_back(mu);  // Store μ = μ_eff * μ₀
     }
 
+    // ========================================
+    // B-H Curve Validation (ALWAYS SHOW WARNINGS)
+    // ========================================
+
+    // Check 1: B-H curve monotonicity (dB/dH > 0)
+    bool is_BH_monotonic = true;
+    for (size_t i = 1; i < table.B_values.size(); i++) {
+        double dB = table.B_values[i] - table.B_values[i-1];
+        double dH = table.H_values[i] - table.H_values[i-1];
+        if (dB < 0.0) {
+            std::cerr << "\n**************************************************\n"
+                      << "WARNING: Material '" << material_name << "'\n"
+                      << "  B-H curve is NOT monotonically increasing!\n"
+                      << "  At H=" << table.H_values[i] << " A/m: dB/dH = " << (dB/dH) << " < 0\n"
+                      << "  This will cause severe convergence issues!\n"
+                      << "  Please check your mu_r table definition in YAML.\n"
+                      << "**************************************************\n" << std::endl;
+            is_BH_monotonic = false;
+            break;
+        }
+    }
+
+    // Check 2: Extrapolation function validation (if specified)
+    if (mu_val.has_dmu_extrapolation) {
+        bool extrapolation_valid = true;
+
+        // Test extrapolation function at several high-H values
+        std::vector<double> test_H_values = {
+            mu_val.H_table.back() * 1.5,
+            mu_val.H_table.back() * 2.0,
+            mu_val.H_table.back() * 5.0,
+            mu_val.H_table.back() * 10.0
+        };
+
+        for (double H_test : test_H_values) {
+            double dmu_r_extrap = 0.0;
+
+            if (!mu_val.dmu_r_extrap_formula.empty()) {
+                // Evaluate formula
+                te_parser parser;
+                te_variable H_var;
+                H_var.m_name = "H";
+                H_var.m_value = H_test;
+
+                std::set<te_variable> vars = {H_var};
+                parser.set_variables_and_functions(vars);
+
+                dmu_r_extrap = parser.evaluate(mu_val.dmu_r_extrap_formula);
+                if (!parser.success()) {
+                    dmu_r_extrap = mu_val.dmu_r_extrap_const;
+                }
+            } else {
+                dmu_r_extrap = mu_val.dmu_r_extrap_const;
+            }
+
+            if (dmu_r_extrap < 0.0) {
+                std::cerr << "\n**************************************************\n"
+                          << "WARNING: Material '" << material_name << "'\n"
+                          << "  Extrapolation function dmu_r/dH is NEGATIVE!\n"
+                          << "  At H=" << H_test << " A/m: dmu_r/dH = " << dmu_r_extrap << "\n"
+                          << "  This will cause Newton-Krylov divergence!\n"
+                          << "  Please fix your dmu_r_extrapolation definition.\n"
+                          << "**************************************************\n" << std::endl;
+                extrapolation_valid = false;
+                break;
+            }
+        }
+    }
+
     table.is_valid = true;
 
     std::cout << "Generated B-H table for '" << material_name << "': "
               << table.H_values.size() << " points, "
               << "H = [" << table.H_values.front() << ", " << table.H_values.back() << "] A/m, "
-              << "B = [" << table.B_values.front() << ", " << table.B_values.back() << "] T"
-              << std::endl;
+              << "B = [" << table.B_values.front() << ", " << table.B_values.back() << "] T";
+    if (is_BH_monotonic) {
+        std::cout << " [Monotonic: OK]";
+    } else {
+        std::cout << " [Monotonic: FAILED]";
+    }
+    std::cout << std::endl;
 }
 
 /**

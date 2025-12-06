@@ -146,7 +146,14 @@ public:
         std::vector<double> H_table;   // For TABLE type: |H| values [A/m] (must be monotonically increasing)
         std::vector<double> mu_table;  // For TABLE type: mu_r values (recommended monotonically decreasing)
 
-        MuValue() : type(MuType::STATIC), static_value(1.0) {}
+        // Extrapolation for differential permeability dμ_r/dH (outside table domain)
+        bool has_dmu_extrapolation;     // True if user specified extrapolation
+        double dmu_r_extrap_const;      // Constant extrapolation value (default: 1.0)
+        std::string dmu_r_extrap_formula; // Formula for dμ_r/dH(H) extrapolation
+
+        MuValue() : type(MuType::STATIC), static_value(1.0),
+                    has_dmu_extrapolation(false), dmu_r_extrap_const(1.0),
+                    dmu_r_extrap_formula("") {}
     };
 
     // B-H relationship tables (generated from mu_r(H))

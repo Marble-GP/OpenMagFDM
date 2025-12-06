@@ -278,6 +278,32 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 
         // Parse mu_r value (static, formula, or table) - NEW: Nonlinear support
         MuValue mu_value = parseMuValue(props["mu_r"]);
+
+        // Parse dmu_r_extrapolation if specified (for TABLE type only)
+        if (props["dmu_r_extrapolation"]) {
+            const YAML::Node& extrap_node = props["dmu_r_extrapolation"];
+
+            if (extrap_node.IsScalar()) {
+                std::string extrap_str = extrap_node.as<std::string>();
+
+                // Check if it's a formula (contains $H or math operators)
+                if (extrap_str.find('$') != std::string::npos ||
+                    extrap_str.find('*') != std::string::npos ||
+                    extrap_str.find('/') != std::string::npos ||
+                    extrap_str.find('(') != std::string::npos) {
+                    // Formula-based extrapolation
+                    mu_value.has_dmu_extrapolation = true;
+                    mu_value.dmu_r_extrap_formula = extrap_str;
+                    std::cout << "  dmu_r extrapolation: formula = \"" << extrap_str << "\"" << std::endl;
+                } else {
+                    // Constant extrapolation
+                    mu_value.has_dmu_extrapolation = true;
+                    mu_value.dmu_r_extrap_const = std::stod(extrap_str);
+                    std::cout << "  dmu_r extrapolation: constant = " << mu_value.dmu_r_extrap_const << std::endl;
+                }
+            }
+        }
+
         material_mu[name] = mu_value;
 
         // Check if this material is nonlinear
