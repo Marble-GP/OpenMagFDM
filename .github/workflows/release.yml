@@ -292,23 +292,46 @@ jobs:
 
         Name "`${PRODUCT_NAME} `${PRODUCT_VERSION}"
         OutFile "OpenMagFDM-Installer-Windows-x86_64.exe"
-        InstallDir "`$PROGRAMFILES64\OpenMagFDM"
+
+        # Install to user directory (no admin rights required)
+        InstallDir "`$PROFILE\OpenMagFDM"
+        RequestExecutionLevel user
 
         Section "MainSection" SEC01
           SetOutPath "`$INSTDIR"
           File /r "installer-source\OpenMagFDM-Windows\*.*"
           File /r "installer-source\OpenMagFDM-WebUI-Windows\*.*"
 
+          # Create shortcuts
           CreateDirectory "`$SMPROGRAMS\OpenMagFDM"
-          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM Solver.lnk" "`$INSTDIR\MagFDMsolver.exe"
-          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM WebUI.lnk" "`$INSTDIR\webui-server.exe"
-          CreateShortcut "`$DESKTOP\OpenMagFDM.lnk" "`$INSTDIR\MagFDMsolver.exe"
+          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM Solver.lnk" "`$INSTDIR\MagFDMsolver.exe" "" "`$INSTDIR\MagFDMsolver.exe" 0 SW_SHOWNORMAL "" "Magnetic Field FDM Solver"
+          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM WebUI.lnk" "`$INSTDIR\webui-server.exe" "" "`$INSTDIR\webui-server.exe" 0 SW_SHOWNORMAL "" "Web UI for OpenMagFDM"
+          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\Uninstall.lnk" "`$INSTDIR\Uninstall.exe"
+          CreateShortcut "`$DESKTOP\OpenMagFDM.lnk" "`$INSTDIR\MagFDMsolver.exe" "" "`$INSTDIR\MagFDMsolver.exe" 0 SW_SHOWNORMAL "" "Magnetic Field FDM Solver"
+
+          # Write uninstaller
+          WriteUninstaller "`$INSTDIR\Uninstall.exe"
+
+          # Add to Windows Add/Remove Programs
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "DisplayName" "OpenMagFDM"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "UninstallString" "`$INSTDIR\Uninstall.exe"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "DisplayVersion" "`${PRODUCT_VERSION}"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "Publisher" "`${PRODUCT_PUBLISHER}"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "URLInfoAbout" "`${PRODUCT_WEB_SITE}"
+          WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "NoModify" 1
+          WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "NoRepair" 1
         SectionEnd
 
         Section "Uninstall"
+          # Remove shortcuts
           Delete "`$SMPROGRAMS\OpenMagFDM\*.*"
           RMDir "`$SMPROGRAMS\OpenMagFDM"
           Delete "`$DESKTOP\OpenMagFDM.lnk"
+
+          # Remove registry entries
+          DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM"
+
+          # Remove installation directory
           RMDir /r "`$INSTDIR"
         SectionEnd
         "@ | Out-File -FilePath installer.nsi -Encoding UTF8
