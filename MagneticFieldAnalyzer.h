@@ -1,6 +1,10 @@
 #ifndef MAGNETICFIELDANALYZER_H
 #define MAGNETICFIELDANALYZER_H
 
+// Define M_PI for MSVC
+#define _USE_MATH_DEFINES
+#include <cmath>
+
 #include <Eigen/Sparse>
 #include <opencv2/opencv.hpp>
 #include <yaml-cpp/yaml.h>
