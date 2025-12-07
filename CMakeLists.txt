@@ -51,5 +51,5 @@ message(STATUS "yaml-cpp version: ${yaml-cpp_VERSION}")
 target_link_libraries(MagFDMsolver
     Eigen3::Eigen
     ${OpenCV_LIBS}
-    yaml-cpp
+    yaml-cpp::yaml-cpp
 )
