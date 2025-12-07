@@ -92,14 +92,34 @@ jobs:
         Copy-Item -Recurse webui release/OpenMagFDM-Windows/
         Copy-Item sample_config.yaml release/OpenMagFDM-Windows/
 
+        # Debug: Show directory structure
+        Write-Host "=== Workspace structure ==="
+        Get-ChildItem "${{github.workspace}}" -Directory | Select-Object Name | Format-Table
+
+        Write-Host "=== Looking for vcpkg directories ==="
+        if (Test-Path "${{github.workspace}}/vcpkg_installed") {
+          Write-Host "vcpkg_installed exists:"
+          Get-ChildItem "${{github.workspace}}/vcpkg_installed" -Recurse -Directory | Where-Object { $_.Name -eq "bin" } | Select-Object FullName
+        }
+        if (Test-Path "${{github.workspace}}/vcpkg") {
+          Write-Host "vcpkg exists, checking installed:"
+          Get-ChildItem "${{github.workspace}}/vcpkg" -Recurse -Directory | Where-Object { $_.Name -eq "bin" } | Select-Object FullName
+        }
+        if (Test-Path "build/vcpkg_installed") {
+          Write-Host "build/vcpkg_installed exists:"
+          Get-ChildItem "build/vcpkg_installed" -Recurse -Directory | Where-Object { $_.Name -eq "bin" } | Select-Object FullName
+        }
+
         # Find vcpkg installed directory (manifest mode uses vcpkg_installed)
         $VCPKG_BIN_PATHS = @(
           "${{github.workspace}}/vcpkg_installed/x64-windows/bin",
+          "${{github.workspace}}/build/vcpkg_installed/x64-windows/bin",
           "${{github.workspace}}/vcpkg/installed/x64-windows/bin"
         )
 
         $VCPKG_BIN = $null
         foreach ($path in $VCPKG_BIN_PATHS) {
+          Write-Host "Checking path: $path"
           if (Test-Path $path) {
             $VCPKG_BIN = $path
             Write-Host "Found vcpkg bin directory: $VCPKG_BIN"
@@ -108,6 +128,8 @@ jobs:
         }
 
         if (-not $VCPKG_BIN) {
+          Write-Host "=== Searching for opencv DLLs recursively ==="
+          Get-ChildItem "${{github.workspace}}" -Filter "opencv_core*.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
           Write-Error "Could not find vcpkg bin directory"
           exit 1
         }
