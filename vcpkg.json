@@ -4,6 +4,10 @@
   "dependencies": [
     "eigen3",
     "yaml-cpp",
-    "opencv4"
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": ["jpeg", "png"]
+    }
   ]
 }

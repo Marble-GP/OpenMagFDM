@@ -61,11 +61,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
-          vcpkg
-          !vcpkg/buildtrees
-          !vcpkg/packages
-          !vcpkg/downloads
-        key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}
+          vcpkg/installed
+          vcpkg/packages
+        key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}-v2
         restore-keys: |
           ${{ runner.os }}-vcpkg-
 
