@@ -69,20 +69,37 @@ jobs:
     - name: Setup vcpkg
       run: |
         if (-not (Test-Path vcpkg)) {
+          Write-Host "Cloning vcpkg..."
           git clone https://github.com/Microsoft/vcpkg.git
+        } else {
+          Write-Host "vcpkg directory already exists"
         }
         cd vcpkg
         if (-not (Test-Path vcpkg.exe)) {
+          Write-Host "Bootstrapping vcpkg..."
           .\bootstrap-vcpkg.bat
+        } else {
+          Write-Host "vcpkg.exe already exists"
         }
+        Write-Host "vcpkg version:"
+        .\vcpkg version
         cd ..
 
     - name: Install dependencies via vcpkg
       run: |
+        Write-Host "Starting vcpkg package installation..."
+        Write-Host "Working directory: $PWD"
+        Write-Host "vcpkg path: $(Get-Item .\vcpkg\vcpkg.exe | Select-Object -ExpandProperty FullName)"
+
         $env:VCPKG_MAX_CONCURRENCY = $env:NUMBER_OF_PROCESSORS
-        # Install packages one by one to track progress
+
+        Write-Host "Installing eigen3..."
         .\vcpkg\vcpkg install eigen3:x64-windows
+
+        Write-Host "Installing yaml-cpp..."
         .\vcpkg\vcpkg install yaml-cpp:x64-windows
+
+        Write-Host "Installing opencv (this may take 30+ minutes)..."
         .\vcpkg\vcpkg install opencv[core,imgcodecs,imgproc]:x64-windows
       timeout-minutes: 90
 
@@ -138,9 +155,25 @@ jobs:
 
     - name: Configure CMake
       run: |
+        echo "=== Checking Homebrew package locations ==="
+        echo "OpenCV prefix: $(brew --prefix opencv)"
+        echo "yaml-cpp prefix: $(brew --prefix yaml-cpp)"
+        echo "Eigen prefix: $(brew --prefix eigen)"
+
+        echo "=== Checking for CMake config files ==="
+        ls -la $(brew --prefix opencv)/lib/cmake/ || echo "OpenCV cmake dir not found"
+        ls -la $(brew --prefix yaml-cpp)/lib/cmake/ || echo "yaml-cpp cmake dir not found"
+        ls -la $(brew --prefix eigen)/share/eigen3/cmake/ || echo "Eigen cmake dir not found"
+
         export OPENCV_DIR=$(brew --prefix opencv)/lib/cmake/opencv4
         export yaml-cpp_DIR=$(brew --prefix yaml-cpp)/lib/cmake/yaml-cpp
         export Eigen3_DIR=$(brew --prefix eigen)/share/eigen3/cmake
+
+        echo "=== CMake configuration ==="
+        echo "OpenCV_DIR: $OPENCV_DIR"
+        echo "yaml-cpp_DIR: $yaml-cpp_DIR"
+        echo "Eigen3_DIR: $Eigen3_DIR"
+
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
           -DOpenCV_DIR="$OPENCV_DIR" \
           -Dyaml-cpp_DIR="$yaml-cpp_DIR" \
