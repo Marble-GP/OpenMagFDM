@@ -70,11 +70,17 @@ jobs:
 
     - name: Setup vcpkg
       run: |
-        if (-not (Test-Path "vcpkg")) {
+        # Check if vcpkg repository is properly set up (not just an empty directory from cache)
+        if (-not (Test-Path "vcpkg/bootstrap-vcpkg.bat")) {
+          Write-Host "vcpkg repository not found or incomplete, setting up..."
+          if (Test-Path "vcpkg") {
+            Write-Host "Removing incomplete vcpkg directory"
+            Remove-Item -Recurse -Force vcpkg
+          }
           Write-Host "Cloning vcpkg..."
           git clone https://github.com/Microsoft/vcpkg.git
         } else {
-          Write-Host "vcpkg directory exists (from cache), skipping clone"
+          Write-Host "vcpkg repository exists, skipping clone"
         }
 
         cd vcpkg
