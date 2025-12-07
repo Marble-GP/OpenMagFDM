@@ -70,9 +70,21 @@ jobs:
 
     - name: Setup vcpkg
       run: |
-        git clone https://github.com/Microsoft/vcpkg.git
+        if (-not (Test-Path "vcpkg")) {
+          Write-Host "Cloning vcpkg..."
+          git clone https://github.com/Microsoft/vcpkg.git
+        } else {
+          Write-Host "vcpkg directory exists (from cache), skipping clone"
+        }
+
         cd vcpkg
-        .\bootstrap-vcpkg.bat
+
+        if (-not (Test-Path "vcpkg.exe")) {
+          Write-Host "Bootstrapping vcpkg..."
+          .\bootstrap-vcpkg.bat
+        } else {
+          Write-Host "vcpkg.exe already exists, skipping bootstrap"
+        }
 
     - name: Configure CMake
       run: |
