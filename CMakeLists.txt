@@ -26,8 +26,17 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+# Compiler-specific flags
+if(MSVC)
+    # MSVC flags
+    add_definitions(-D_USE_MATH_DEFINES)
+    set(CMAKE_CXX_FLAGS_DEBUG "/Od /Zi /W4")
+    set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
+else()
+    # GCC/Clang flags
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
+endif()
 
 # ライブラリを探す
 find_package(Eigen3 REQUIRED NO_MODULE)
