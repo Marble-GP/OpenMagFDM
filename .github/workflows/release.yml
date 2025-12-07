@@ -78,7 +78,9 @@ jobs:
           -DCMAKE_TOOLCHAIN_FILE="${{github.workspace}}\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
     - name: Build
-      run: cmake --build build --config ${{env.BUILD_TYPE}} -j$env:NUMBER_OF_PROCESSORS
+      run: |
+        $jobs = $env:NUMBER_OF_PROCESSORS
+        cmake --build build --config ${{env.BUILD_TYPE}} -j $jobs
 
     - name: Create release package
       run: |
