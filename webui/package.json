@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Web UI for MagFDMsolver visualization",
   "main": "server.js",
+  "bin": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"
@@ -18,5 +19,15 @@
     "express": "^4.21.2",
     "js-yaml": "^4.1.0",
     "multer": "^1.4.5-lts.1"
+  },
+  "pkg": {
+    "assets": [
+      "public/**/*"
+    ],
+    "targets": [
+      "node20-linux-x64",
+      "node20-win-x64",
+      "node20-macos-x64"
+    ]
   }
 }

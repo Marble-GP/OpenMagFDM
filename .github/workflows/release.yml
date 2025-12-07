@@ -55,20 +55,21 @@ jobs:
     - uses: actions/checkout@v4
 
     - name: Setup vcpkg
-      uses: lukka/run-vcpkg@v11
-      with:
-        vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6'
+      run: |
+        git clone https://github.com/Microsoft/vcpkg.git
+        cd vcpkg
+        .\bootstrap-vcpkg.bat
 
     - name: Install dependencies via vcpkg
       run: |
-        vcpkg install eigen3:x64-windows
-        vcpkg install opencv[core,imgcodecs,imgproc]:x64-windows
-        vcpkg install yaml-cpp:x64-windows
+        .\vcpkg\vcpkg install eigen3:x64-windows
+        .\vcpkg\vcpkg install opencv[core,imgcodecs,imgproc]:x64-windows
+        .\vcpkg\vcpkg install yaml-cpp:x64-windows
 
     - name: Configure CMake
       run: |
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
-          -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}\vcpkg\scripts\buildsystems\vcpkg.cmake
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$env:NUMBER_OF_PROCESSORS
@@ -111,7 +112,10 @@ jobs:
         brew install yaml-cpp
 
     - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+      run: |
+        export PKG_CONFIG_PATH="$(brew --prefix opencv)/lib/pkgconfig:$(brew --prefix yaml-cpp)/lib/pkgconfig:$PKG_CONFIG_PATH"
+        cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+          -DCMAKE_PREFIX_PATH="$(brew --prefix opencv);$(brew --prefix yaml-cpp);$(brew --prefix eigen)"
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
@@ -147,12 +151,13 @@ jobs:
       run: |
         cd webui
         npm install
-
-        # Install pkg globally
         npm install -g pkg
+        mkdir -p ../release
 
-        # Create standalone executables
-        pkg server.js --targets node20-linux-x64,node20-win-x64,node20-macos-x64 --output ../release/webui-server
+        # Create standalone executables for each platform
+        pkg package.json --targets node20-linux-x64 --output ../release/webui-server-linux
+        pkg package.json --targets node20-win-x64 --output ../release/webui-server-win.exe
+        pkg package.json --targets node20-macos-x64 --output ../release/webui-server-macos
 
     - name: Create WebUI packages
       run: |
