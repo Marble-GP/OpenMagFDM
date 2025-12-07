@@ -1,0 +1,13 @@
+{
+  "name": "openmagfdm",
+  "version": "1.0.0",
+  "dependencies": [
+    "eigen3",
+    "yaml-cpp",
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": ["core", "imgcodecs", "imgproc"]
+    }
+  ]
+}
