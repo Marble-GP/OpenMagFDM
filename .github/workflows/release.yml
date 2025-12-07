@@ -120,7 +120,6 @@ jobs:
     - name: Configure CMake
       run: |
         # Set up paths for Homebrew packages
-        export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix opencv)/lib/pkgconfig:$(brew --prefix yaml-cpp)/lib/pkgconfig"
         export CMAKE_PREFIX_PATH="$(brew --prefix):$(brew --prefix opencv):$(brew --prefix yaml-cpp):$(brew --prefix eigen)"
 
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
