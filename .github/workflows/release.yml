@@ -61,9 +61,10 @@ jobs:
       uses: actions/cache@v4
       with:
         path: |
+          vcpkg_installed
           vcpkg/installed
           vcpkg/packages
-        key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}-v2
+        key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}-v3
         restore-keys: |
           ${{ runner.os }}-vcpkg-
 
@@ -91,8 +92,26 @@ jobs:
         Copy-Item -Recurse webui release/OpenMagFDM-Windows/
         Copy-Item sample_config.yaml release/OpenMagFDM-Windows/
 
-        # Copy necessary DLLs from vcpkg
-        $VCPKG_BIN = "${{github.workspace}}/vcpkg/installed/x64-windows/bin"
+        # Find vcpkg installed directory (manifest mode uses vcpkg_installed)
+        $VCPKG_BIN_PATHS = @(
+          "${{github.workspace}}/vcpkg_installed/x64-windows/bin",
+          "${{github.workspace}}/vcpkg/installed/x64-windows/bin"
+        )
+
+        $VCPKG_BIN = $null
+        foreach ($path in $VCPKG_BIN_PATHS) {
+          if (Test-Path $path) {
+            $VCPKG_BIN = $path
+            Write-Host "Found vcpkg bin directory: $VCPKG_BIN"
+            break
+          }
+        }
+
+        if (-not $VCPKG_BIN) {
+          Write-Error "Could not find vcpkg bin directory"
+          exit 1
+        }
+
         Write-Host "Searching for DLLs in: $VCPKG_BIN"
         Get-ChildItem $VCPKG_BIN -Filter "*.dll" | Select-Object -First 10 | ForEach-Object { Write-Host "  Found: $($_.Name)" }
 
