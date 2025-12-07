@@ -86,14 +86,19 @@ app.use(express.json());
 
 // 静的ファイルの提供
 const PUBLIC_DIR = path.join(__dirname, 'public');
+const ICON_DIR = isPkg ? path.join(BASE_DIR, 'webui', 'icon') : path.join(__dirname, 'icon');
+
 app.use(express.static(PUBLIC_DIR));
-app.use('/icon', express.static(path.join(__dirname, 'icon')));
+app.use('/icon', express.static(ICON_DIR));
 
 // 親ディレクトリのCSVファイルへのアクセス
 app.use('/data', express.static(BASE_DIR));
 
 // ユーザーごとのアップロード画像へのアクセス
 app.use('/uploads', express.static(UPLOAD_DIR));
+
+// 出力結果へのアクセス
+app.use('/outputs', express.static(OUTPUTS_DIR));
 
 // ===== API エンドポイント =====
 
@@ -1114,7 +1119,7 @@ app.get('/api/detect-steps', async (req, res) => {
             return res.json({ success: false, error: 'Result path required' });
         }
 
-        const azFolder = path.join(__dirname, '..', resultPath, 'Az');
+        const azFolder = path.join(BASE_DIR, resultPath, 'Az');
         const files = await fs.readdir(azFolder);
 
         // step_XXXX.csv 形式のファイルをカウント
@@ -1139,7 +1144,7 @@ app.get('/api/load-csv', async (req, res) => {
             return res.json({ success: false, error: 'Missing parameters' });
         }
 
-        const filePath = path.join(__dirname, '..', resultPath, file);
+        const filePath = path.join(BASE_DIR, resultPath, file);
         const content = await fs.readFile(filePath, 'utf8');
 
         // CSVをパース
@@ -1166,7 +1171,7 @@ app.get('/api/load-csv-raw', async (req, res) => {
             return res.status(400).send('Missing parameters');
         }
 
-        const filePath = path.join(__dirname, '..', resultPath, file);
+        const filePath = path.join(BASE_DIR, resultPath, file);
         const content = await fs.readFile(filePath, 'utf8');
 
         // 生のテキストとして返す
@@ -1185,7 +1190,7 @@ app.get('/api/load-conditions', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const conditionsPath = path.join(__dirname, '..', resultPath, 'conditions.json');
+        const conditionsPath = path.join(BASE_DIR, resultPath, 'conditions.json');
 
         // ファイルが存在するか確認
         await fs.access(conditionsPath);
@@ -1210,7 +1215,7 @@ app.get('/api/get-boundary-image', async (req, res) => {
         }
 
         const stepName = `step_${String(step).padStart(4, '0')}`;
-        const imagePath = path.join(__dirname, '..', resultPath, 'BoundaryImg', `${stepName}.png`);
+        const imagePath = path.join(BASE_DIR, resultPath, 'BoundaryImg', `${stepName}.png`);
 
         // ファイルが存在するか確認
         await fs.access(imagePath);
@@ -1233,7 +1238,7 @@ app.get('/api/get-step-input-image', async (req, res) => {
         }
 
         const stepName = `step_${String(step).padStart(4, '0')}`;
-        const imagePath = path.join(__dirname, '..', resultPath, 'InputImg', `${stepName}.png`);
+        const imagePath = path.join(BASE_DIR, resultPath, 'InputImg', `${stepName}.png`);
 
         // ファイルが存在するか確認
         await fs.access(imagePath);
@@ -1254,7 +1259,7 @@ app.get('/api/get-log', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const logPath = path.join(__dirname, '..', resultPath, 'log.txt');
+        const logPath = path.join(BASE_DIR, resultPath, 'log.txt');
 
         // Check if file exists
         await fs.access(logPath);
@@ -1276,7 +1281,7 @@ app.get('/api/get-conditions', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const conditionsPath = path.join(__dirname, '..', resultPath, 'conditions.json');
+        const conditionsPath = path.join(BASE_DIR, resultPath, 'conditions.json');
 
         // Check if file exists
         await fs.access(conditionsPath);
