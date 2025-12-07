@@ -4,6 +4,7 @@ const fs = require('fs').promises;
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const yaml = require('js-yaml');
+const iconv = require('iconv-lite');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -596,9 +597,11 @@ app.post('/api/solve-stream', async (req, res) => {
         console.log(`Output directory for user ${userIdKey}: ${outputPath}`);
 
         // spawnを使用してリアルタイムで出力を取得（第3引数に出力パスを追加）
-        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], {
-            cwd: path.join(__dirname, '..'),
-        });
+        const spawnOptions = {
+            cwd: BASE_DIR
+        };
+
+        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], spawnOptions);
 
         // プロセスをマップに登録
         runningProcesses.set(userIdKey, solverProcess);
@@ -609,7 +612,8 @@ app.post('/api/solve-stream', async (req, res) => {
 
         // 標準出力の処理
         solverProcess.stdout.on('data', (data) => {
-            const text = data.toString();
+            // Windowsの場合、CP932 (Shift-JIS)からUTF-8に変換
+            const text = process.platform === 'win32' ? iconv.decode(data, 'cp932') : data.toString('utf8');
             outputBuffer += text;
 
             // 行ごとに処理
