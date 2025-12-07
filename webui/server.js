@@ -8,12 +8,18 @@ const yaml = require('js-yaml');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Detect if running in pkg (standalone executable)
+const isPkg = typeof process.pkg !== 'undefined';
+const BASE_DIR = isPkg ? process.cwd() : path.join(__dirname, '..');
+
 // アップロードディレクトリの設定
-const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
-const SOLVER_PATH = path.join(__dirname, '..', 'build', 'MagFDMsolver');
-const CONFIG_PATH = path.join(__dirname, '..', 'sample_config.yaml');
-const USER_CONFIGS_DIR = path.join(__dirname, '..', 'configs');
-const OUTPUTS_DIR = path.join(__dirname, '..', 'outputs');
+const UPLOAD_DIR = path.join(BASE_DIR, 'uploads');
+const SOLVER_PATH = isPkg ?
+  path.join(BASE_DIR, process.platform === 'win32' ? 'MagFDMsolver.exe' : 'MagFDMsolver') :
+  path.join(BASE_DIR, 'build', process.platform === 'win32' ? 'MagFDMsolver.exe' : 'MagFDMsolver');
+const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
+const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
+const OUTPUTS_DIR = path.join(BASE_DIR, 'outputs');
 
 // ディレクトリの作成
 fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(console.error);
@@ -79,11 +85,12 @@ const upload = multer({ storage: storage });
 app.use(express.json());
 
 // 静的ファイルの提供
-app.use(express.static('public'));
+const PUBLIC_DIR = path.join(__dirname, 'public');
+app.use(express.static(PUBLIC_DIR));
 app.use('/icon', express.static(path.join(__dirname, 'icon')));
 
 // 親ディレクトリのCSVファイルへのアクセス
-app.use('/data', express.static(path.join(__dirname, '..')));
+app.use('/data', express.static(BASE_DIR));
 
 // ユーザーごとのアップロード画像へのアクセス
 app.use('/uploads', express.static(UPLOAD_DIR));
@@ -1014,17 +1021,20 @@ app.delete('/api/user-outputs/:folderName', async (req, res) => {
 
 // ルートへのアクセス
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
 // サーバー起動
 app.listen(PORT, () => {
     console.log('='.repeat(60));
     console.log('MagFDM Visualizer Server (Integrated)');
+    if (isPkg) {
+        console.log('Running as standalone executable');
+    }
     console.log('='.repeat(60));
     console.log(`Server running at: http://localhost:${PORT}`);
-    console.log(`Serving files from: ${path.join(__dirname, 'public')}`);
-    console.log(`CSV data directory: ${path.join(__dirname, '..')}`);
+    console.log(`Serving files from: ${PUBLIC_DIR}`);
+    console.log(`CSV data directory: ${BASE_DIR}`);
     console.log(`Upload directory: ${UPLOAD_DIR}`);
     console.log(`Solver path: ${SOLVER_PATH}`);
     console.log(`Config file: ${CONFIG_PATH}`);

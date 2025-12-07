@@ -94,11 +94,22 @@ jobs:
         Copy-Item sample_config.yaml release/OpenMagFDM-Windows/
 
         # Copy necessary DLLs from vcpkg
-        $VCPKG_ROOT = "${{github.workspace}}/vcpkg/installed/x64-windows/bin"
-        Copy-Item "$VCPKG_ROOT/opencv_core4*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
-        Copy-Item "$VCPKG_ROOT/opencv_imgcodecs4*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
-        Copy-Item "$VCPKG_ROOT/opencv_imgproc4*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
-        Copy-Item "$VCPKG_ROOT/yaml-cpp*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
+        $VCPKG_BIN = "${{github.workspace}}/vcpkg/installed/x64-windows/bin"
+        Write-Host "Searching for DLLs in: $VCPKG_BIN"
+        Get-ChildItem $VCPKG_BIN -Filter "*.dll" | Select-Object -First 10 | ForEach-Object { Write-Host "  Found: $($_.Name)" }
+
+        # Copy all required DLLs
+        Get-ChildItem $VCPKG_BIN -Filter "opencv_*.dll" | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+        Get-ChildItem $VCPKG_BIN -Filter "yaml-cpp.dll" | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+
+        # Copy OpenCV dependencies (jpeg, png, tiff, zlib, etc.)
+        $dependencies = @("jpeg*.dll", "libpng*.dll", "tiff*.dll", "zlib*.dll", "lzma*.dll", "webp*.dll")
+        foreach ($dep in $dependencies) {
+          Get-ChildItem $VCPKG_BIN -Filter $dep -ErrorAction SilentlyContinue | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+        }
+
+        Write-Host "DLLs copied to release package:"
+        Get-ChildItem release/OpenMagFDM-Windows -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.Name)" }
 
         cd release
         Compress-Archive -Path OpenMagFDM-Windows -DestinationPath OpenMagFDM-Windows-x86_64.zip
