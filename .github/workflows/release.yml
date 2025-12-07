@@ -145,7 +145,7 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        node-version: '18'
 
     - name: Install dependencies and create standalone package
       run: |
@@ -155,9 +155,9 @@ jobs:
         mkdir -p ../release
 
         # Create standalone executables for each platform
-        pkg package.json --targets node20-linux-x64 --output ../release/webui-server-linux
-        pkg package.json --targets node20-win-x64 --output ../release/webui-server-win.exe
-        pkg package.json --targets node20-macos-x64 --output ../release/webui-server-macos
+        pkg package.json --targets node18-linux-x64 --output ../release/webui-server-linux
+        pkg package.json --targets node18-win-x64 --output ../release/webui-server-win.exe
+        pkg package.json --targets node18-macos-x64 --output ../release/webui-server-macos
 
     - name: Create WebUI packages
       run: |
