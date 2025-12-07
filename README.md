@@ -18,13 +18,33 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 - 軽量数式評価に `tinyexpr` を利用
 - WebUI によるインタラクティブな結果確認（ローカルホストで起動）
 
-## 必要環境
-- C++ コンパイラ（C++13 相当の機能が使えるもの）
-- CMake
-- make / Ninja などのビルドツール
-- Node.js (WebUI を使う場合)
+## ダウンロード
 
-## ビルド (C++ ソルバー)
+### プリビルドバイナリ（推奨）
+[Releases](https://github.com/Marble-GP/OpenMagFDM/releases) から各プラットフォーム向けのビルド済みパッケージをダウンロードできます：
+
+- **Linux** (x86_64): `OpenMagFDM-Linux-x86_64.tar.gz`
+- **Windows** (x86_64): `OpenMagFDM-Windows-x86_64.zip` または `OpenMagFDM-Installer-Windows-x86_64.exe`（インストーラ）
+- **macOS** (x86_64): `OpenMagFDM-macOS-x86_64.tar.gz`
+- **WebUI Standalone**: Node.js不要の単体実行可能ファイル（全プラットフォーム対応）
+
+### 依存関係
+プリビルドバイナリを使用する場合、以下のライブラリが必要です：
+- Linux: `libeigen3-dev`, `libopencv-dev`, `libyaml-cpp-dev`（apt経由でインストール）
+- Windows: インストーラ使用時はDLL同梱
+- macOS: `eigen`, `opencv`, `yaml-cpp`（Homebrew経由でインストール）
+
+## ソースからビルド
+
+### 必要環境
+- C++ コンパイラ（C++17 以降）
+- CMake 3.5 以降
+- Eigen3
+- OpenCV
+- yaml-cpp
+- Node.js 20.x (WebUI を使う場合)
+
+### ビルド方法 (C++ ソルバー)
 1. リポジトリのルートでビルドディレクトリを作成します。
 
 ```bash
