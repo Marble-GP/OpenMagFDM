@@ -80,8 +80,11 @@ jobs:
     - name: Install dependencies via vcpkg
       run: |
         $env:VCPKG_MAX_CONCURRENCY = $env:NUMBER_OF_PROCESSORS
-        .\vcpkg\vcpkg install eigen3:x64-windows opencv[core,imgcodecs,imgproc]:x64-windows yaml-cpp:x64-windows --clean-after-build
-      timeout-minutes: 60
+        # Install packages one by one to track progress
+        .\vcpkg\vcpkg install eigen3:x64-windows
+        .\vcpkg\vcpkg install yaml-cpp:x64-windows
+        .\vcpkg\vcpkg install opencv[core,imgcodecs,imgproc]:x64-windows
+      timeout-minutes: 90
 
     - name: Verify vcpkg installation
       run: |
@@ -135,9 +138,13 @@ jobs:
 
     - name: Configure CMake
       run: |
-        export PKG_CONFIG_PATH="$(brew --prefix opencv)/lib/pkgconfig:$(brew --prefix yaml-cpp)/lib/pkgconfig:$PKG_CONFIG_PATH"
+        export OPENCV_DIR=$(brew --prefix opencv)/lib/cmake/opencv4
+        export yaml-cpp_DIR=$(brew --prefix yaml-cpp)/lib/cmake/yaml-cpp
+        export Eigen3_DIR=$(brew --prefix eigen)/share/eigen3/cmake
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCMAKE_PREFIX_PATH="$(brew --prefix opencv):$(brew --prefix yaml-cpp):$(brew --prefix eigen)"
+          -DOpenCV_DIR="$OPENCV_DIR" \
+          -Dyaml-cpp_DIR="$yaml-cpp_DIR" \
+          -DEigen3_DIR="$Eigen3_DIR"
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
