@@ -909,12 +909,32 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
         }
         const r_start = polar.r_start;
         const r_end = polar.r_end;
-        const nr = cols;
-        const ntheta = rows;
+        const r_orientation = polar.r_orientation || 'horizontal';
+
+        // Determine nr and ntheta based on r_orientation
+        let nr, ntheta;
+        if (r_orientation === 'horizontal') {
+            // Az[theta_idx][r_idx]: rows = ntheta, cols = nr
+            nr = cols;
+            ntheta = rows;
+        } else {
+            // Az[r_idx][theta_idx]: rows = nr, cols = ntheta
+            nr = rows;
+            ntheta = cols;
+        }
 
         // Calculate dr, dtheta (use from conditions.json if available, otherwise calculate)
         const dr = AppState.analysisConditions.dr || (r_end - r_start) / (nr - 1);
         const dtheta = AppState.analysisConditions.dtheta || polar.theta_range / (ntheta - 1);
+
+        // Determine theta boundary conditions
+        const bc = AppState.analysisConditions.boundary_conditions || {};
+        const thetaMinBC = bc.theta_min || {};
+        const thetaMaxBC = bc.theta_max || {};
+        const thetaPeriodic = (thetaMinBC.type === 'periodic' && thetaMaxBC.type === 'periodic');
+        const thetaAntiperiodic = thetaPeriodic &&
+            ((thetaMinBC.value !== undefined && thetaMinBC.value < 0) ||
+             (thetaMaxBC.value !== undefined && thetaMaxBC.value < 0));
 
         // Generate r coordinate array
         const r_coords = Array(nr).fill(0).map((_, ir) => r_start + ir * dr);
@@ -923,34 +943,83 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
         const Br = Array(rows).fill(0).map(() => Array(cols).fill(0));
         const Btheta = Array(rows).fill(0).map(() => Array(cols).fill(0));
 
-        // Polar coordinates are ALWAYS periodic in theta direction
+        // Helper function to get Az value at (ir, jt) with r_orientation handling
+        const getAz = (ir, jt) => {
+            if (r_orientation === 'horizontal') {
+                return Az[jt][ir];
+            } else {
+                return Az[ir][jt];
+            }
+        };
+
+        // Helper function to set field value at (ir, jt) with r_orientation handling
+        const setField = (field, ir, jt, value) => {
+            if (r_orientation === 'horizontal') {
+                field[jt][ir] = value;
+            } else {
+                field[ir][jt] = value;
+            }
+        };
+
         for (let jt = 0; jt < ntheta; jt++) {
             for (let ir = 0; ir < nr; ir++) {
                 const r = r_coords[ir];
                 const safe_r = Math.max(r, 1e-15);
 
                 // Br = (1/r) * ∂Az/∂θ
-                // IMPORTANT: Use periodic boundary in theta direction
-                const jt_next = (jt + 1) % ntheta;
-                const jt_prev = (jt - 1 + ntheta) % ntheta;
-                const dAz_dtheta = (Az[jt_next][ir] - Az[jt_prev][ir]) / (2 * dtheta);
-                Br[jt][ir] = dAz_dtheta / safe_r;
+                let jt_next, jt_prev;
+                let Az_next, Az_prev;
+
+                if (thetaPeriodic) {
+                    // Periodic or anti-periodic boundary
+                    jt_next = (jt + 1) % ntheta;
+                    jt_prev = (jt - 1 + ntheta) % ntheta;
+                    Az_next = getAz(ir, jt_next);
+                    Az_prev = getAz(ir, jt_prev);
+
+                    // Apply sign flip for anti-periodic BC
+                    if (thetaAntiperiodic) {
+                        if (jt === ntheta - 1) Az_next = -Az_next;  // next crosses boundary
+                        if (jt === 0) Az_prev = -Az_prev;          // prev crosses boundary
+                    }
+                } else {
+                    // Non-periodic (Dirichlet/Neumann) - use one-sided difference at boundaries
+                    if (jt === 0) {
+                        jt_next = 1;
+                        jt_prev = 0;
+                        Az_next = getAz(ir, jt_next);
+                        Az_prev = getAz(ir, jt_prev);
+                    } else if (jt === ntheta - 1) {
+                        jt_next = ntheta - 1;
+                        jt_prev = ntheta - 2;
+                        Az_next = getAz(ir, jt_next);
+                        Az_prev = getAz(ir, jt_prev);
+                    } else {
+                        jt_next = jt + 1;
+                        jt_prev = jt - 1;
+                        Az_next = getAz(ir, jt_next);
+                        Az_prev = getAz(ir, jt_prev);
+                    }
+                }
+
+                const denom = (jt === 0 || jt === ntheta - 1) && !thetaPeriodic ? dtheta : (2 * dtheta);
+                const dAz_dtheta = (Az_next - Az_prev) / denom;
+                setField(Br, ir, jt, dAz_dtheta / safe_r);
 
                 // Bθ = -∂Az/∂r
                 let dAz_dr = 0;
                 if (ir === 0) {
-                    dAz_dr = (Az[jt][1] - Az[jt][0]) / dr;
+                    dAz_dr = (getAz(1, jt) - getAz(0, jt)) / dr;
                 } else if (ir === nr - 1) {
-                    dAz_dr = (Az[jt][nr-1] - Az[jt][nr-2]) / dr;
+                    dAz_dr = (getAz(nr-1, jt) - getAz(nr-2, jt)) / dr;
                 } else {
-                    dAz_dr = (Az[jt][ir+1] - Az[jt][ir-1]) / (2 * dr);
+                    dAz_dr = (getAz(ir+1, jt) - getAz(ir-1, jt)) / (2 * dr);
                 }
-                Btheta[jt][ir] = -dAz_dr;
+                setField(Btheta, ir, jt, -dAz_dr);
             }
         }
 
         // Polar → Cartesian transformation (for visualization)
-        // If r_orientation is horizontal: i = r direction, j = θ direction
         // Physical coordinates: x = r*cos(θ), y = r*sin(θ)
         // Field transformation: Bx = Br*cos(θ) - Bθ*sin(θ), By = Br*sin(θ) + Bθ*cos(θ)
         for (let jt = 0; jt < ntheta; jt++) {
@@ -959,8 +1028,18 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
             const sin_theta = Math.sin(theta);
 
             for (let ir = 0; ir < nr; ir++) {
-                Bx[jt][ir] = Br[jt][ir] * cos_theta - Btheta[jt][ir] * sin_theta;
-                By[jt][ir] = Br[jt][ir] * sin_theta + Btheta[jt][ir] * cos_theta;
+                let Br_val, Btheta_val;
+                if (r_orientation === 'horizontal') {
+                    Br_val = Br[jt][ir];
+                    Btheta_val = Btheta[jt][ir];
+                    Bx[jt][ir] = Br_val * cos_theta - Btheta_val * sin_theta;
+                    By[jt][ir] = Br_val * sin_theta + Btheta_val * cos_theta;
+                } else {
+                    Br_val = Br[ir][jt];
+                    Btheta_val = Btheta[ir][jt];
+                    Bx[ir][jt] = Br_val * cos_theta - Btheta_val * sin_theta;
+                    By[ir][jt] = Br_val * sin_theta + Btheta_val * cos_theta;
+                }
             }
         }
     } else {
@@ -1128,6 +1207,7 @@ async function runSolver() {
     outputDiv.textContent = '';
     progressContainer.style.display = 'block';
     progressBar.style.width = '0%';
+    progressBar.style.background = 'linear-gradient(90deg, #667eea 0%, #764ba2 100%)';  // Reset to default color
     progressText.textContent = 'Initializing...';
     progressPercent.textContent = '0%';
 
@@ -2110,9 +2190,22 @@ function transformPolarImageToCartesian(polarCanvas, conditions, fullModel = fal
     const r_i = conditions.polar?.r_start || conditions.r_i || 0;
     const r_o = conditions.polar?.r_end || conditions.r_o || 1;
     const thetaRange = conditions.polar?.theta_range || conditions.theta_range || 0;
+    const r_orientation = conditions.polar?.r_orientation || 'horizontal';
 
     const polarWidth = polarCanvas.width;
     const polarHeight = polarCanvas.height;
+
+    // Determine nr and ntheta based on r_orientation
+    // r_orientation: 'horizontal' means r is horizontal (cols), theta is vertical (rows)
+    // r_orientation: 'vertical' means r is vertical (rows), theta is horizontal (cols)
+    let nr, ntheta;
+    if (r_orientation === 'horizontal') {
+        nr = polarWidth;
+        ntheta = polarHeight;
+    } else {
+        nr = polarHeight;
+        ntheta = polarWidth;
+    }
 
     // Determine repetitions for full model
     const N = fullModel ? AppState.polarFullModelMultiplier : 1;
@@ -2180,9 +2273,21 @@ function transformPolarImageToCartesian(polarCanvas, conditions, fullModel = fal
                 }
             }
 
-            // Map to polar image coordinates
-            const polarX = Math.floor((r - r_i) / (r_o - r_i) * (polarWidth - 1));
-            const polarY = Math.floor(theta / thetaRange * (polarHeight - 1));
+            // Calculate fractional indices for r and theta
+            const r_frac = (r - r_i) / (r_o - r_i) * (nr - 1);
+            const theta_frac = theta / thetaRange * (ntheta - 1);
+
+            // Map to polar image coordinates based on r_orientation
+            let polarX, polarY;
+            if (r_orientation === 'horizontal') {
+                // r is horizontal (x), theta is vertical (y)
+                polarX = Math.floor(r_frac);
+                polarY = Math.floor(theta_frac);
+            } else {
+                // r is vertical (y), theta is horizontal (x)
+                polarX = Math.floor(theta_frac);
+                polarY = Math.floor(r_frac);
+            }
 
             if (polarX >= 0 && polarX < polarWidth && polarY >= 0 && polarY < polarHeight) {
                 const polarIdx = (polarY * polarWidth + polarX) * 4;
@@ -2504,15 +2609,41 @@ async function renderAzBoundary(containerId, step) {
                 const theta_start = AppState.analysisConditions.theta_start || 0;
                 const dr = AppState.analysisConditions.dr || 0.001;
                 const dtheta = AppState.analysisConditions.dtheta || 0.001;
-                xVals = Array.from({ length: cols }, (_, i) => i * dr * 1000);
-                yVals = Array.from({ length: rows }, (_, i) => theta_start + i * dtheta);
+                const r_orientation = AppState.analysisConditions.polar?.r_orientation || 'horizontal';
+
+                // Determine nr and ntheta based on r_orientation
+                let nr, ntheta;
+                if (r_orientation === 'horizontal') {
+                    nr = cols;
+                    ntheta = rows;
+                } else {
+                    nr = rows;
+                    ntheta = cols;
+                }
+
+                const rVals = Array.from({ length: nr }, (_, i) => i * dr * 1000);
+                const thetaVals = Array.from({ length: ntheta }, (_, i) => theta_start + i * dtheta);
                 zVals = azFlipped;
-                xTitle = 'r - r_start [mm]';
-                yTitle = 'θ [rad]';
-                xMin = 0;
-                xMax = (cols - 1) * dr * 1000;
-                yMin = theta_start;
-                yMax = theta_start + (rows - 1) * dtheta;
+
+                if (r_orientation === 'horizontal') {
+                    xVals = rVals;
+                    yVals = thetaVals;
+                    xTitle = 'r - r_start [mm]';
+                    yTitle = 'θ [rad]';
+                    xMin = 0;
+                    xMax = (nr - 1) * dr * 1000;
+                    yMin = theta_start;
+                    yMax = theta_start + (ntheta - 1) * dtheta;
+                } else {
+                    xVals = thetaVals;
+                    yVals = rVals;
+                    xTitle = 'θ [rad]';
+                    yTitle = 'r - r_start [mm]';
+                    xMin = theta_start;
+                    xMax = theta_start + (ntheta - 1) * dtheta;
+                    yMin = 0;
+                    yMax = (nr - 1) * dr * 1000;
+                }
             } else if (AppState.analysisConditions) {
                 // Cartesian coordinates
                 const dx = AppState.analysisConditions.dx || 0.001;
@@ -3391,15 +3522,35 @@ function plotContour(elementId, data, title, usePhysicalAxes = false) {
             const theta_start = AppState.analysisConditions.theta_start || 0;
             const dr = AppState.analysisConditions.dr || 0.001;
             const dtheta = AppState.analysisConditions.dtheta || 0.001;
+            const r_orientation = AppState.analysisConditions.polar?.r_orientation || 'horizontal';
+
+            // Determine nr and ntheta based on r_orientation
+            let nr, ntheta;
+            if (r_orientation === 'horizontal') {
+                // data[theta][r]: rows = ntheta, cols = nr
+                nr = cols;
+                ntheta = rows;
+            } else {
+                // data[r][theta]: rows = nr, cols = ntheta
+                nr = rows;
+                ntheta = cols;
+            }
 
             // r: mm (from 0), theta: radians
-            const rVals = Array.from({ length: cols }, (_, i) => i * dr * 1000);
-            const thetaVals = Array.from({ length: rows }, (_, i) => theta_start + i * dtheta);
+            const rVals = Array.from({ length: nr }, (_, i) => i * dr * 1000);
+            const thetaVals = Array.from({ length: ntheta }, (_, i) => theta_start + i * dtheta);
 
-            trace.x = rVals;
-            trace.y = thetaVals;
-            xaxis = { title: 'r - r_start [mm]' };
-            yaxis = { title: 'θ [rad]' };
+            if (r_orientation === 'horizontal') {
+                trace.x = rVals;
+                trace.y = thetaVals;
+                xaxis = { title: 'r - r_start [mm]' };
+                yaxis = { title: 'θ [rad]' };
+            } else {
+                trace.x = thetaVals;
+                trace.y = rVals;
+                xaxis = { title: 'θ [rad]' };
+                yaxis = { title: 'r - r_start [mm]' };
+            }
         } else {
             const dx = AppState.analysisConditions.dx || 0.001;
             const dy = AppState.analysisConditions.dy || 0.001;
@@ -3558,15 +3709,35 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
             const theta_start = AppState.analysisConditions.theta_start || 0;
             const dr = AppState.analysisConditions.dr || 0.001;
             const dtheta = AppState.analysisConditions.dtheta || 0.001;
+            const r_orientation = AppState.analysisConditions.polar?.r_orientation || 'horizontal';
+
+            // Determine nr and ntheta based on r_orientation
+            let nr, ntheta;
+            if (r_orientation === 'horizontal') {
+                // data[theta][r]: rows = ntheta, cols = nr
+                nr = cols;
+                ntheta = rows;
+            } else {
+                // data[r][theta]: rows = nr, cols = ntheta
+                nr = rows;
+                ntheta = cols;
+            }
 
             // r: mm (from 0), theta: radians
-            const rVals = Array.from({ length: cols }, (_, i) => i * dr * 1000);
-            const thetaVals = Array.from({ length: rows }, (_, i) => theta_start + i * dtheta);
+            const rVals = Array.from({ length: nr }, (_, i) => i * dr * 1000);
+            const thetaVals = Array.from({ length: ntheta }, (_, i) => theta_start + i * dtheta);
 
-            trace.x = rVals;
-            trace.y = thetaVals;
-            xaxis = { title: 'r - r_start [mm]' };
-            yaxis = { title: 'θ [rad]' };
+            if (r_orientation === 'horizontal') {
+                trace.x = rVals;
+                trace.y = thetaVals;
+                xaxis = { title: 'r - r_start [mm]' };
+                yaxis = { title: 'θ [rad]' };
+            } else {
+                trace.x = thetaVals;
+                trace.y = rVals;
+                xaxis = { title: 'θ [rad]' };
+                yaxis = { title: 'r - r_start [mm]' };
+            }
         } else {
             // Cartesian coordinates
             const dx = AppState.analysisConditions.dx || 0.001;
@@ -3888,8 +4059,8 @@ function toggleFullModel() {
 
 /**
  * Transform polar coordinate data to cartesian (arc or full donut)
- * @param {Array<Array<number>>} polarData - 2D array in polar coordinates [ntheta][nr]
- * @param {object} conditions - Analysis conditions containing r_i, r_o, theta_range
+ * @param {Array<Array<number>>} polarData - 2D array in polar coordinates
+ * @param {object} conditions - Analysis conditions containing r_i, r_o, theta_range, r_orientation, boundary_conditions
  * @param {boolean} fullModel - If true, replicate to full 360 degrees
  * @returns {object} - {x: Array, y: Array, z: Array} for Plotly heatmap
  */
@@ -3898,9 +4069,28 @@ function transformPolarToCartesian(polarData, conditions, fullModel = false) {
     const r_i = conditions.polar?.r_start || conditions.r_i || 0;
     const r_o = conditions.polar?.r_end || conditions.r_o || 1;
     const thetaRange = conditions.polar?.theta_range || conditions.theta_range || 0;
+    const r_orientation = conditions.polar?.r_orientation || 'horizontal';
 
-    const ntheta = polarData.length;
-    const nr = polarData[0].length;
+    // Determine theta boundary conditions
+    const bcTheta = conditions.boundary_conditions || {};
+    const thetaMinBC = bcTheta.theta_min || {};
+    const thetaMaxBC = bcTheta.theta_max || {};
+    const thetaPeriodic = (thetaMinBC.type === 'periodic' && thetaMaxBC.type === 'periodic');
+    const thetaAntiperiodic = thetaPeriodic &&
+        ((thetaMinBC.value !== undefined && thetaMinBC.value < 0) ||
+         (thetaMaxBC.value !== undefined && thetaMaxBC.value < 0));
+
+    // Determine nr and ntheta based on r_orientation
+    let ntheta, nr;
+    if (r_orientation === 'horizontal') {
+        // polarData[theta_idx][r_idx]: rows = ntheta, cols = nr
+        ntheta = polarData.length;
+        nr = polarData[0].length;
+    } else {
+        // polarData[r_idx][theta_idx]: rows = nr, cols = ntheta
+        nr = polarData.length;
+        ntheta = polarData[0].length;
+    }
 
     // Determine number of repetitions
     const N = fullModel ? AppState.polarFullModelMultiplier : 1;
@@ -3951,8 +4141,8 @@ function transformPolarToCartesian(polarData, conditions, fullModel = false) {
             const r_idx = (r - r_i) / (r_o - r_i) * (nr - 1);
             const theta_idx = theta / thetaRange * (ntheta - 1);
 
-            // Bilinear interpolation
-            const value = bilinearInterpolate(polarData, theta_idx, r_idx);
+            // Bilinear interpolation with periodic/anti-periodic BC support
+            const value = bilinearInterpolate(polarData, theta_idx, r_idx, thetaPeriodic, thetaAntiperiodic, r_orientation);
             row_z.push(value);
         }
 
@@ -3963,42 +4153,84 @@ function transformPolarToCartesian(polarData, conditions, fullModel = false) {
 }
 
 /**
- * Bilinear interpolation for 2D array
- * @param {Array<Array<number>>} data - 2D array [ntheta][nr]
+ * Bilinear interpolation for 2D array with periodic/anti-periodic BC support
+ * @param {Array<Array<number>>} data - 2D array [ntheta][nr] or [nr][ntheta] depending on r_orientation
  * @param {number} theta_idx - Theta index (fractional)
  * @param {number} r_idx - R index (fractional)
+ * @param {boolean} thetaPeriodic - If true, wrap theta index periodically
+ * @param {boolean} thetaAntiperiodic - If true, apply sign flip when crossing theta boundary
+ * @param {string} r_orientation - 'horizontal' (data[theta][r]) or 'vertical' (data[r][theta])
  * @returns {number} - Interpolated value
  */
-function bilinearInterpolate(data, theta_idx, r_idx) {
+function bilinearInterpolate(data, theta_idx, r_idx, thetaPeriodic = false, thetaAntiperiodic = false, r_orientation = 'horizontal') {
     // Safety checks
     if (!data || data.length === 0 || !data[0] || data[0].length === 0) {
         return 0;
     }
 
-    const ntheta = data.length;
-    const nr = data[0].length;
+    let ntheta, nr;
+    if (r_orientation === 'horizontal') {
+        // data[theta_idx][r_idx]: rows = ntheta, cols = nr
+        ntheta = data.length;
+        nr = data[0].length;
+    } else {
+        // data[r_idx][theta_idx]: rows = nr, cols = ntheta
+        nr = data.length;
+        ntheta = data[0].length;
+    }
 
-    // Clamp indices to valid range
-    theta_idx = Math.max(0, Math.min(ntheta - 1.001, theta_idx));
+    // Clamp r index to valid range
     r_idx = Math.max(0, Math.min(nr - 1.001, r_idx));
 
-    const i0 = Math.floor(theta_idx);
-    const i1 = Math.min(i0 + 1, ntheta - 1);
+    // Handle theta index based on periodicity
+    let crossesBoundary = false;
+    let i0, i1, dt;
+
+    if (thetaPeriodic) {
+        // Wrap theta index periodically
+        theta_idx = ((theta_idx % ntheta) + ntheta) % ntheta;
+        i0 = Math.floor(theta_idx);
+        i1 = (i0 + 1) % ntheta;
+        dt = theta_idx - i0;
+        // Check if interpolation crosses the theta boundary
+        crossesBoundary = (i1 < i0);
+    } else {
+        // Clamp theta index
+        theta_idx = Math.max(0, Math.min(ntheta - 1.001, theta_idx));
+        i0 = Math.floor(theta_idx);
+        i1 = Math.min(i0 + 1, ntheta - 1);
+        dt = theta_idx - i0;
+    }
+
     const j0 = Math.floor(r_idx);
     const j1 = Math.min(j0 + 1, nr - 1);
-
-    const dt = theta_idx - i0;
     const dr = r_idx - j0;
 
-    // Get corner values with safety checks
-    const v00 = (data[i0] && data[i0][j0] !== undefined) ? data[i0][j0] : 0;
-    const v01 = (data[i0] && data[i0][j1] !== undefined) ? data[i0][j1] : 0;
-    const v10 = (data[i1] && data[i1][j0] !== undefined) ? data[i1][j0] : 0;
-    const v11 = (data[i1] && data[i1][j1] !== undefined) ? data[i1][j1] : 0;
+    // Get corner values with safety checks (handle r_orientation)
+    let v00, v01, v10, v11;
+    if (r_orientation === 'horizontal') {
+        // data[theta_idx][r_idx]
+        v00 = (data[i0] && data[i0][j0] !== undefined) ? data[i0][j0] : 0;
+        v01 = (data[i0] && data[i0][j1] !== undefined) ? data[i0][j1] : 0;
+        v10 = (data[i1] && data[i1][j0] !== undefined) ? data[i1][j0] : 0;
+        v11 = (data[i1] && data[i1][j1] !== undefined) ? data[i1][j1] : 0;
+    } else {
+        // data[r_idx][theta_idx]
+        v00 = (data[j0] && data[j0][i0] !== undefined) ? data[j0][i0] : 0;
+        v01 = (data[j1] && data[j1][i0] !== undefined) ? data[j1][i0] : 0;
+        v10 = (data[j0] && data[j0][i1] !== undefined) ? data[j0][i1] : 0;
+        v11 = (data[j1] && data[j1][i1] !== undefined) ? data[j1][i1] : 0;
+    }
 
-    // Interpolate
-    const v0 = v00 * (1 - dr) + v01 * dr;
-    const v1 = v10 * (1 - dr) + v11 * dr;
+    // Apply sign flip for anti-periodic BC when crossing boundary
+    if (thetaAntiperiodic && crossesBoundary) {
+        v10 = -v10;
+        v11 = -v11;
+    }
+
+    // Bilinear interpolation
+    const v0 = v00 * (1 - dr) + v01 * dr;  // at theta=i0
+    const v1 = v10 * (1 - dr) + v11 * dr;  // at theta=i1
 
     return v0 * (1 - dt) + v1 * dt;
 }

@@ -5,6 +5,11 @@
       "values": ["cartesian", "polar"],
       "example": "coordinate_system: polar"
     },
+    "variables": {
+      "description": "User-defined variables for use in jz/mu_r formulas. Values can be numbers or formulas (quotes optional). Variables can reference previously defined variables using $varname syntax. Reserved names: step, H, dx, dy, dr, dtheta, N, A, pi, e",
+      "acceptsAnyChild": true,
+      "example": "variables:\n  freq: 60\n  omega: 2*pi*freq  # Can reference $freq\n  rpm: freq/60      # Quotes optional for formulas"
+    },
     "mesh": {
       "description": "Mesh configuration for Cartesian coordinates",
       "children": ["dx", "dy"]
@@ -44,8 +49,8 @@
       "example": "theta_range: 1.0471975512  # π/3 for 3-pole sector"
     },
     "polar_boundary_conditions": {
-      "description": "Boundary conditions for polar coordinates",
-      "children": ["inner", "outer"]
+      "description": "Boundary conditions for polar coordinates (radial: inner/outer, angular: theta_min/theta_max)",
+      "children": ["inner", "outer", "theta_min", "theta_max"]
     },
     "inner": {
       "description": "Inner boundary condition (at r=r_start)",
@@ -55,13 +60,21 @@
       "description": "Outer boundary condition (at r=r_end)",
       "children": ["type", "value"]
     },
+    "theta_min": {
+      "description": "Boundary condition at θ=0 (angular start boundary)",
+      "children": ["type", "value"]
+    },
+    "theta_max": {
+      "description": "Boundary condition at θ=theta_range (angular end boundary)",
+      "children": ["type", "value"]
+    },
     "type": {
-      "description": "Boundary condition type: 'dirichlet', 'neumann', or 'periodic'",
+      "description": "Boundary condition type: 'dirichlet', 'neumann', or 'periodic'. For periodic BC with value<0, anti-periodic BC is applied (f(θ=0) = -f(θ=θ_range))",
       "values": ["dirichlet", "neumann", "periodic"],
       "example": "type: dirichlet"
     },
     "value": {
-      "description": "Boundary condition value (for Dirichlet/Neumann)",
+      "description": "Boundary condition value. For Dirichlet: fixed Az value. For Neumann: normal derivative. For periodic: >=0 normal periodic, <0 anti-periodic",
       "type": "number",
       "example": "value: 0.0"
     },
@@ -97,13 +110,13 @@
       "validParents": ["materials"]
     },
     "mu_r": {
-      "description": "Relative permeability (dimensionless)",
-      "type": "number",
+      "description": "Relative permeability (dimensionless). Supports: constant, formula (quotes optional, with $H, $dx/$dy for Cartesian, $dr/$dtheta for polar, and user-defined $variables), or table [[H_values], [mu_r_values]]",
+      "type": "number|string|array",
       "example": "mu_r: 1.0",
       "validParents": ["materials"]
     },
     "jz": {
-      "description": "Current density [A/m²], can be constant, formula, or array",
+      "description": "Current density [A/m²]. Supports: constant, formula (quotes optional), or array. Formula variables: $step, $dx/$dy (Cartesian), $dr/$dtheta (polar), $N (pixel count), $A (area [m²]), and user-defined $variables",
       "type": "number|string|array",
       "example": "jz: 1.0e9",
       "validParents": ["materials"]
@@ -259,6 +272,41 @@
       "trigger": "type",
       "snippet": "type: periodic\nvalue: 0.0"
     },
+    "boundary_antiperiodic": {
+      "name": "Anti-Periodic Boundary (f(θ=0) = -f(θ=θ_range))",
+      "trigger": "type",
+      "snippet": "type: periodic\nvalue: -1.0"
+    },
+    "theta_min_periodic": {
+      "name": "θ_min Periodic Boundary",
+      "trigger": "theta_min",
+      "snippet": "theta_min:\n  type: periodic\n  value: 0.0"
+    },
+    "theta_min_antiperiodic": {
+      "name": "θ_min Anti-Periodic Boundary",
+      "trigger": "theta_min",
+      "snippet": "theta_min:\n  type: periodic\n  value: -1.0"
+    },
+    "theta_min_dirichlet": {
+      "name": "θ_min Dirichlet Boundary",
+      "trigger": "theta_min",
+      "snippet": "theta_min:\n  type: dirichlet\n  value: 0.0"
+    },
+    "theta_max_periodic": {
+      "name": "θ_max Periodic Boundary",
+      "trigger": "theta_max",
+      "snippet": "theta_max:\n  type: periodic\n  value: 0.0"
+    },
+    "theta_max_antiperiodic": {
+      "name": "θ_max Anti-Periodic Boundary",
+      "trigger": "theta_max",
+      "snippet": "theta_max:\n  type: periodic\n  value: -1.0"
+    },
+    "theta_max_dirichlet": {
+      "name": "θ_max Dirichlet Boundary",
+      "trigger": "theta_max",
+      "snippet": "theta_max:\n  type: dirichlet\n  value: 0.0"
+    },
     "material_template": {
       "name": "Material Definition Template",
       "trigger": "material",
@@ -289,7 +337,7 @@
     "polar_2d_motor": {
       "name": "Polar 2D Motor Analysis",
       "description": "Template for 2D motor analysis in polar coordinates",
-      "content": "coordinate_system: polar\n\nmesh:\n  dx: 0.2e-3\n  dy: 0.2e-3\n\npolar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # π/3\n\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0.0\n  outer:\n    type: dirichlet\n    value: 0.0\n\nmaterials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n\n  iron_stator:\n    rgb: [128, 128, 128]\n    mu_r: 100.0\n    jz: 0.0\n    calc_force: false\n\n  iron_rotor:\n    rgb: [100, 100, 100]\n    mu_r: 500.0\n    jz: 0.0\n    calc_force: true\n\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 167\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n"
+      "content": "coordinate_system: polar\n\nmesh:\n  dx: 0.2e-3\n  dy: 0.2e-3\n\npolar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # π/3\n\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0.0\n  outer:\n    type: dirichlet\n    value: 0.0\n  theta_min:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n  theta_max:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n\nmaterials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n\n  iron_stator:\n    rgb: [128, 128, 128]\n    mu_r: 100.0\n    jz: 0.0\n    calc_force: false\n\n  iron_rotor:\n    rgb: [100, 100, 100]\n    mu_r: 500.0\n    jz: 0.0\n    calc_force: true\n\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 167\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n"
     }
   }
 }

@@ -49,11 +49,62 @@ MagneticFieldAnalyzer::MuValue MagneticFieldAnalyzer::parseMuValue(const YAML::N
             // It's a formula
             result.type = MuType::FORMULA;
             result.formula = mu_str;
-            // Replace $H with H for tinyexpr
+
+            // Validate coordinate system-specific variables
+            bool has_dx_dy = (mu_str.find("$dx") != std::string::npos ||
+                              mu_str.find("$dy") != std::string::npos);
+            bool has_dr_dtheta = (mu_str.find("$dr") != std::string::npos ||
+                                  mu_str.find("$dtheta") != std::string::npos);
+
+            if (has_dx_dy && coordinate_system == "polar") {
+                throw std::runtime_error("mu_r formula error: $dx, $dy can only be used in Cartesian coordinates. "
+                                         "Use $dr, $dtheta for polar coordinates.");
+            }
+            if (has_dr_dtheta && coordinate_system == "cartesian") {
+                throw std::runtime_error("mu_r formula error: $dr, $dtheta can only be used in polar coordinates. "
+                                         "Use $dx, $dy for Cartesian coordinates.");
+            }
+
+            // Replace formula variables with tinyexpr-compatible names
+            // Order matters: longer names first to avoid partial replacements
             size_t pos = 0;
+            while ((pos = result.formula.find("$dtheta", pos)) != std::string::npos) {
+                result.formula.replace(pos, 7, "dtheta");
+                pos += 6;
+            }
+            pos = 0;
             while ((pos = result.formula.find("$H", pos)) != std::string::npos) {
                 result.formula.replace(pos, 2, "H");
                 pos += 1;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$dx", pos)) != std::string::npos) {
+                result.formula.replace(pos, 3, "dx");
+                pos += 2;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$dy", pos)) != std::string::npos) {
+                result.formula.replace(pos, 3, "dy");
+                pos += 2;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$dr", pos)) != std::string::npos) {
+                result.formula.replace(pos, 3, "dr");
+                pos += 2;
+            }
+
+            // Replace user-defined variables (sorted by name length descending to avoid partial replacements)
+            std::vector<std::pair<std::string, double>> sorted_vars(user_variables.begin(), user_variables.end());
+            std::sort(sorted_vars.begin(), sorted_vars.end(),
+                      [](const auto& a, const auto& b) { return a.first.length() > b.first.length(); });
+
+            for (const auto& [var_name, var_value] : sorted_vars) {
+                std::string search_str = "$" + var_name;
+                pos = 0;
+                while ((pos = result.formula.find(search_str, pos)) != std::string::npos) {
+                    result.formula.replace(pos, search_str.length(), var_name);
+                    pos += var_name.length();
+                }
             }
         } else {
             // It's a plain number
@@ -109,11 +160,43 @@ double MagneticFieldAnalyzer::evaluateMu(const MuValue& mu_val, double H_magnitu
 
         case MuType::FORMULA: {
             te_parser parser;
+
+            // Prepare variables
+            std::set<te_variable> vars;
+
+            // H variable (magnetic field intensity)
             te_variable H_var;
             H_var.m_name = "H";
             H_var.m_value = H_magnitude;
+            vars.insert(H_var);
 
-            std::set<te_variable> vars = {H_var};
+            // Coordinate system-specific variables
+            if (coordinate_system == "cartesian") {
+                te_variable dx_var, dy_var;
+                dx_var.m_name = "dx";
+                dx_var.m_value = dx;
+                dy_var.m_name = "dy";
+                dy_var.m_value = dy;
+                vars.insert(dx_var);
+                vars.insert(dy_var);
+            } else {  // polar
+                te_variable dr_var, dtheta_var;
+                dr_var.m_name = "dr";
+                dr_var.m_value = dr;
+                dtheta_var.m_name = "dtheta";
+                dtheta_var.m_value = dtheta;
+                vars.insert(dr_var);
+                vars.insert(dtheta_var);
+            }
+
+            // User-defined variables
+            for (const auto& [var_name, var_value] : user_variables) {
+                te_variable user_var;
+                user_var.m_name = var_name.c_str();
+                user_var.m_value = var_value;
+                vars.insert(user_var);
+            }
+
             parser.set_variables_and_functions(vars);
 
             double mu_r = parser.evaluate(mu_val.formula);

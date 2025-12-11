@@ -615,11 +615,13 @@ app.post('/api/solve-stream', async (req, res) => {
                 if (stepMatch) {
                     const current = parseInt(stepMatch[1]);
                     const total = parseInt(stepMatch[2]);
+                    // percentage reflects COMPLETED steps, not started steps
+                    // Step 1/N -> 0%, Step N/N -> (N-1)/N%, 100% only on complete
                     progressData = {
                         type: 'progress',
                         step: current,
                         total: total,
-                        percentage: Math.round((current / total) * 100),
+                        percentage: Math.round(((current - 1) / total) * 100),
                         message: line
                     };
                 }

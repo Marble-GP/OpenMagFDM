@@ -65,6 +65,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         setupCartesianSystem();
     }
 
+    parseUserVariables();  // Parse user-defined variables before material properties
     setupMaterialProperties();  // This may set has_nonlinear_materials = true
     validateBoundaryConditions();
 }
@@ -243,10 +244,36 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
             bc_outer.type = bc_cfg["outer"]["type"].as<std::string>("dirichlet");
             bc_outer.value = bc_cfg["outer"]["value"].as<double>(0.0);
         }
+
+        // Theta direction boundary conditions (angular boundaries)
+        if (bc_cfg["theta_min"]) {
+            bc_theta_min.type = bc_cfg["theta_min"]["type"].as<std::string>("dirichlet");
+            bc_theta_min.value = bc_cfg["theta_min"]["value"].as<double>(0.0);
+        }
+
+        if (bc_cfg["theta_max"]) {
+            bc_theta_max.type = bc_cfg["theta_max"]["type"].as<std::string>("dirichlet");
+            bc_theta_max.value = bc_cfg["theta_max"]["value"].as<double>(0.0);
+        }
+    }
+
+    // Determine if theta is periodic (both theta_min and theta_max must be "periodic")
+    // Anti-periodic: type="periodic" with value < 0
+    bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    bool theta_antiperiodic = theta_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+
+    std::string theta_bc_str;
+    if (theta_antiperiodic) {
+        theta_bc_str = "anti-periodic";
+    } else if (theta_periodic) {
+        theta_bc_str = "periodic";
+    } else {
+        theta_bc_str = bc_theta_min.type;
     }
 
     std::cout << "Boundary conditions: inner=" << bc_inner.type
-              << ", outer=" << bc_outer.type << std::endl;
+              << ", outer=" << bc_outer.type
+              << ", theta=" << theta_bc_str << std::endl;
 
     // Initialize material property matrices with r_orientation-dependent shape
     // This must match the shape of Br, Btheta, and Az matrices
@@ -263,12 +290,88 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
     }
 }
 
+void MagneticFieldAnalyzer::parseUserVariables() {
+    // Reserved variable names that cannot be used as user-defined variables
+    static const std::set<std::string> reserved_vars = {
+        "step",    // Jz: step number
+        "H",       // mu_r: magnetic field intensity
+        "dx", "dy",        // Cartesian cell size
+        "dr", "dtheta",    // Polar cell size
+        "N", "A",          // Jz: material pixel count and area
+        "pi", "e"          // tinyexpr built-in constants
+    };
+
+    if (!config["variables"]) {
+        return;  // No user-defined variables
+    }
+
+    std::cout << "Parsing user-defined variables:" << std::endl;
+
+    for (const auto& var : config["variables"]) {
+        std::string var_name = var.first.as<std::string>();
+
+        // Check for reserved variable names
+        if (reserved_vars.count(var_name) > 0) {
+            throw std::runtime_error("Variable '" + var_name + "' is a reserved variable name. "
+                                     "Reserved variables: step, H, dx, dy, dr, dtheta, N, A, pi, e");
+        }
+
+        // Get the value (can be number or formula string)
+        double var_value = 0.0;
+
+        if (var.second.IsScalar()) {
+            std::string val_str = var.second.as<std::string>();
+
+            // Replace references to already-defined user variables ($varname -> value)
+            // Sort by name length descending to avoid partial replacement issues
+            // (e.g., $omega shouldn't partially match $o)
+            std::vector<std::pair<std::string, double>> sorted_vars(user_variables.begin(), user_variables.end());
+            std::sort(sorted_vars.begin(), sorted_vars.end(),
+                      [](const auto& a, const auto& b) { return a.first.length() > b.first.length(); });
+
+            for (const auto& [existing_var_name, existing_var_value] : sorted_vars) {
+                std::string search_str = "$" + existing_var_name;
+                size_t pos = 0;
+                while ((pos = val_str.find(search_str, pos)) != std::string::npos) {
+                    // Replace $varname with the actual numeric value
+                    std::ostringstream oss;
+                    oss << std::setprecision(17) << existing_var_value;
+                    val_str.replace(pos, search_str.length(), oss.str());
+                    pos += oss.str().length();
+                }
+            }
+
+            // Try to evaluate as formula using tinyexpr
+            te_parser parser;
+            var_value = parser.evaluate(val_str);
+
+            if (!parser.success()) {
+                throw std::runtime_error("Failed to evaluate variable '" + var_name + "' with value: " + val_str +
+                                         ". Note: You can reference previously defined variables with $varname syntax.");
+            }
+        } else {
+            throw std::runtime_error("Variable '" + var_name + "' must be a scalar value or formula");
+        }
+
+        user_variables[var_name] = var_value;
+        std::cout << "  $" << var_name << " = " << var_value << std::endl;
+    }
+}
+
 void MagneticFieldAnalyzer::setupMaterialProperties() {
     if (!config["materials"]) {
         std::cout << "No materials defined in config" << std::endl;
         return;
     }
 
+    // Flip image once for coordinate system transformation
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
+
+    // =========================================================================
+    // PASS 1: Count pixels and calculate area for each material
+    // This populates material_pixel_info so that $N and $A can be used in formulas
+    // =========================================================================
     for (const auto& material : config["materials"]) {
         std::string name = material.first.as<std::string>();
         const auto& props = material.second;
@@ -276,7 +379,64 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
 
-        // Parse mu_r value (static, formula, or table) - NEW: Nonlinear support
+        int count = 0;
+        double total_area = 0.0;
+
+        if (coordinate_system == "polar") {
+            if (r_orientation == "horizontal") {
+                for (int j = 0; j < ntheta; j++) {
+                    for (int i = 0; i < nr; i++) {
+                        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                        if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                            count++;
+                            double r_at_cell = r_start + (i + 0.5) * dr;
+                            total_area += r_at_cell * dr * dtheta;
+                        }
+                    }
+                }
+            } else {  // vertical
+                for (int j = 0; j < nr; j++) {
+                    for (int i = 0; i < ntheta; i++) {
+                        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                        if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                            count++;
+                            double r_at_cell = r_start + (j + 0.5) * dr;
+                            total_area += r_at_cell * dr * dtheta;
+                        }
+                    }
+                }
+            }
+        } else {  // Cartesian
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                        count++;
+                    }
+                }
+            }
+            total_area = count * dx * dy;
+        }
+
+        // Store material pixel information
+        MaterialPixelInfo pixel_info;
+        pixel_info.pixel_count = count;
+        pixel_info.area = total_area;
+        material_pixel_info[name] = pixel_info;
+    }
+
+    // =========================================================================
+    // PASS 2: Parse formulas, evaluate properties, and apply to maps
+    // Now $N and $A are available for all materials
+    // =========================================================================
+    for (const auto& material : config["materials"]) {
+        std::string name = material.first.as<std::string>();
+        const auto& props = material.second;
+
+        // Get RGB values
+        std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
+
+        // Parse mu_r value (static, formula, or table) - Nonlinear support
         MuValue mu_value = parseMuValue(props["mu_r"]);
 
         // Parse dmu_r_extrapolation if specified (for TABLE type only)
@@ -328,62 +488,48 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         material_jz[name] = jz_value;
 
         // Evaluate Jz for step 0 (initial state)
-        double jz = evaluateJz(jz_value, 0);
+        // Now material_pixel_info is populated, so $N and $A are available
+        double jz = evaluateJz(jz_value, 0, name);
 
-        // Find matching pixels
-        int count = 0;
-
+        // Apply properties to matching pixels
         if (coordinate_system == "polar") {
-            // For polar coordinates, flip image to match analysis coordinates
-            // Convention: image bottom (row=ntheta-1) -> theta=0, image top (row=0) -> theta=theta_range
-            // theta increases upward (counterclockwise from x-axis, like standard y-axis)
-            cv::Mat image_flipped;
-            cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
-
             if (r_orientation == "horizontal") {
-                // r: cols (i), theta: rows (j, after flip)
                 // mu_map shape: (ntheta, nr), indexing: (theta_idx, r_idx) = (j, i)
                 for (int j = 0; j < ntheta; j++) {
                     for (int i = 0; i < nr; i++) {
                         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                            mu_map(j, i) = mu_r * MU_0;  // (theta_idx, r_idx)
+                            mu_map(j, i) = mu_r * MU_0;
                             jz_map(j, i) = jz;
-                            count++;
                         }
                     }
                 }
             } else {  // vertical
-                // r: rows (j), theta: cols (i)
                 // mu_map shape: (nr, ntheta), indexing: (r_idx, theta_idx) = (j, i)
                 for (int j = 0; j < nr; j++) {
                     for (int i = 0; i < ntheta; i++) {
                         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                            mu_map(j, i) = mu_r * MU_0;  // (r_idx, theta_idx)
+                            mu_map(j, i) = mu_r * MU_0;
                             jz_map(j, i) = jz;
-                            count++;
                         }
                     }
                 }
             }
-        } else {
-            // Cartesian coordinates
-            // Create flipped image to match analysis coordinates (y up)
-            cv::Mat image_flipped;
-            cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
-
+        } else {  // Cartesian
             for (int j = 0; j < ny; j++) {
                 for (int i = 0; i < nx; i++) {
                     cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                     if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                         mu_map(j, i) = mu_r * MU_0;
                         jz_map(j, i) = jz;
-                        count++;
                     }
                 }
             }
         }
+
+        // Get pixel info for display
+        const auto& pix_info = material_pixel_info[name];
 
         // Display Jz type
         std::string jz_type_str;
@@ -393,7 +539,8 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             case JzType::ARRAY: jz_type_str = "array"; break;
         }
 
-        std::cout << "Material '" << name << "': mu_r=" << mu_r << ", Jz=" << jz << " A/m^2, pixels=" << count << std::endl;
+        std::cout << "Material '" << name << "': mu_r=" << mu_r << ", Jz=" << jz << " A/m^2, pixels=" << pix_info.pixel_count
+                  << ", area=" << pix_info.area << " m^2" << std::endl;
     }
 }
 
@@ -1003,14 +1150,15 @@ void MagneticFieldAnalyzer::applyLaplacianWithPeriodicBC(const cv::Mat& src, cv:
     bool y_periodic = false;
 
     if (coordinate_system == "polar") {
-        // Polar coordinates: theta direction is always periodic
-        // Determine which image direction corresponds to theta
+        // Polar coordinates: check theta boundary conditions
+        // theta is periodic only if both theta_min and theta_max are set to "periodic"
+        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
         if (r_orientation == "horizontal") {
-            // r = x (columns), theta = y (rows) → y is periodic
-            y_periodic = true;
+            // r = x (columns), theta = y (rows)
+            y_periodic = theta_periodic;
         } else {
-            // r = y (rows), theta = x (columns) → x is periodic
-            x_periodic = true;
+            // r = y (rows), theta = x (columns)
+            x_periodic = theta_periodic;
         }
     } else {
         // Cartesian coordinates: check boundary conditions
@@ -1066,14 +1214,15 @@ void MagneticFieldAnalyzer::applySobelWithPeriodicBC(const cv::Mat& src, cv::Mat
     bool y_periodic = false;
 
     if (coordinate_system == "polar") {
-        // Polar coordinates: theta direction is always periodic
-        // Determine which image direction corresponds to theta
+        // Polar coordinates: check theta boundary conditions
+        // theta is periodic only if both theta_min and theta_max are set to "periodic"
+        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
         if (r_orientation == "horizontal") {
-            // r = x (columns), theta = y (rows) → y is periodic
-            y_periodic = true;
+            // r = x (columns), theta = y (rows)
+            y_periodic = theta_periodic;
         } else {
-            // r = y (rows), theta = x (columns) → x is periodic
-            x_periodic = true;
+            // r = y (rows), theta = x (columns)
+            x_periodic = theta_periodic;
         }
     } else {
         // Cartesian coordinates: check boundary conditions
@@ -1124,14 +1273,14 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
     bool y_periodic = false;
 
     if (coordinate_system == "polar") {
-        // Polar coordinates: theta direction is always periodic
-        // Determine which image direction corresponds to theta
+        // Polar coordinates: check theta boundary conditions
+        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
         if (r_orientation == "horizontal") {
-            // r = x (columns), theta = y (rows) → y is periodic
-            y_periodic = true;
+            // r = x (columns), theta = y (rows)
+            y_periodic = theta_periodic;
         } else {
-            // r = y (rows), theta = x (columns) → x is periodic
-            x_periodic = true;
+            // r = y (rows), theta = x (columns)
+            x_periodic = theta_periodic;
         }
     } else {
         // Cartesian coordinates: check boundary conditions
@@ -1317,25 +1466,32 @@ inline double getJzPolar(const Eigen::MatrixXd& jz_map, int r_idx, int theta_idx
     }
 }
 
-// Bilinear interpolation for polar coordinates with periodic theta boundary
-// Input: physical coordinates (r_phys, theta_phys)
+// Bilinear interpolation for polar coordinates
+// Input: physical coordinates (r_phys, theta_phys), theta_periodic/antiperiodic flags
 // Output: interpolated field value
 inline double bilinearInterpolatePolar(
     const Eigen::MatrixXd& field,
     double r_phys, double theta_phys,
     double r_start, double dr, double dtheta, double theta_range,
     int nr, int ntheta,
-    const std::string& r_orientation) {
+    const std::string& r_orientation,
+    bool theta_periodic,
+    bool theta_antiperiodic = false) {
 
     // Convert physical coordinates to continuous grid indices
     double r_idx_cont = (r_phys - r_start) / dr;
 
-    // FIX5: Normalize theta to [0, theta_range) in radians BEFORE converting to index
-    //  sector models (theta_range < 2π) correctly
-    // Periodic boundary: theta = theta_range wraps to theta = 0
-    double theta_norm = std::fmod(theta_phys, theta_range);
-    if (theta_norm < 0.0) theta_norm += theta_range;
-    double theta_idx_cont = theta_norm / dtheta;
+    double theta_idx_cont;
+    if (theta_periodic) {
+        // Periodic boundary: normalize theta to [0, theta_range) and wrap
+        double theta_norm = std::fmod(theta_phys, theta_range);
+        if (theta_norm < 0.0) theta_norm += theta_range;
+        theta_idx_cont = theta_norm / dtheta;
+    } else {
+        // Non-periodic boundary: clamp theta to valid range
+        theta_idx_cont = theta_phys / dtheta;
+        theta_idx_cont = std::max(0.0, std::min(theta_idx_cont, static_cast<double>(ntheta - 1)));
+    }
 
     // Clamp r index to valid range [0, nr-2] (need r0+1 to be valid)
     r_idx_cont = std::max(0.0, std::min(r_idx_cont, static_cast<double>(nr - 2) + 0.999));
@@ -1348,8 +1504,21 @@ inline double bilinearInterpolatePolar(
     r0 = std::max(0, std::min(r0, nr - 2));
     int r1 = r0 + 1;
 
-    // Theta wraps periodically
-    int t1 = (t0 + 1) % ntheta;
+    // Theta index handling depends on periodicity
+    int t1;
+    bool crosses_theta_boundary = false;  // For anti-periodic sign flip
+    if (theta_periodic) {
+        // Theta wraps periodically
+        t0 = t0 % ntheta;
+        if (t0 < 0) t0 += ntheta;
+        t1 = (t0 + 1) % ntheta;
+        // Check if interpolation crosses the theta boundary (t1 wraps to 0)
+        crosses_theta_boundary = (t1 < t0);
+    } else {
+        // Theta clamps at boundaries
+        t0 = std::max(0, std::min(t0, ntheta - 2));
+        t1 = t0 + 1;
+    }
 
     // Interpolation weights
     double wr = r_idx_cont - r0;
@@ -1373,6 +1542,12 @@ inline double bilinearInterpolatePolar(
         v10 = field(r1, t0);
         v01 = field(r0, t1);
         v11 = field(r1, t1);
+    }
+
+    // Apply sign flip for anti-periodic BC when crossing the theta boundary
+    if (theta_antiperiodic && crosses_theta_boundary) {
+        v01 = -v01;
+        v11 = -v11;
     }
 
     // Bilinear interpolation: first interpolate in r, then in theta
@@ -1430,13 +1605,17 @@ MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPhysical
         sample.theta_phys = std::atan2(y_phys, x_phys);
         if (sample.theta_phys < 0.0) sample.theta_phys += 2.0 * M_PI;
 
+        // Determine if theta is periodic/anti-periodic
+        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+        bool theta_antiperiodic = theta_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+
         // Interpolate Br, Btheta, mu at (r_phys, theta_phys)
         sample.Br = bilinearInterpolatePolar(Br, sample.r_phys, sample.theta_phys,
-                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation, theta_periodic, theta_antiperiodic);
         sample.Btheta = bilinearInterpolatePolar(Btheta, sample.r_phys, sample.theta_phys,
-                                                r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
+                                                r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation, theta_periodic, theta_antiperiodic);
         sample.mu = bilinearInterpolatePolar(mu_map, sample.r_phys, sample.theta_phys,
-                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation, theta_periodic, theta_antiperiodic);
 
         // Convert to Cartesian using the SAME theta from atan2
         sample.Bx = sample.Br * std::cos(sample.theta_phys) - sample.Btheta * std::sin(sample.theta_phys);
@@ -1458,13 +1637,17 @@ MagneticFieldAnalyzer::PolarSample MagneticFieldAnalyzer::sampleFieldsAtPolarPoi
     sample.theta_phys = theta_phys;
 
     if (coordinate_system == "polar") {
+        // Determine if theta is periodic/anti-periodic
+        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+        bool theta_antiperiodic = theta_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+
         // Interpolate Br, Btheta, mu at (r_phys, theta_phys)
         sample.Br = bilinearInterpolatePolar(Br, r_phys, theta_phys,
-                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation, theta_periodic, theta_antiperiodic);
         sample.Btheta = bilinearInterpolatePolar(Btheta, r_phys, theta_phys,
-                                                r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
+                                                r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation, theta_periodic, theta_antiperiodic);
         sample.mu = bilinearInterpolatePolar(mu_map, r_phys, theta_phys,
-                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation);
+                                            r_start, dr, dtheta, theta_range, nr, ntheta, r_orientation, theta_periodic, theta_antiperiodic);
 
         // Convert to Cartesian using the SAME theta (no atan2!)
         sample.Bx = sample.Br * std::cos(theta_phys) - sample.Btheta * std::sin(theta_phys);
@@ -1604,11 +1787,12 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
         bool y_periodic_loop = false;
 
         if (coordinate_system == "polar") {
-            // Polar coordinates: theta direction is always periodic
+            // Polar coordinates: check theta boundary conditions
+            bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
             if (r_orientation == "horizontal") {
-                y_periodic_loop = true;  // theta = y (rows) is periodic
+                y_periodic_loop = theta_periodic;  // theta = y (rows)
             } else {
-                x_periodic_loop = true;  // theta = x (columns) is periodic
+                x_periodic_loop = theta_periodic;  // theta = x (columns)
             }
         } else {
             // Cartesian coordinates
@@ -1650,11 +1834,12 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     bool y_periodic_fallback = false;
 
                     if (coordinate_system == "polar") {
-                        // Polar coordinates: theta direction is always periodic
+                        // Polar coordinates: check theta boundary conditions
+                        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
                         if (r_orientation == "horizontal") {
-                            y_periodic_fallback = true;
+                            y_periodic_fallback = theta_periodic;
                         } else {
-                            x_periodic_fallback = true;
+                            x_periodic_fallback = theta_periodic;
                         }
                     } else {
                         // Cartesian coordinates
@@ -1705,13 +1890,14 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                 bool y_periodic = false;
 
                 if (coordinate_system == "polar") {
-                    // Polar coordinates: theta direction is always periodic
+                    // Polar coordinates: check theta boundary conditions
+                    bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
                     if (r_orientation == "horizontal") {
-                        // r = x (columns), theta = y (rows) → y is periodic
-                        y_periodic = true;
+                        // r = x (columns), theta = y (rows)
+                        y_periodic = theta_periodic;
                     } else {
-                        // r = y (rows), theta = x (columns) → x is periodic
-                        x_periodic = true;
+                        // r = y (rows), theta = x (columns)
+                        x_periodic = theta_periodic;
                     }
                 } else {
                     // Cartesian coordinates: check boundary conditions
@@ -2555,11 +2741,12 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
     std::vector<Eigen::Triplet<double>> triplets;
     triplets.reserve(n * 7);  // Estimate: 7 non-zeros per row
 
-    // Determine boundary condition type (move outside loop for efficiency)
-    // IMPORTANT: θ direction is periodic ONLY if theta_range == 2*pi (full rotation)
-    // For sector domains (theta_range < 2*pi), use Dirichlet BC at θ=0 and θ=theta_range
-    const double TWO_PI = 2.0 * M_PI;
-    bool is_periodic = (std::abs(theta_range - TWO_PI) < 1e-6);  // Check if full rotation
+    // Determine boundary condition type from YAML settings
+    // theta is periodic only if both theta_min and theta_max are set to "periodic"
+    // Anti-periodic: type="periodic" with value < 0
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+    double periodic_sign = is_antiperiodic ? -1.0 : 1.0;  // Sign for coupling across theta boundary
 
     // Build equation for each grid point
     for (int i = 0; i < nr; i++) {  // Radial direction
@@ -2567,13 +2754,18 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             int idx = i * ntheta + j;
             double r = r_coords[i];
 
-            // Angular boundary conditions (only for sector domain, not periodic)
+            // Angular boundary conditions (only for non-periodic boundaries)
             if (!is_periodic) {
-                // Sector domain: Dirichlet boundary at θ=0 and θ=theta_range
-                if (j == 0 || j == ntheta - 1) {
-                    // Dirichlet BC: Az = 0 at sector boundaries
+                // Handle theta_min boundary (j == 0)
+                if (j == 0 && bc_theta_min.type == "dirichlet") {
                     triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                    rhs(idx) = 0.0;
+                    rhs(idx) = bc_theta_min.value;
+                    continue;
+                }
+                // Handle theta_max boundary (j == ntheta - 1)
+                if (j == ntheta - 1 && bc_theta_max.type == "dirichlet") {
+                    triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                    rhs(idx) = bc_theta_max.value;
                     continue;
                 }
             }
@@ -2697,35 +2889,31 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             double coeff_theta_prev = 1.0 / (r * mu_theta_prev * dtheta * dtheta);
             double coeff_theta_next = 1.0 / (r * mu_theta_next * dtheta * dtheta);
 
-            // Check if neighbors are sector Dirichlet boundaries (Az=0)
-            // For sector domain: j=0 and j=ntheta-1 have Dirichlet BC
-            bool theta_prev_is_dirichlet = (!is_periodic) && (j == 1);  // j_prev_idx = 0
-            bool theta_next_is_dirichlet = (!is_periodic) && (j == ntheta - 2);  // j_next_idx = ntheta-1
+            // Check if neighbors are theta Dirichlet boundaries
+            // For non-periodic domain: j=0 (theta_min) and j=ntheta-1 (theta_max) may have Dirichlet BC
+            bool theta_prev_is_dirichlet = (!is_periodic) && (j == 1) && (bc_theta_min.type == "dirichlet");
+            bool theta_next_is_dirichlet = (!is_periodic) && (j == ntheta - 2) && (bc_theta_max.type == "dirichlet");
 
-            //  For periodic boundaries, also check if theta neighbor is on radial Dirichlet boundary
-            // symmetry when periodic wrap connects to Dirichlet points
-            if (is_periodic) {
-                int idx_theta_prev = i * ntheta + j_prev_idx;
-                int idx_theta_next = i * ntheta + j_next_idx;
-
-                // Check if wrapped theta neighbor is on radial Dirichlet boundary
-                // (the case where j wraps around and i is on boundary)
-                // For now, we don't have this case in our problem, but keep the structure consistent
-                // The key is to use the same harmonic mean calculation in both directions
-            }
+            // For (anti-)periodic BC, check if coupling crosses the theta boundary
+            // j=0 couples to j_prev=ntheta-1 (crosses boundary)
+            // j=ntheta-1 couples to j_next=0 (crosses boundary)
+            bool prev_crosses_boundary = is_periodic && (j == 0);
+            bool next_crosses_boundary = is_periodic && (j == ntheta - 1);
 
             if (!theta_prev_is_dirichlet) {
-                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, coeff_theta_prev));
+                double sign = prev_crosses_boundary ? periodic_sign : 1.0;
+                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, sign * coeff_theta_prev));
             } else {
-                // Sector boundary has Az=0, so rhs(idx) -= coeff_theta_prev * 0.0 (no change)
-                // Don't add matrix entry to maintain symmetry
+                // Theta_min neighbor is Dirichlet: move bc value to RHS
+                rhs(idx) -= coeff_theta_prev * bc_theta_min.value;
             }
 
             if (!theta_next_is_dirichlet) {
-                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, coeff_theta_next));
+                double sign = next_crosses_boundary ? periodic_sign : 1.0;
+                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, sign * coeff_theta_next));
             } else {
-                // Sector boundary has Az=0, so rhs(idx) -= coeff_theta_next * 0.0 (no change)
-                // Don't add matrix entry to maintain symmetry
+                // Theta_max neighbor is Dirichlet: move bc value to RHS
+                rhs(idx) -= coeff_theta_next * bc_theta_max.value;
             }
 
             coeff_center -= (coeff_theta_prev + coeff_theta_next);
@@ -2859,10 +3047,11 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
         Btheta = Eigen::MatrixXd::Zero(nr, ntheta);
     }
 
-    // IMPORTANT: θ direction is periodic ONLY if theta_range == 2*pi (full rotation)
-    // For sector domains (theta_range < 2*pi), NOT periodic
-    const double TWO_PI = 2.0 * M_PI;
-    bool is_periodic = (std::abs(theta_range - TWO_PI) < 1e-6);  // Check if full rotation
+    // Determine if theta is periodic from boundary condition settings
+    // theta is periodic only if both theta_min and theta_max are set to "periodic"
+    // Anti-periodic: type="periodic" with value < 0
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
 
     // Calculate field components: Br = (1/r)∂Az/∂θ, Btheta = -∂Az/∂r
     for (int i = 0; i < nr; i++) {
@@ -2921,7 +3110,24 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
                     denom_theta = 2.0 * dtheta;
                 }
             }
-            double dAz_dtheta = (getAz(i, j_next) - getAz(i, j_prev)) / denom_theta;
+
+            // Get Az values at neighbors
+            double Az_prev = getAz(i, j_prev);
+            double Az_next = getAz(i, j_next);
+
+            // For anti-periodic BC, apply sign flip when crossing the theta boundary
+            if (is_antiperiodic) {
+                if (j == 0) {
+                    // j_prev = ntheta-1 crosses the boundary
+                    Az_prev *= -1.0;
+                }
+                if (j == ntheta - 1) {
+                    // j_next = 0 crosses the boundary
+                    Az_next *= -1.0;
+                }
+            }
+
+            double dAz_dtheta = (Az_next - Az_prev) / denom_theta;
             double safe_r = (r > 1e-15) ? r : 1e-15;
             setBr(i, j, dAz_dtheta / safe_r);
 
@@ -2980,11 +3186,72 @@ MagneticFieldAnalyzer::JzValue MagneticFieldAnalyzer::parseJzValue(const YAML::N
             // It's a formula
             result.type = JzType::FORMULA;
             result.formula = jz_str;
-            // Replace $step with step for tinyexpr
+
+            // Validate coordinate system-specific variables
+            bool has_dx_dy = (jz_str.find("$dx") != std::string::npos ||
+                              jz_str.find("$dy") != std::string::npos);
+            bool has_dr_dtheta = (jz_str.find("$dr") != std::string::npos ||
+                                  jz_str.find("$dtheta") != std::string::npos);
+
+            if (has_dx_dy && coordinate_system == "polar") {
+                throw std::runtime_error("Jz formula error: $dx, $dy can only be used in Cartesian coordinates. "
+                                         "Use $dr, $dtheta for polar coordinates.");
+            }
+            if (has_dr_dtheta && coordinate_system == "cartesian") {
+                throw std::runtime_error("Jz formula error: $dr, $dtheta can only be used in polar coordinates. "
+                                         "Use $dx, $dy for Cartesian coordinates.");
+            }
+
+            // Replace formula variables with tinyexpr-compatible names
+            // Order matters: longer names first to avoid partial replacements
             size_t pos = 0;
+            while ((pos = result.formula.find("$dtheta", pos)) != std::string::npos) {
+                result.formula.replace(pos, 7, "dtheta");
+                pos += 6;
+            }
+            pos = 0;
             while ((pos = result.formula.find("$step", pos)) != std::string::npos) {
                 result.formula.replace(pos, 5, "step");
                 pos += 4;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$dx", pos)) != std::string::npos) {
+                result.formula.replace(pos, 3, "dx");
+                pos += 2;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$dy", pos)) != std::string::npos) {
+                result.formula.replace(pos, 3, "dy");
+                pos += 2;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$dr", pos)) != std::string::npos) {
+                result.formula.replace(pos, 3, "dr");
+                pos += 2;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$N", pos)) != std::string::npos) {
+                result.formula.replace(pos, 2, "N");
+                pos += 1;
+            }
+            pos = 0;
+            while ((pos = result.formula.find("$A", pos)) != std::string::npos) {
+                result.formula.replace(pos, 2, "A");
+                pos += 1;
+            }
+
+            // Replace user-defined variables (sorted by name length descending to avoid partial replacements)
+            std::vector<std::pair<std::string, double>> sorted_vars(user_variables.begin(), user_variables.end());
+            std::sort(sorted_vars.begin(), sorted_vars.end(),
+                      [](const auto& a, const auto& b) { return a.first.length() > b.first.length(); });
+
+            for (const auto& [var_name, var_value] : sorted_vars) {
+                std::string search_str = "$" + var_name;
+                pos = 0;
+                while ((pos = result.formula.find(search_str, pos)) != std::string::npos) {
+                    result.formula.replace(pos, search_str.length(), var_name);
+                    pos += var_name.length();
+                }
             }
         } else {
             // It's a plain number
@@ -3006,19 +3273,67 @@ MagneticFieldAnalyzer::JzValue MagneticFieldAnalyzer::parseJzValue(const YAML::N
     return result;
 }
 
-double MagneticFieldAnalyzer::evaluateJz(const JzValue& jz_val, int step) {
+double MagneticFieldAnalyzer::evaluateJz(const JzValue& jz_val, int step, const std::string& material_name) {
     switch (jz_val.type) {
         case JzType::STATIC:
             return jz_val.static_value;
 
         case JzType::FORMULA: {
             te_parser parser;
+
+            // Prepare variables
+            std::set<te_variable> vars;
+
+            // step variable
             te_variable step_var;
             step_var.m_name = "step";
             step_var.m_value = static_cast<double>(step);
-            // m_type defaults to TE_DEFAULT which is correct for variables
+            vars.insert(step_var);
 
-            std::set<te_variable> vars = {step_var};
+            // Coordinate system-specific variables
+            if (coordinate_system == "cartesian") {
+                te_variable dx_var, dy_var;
+                dx_var.m_name = "dx";
+                dx_var.m_value = dx;
+                dy_var.m_name = "dy";
+                dy_var.m_value = dy;
+                vars.insert(dx_var);
+                vars.insert(dy_var);
+            } else {  // polar
+                te_variable dr_var, dtheta_var;
+                dr_var.m_name = "dr";
+                dr_var.m_value = dr;
+                dtheta_var.m_name = "dtheta";
+                dtheta_var.m_value = dtheta;
+                vars.insert(dr_var);
+                vars.insert(dtheta_var);
+            }
+
+            // Material pixel info variables (N, A)
+            te_variable n_var, a_var;
+            n_var.m_name = "N";
+            a_var.m_name = "A";
+
+            if (!material_name.empty() && material_pixel_info.find(material_name) != material_pixel_info.end()) {
+                const auto& pix_info = material_pixel_info.at(material_name);
+                n_var.m_value = static_cast<double>(pix_info.pixel_count);
+                a_var.m_value = pix_info.area;
+            } else {
+                // Fallback values if material not found
+                n_var.m_value = 0.0;
+                a_var.m_value = 0.0;
+            }
+            vars.insert(n_var);
+            vars.insert(a_var);
+
+            // User-defined variables
+            for (const auto& [var_name, var_value] : user_variables) {
+                te_variable user_var;
+                user_var.m_name = var_name.c_str();
+                user_var.m_value = var_value;
+                vars.insert(user_var);
+            }
+
             parser.set_variables_and_functions(vars);
 
             double result = parser.evaluate(jz_val.formula);
@@ -3059,7 +3374,7 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         // Evaluate Jz for this step (0.0 if not defined)
         double jz = 0.0;
         if (material_jz.find(name) != material_jz.end()) {
-            jz = evaluateJz(material_jz[name], step);
+            jz = evaluateJz(material_jz[name], step, name);
         }
 
         // Update mu_map and jz_map for ALL matching pixels

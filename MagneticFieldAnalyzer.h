@@ -221,6 +221,14 @@ private:
         JzValue() : type(JzType::STATIC), static_value(0.0) {}
     };
 
+    // Material pixel information (for formula variables $N, $A)
+    struct MaterialPixelInfo {
+        int pixel_count;        // Number of pixels (N)
+        double area;            // Physical cross-sectional area [m²] (A = N * cell_area)
+
+        MaterialPixelInfo() : pixel_count(0), area(0.0) {}
+    };
+
     // Nonlinear solver configuration
     struct NonlinearSolverConfig {
         bool enabled;               // Enable nonlinear solver (default: true, used with has_nonlinear_materials)
@@ -313,7 +321,8 @@ private:
 
     // Boundary conditions
     BoundaryCondition bc_left, bc_right, bc_bottom, bc_top;  // Cartesian
-    BoundaryCondition bc_inner, bc_outer;  // Polar
+    BoundaryCondition bc_inner, bc_outer;  // Polar (radial direction)
+    BoundaryCondition bc_theta_min, bc_theta_max;  // Polar (angular direction)
 
     // Transient analysis configuration
     struct TransientConfig {
@@ -338,6 +347,10 @@ private:
     std::map<std::string, JzValue> material_jz;  // Dynamic Jz values per material
     std::map<std::string, MuValue> material_mu;  // Nonlinear permeability values per material
     std::map<std::string, BHTable> material_bh_tables;  // B-H tables per nonlinear material
+    std::map<std::string, MaterialPixelInfo> material_pixel_info;  // Pixel count and area per material
+
+    // User-defined variables (from YAML "variables" section)
+    std::map<std::string, double> user_variables;  // Variable name -> evaluated value
 
     // Nonlinear solver
     NonlinearSolverConfig nonlinear_config;
@@ -361,6 +374,7 @@ private:
     // Private methods
     void loadConfig(const std::string& config_path);
     void loadImage(const std::string& image_path);
+    void parseUserVariables();  // Parse and evaluate user-defined variables from YAML
     void setupCartesianSystem();
     void setupPolarSystem();
     void setupMaterialProperties();
@@ -372,7 +386,7 @@ private:
 
     // Dynamic Jz evaluation
     JzValue parseJzValue(const YAML::Node& jz_node);
-    double evaluateJz(const JzValue& jz_val, int step);
+    double evaluateJz(const JzValue& jz_val, int step, const std::string& material_name = "");
 
     // Nonlinear permeability methods
     MuValue parseMuValue(const YAML::Node& mu_node);
