@@ -169,13 +169,30 @@
     },
     "nonlinear_solver": {
       "description": "Nonlinear solver configuration for materials with field-dependent permeability μ(H)",
-      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson_depth", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence"]
+      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence"]
     },
     "solver_type": {
-      "description": "Nonlinear solver algorithm: 'picard' (basic), 'anderson' (accelerated), 'newton-krylov' (recommended for fast convergence)",
-      "values": ["picard", "anderson", "newton-krylov"],
+      "description": "Nonlinear solver algorithm: 'picard' (simple fixed-point) or 'newton-krylov' (recommended for fast convergence)",
+      "values": ["picard", "newton-krylov"],
       "example": "solver_type: newton-krylov",
       "validParents": ["nonlinear_solver"]
+    },
+    "anderson": {
+      "description": "Anderson acceleration settings (works with both picard and newton-krylov solvers)",
+      "children": ["enabled", "depth", "beta"],
+      "validParents": ["nonlinear_solver"]
+    },
+    "depth": {
+      "description": "Anderson acceleration history depth (typically 3-10, larger = more acceleration but more memory)",
+      "type": "integer",
+      "example": "depth: 5",
+      "validParents": ["anderson"]
+    },
+    "beta": {
+      "description": "Anderson mixing parameter (0.0-1.0, 1.0 = full Anderson, smaller = more conservative)",
+      "type": "number",
+      "example": "beta: 1.0",
+      "validParents": ["anderson"]
     },
     "max_iterations": {
       "description": "Maximum number of nonlinear iterations",
@@ -193,12 +210,6 @@
       "description": "Relaxation factor for Picard/Anderson methods (0.5 ~ 0.8, lower = more stable)",
       "type": "number",
       "example": "relaxation: 0.7",
-      "validParents": ["nonlinear_solver"]
-    },
-    "anderson_depth": {
-      "description": "Anderson acceleration depth (0 = disabled, typically 5-10)",
-      "type": "integer",
-      "example": "anderson_depth: 5",
       "validParents": ["nonlinear_solver"]
     },
     "gmres_restart": {
@@ -322,15 +333,20 @@
       "trigger": "nonlinear_solver",
       "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 50\ntolerance: 1.0e-5\nrelaxation: 0.7\nverbose: false\nexport_convergence: true"
     },
-    "nonlinear_anderson": {
-      "name": "Nonlinear Solver - Anderson Acceleration",
+    "nonlinear_picard_anderson": {
+      "name": "Nonlinear Solver - Picard with Anderson Acceleration",
       "trigger": "nonlinear_solver",
-      "snippet": "enabled: true\nsolver_type: anderson\nmax_iterations: 50\ntolerance: 1.0e-5\nrelaxation: 0.7\nanderson_depth: 5\nverbose: false\nexport_convergence: true"
+      "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 50\ntolerance: 1.0e-5\nrelaxation: 0.7\nanderson:\n  enabled: true\n  depth: 5\n  beta: 1.0\nverbose: false\nexport_convergence: true"
     },
     "nonlinear_newton_krylov": {
-      "name": "Nonlinear Solver - Newton-Krylov (Recommended)",
+      "name": "Nonlinear Solver - Newton-Krylov",
       "trigger": "nonlinear_solver",
       "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 50\ntolerance: 1.0e-5\ngmres_restart: 30\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
+    },
+    "nonlinear_newton_krylov_anderson": {
+      "name": "Nonlinear Solver - Newton-Krylov + Anderson (Recommended)",
+      "trigger": "nonlinear_solver",
+      "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 50\ntolerance: 1.0e-5\ngmres_restart: 30\nanderson:\n  enabled: true\n  depth: 5\n  beta: 0.3\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
     }
   },
   "templates": {

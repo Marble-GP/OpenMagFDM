@@ -99,10 +99,113 @@ public:
     const Eigen::MatrixXd& getMu() const { return mu_map; }
 
     /**
-     * @brief Calculate Maxwell stress and electromagnetic forces
+     * @brief Calculate Maxwell stress and electromagnetic forces (Sobel-based)
      * @param step Step number for field caching (-1 for static analysis)
+     * @deprecated Use calculateForceDistributedAmperian() instead (default method)
      */
     void calculateMaxwellStress(int step = -1);
+
+    /**
+     * @brief Calculate Maxwell stress using edge-based integration (more robust)
+     * @param step Step number for field caching (-1 for static analysis)
+     * @deprecated Use calculateForceDistributedAmperian() instead (default method)
+     *
+     * This method uses cell-edge-based integration which is more accurate
+     * than Sobel-based normal estimation, especially for:
+     * - Uniform permeability materials (should give zero force)
+     * - Boundaries crossing periodic boundaries
+     * - Rectangular/axis-aligned geometries
+     */
+    void calculateMaxwellStressEdgeBased(int step = -1);
+
+    /**
+     * @brief Calculate electromagnetic force using volume integral method
+     * @param step Step number for field caching (-1 for static analysis)
+     * @deprecated Use calculateForceDistributedAmperian() instead (default method)
+     *
+     * This method uses volume integral of force density:
+     *   f = J×B + (M·∇)B
+     * where M = (μr - 1)·H is the magnetization.
+     *
+     * Advantages over surface integral (Maxwell stress tensor):
+     * - No boundary normal vector evaluation required
+     * - More robust against jaggy boundaries
+     * - Naturally handles permeability discontinuities
+     * - Numerically more stable
+     *
+     * Results are stored in force_results_volume member.
+     */
+    void calculateForceVolumeIntegral(int step = -1);
+
+    /**
+     * @brief Calculate electromagnetic force using face-flux method (Maxwell stress divergence)
+     * @param step Step number for field caching (-1 for static analysis)
+     * @deprecated Use calculateForceDistributedAmperian() instead (default method)
+     *
+     * This method uses face-flux discretization of Maxwell stress tensor divergence:
+     *   F = ∫_V ∇·T dV = Σ_faces (T·n) * A_face
+     * where T = B⊗H - (1/2)(B·H)I is the Maxwell stress tensor.
+     *
+     * Advantages:
+     * - Discrete divergence theorem is satisfied (conservation)
+     * - Face-averaged fluxes reduce boundary noise from jaggy geometries
+     * - Theoretically consistent with energy method
+     * - Automatically zero for uniform field
+     *
+     * Results are stored in force_results_flux member.
+     */
+    void calculateForceMaxwellStressFaceFlux(int step = -1);
+
+    /**
+     * @brief Calculate electromagnetic force using Shell Volume Integration method
+     * @param step Step number for field caching (-1 for static analysis)
+     * @param shell_thickness Number of pixels for shell thickness (default: 3)
+     * @deprecated Use calculateForceDistributedAmperian() instead (default method)
+     *
+     * This method uses weighted volume integration in the air shell surrounding
+     * the material, avoiding direct boundary calculations:
+     *   F = ∫_Ω_shell T · ∇G dS
+     * where G is a smooth weight function (1 at material surface, 0 at shell outer edge).
+     *
+     * Key advantages:
+     * - Avoids jaggy boundary normal vector evaluation
+     * - All calculations in air (μ₀), avoiding material discontinuities
+     * - Spatial averaging reduces numerical noise
+     * - Uses image processing (morphology, distance transform) for robust shell generation
+     *
+     * Mathematically equivalent to surface integral via divergence theorem,
+     * but numerically more stable.
+     *
+     * Results are stored in force_results_shell member.
+     */
+    void calculateForceShellIntegration(int step = -1, int shell_thickness = 3);
+
+    /**
+     * @brief [DEFAULT] Calculate electromagnetic force using Distributed Amperian Force method
+     * @param step Step number for field caching (-1 for static analysis)
+     * @param sigma_smooth Gaussian smoothing sigma for magnetization (default: 0.0 = no smoothing)
+     *
+     * THIS IS THE RECOMMENDED AND DEFAULT FORCE CALCULATION METHOD.
+     *
+     * This method converts magnetization M to equivalent bound current and uses Lorentz force:
+     *   M = B/μ₀ - H (magnetization, exactly 0 in air where μ_r = 1)
+     *   J_b = ∇ × M (bound current from curl of magnetization)
+     *   F = ∫ J_b × B dV (Lorentz force on bound current)
+     *
+     * Key advantages over other methods:
+     * - NO ghost force: M = 0 exactly in air (μ_r = 1), so J_b = 0 in air
+     * - Surface magnetization current automatically captured via numerical curl
+     * - Optional Gaussian smoothing reduces numerical noise while preserving physics
+     * - Avoids jaggy boundary issues inherent to surface integral methods
+     * - Robust for complex geometries with multiple materials
+     * - Results closely match Virtual Work principle (energy-based) method
+     *
+     * For 2D (z-invariant): J_bz = ∂My/∂x - ∂Mx/∂y
+     *                       Fx = +Jz·By, Fy = -Jz·Bx (sign adjusted to match Virtual Work)
+     *
+     * Results are stored in force_results_amperian member.
+     */
+    void calculateForceDistributedAmperian(int step = -1, double sigma_smooth = 0.0);
 
     /**
      * @brief Calculate total magnetic energy of the system
@@ -184,26 +287,6 @@ public:
      */
     double evaluateMuDerivative(const MuValue& mu_val, double H_magnitude);
 
-    /**
-     * @brief Compute differential permeability dB/dH analytically from effective permeability
-     *
-     * This function converts effective permeability μ_eff = B/H (catalog data format)
-     * to differential permeability dB/dH (needed for accurate Jacobian in Newton-Krylov).
-     *
-     * Mathematical derivation:
-     *   Given: B(H) = μ_eff(H) · μ₀ · H
-     *   Then:  dB/dH = d/dH[μ_eff(H) · μ₀ · H]
-     *               = μ₀ · [dμ_eff/dH · H + μ_eff · 1]
-     *               = μ₀ · (μ_eff + H · dμ_eff/dH)
-     *
-     * This avoids numerical differentiation errors that plague the naive approach.
-     *
-     * @param mu_val Effective permeability specification (μ_eff = B/H from YAML)
-     * @param H_magnitude Magnetic field intensity |H| [A/m]
-     * @return Differential permeability dB/dH [H/m] (absolute permeability units)
-     */
-    double computeDifferentialPermeability(const MuValue& mu_val, double H_magnitude);
-
 private:
     // Dynamic current density representation
     enum class JzType {
@@ -229,14 +312,23 @@ private:
         MaterialPixelInfo() : pixel_count(0), area(0.0) {}
     };
 
+    // Anderson acceleration configuration (shared by Picard and Newton-Krylov)
+    struct AndersonConfig {
+        bool enabled;       // Enable Anderson acceleration (default: false)
+        int depth;          // History depth (default: 5)
+        double beta;        // Mixing parameter (default: 1.0)
+
+        AndersonConfig() : enabled(false), depth(5), beta(1.0) {}
+    };
+
     // Nonlinear solver configuration
     struct NonlinearSolverConfig {
         bool enabled;               // Enable nonlinear solver (default: true, used with has_nonlinear_materials)
-        std::string solver_type;    // Solver type: "picard", "anderson", "newton-krylov" (default: "newton-krylov")
+        std::string solver_type;    // Solver type: "picard", "newton-krylov" (default: "newton-krylov")
         int max_iterations;         // Maximum nonlinear iterations (default: 50)
         double tolerance;           // Convergence tolerance (relative) (default: 5e-4)
-        double relaxation;          // Relaxation factor (0.5 ~ 0.8) (default: 0.7) - for Picard/Anderson
-        int anderson_depth;         // Anderson acceleration depth (default: 5) - for Anderson
+        double relaxation;          // Relaxation factor (0.5 ~ 0.8) (default: 0.7) - for Picard
+        AndersonConfig anderson;    // Anderson acceleration settings (for Picard and Newton-Krylov)
         int gmres_restart;          // GMRES restart parameter (default: 30) - for Newton-Krylov
         double line_search_c;       // Line search Armijo parameter (default: 1e-4) - for Newton-Krylov
         double line_search_alpha_init;    // Initial step length (default: 1.0) - for Newton-Krylov
@@ -249,7 +341,7 @@ private:
 
         NonlinearSolverConfig() :
             enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
-            relaxation(0.7), anderson_depth(5), gmres_restart(30), line_search_c(1e-4),
+            relaxation(0.7), anderson(), gmres_restart(30), line_search_c(1e-4),
             line_search_alpha_init(1.0), line_search_alpha_min(1e-3), line_search_rho(0.65),
             line_search_max_trials(50), line_search_adaptive(true),
             verbose(false), export_convergence(false) {}
@@ -286,9 +378,14 @@ private:
         std::string material; // Material name
     };
 
-    std::vector<ForceResult> force_results;
+    std::vector<ForceResult> force_results;           // Results from surface integral (Maxwell stress)
+    std::vector<ForceResult> force_results_volume;    // Results from volume integral (f = J×B + (M·∇)B)
+    std::vector<ForceResult> force_results_flux;      // Results from face-flux method (∇·T with T=B⊗H-(1/2)(B·H)I)
+    std::vector<ForceResult> force_results_shell;     // Results from shell volume integration (T·∇G in air shell)
+    std::vector<ForceResult> force_results_amperian;  // Results from distributed Amperian force (J_b × B)
     std::vector<BoundaryStressPoint> boundary_stress_vectors;  // Stress vectors at boundaries
     cv::Mat boundary_image;  // Cached boundary detection visualization
+    double system_total_energy;  // Total magnetic energy of the entire system [J/m]
 
     // Boundary detection optimization for transient analysis (incremental update)
     cv::Mat cached_boundaries;  // Cached boundary detection result (binary mask)
@@ -413,6 +510,7 @@ private:
 
     void buildAndSolveSystem();
     void buildAndSolveSystemPolar();
+    void buildAndSolveCartesianPseudoPolar();  // Hybrid initialization for polar Newton-Krylov
 
     // Matrix building methods (without solving) for transient optimization
     void buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);

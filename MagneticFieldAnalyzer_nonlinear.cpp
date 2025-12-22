@@ -19,6 +19,91 @@
 #include <Eigen/Cholesky>
 
 // ============================================
+// PCHIP (Piecewise Cubic Hermite Interpolating Polynomial) Helper Functions
+// Guarantees monotonicity preservation for B-H curve interpolation
+// ============================================
+
+namespace {
+
+/**
+ * @brief Compute PCHIP slopes that preserve monotonicity
+ *
+ * Uses Fritsch-Carlson method to ensure interpolated curve is monotonic
+ * in regions where input data is monotonic.
+ */
+std::vector<double> computePCHIPSlopes(const std::vector<double>& x, const std::vector<double>& y) {
+    int n = static_cast<int>(x.size());
+    if (n < 2) return std::vector<double>(n, 0.0);
+
+    std::vector<double> h(n-1), delta(n-1);
+
+    // Compute intervals and secants
+    for (int i = 0; i < n-1; i++) {
+        h[i] = x[i+1] - x[i];
+        if (h[i] > 0) {
+            delta[i] = (y[i+1] - y[i]) / h[i];
+        } else {
+            delta[i] = 0.0;
+        }
+    }
+
+    // Compute slopes with monotonicity preservation
+    std::vector<double> d(n);
+
+    // Endpoint slopes
+    d[0] = delta[0];
+    d[n-1] = delta[n-2];
+
+    // Interior slopes
+    for (int i = 1; i < n-1; i++) {
+        if (delta[i-1] * delta[i] <= 0) {
+            // Sign change or zero: set slope to zero for monotonicity
+            d[i] = 0.0;
+        } else {
+            // Weighted harmonic mean (Fritsch-Carlson)
+            double w1 = 2.0 * h[i] + h[i-1];
+            double w2 = h[i] + 2.0 * h[i-1];
+            d[i] = (w1 + w2) / (w1 / delta[i-1] + w2 / delta[i]);
+        }
+    }
+
+    return d;
+}
+
+/**
+ * @brief PCHIP interpolation at query point
+ */
+double pchipInterpolate(const std::vector<double>& x, const std::vector<double>& y,
+                        const std::vector<double>& d, double xq) {
+    int n = static_cast<int>(x.size());
+
+    // Handle out of range
+    if (xq <= x[0]) return y[0];
+    if (xq >= x[n-1]) return y[n-1];
+
+    // Find interval using binary search
+    auto it = std::upper_bound(x.begin(), x.end(), xq);
+    int idx = static_cast<int>(std::distance(x.begin(), it)) - 1;
+    if (idx < 0) idx = 0;
+    if (idx >= n-1) idx = n-2;
+
+    double h = x[idx+1] - x[idx];
+    if (h <= 0) return y[idx];
+
+    double t = (xq - x[idx]) / h;
+
+    // Hermite basis functions
+    double h00 = (1.0 + 2.0*t) * (1.0-t) * (1.0-t);
+    double h10 = t * (1.0-t) * (1.0-t);
+    double h01 = t * t * (3.0 - 2.0*t);
+    double h11 = t * t * (t - 1.0);
+
+    return h00*y[idx] + h10*h*d[idx] + h01*y[idx+1] + h11*h*d[idx+1];
+}
+
+} // anonymous namespace
+
+// ============================================
 // Nonlinear Material Support Functions
 // ============================================
 
@@ -215,11 +300,18 @@ double MagneticFieldAnalyzer::evaluateMu(const MuValue& mu_val, double H_magnitu
         }
 
         case MuType::TABLE: {
-            // Linear interpolation in mu_r(H) table
+            // PCHIP interpolation of B = μ₀ × μ_r × H to ensure monotonicity
+            // Then compute μ_r = B / (μ₀ × H)
+            const double MU_0 = 4.0 * M_PI * 1e-7;
             const auto& H_tab = mu_val.H_table;
             const auto& mu_tab = mu_val.mu_table;
 
-            // Handle out-of-range (extrapolate with constant)
+            // Handle H = 0 case
+            if (H_magnitude <= 1e-12) {
+                return mu_tab.front();
+            }
+
+            // Handle out-of-range (extrapolate with constant μ_r)
             if (H_magnitude <= H_tab.front()) {
                 return mu_tab.front();
             }
@@ -227,18 +319,25 @@ double MagneticFieldAnalyzer::evaluateMu(const MuValue& mu_val, double H_magnitu
                 return mu_tab.back();
             }
 
-            // Find interpolation interval
-            auto it = std::upper_bound(H_tab.begin(), H_tab.end(), H_magnitude);
-            size_t idx = std::distance(H_tab.begin(), it) - 1;
+            // Compute B values at table points: B_i = μ₀ × μ_r_i × H_i
+            std::vector<double> B_tab(H_tab.size());
+            for (size_t i = 0; i < H_tab.size(); i++) {
+                B_tab[i] = MU_0 * mu_tab[i] * H_tab[i];
+            }
 
-            // Linear interpolation
-            double H0 = H_tab[idx];
-            double H1 = H_tab[idx + 1];
-            double mu0 = mu_tab[idx];
-            double mu1 = mu_tab[idx + 1];
+            // Compute PCHIP slopes for B(H) curve
+            std::vector<double> slopes = computePCHIPSlopes(H_tab, B_tab);
 
-            double alpha = (H_magnitude - H0) / (H1 - H0);
-            double mu_r = mu0 + alpha * (mu1 - mu0);
+            // PCHIP interpolation to get B at H_magnitude
+            double B_interp = pchipInterpolate(H_tab, B_tab, slopes, H_magnitude);
+
+            // Compute μ_r = B / (μ₀ × H)
+            double mu_r = B_interp / (MU_0 * H_magnitude);
+
+            // Ensure μ_r >= 1 (physical constraint)
+            if (mu_r < 1.0) {
+                mu_r = 1.0;
+            }
 
             return mu_r;
         }
@@ -331,66 +430,6 @@ double MagneticFieldAnalyzer::evaluateMuDerivative(const MuValue& mu_val, double
         default:
             return 0.0;
     }
-}
-
-/**
- * @brief Compute differential permeability dB/dH analytically from effective permeability
- *
- * HYBRID APPROACH: This function bridges the gap between user-friendly input format
- * (effective permeability μ_eff = B/H from catalog data) and the accurate gradient
- * information needed for Newton-Krylov convergence (differential permeability dB/dH).
- *
- * Mathematical Foundation:
- * ========================
- * Given effective permeability μ_eff(H) = B(H)/H from YAML input, we need dB/dH
- * for the Jacobian correction in the Newton-Krylov solver.
- *
- * Starting from the relationship:
- *   B(H) = μ_eff(H) · μ₀ · H
- *
- * Differentiate both sides with respect to H (product rule):
- *   dB/dH = d/dH[μ_eff(H) · μ₀ · H]
- *        = μ₀ · d/dH[μ_eff(H) · H]
- *        = μ₀ · [dμ_eff/dH · H + μ_eff(H) · 1]
- *        = μ₀ · (μ_eff + H · dμ_eff/dH)
- *
- * Key Insight:
- * -----------
- * For TABLE type mu_val, evaluateMuDerivative() returns the *analytical* slope
- * dμ_eff/dH from the linear interpolation segments (no numerical differentiation!).
- * This gives us exact gradient information, avoiding the epsilon-related errors
- * that plagued the previous numerical differentiation approach.
- *
- * Physical Constraints:
- * --------------------
- * - In vacuum/air: dB/dH = μ₀ (minimum value)
- * - In saturation: dB/dH → μ₀ (approaches vacuum permeability)
- * - In linear region: dB/dH = μ_eff · μ₀ (when dμ_eff/dH ≈ 0)
- *
- * @param mu_val Effective permeability specification (μ_eff = B/H from YAML)
- * @param H_magnitude Magnetic field intensity |H| [A/m]
- * @return Differential permeability dB/dH [H/m] (absolute permeability units)
- */
-double MagneticFieldAnalyzer::computeDifferentialPermeability(
-    const MuValue& mu_val, double H_magnitude)
-{
-    const double MU_0 = 4.0 * M_PI * 1e-7;  // Vacuum permeability [H/m]
-
-    // Step 1: Get effective permeability μ_eff(H) = B/H
-    double mu_eff = evaluateMu(mu_val, H_magnitude);
-
-    // Step 2: Get dμ_eff/dH analytically (for TABLE: exact slope from linear segments)
-    double dmu_eff_dH = evaluateMuDerivative(mu_val, H_magnitude);
-
-    // Step 3: Apply the product rule formula
-    // dB/dH = μ₀ · (μ_eff + H · dμ_eff/dH)
-    double dB_dH = MU_0 * (mu_eff + H_magnitude * dmu_eff_dH);
-
-    // Step 4: Enforce physical constraint (dB/dH cannot be less than vacuum)
-    // This handles numerical edge cases and ensures physical validity
-    dB_dH = std::max(dB_dH, MU_0);
-
-    return dB_dH;
 }
 
 /**
@@ -950,15 +989,18 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         return;
     }
 
-    const int m_AA = nonlinear_config.anderson_depth;  // Anderson depth
-    if (m_AA <= 0) {
+    // Anderson acceleration settings (shared config)
+    const int m_AA = nonlinear_config.anderson.depth;
+    const double beta_AA = nonlinear_config.anderson.beta;
+
+    if (!nonlinear_config.anderson.enabled || m_AA <= 0) {
         // Anderson disabled, fall back to standard Picard
         solveNonlinear();
         return;
     }
 
     std::cout << "\n=== Nonlinear Solver (Picard + Anderson Acceleration) ===" << std::endl;
-    std::cout << "Anderson depth: " << m_AA << std::endl;
+    std::cout << "Anderson depth: " << m_AA << ", beta: " << beta_AA << std::endl;
 
     const int MAX_ITER = nonlinear_config.max_iterations;
     const double TOL = nonlinear_config.tolerance;

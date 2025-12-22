@@ -1441,7 +1441,8 @@ const plotDefinitions = {
     force_x_time: { name: 'Force X-axis', render: renderForceXTime },
     force_y_time: { name: 'Force Y-axis', render: renderForceYTime },
     torque_time: { name: 'Torque', render: renderTorqueTime },
-    energy_time: { name: 'Magnetic Energy', render: renderEnergyTime }
+    energy_time: { name: 'Magnetic Energy', render: renderEnergyTime },
+    virtual_work: { name: 'Virtual Work (dW/dx)', render: renderVirtualWork }
 };
 
 let plotIdCounter = 0;
@@ -2986,6 +2987,7 @@ async function loadForceData(step) {
         let totalForceX = 0;
         let totalForceY = 0;
         let totalTorque = 0;
+        let systemTotalEnergy = 0;  // System total energy from _SYSTEM_TOTAL row
         let dataRowCount = 0;
 
         for (let i = headerIdx + 1; i < lines.length; i++) {
@@ -2995,6 +2997,13 @@ async function loadForceData(step) {
             const values = line.split(',');
             if (values.length > Math.max(forceXIdx, forceYIdx, torqueIdx)) {
                 const materialName = materialIdx !== -1 ? values[materialIdx].trim() : `Material_${dataRowCount}`;
+
+                // Check for special _SYSTEM_TOTAL row
+                if (materialName === '_SYSTEM_TOTAL') {
+                    systemTotalEnergy = energyIdx !== -1 ? (parseFloat(values[energyIdx]) || 0) : 0;
+                    continue;  // Don't add to materials list
+                }
+
                 const forceX = parseFloat(values[forceXIdx]) || 0;
                 const forceY = parseFloat(values[forceYIdx]) || 0;
                 const torque = parseFloat(values[torqueIdx]) || 0;
@@ -3032,7 +3041,8 @@ async function loadForceData(step) {
                 force_y: totalForceY,
                 torque: totalTorque
             },
-            materials: materials
+            materials: materials,
+            system_total_energy: systemTotalEnergy
         };
     } catch (error) {
         console.error(`Force data load error for step ${step}:`, error);
@@ -3407,6 +3417,12 @@ async function renderEnergyTime(containerId) {
             });
         };
 
+        // Full model multiplier for polar coordinates (energy is also multiplied for full model)
+        const energyMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
+            ? AppState.polarFullModelMultiplier
+            : 1;
+
+        // Per-material energy traces
         materialNames.forEach(matName => {
             const energyData = [];
             let matColor = null;
@@ -3437,6 +3453,31 @@ async function renderEnergyTime(containerId) {
             });
         });
 
+        // Add system total energy as black line
+        const systemEnergyData = [];
+        let hasSystemEnergy = false;
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const stepData = allStepsData[i];
+            if (stepData && stepData.system_total_energy !== undefined) {
+                systemEnergyData.push(stepData.system_total_energy * energyMultiplier);
+                hasSystemEnergy = true;
+            } else {
+                systemEnergyData.push(0);
+            }
+        }
+
+        if (hasSystemEnergy) {
+            traces.push({
+                x: xSteps,
+                y: systemEnergyData,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: 'System Total',
+                line: { color: '#000000', width: 2 },
+                marker: { color: '#000000', size: getMarkerSizes(6, 14) }
+            });
+        }
+
         // Legend position: inside plot if traces <= 3, outside otherwise
         const legendConfig = traces.length <= 3
             ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
@@ -3454,6 +3495,229 @@ async function renderEnergyTime(containerId) {
         }, { responsive: true, displayModeBar: false });
     } catch (error) {
         console.error('Energy time plot error:', error);
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
+    }
+}
+
+async function renderSystemEnergyTime(containerId) {
+    try {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        // Load all steps data
+        const allStepsData = [];
+        let hasData = false;
+
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const data = await loadForceData(i + 1);
+            allStepsData.push(data || null);
+            if (data && data.system_total_energy !== undefined) hasData = true;
+        }
+
+        if (!hasData) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No System Energy data available</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+
+        // Full model multiplier for polar coordinates (energy is also multiplied for full model)
+        const energyMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
+            ? AppState.polarFullModelMultiplier
+            : 1;
+
+        // Extract system total energy for each step
+        const energyData = [];
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const stepData = allStepsData[i];
+            if (stepData && stepData.system_total_energy !== undefined) {
+                energyData.push(stepData.system_total_energy * energyMultiplier);
+            } else {
+                energyData.push(0);
+            }
+        }
+
+        const getMarkerSizes = (baseSize, highlightSize) => {
+            return Array.from({ length: AppState.totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            });
+        };
+
+        const traces = [{
+            x: xSteps,
+            y: energyData,
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'System Total',
+            line: { color: '#1f77b4', width: 2 },
+            marker: { color: '#1f77b4', size: getMarkerSizes(6, 14) }
+        }];
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 55, r: 10, t: 10, b: 35 },
+            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            yaxis: { title: 'System Energy [J/m]' },
+            showlegend: false,
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('System energy time plot error:', error);
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
+    }
+}
+
+async function renderVirtualWork(containerId) {
+    try {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        // Load all steps data
+        const allStepsData = [];
+        let hasData = false;
+
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const data = await loadForceData(i + 1);
+            allStepsData.push(data || null);
+            if (data && data.system_total_energy !== undefined) hasData = true;
+        }
+
+        if (!hasData) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No System Energy data available</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+
+        // Full model multiplier for polar coordinates
+        const energyMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
+            ? AppState.polarFullModelMultiplier
+            : 1;
+
+        // Extract system total energy for each step
+        const energyData = [];
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            const stepData = allStepsData[i];
+            if (stepData && stepData.system_total_energy !== undefined) {
+                energyData.push(stepData.system_total_energy * energyMultiplier);
+            } else {
+                energyData.push(0);
+            }
+        }
+
+        // Determine displacement per step and units based on coordinate system and slide direction
+        let displacementPerStep = 1;  // default
+        let yAxisTitle = '-dW/dx [N/m]';
+        let isAngular = false;
+
+        if (AppState.analysisConditions) {
+            const transient = AppState.analysisConditions.transient;
+            const slidePixelsPerStep = transient?.slide_pixels_per_step || 1;
+            const slideDirection = transient?.slide_direction || 'horizontal';
+            const coordSystem = AppState.analysisConditions.coordinate_system || 'cartesian';
+
+            if (coordSystem === 'polar') {
+                const polar = AppState.analysisConditions.polar;
+                const rOrientation = polar?.r_orientation || 'horizontal';
+                const dr = AppState.analysisConditions.dr || 0.001;
+                const dtheta = AppState.analysisConditions.dtheta || 0.01;
+
+                // Determine if sliding is in theta direction (angular) or r direction (radial)
+                // r_orientation = 'horizontal': r along x-axis, theta along y-axis
+                //   slide_direction = 'vertical' → theta direction → torque
+                //   slide_direction = 'horizontal' → r direction → force
+                // r_orientation = 'vertical': r along y-axis, theta along x-axis
+                //   slide_direction = 'vertical' → r direction → force
+                //   slide_direction = 'horizontal' → theta direction → torque
+
+                if ((rOrientation === 'horizontal' && slideDirection === 'vertical') ||
+                    (rOrientation === 'vertical' && slideDirection === 'horizontal')) {
+                    // Theta direction sliding → torque
+                    displacementPerStep = slidePixelsPerStep * dtheta;  // [rad]
+                    yAxisTitle = '-dW/dθ (Torque) [N·m/m]';
+                    isAngular = true;
+                } else {
+                    // R direction sliding → force
+                    displacementPerStep = slidePixelsPerStep * dr;  // [m]
+                    yAxisTitle = '-dW/dr [N/m]';
+                }
+            } else {
+                // Cartesian coordinates
+                const dx = AppState.analysisConditions.dx || 0.001;
+                const dy = AppState.analysisConditions.dy || 0.001;
+
+                if (slideDirection === 'horizontal') {
+                    displacementPerStep = slidePixelsPerStep * dx;  // [m]
+                    yAxisTitle = '-dW/dx [N/m]';
+                } else {
+                    displacementPerStep = slidePixelsPerStep * dy;  // [m]
+                    yAxisTitle = '-dW/dy [N/m]';
+                }
+            }
+        }
+
+        // Calculate virtual work: F = -dW/dx (central difference for interior points)
+        const virtualWorkData = [];
+        for (let i = 0; i < AppState.totalSteps; i++) {
+            if (i === 0) {
+                // Forward difference for first point
+                if (AppState.totalSteps > 1) {
+                    const dW = energyData[1] - energyData[0];
+                    virtualWorkData.push(-dW / displacementPerStep);
+                } else {
+                    virtualWorkData.push(0);
+                }
+            } else if (i === AppState.totalSteps - 1) {
+                // Backward difference for last point
+                const dW = energyData[i] - energyData[i - 1];
+                virtualWorkData.push(-dW / displacementPerStep);
+            } else {
+                // Central difference for interior points
+                const dW = energyData[i + 1] - energyData[i - 1];
+                virtualWorkData.push(-dW / (2 * displacementPerStep));
+            }
+        }
+
+        const getMarkerSizes = (baseSize, highlightSize) => {
+            return Array.from({ length: AppState.totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            });
+        };
+
+        const traces = [{
+            x: xSteps,
+            y: virtualWorkData,
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Virtual Work',
+            line: { color: '#d62728', width: 2 },
+            marker: { color: '#d62728', size: getMarkerSizes(6, 14) }
+        }];
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 55, r: 10, t: 10, b: 35 },
+            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            yaxis: { title: yAxisTitle },
+            showlegend: false,
+            dragmode: false
+        }, { responsive: true, displayModeBar: false });
+    } catch (error) {
+        console.error('Virtual work plot error:', error);
         const container = document.getElementById(containerId);
         if (container) {
             container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;

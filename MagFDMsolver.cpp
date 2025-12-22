@@ -380,8 +380,8 @@ int main(int argc, char* argv[]) {
             // Static analysis: single solve
             analyzer.solve();
 
-            // Calculate Maxwell stress and forces
-            analyzer.calculateMaxwellStress();
+            // Calculate Maxwell stress and forces (using edge-based integration)
+            analyzer.calculateMaxwellStressEdgeBased();
 
             // Calculate total magnetic energy
             double total_energy = analyzer.calculateTotalMagneticEnergy();

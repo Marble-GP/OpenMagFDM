@@ -21,7 +21,8 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
     use_iterative_solver = false;
 
     // Magnetic field step tracking
-    current_field_step = -1;  // Not calculated yet
+    current_field_step = -999;  // Not calculated yet (use sentinel value different from any valid step)
+    system_total_energy = 0.0;  // Initialize system total energy
 
     // Nonlinear solver flags (MUST be initialized before setupMaterialProperties)
     has_nonlinear_materials = false;
@@ -41,9 +42,16 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.verbose = nl_config["verbose"].as<bool>(false);
         nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>(false);
 
-        // Picard/Anderson specific settings
+        // Picard specific settings
         nonlinear_config.relaxation = nl_config["relaxation"].as<double>(0.7);
-        nonlinear_config.anderson_depth = nl_config["anderson_depth"].as<int>(5);
+
+        // Anderson acceleration settings (shared by Picard and Newton-Krylov)
+        if (nl_config["anderson"]) {
+            auto anderson_cfg = nl_config["anderson"];
+            nonlinear_config.anderson.enabled = anderson_cfg["enabled"].as<bool>(false);
+            nonlinear_config.anderson.depth = anderson_cfg["depth"].as<int>(5);
+            nonlinear_config.anderson.beta = anderson_cfg["beta"].as<double>(1.0);
+        }
 
         // Newton-Krylov specific settings
         nonlinear_config.gmres_restart = nl_config["gmres_restart"].as<int>(30);
@@ -1351,7 +1359,7 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
             cv::Mat gray;
             cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
 
-            std::cout << "[DEBUG] Recomputing seam at circular shift boundary (row=0)" << std::endl;
+            // std::cout << "[DEBUG] Recomputing seam at circular shift boundary (row=0)" << std::endl;
             const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
             int seam_row = 0;  // Circular shift seam is always at row=0
 
@@ -1371,7 +1379,7 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
                 cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
 
                 boundaries_roi.copyTo(boundaries(roi));
-                std::cout << "[DEBUG] Seam recomputed: y_range=[" << y_min << ", " << y_max << ")" << std::endl;
+                // std::cout << "[DEBUG] Seam recomputed: y_range=[" << y_min << ", " << y_max << ")" << std::endl;
             }
         } else {  // horizontal
             // Horizontal slide: shift columns (x direction)
@@ -1394,7 +1402,7 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
             cv::Mat gray;
             cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
 
-            std::cout << "[DEBUG] Recomputing seam at circular shift boundary (col=0)" << std::endl;
+            // std::cout << "[DEBUG] Recomputing seam at circular shift boundary (col=0)" << std::endl;
             const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
             int seam_col = 0;  // Circular shift seam is always at col=0
 
@@ -2055,28 +2063,44 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
                     }
                 }
 
-                // Basis vectors in rotor frame for polar coordinates
+                // Calculate ds (boundary line element length) based on coordinate system
+                // ds is the physical length of the boundary segment that this pixel represents
+                // The boundary line is perpendicular to the normal vector
+                double ds = 0.0;
+
+                if (coordinate_system == "polar") {
+                    // Polar coordinates: decompose normal into (r, θ) components
+                    // Use rotor frame angle (without theta_offset) for consistency
+                    double theta_rotor = jt * dtheta;
+                    double n_r = n_phys_x * std::cos(theta_rotor) + n_phys_y * std::sin(theta_rotor);
+                    double n_theta = -n_phys_x * std::sin(theta_rotor) + n_phys_y * std::cos(theta_rotor);
+
+                    // Cell dimensions in physical units
+                    double len_r = dr;
+                    double len_theta = (r_phys > 0.0) ? (r_phys * dtheta) : 0.0;
+
+                    // ds = length of boundary segment perpendicular to normal
+                    // If normal is in r-direction, boundary is in θ-direction → ds = r*dθ
+                    // If normal is in θ-direction, boundary is in r-direction → ds = dr
+                    // General case: ds² = n_θ² * dr² + n_r² * (r*dθ)²
+                    ds = std::sqrt(n_theta * n_theta * len_r * len_r +
+                                   n_r * n_r * len_theta * len_theta);
+                } else {
+                    // Cartesian coordinates: normal is (n_phys_x, n_phys_y)
+                    // Boundary line is perpendicular to normal
+                    // If normal is in x-direction, boundary is in y-direction → ds = dy
+                    // If normal is in y-direction, boundary is in x-direction → ds = dx
+                    // General case: ds² = ny² * dx² + nx² * dy²
+                    ds = std::sqrt(n_phys_y * n_phys_y * dx * dx +
+                                   n_phys_x * n_phys_x * dy * dy);
+                }
+
+                if (ds <= 0.0) ds = DS_MIN;
+
+                // Basis vectors in rotor frame (used for radial force calculation)
                 double theta_for_basis = (coordinate_system == "polar") ? (jt * dtheta) : theta;
                 double er_x = std::cos(theta_for_basis), er_y = std::sin(theta_for_basis);
                 double et_x = -std::sin(theta_for_basis), et_y = std::cos(theta_for_basis);
-
-                // tangent vector physical
-                double t_phys_x = -n_phys_y;
-                double t_phys_y =  n_phys_x;
-                double tnorm = std::sqrt(t_phys_x*t_phys_x + t_phys_y*t_phys_y);
-                if (tnorm > 0.0) { t_phys_x /= tnorm; t_phys_y /= tnorm; }
-
-                // components of tangent in (er,et)
-                double t_r = t_phys_x * er_x + t_phys_y * er_y;
-                double t_t = t_phys_x * et_x + t_phys_y * et_y;
-
-                // pixel physical lengths
-                double len_r = (coordinate_system == "polar") ? dr : dx;
-                double len_t = (coordinate_system == "polar") ? ((r_phys > 0.0) ? (r_phys * dtheta) : 0.0) : dy;
-
-                // ds
-                double ds = std::sqrt( (t_r * len_r)*(t_r * len_r) + (t_t * len_t)*(t_t * len_t) );
-                if (ds <= 0.0) ds = DS_MIN;
 
                 //  Sample B and μ at SAME physical point using bilinear interpolation
                 // Calculate sample point in the SAME coordinate system to avoid atan2 inconsistency
@@ -2383,6 +2407,2053 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     std::cout << "\nMaxwell stress (polar-aware, Sobel normals) calculation complete!" << std::endl;
 }
 
+void MagneticFieldAnalyzer::calculateMaxwellStressEdgeBased(int step) {
+    std::cout << "\n=== Calculating Maxwell Stress (Edge-Based Integration) ===" << std::endl;
+
+    // --- Calculate magnetic field if not already done for this step ---
+    if (current_field_step != step) {
+        if (coordinate_system == "polar") {
+            calculateMagneticFieldPolar();
+        } else {
+            calculateMagneticField();
+        }
+        current_field_step = step;
+    } else {
+        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
+    }
+
+    const double mu0 = MU_0;
+
+    // Physical center for torque calculation
+    double cx_physical = (static_cast<double>(image.cols) * dx) / 2.0;
+    double cy_physical = (static_cast<double>(image.rows) * dy) / 2.0;
+
+    // Check boundary conditions for periodic handling
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
+    // Clear previous results
+    force_results.clear();
+
+    // For each material with calc_force=true
+    for (const auto& material : config["materials"]) {
+        std::string name = material.first.as<std::string>();
+        const auto& props = material.second;
+        bool calc_force = props["calc_force"].as<bool>(false);
+        if (!calc_force) continue;
+
+        std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255,255,255});
+
+        // Build material mask from current image (in FDM coordinates, y=0 at bottom)
+        // We need to flip the image to match FDM coordinates
+        cv::Mat image_flipped;
+        cv::flip(image, image_flipped, 0);
+
+        cv::Mat mat_mask(ny, nx, CV_8U, cv::Scalar(0));
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                cv::Vec3b px = image_flipped.at<cv::Vec3b>(j, i);
+                if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
+                    mat_mask.at<uchar>(j, i) = 255;
+                }
+            }
+        }
+
+        ForceResult result;
+        result.material_name = name;
+        result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
+        result.force_x = result.force_y = result.force_radial = 0.0;
+        result.torque = result.torque_origin = result.torque_center = 0.0;
+        result.pixel_count = 0;
+        result.magnetic_energy = 0.0;
+
+        std::cout << "\nCalculating force for material: " << name << " (edge-based)" << std::endl;
+
+        // Diagnostic: track contributions from each edge direction
+        double fx_right = 0.0, fx_left = 0.0, fx_top = 0.0, fx_bottom = 0.0;
+        double fy_right = 0.0, fy_left = 0.0, fy_top = 0.0, fy_bottom = 0.0;
+        int edge_right = 0, edge_left = 0, edge_top = 0, edge_bottom = 0;
+
+        // Edge-based integration:
+        // For each material pixel, check 4 neighbors (right, left, up, down)
+        // If neighbor is non-material, integrate T·n over that edge
+        //
+        // Edge directions and normals (outward from material):
+        // - Right edge (i+0.5, j): normal = (+1, 0), ds = dy
+        // - Left edge (i-0.5, j): normal = (-1, 0), ds = dy
+        // - Top edge (i, j+0.5): normal = (0, +1), ds = dx
+        // - Bottom edge (i, j-0.5): normal = (0, -1), ds = dx
+
+        int edge_count = 0;
+
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                // Skip non-material pixels
+                if (mat_mask.at<uchar>(j, i) == 0) continue;
+
+                // Physical coordinates of cell center
+                double x_c = (i + 0.5) * dx;
+                double y_c = (j + 0.5) * dy;
+
+                // Get B at this cell (use cell center values)
+                double bx_c = Bx(j, i);
+                double by_c = By(j, i);
+                double mu_c = mu_map(j, i);
+
+                // Check each of 4 neighbors
+                // Right neighbor (i+1)
+                {
+                    int i_n = i + 1;
+                    bool is_boundary_edge = false;
+                    double mu_neighbor = mu_c;  // Default to same as current cell
+
+                    if (i_n >= nx) {
+                        if (x_periodic) {
+                            i_n = 0;  // Wrap around
+                            if (mat_mask.at<uchar>(j, i_n) == 0) {
+                                is_boundary_edge = true;
+                                mu_neighbor = mu_map(j, i_n);
+                            }
+                        } else {
+                            // Domain boundary - treat as boundary if non-periodic
+                            is_boundary_edge = true;
+                            // At domain boundary, assume same μ (no force contribution)
+                            mu_neighbor = mu_c;
+                        }
+                    } else {
+                        if (mat_mask.at<uchar>(j, i_n) == 0) {
+                            is_boundary_edge = true;
+                            mu_neighbor = mu_map(j, i_n);
+                        }
+                    }
+
+                    if (is_boundary_edge) {
+                        // Right edge: normal = (+1, 0), ds = dy
+                        // Sample B at edge midpoint (average of cell and neighbor)
+                        double bx_edge, by_edge, mu_edge;
+                        if (i_n < nx && i_n >= 0) {
+                            bx_edge = 0.5 * (bx_c + Bx(j, i_n));
+                            by_edge = 0.5 * (by_c + By(j, i_n));
+                            mu_edge = mu_c;
+                        } else {
+                            bx_edge = bx_c;
+                            by_edge = by_c;
+                            mu_edge = mu_c;
+                        }
+
+                        // Maxwell stress tensor: T_ij = B_i*H_j - 0.5*(B·H)*δ_ij
+                        double Hx = bx_edge / mu_edge;
+                        double Hy = by_edge / mu_edge;
+                        double B_dot_H = bx_edge * Hx + by_edge * Hy;
+
+                        double T_xx = bx_edge * Hx - 0.5 * B_dot_H;
+                        double T_xy = bx_edge * Hy;
+
+                        // Traction: t = T · n, where n = (+1, 0)
+                        double fx = T_xx * 1.0 + T_xy * 0.0;
+                        double fy = T_xy * 1.0 + (by_edge * Hy - 0.5 * B_dot_H) * 0.0;
+
+                        // Integrate: F += t * ds, where ds = dy
+                        result.force_x += fx * dy;
+                        result.force_y += fy * dy;
+                        fx_right += fx * dy;
+                        fy_right += fy * dy;
+
+                        // Torque about center: τ = r × F
+                        double x_edge = (i + 1.0) * dx;
+                        double y_edge = y_c;
+                        result.torque_center += (x_edge - cx_physical) * (fy * dy) - (y_edge - cy_physical) * (fx * dy);
+                        result.torque_origin += x_edge * (fy * dy) - y_edge * (fx * dy);
+
+                        edge_count++;
+                        edge_right++;
+                    }
+                }
+
+                // Left neighbor (i-1)
+                {
+                    int i_n = i - 1;
+                    bool is_boundary_edge = false;
+                    double mu_neighbor = mu_c;
+
+                    if (i_n < 0) {
+                        if (x_periodic) {
+                            i_n = nx - 1;
+                            if (mat_mask.at<uchar>(j, i_n) == 0) {
+                                is_boundary_edge = true;
+                                mu_neighbor = mu_map(j, i_n);
+                            }
+                        } else {
+                            is_boundary_edge = true;
+                            mu_neighbor = mu_c;  // Domain boundary
+                        }
+                    } else {
+                        if (mat_mask.at<uchar>(j, i_n) == 0) {
+                            is_boundary_edge = true;
+                            mu_neighbor = mu_map(j, i_n);
+                        }
+                    }
+
+                    if (is_boundary_edge) {
+                        // Left edge: normal = (-1, 0), ds = dy
+                        double bx_edge, by_edge, mu_edge;
+                        if (i_n >= 0 && i_n < nx) {
+                            bx_edge = 0.5 * (bx_c + Bx(j, i_n));
+                            by_edge = 0.5 * (by_c + By(j, i_n));
+                            mu_edge = mu_c;
+                        } else {
+                            bx_edge = bx_c;
+                            by_edge = by_c;
+                            mu_edge = mu_c;
+                        }
+
+                        double Hx = bx_edge / mu_edge;
+                        double Hy = by_edge / mu_edge;
+                        double B_dot_H = bx_edge * Hx + by_edge * Hy;
+
+                        double T_xx = bx_edge * Hx - 0.5 * B_dot_H;
+                        double T_xy = bx_edge * Hy;
+
+                        // n = (-1, 0)
+                        double fx = T_xx * (-1.0);
+                        double fy = T_xy * (-1.0);
+
+                        result.force_x += fx * dy;
+                        result.force_y += fy * dy;
+                        fx_left += fx * dy;
+                        fy_left += fy * dy;
+
+                        double x_edge = i * dx;
+                        double y_edge = y_c;
+                        result.torque_center += (x_edge - cx_physical) * (fy * dy) - (y_edge - cy_physical) * (fx * dy);
+                        result.torque_origin += x_edge * (fy * dy) - y_edge * (fx * dy);
+
+                        edge_count++;
+                        edge_left++;
+                    }
+                }
+
+                // Top neighbor (j+1)
+                {
+                    int j_n = j + 1;
+                    bool is_boundary_edge = false;
+                    double mu_neighbor = mu_c;
+
+                    if (j_n >= ny) {
+                        if (y_periodic) {
+                            j_n = 0;
+                            if (mat_mask.at<uchar>(j_n, i) == 0) {
+                                is_boundary_edge = true;
+                                mu_neighbor = mu_map(j_n, i);
+                            }
+                        } else {
+                            is_boundary_edge = true;
+                            mu_neighbor = mu_c;  // Domain boundary
+                        }
+                    } else {
+                        if (mat_mask.at<uchar>(j_n, i) == 0) {
+                            is_boundary_edge = true;
+                            mu_neighbor = mu_map(j_n, i);
+                        }
+                    }
+
+                    if (is_boundary_edge) {
+                        // Top edge: normal = (0, +1), ds = dx
+                        double bx_edge, by_edge, mu_edge;
+                        if (j_n >= 0 && j_n < ny) {
+                            bx_edge = 0.5 * (bx_c + Bx(j_n, i));
+                            by_edge = 0.5 * (by_c + By(j_n, i));
+                            mu_edge = mu_c;
+                        } else {
+                            bx_edge = bx_c;
+                            by_edge = by_c;
+                            mu_edge = mu_c;
+                        }
+
+                        double Hx = bx_edge / mu_edge;
+                        double Hy = by_edge / mu_edge;
+                        double B_dot_H = bx_edge * Hx + by_edge * Hy;
+
+                        double T_yy = by_edge * Hy - 0.5 * B_dot_H;
+                        double T_xy = bx_edge * Hy;
+
+                        // n = (0, +1)
+                        double fx = T_xy * 1.0;
+                        double fy = T_yy * 1.0;
+
+                        result.force_x += fx * dx;
+                        result.force_y += fy * dx;
+                        fx_top += fx * dx;
+                        fy_top += fy * dx;
+
+                        double x_edge = x_c;
+                        double y_edge = (j + 1.0) * dy;
+                        result.torque_center += (x_edge - cx_physical) * (fy * dx) - (y_edge - cy_physical) * (fx * dx);
+                        result.torque_origin += x_edge * (fy * dx) - y_edge * (fx * dx);
+
+                        edge_count++;
+                        edge_top++;
+                    }
+                }
+
+                // Bottom neighbor (j-1)
+                {
+                    int j_n = j - 1;
+                    bool is_boundary_edge = false;
+                    double mu_neighbor = mu_c;
+
+                    if (j_n < 0) {
+                        if (y_periodic) {
+                            j_n = ny - 1;
+                            if (mat_mask.at<uchar>(j_n, i) == 0) {
+                                is_boundary_edge = true;
+                                mu_neighbor = mu_map(j_n, i);
+                            }
+                        } else {
+                            is_boundary_edge = true;
+                            mu_neighbor = mu_c;  // Domain boundary
+                        }
+                    } else {
+                        if (mat_mask.at<uchar>(j_n, i) == 0) {
+                            is_boundary_edge = true;
+                            mu_neighbor = mu_map(j_n, i);
+                        }
+                    }
+
+                    if (is_boundary_edge) {
+                        // Bottom edge: normal = (0, -1), ds = dx
+                        double bx_edge, by_edge, mu_edge;
+                        if (j_n >= 0 && j_n < ny) {
+                            bx_edge = 0.5 * (bx_c + Bx(j_n, i));
+                            by_edge = 0.5 * (by_c + By(j_n, i));
+                            mu_edge = mu_c;
+                        } else {
+                            bx_edge = bx_c;
+                            by_edge = by_c;
+                            mu_edge = mu_c;
+                        }
+
+                        double Hx = bx_edge / mu_edge;
+                        double Hy = by_edge / mu_edge;
+                        double B_dot_H = bx_edge * Hx + by_edge * Hy;
+
+                        double T_yy = by_edge * Hy - 0.5 * B_dot_H;
+                        double T_xy = bx_edge * Hy;
+
+                        // n = (0, -1)
+                        double fx = T_xy * (-1.0);
+                        double fy = T_yy * (-1.0);
+
+                        result.force_x += fx * dx;
+                        result.force_y += fy * dx;
+                        fx_bottom += fx * dx;
+                        fy_bottom += fy * dx;
+
+                        double x_edge = x_c;
+                        double y_edge = j * dy;
+                        result.torque_center += (x_edge - cx_physical) * (fy * dx) - (y_edge - cy_physical) * (fx * dx);
+                        result.torque_origin += x_edge * (fy * dx) - y_edge * (fx * dx);
+
+                        edge_count++;
+                        edge_bottom++;
+                    }
+                }
+
+                result.pixel_count++;  // Count material pixels
+            }
+        }
+
+        // Calculate magnetic energy for this material (same as before)
+        double energy = 0.0;
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                if (mat_mask.at<uchar>(j, i) != 0) {
+                    double bx = Bx(j, i);
+                    double by = By(j, i);
+                    double mu = mu_map(j, i);
+                    double B_sq = bx * bx + by * by;
+                    energy += 0.5 * B_sq / mu * dx * dy;
+                }
+            }
+        }
+        result.magnetic_energy = energy;
+
+        // Set force_radial as magnitude for Cartesian
+        result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
+        result.torque = result.torque_origin;
+
+        std::cout << "  Material: " << name << std::endl;
+        std::cout << "    Material pixels: " << result.pixel_count << std::endl;
+        std::cout << "    Boundary edges: " << edge_count << std::endl;
+        std::cout << "      Right edges: " << edge_right << ", Left edges: " << edge_left << std::endl;
+        std::cout << "      Top edges: " << edge_top << ", Bottom edges: " << edge_bottom << std::endl;
+        std::cout << "    --- Edge contribution breakdown ---" << std::endl;
+        std::cout << "      Fx_right: " << fx_right << ", Fx_left: " << fx_left << " => sum: " << (fx_right + fx_left) << std::endl;
+        std::cout << "      Fx_top: " << fx_top << ", Fx_bottom: " << fx_bottom << " => sum: " << (fx_top + fx_bottom) << std::endl;
+        std::cout << "      Fy_right: " << fy_right << ", Fy_left: " << fy_left << " => sum: " << (fy_right + fy_left) << std::endl;
+        std::cout << "      Fy_top: " << fy_top << ", Fy_bottom: " << fy_bottom << " => sum: " << (fy_top + fy_bottom) << std::endl;
+        std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
+        std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
+        std::cout << "    Magnetic energy: " << result.magnetic_energy << " J/m (per unit depth)" << std::endl;
+
+        force_results.push_back(result);
+    }
+
+    std::cout << "\nMaxwell stress (edge-based) calculation complete!" << std::endl;
+}
+
+void MagneticFieldAnalyzer::calculateForceVolumeIntegral(int step) {
+    std::cout << "\n=== Calculating Force using Volume Integral Method ===" << std::endl;
+    std::cout << "  Force density: f = J×B + (M·∇)B" << std::endl;
+
+    // --- Calculate magnetic field if not already done for this step ---
+    if (current_field_step != step) {
+        if (coordinate_system == "polar") {
+            calculateMagneticFieldPolar();
+        } else {
+            calculateMagneticField();
+        }
+        current_field_step = step;
+    } else {
+        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
+    }
+
+    const double mu0 = MU_0;
+
+    // Physical center for torque calculation
+    double cx_physical = (static_cast<double>(nx) * dx) / 2.0;
+    double cy_physical = (static_cast<double>(ny) * dy) / 2.0;
+
+    // Clear previous volume integral results
+    force_results_volume.clear();
+
+    // For each material with calc_force=true
+    for (const auto& material : config["materials"]) {
+        std::string name = material.first.as<std::string>();
+        const auto& props = material.second;
+        bool calc_force = props["calc_force"].as<bool>(false);
+        if (!calc_force) continue;
+
+        std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
+
+        // Build material mask from current image (in FDM coordinates, y=0 at bottom)
+        cv::Mat image_flipped;
+        cv::flip(image, image_flipped, 0);
+
+        cv::Mat mat_mask(ny, nx, CV_8U, cv::Scalar(0));
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                cv::Vec3b px = image_flipped.at<cv::Vec3b>(j, i);
+                if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
+                    mat_mask.at<uchar>(j, i) = 255;
+                }
+            }
+        }
+
+        ForceResult result;
+        result.material_name = name;
+        result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
+        result.force_x = result.force_y = result.force_radial = 0.0;
+        result.torque = result.torque_origin = result.torque_center = 0.0;
+        result.pixel_count = 0;
+        result.magnetic_energy = 0.0;
+
+        std::cout << "\nCalculating force for material: " << name << " (volume integral)" << std::endl;
+
+        // Diagnostic counters
+        double fx_lorentz = 0.0, fy_lorentz = 0.0;  // J×B contribution
+        double fx_magnetization = 0.0, fy_magnetization = 0.0;  // (M·∇)B contribution
+        int pixels_with_current = 0;
+        int pixels_with_magnetization = 0;
+
+        if (coordinate_system == "cartesian") {
+            // Cartesian coordinate system implementation
+            for (int j = 1; j < ny - 1; j++) {  // Skip boundary for central difference
+                for (int i = 1; i < nx - 1; i++) {
+                    // Physical coordinates of cell center
+                    double x_c = (i + 0.5) * dx;
+                    double y_c = (j + 0.5) * dy;
+
+                    // Get B and μ at this cell
+                    double bx = Bx(j, i);
+                    double by = By(j, i);
+                    double mu = mu_map(j, i);
+                    double mu_r = mu / mu0;
+
+                    // Get current density (if any)
+                    double jz = jz_map(j, i);
+
+                    // Calculate H = B/μ
+                    double Hx = bx / mu;
+                    double Hy = by / mu;
+
+                    // Calculate M = (μr - 1) * H
+                    double Mx = (mu_r - 1.0) * Hx;
+                    double My = (mu_r - 1.0) * Hy;
+
+                    // Calculate ∂B/∂x, ∂B/∂y using central difference
+                    double dBx_dx = (Bx(j, i + 1) - Bx(j, i - 1)) / (2.0 * dx);
+                    double dBx_dy = (Bx(j + 1, i) - Bx(j - 1, i)) / (2.0 * dy);
+                    double dBy_dx = (By(j, i + 1) - By(j, i - 1)) / (2.0 * dx);
+                    double dBy_dy = (By(j + 1, i) - By(j - 1, i)) / (2.0 * dy);
+
+                    // Force density: f = J×B + (M·∇)B
+                    // J×B: (0, 0, Jz) × (Bx, By, 0) = (-Jz*By, Jz*Bx, 0)
+                    // Cross product: (J×B)_x = Jy*Bz - Jz*By = -Jz*By
+                    //                (J×B)_y = Jz*Bx - Jx*Bz = Jz*Bx
+                    double fx_JxB = -jz * by;
+                    double fy_JxB = jz * bx;
+
+                    // (M·∇)B: Mx*∂B/∂x + My*∂B/∂y
+                    double fx_MgradB = Mx * dBx_dx + My * dBx_dy;
+                    double fy_MgradB = Mx * dBy_dx + My * dBy_dy;
+
+                    // Total force density
+                    double fx = fx_JxB + fx_MgradB;
+                    double fy = fy_JxB + fy_MgradB;
+
+                    // Volume element (per unit depth)
+                    double dA = dx * dy;
+
+                    // Check if this pixel belongs to the target material
+                    bool is_material = (mat_mask.at<uchar>(j, i) != 0);
+                    if (!is_material) {
+                        continue;  // Only integrate within material region
+                    }
+
+                    result.pixel_count++;
+
+                    // Accumulate forces within material region only
+                    result.force_x += fx * dA;
+                    result.force_y += fy * dA;
+
+                    // Diagnostic accumulation
+                    if (std::abs(jz) > 1e-10) {
+                        fx_lorentz += fx_JxB * dA;
+                        fy_lorentz += fy_JxB * dA;
+                        pixels_with_current++;
+                    }
+                    if (std::abs(mu_r - 1.0) > 1e-6) {
+                        fx_magnetization += fx_MgradB * dA;
+                        fy_magnetization += fy_MgradB * dA;
+                        pixels_with_magnetization++;
+                    }
+
+                    // Torque about origin: τz = x*fy - y*fx
+                    result.torque_origin += x_c * (fy * dA) - y_c * (fx * dA);
+
+                    // Torque about image center
+                    result.torque_center += (x_c - cx_physical) * (fy * dA) - (y_c - cy_physical) * (fx * dA);
+                }
+            }
+        } else {
+            // Polar coordinate system implementation
+            for (int jt = 1; jt < ntheta - 1; jt++) {  // Skip boundary for central difference
+                for (int ir = 1; ir < nr - 1; ir++) {
+                    // Determine array indices based on r_orientation
+                    int i, j;
+                    if (r_orientation == "horizontal") {
+                        i = ir;  // r along columns (x)
+                        j = jt;  // theta along rows (y)
+                    } else {
+                        i = jt;  // theta along columns (x)
+                        j = ir;  // r along rows (y)
+                    }
+
+                    // Physical coordinates
+                    double r = r_coords[ir];
+                    double theta = jt * dtheta;
+                    double x_c = r * std::cos(theta);
+                    double y_c = r * std::sin(theta);
+
+                    // Get B and μ at this cell
+                    double br, bt, mu_val;
+                    if (r_orientation == "horizontal") {
+                        br = Br(jt, ir);
+                        bt = Btheta(jt, ir);
+                        mu_val = mu_map(jt, ir);
+                    } else {
+                        br = Br(ir, jt);
+                        bt = Btheta(ir, jt);
+                        mu_val = mu_map(ir, jt);
+                    }
+                    double mu_r = mu_val / mu0;
+
+                    // Convert to Cartesian for force calculation
+                    double bx = br * std::cos(theta) - bt * std::sin(theta);
+                    double by = br * std::sin(theta) + bt * std::cos(theta);
+
+                    // Get current density
+                    double jz;
+                    if (r_orientation == "horizontal") {
+                        jz = jz_map(jt, ir);
+                    } else {
+                        jz = jz_map(ir, jt);
+                    }
+
+                    // Calculate H = B/μ (in Cartesian)
+                    double Hx = bx / mu_val;
+                    double Hy = by / mu_val;
+
+                    // Calculate M = (μr - 1) * H
+                    double Mx = (mu_r - 1.0) * Hx;
+                    double My = (mu_r - 1.0) * Hy;
+
+                    // Calculate ∂B/∂x, ∂B/∂y using central difference in physical coordinates
+                    // For polar coordinates, use chain rule: ∂/∂x = cos(θ)∂/∂r - sin(θ)/(r)∂/∂θ
+                    //                                        ∂/∂y = sin(θ)∂/∂r + cos(θ)/(r)∂/∂θ
+                    double dBr_dr, dBr_dtheta, dBt_dr, dBt_dtheta;
+                    if (r_orientation == "horizontal") {
+                        dBr_dr = (Br(jt, ir + 1) - Br(jt, ir - 1)) / (2.0 * dr);
+                        dBr_dtheta = (Br(jt + 1, ir) - Br(jt - 1, ir)) / (2.0 * dtheta);
+                        dBt_dr = (Btheta(jt, ir + 1) - Btheta(jt, ir - 1)) / (2.0 * dr);
+                        dBt_dtheta = (Btheta(jt + 1, ir) - Btheta(jt - 1, ir)) / (2.0 * dtheta);
+                    } else {
+                        dBr_dr = (Br(ir + 1, jt) - Br(ir - 1, jt)) / (2.0 * dr);
+                        dBr_dtheta = (Br(ir, jt + 1) - Br(ir, jt - 1)) / (2.0 * dtheta);
+                        dBt_dr = (Btheta(ir + 1, jt) - Btheta(ir - 1, jt)) / (2.0 * dr);
+                        dBt_dtheta = (Btheta(ir, jt + 1) - Btheta(ir, jt - 1)) / (2.0 * dtheta);
+                    }
+
+                    // Transform derivatives to Cartesian coordinates
+                    // Bx = Br*cos(θ) - Bt*sin(θ)
+                    // By = Br*sin(θ) + Bt*cos(θ)
+                    double cos_t = std::cos(theta);
+                    double sin_t = std::sin(theta);
+
+                    // ∂Bx/∂r, ∂Bx/∂θ, ∂By/∂r, ∂By/∂θ
+                    double dBx_dr = dBr_dr * cos_t - dBt_dr * sin_t;
+                    double dBx_dtheta = dBr_dtheta * cos_t - br * sin_t - dBt_dtheta * sin_t - bt * cos_t;
+                    double dBy_dr = dBr_dr * sin_t + dBt_dr * cos_t;
+                    double dBy_dtheta = dBr_dtheta * sin_t + br * cos_t + dBt_dtheta * cos_t - bt * sin_t;
+
+                    // Convert to ∂/∂x, ∂/∂y
+                    double r_safe = std::max(r, 1e-10);
+                    double dBx_dx = cos_t * dBx_dr - sin_t / r_safe * dBx_dtheta;
+                    double dBx_dy = sin_t * dBx_dr + cos_t / r_safe * dBx_dtheta;
+                    double dBy_dx = cos_t * dBy_dr - sin_t / r_safe * dBy_dtheta;
+                    double dBy_dy = sin_t * dBy_dr + cos_t / r_safe * dBy_dtheta;
+
+                    // Force density: f = J×B + (M·∇)B
+                    // J×B: (0, 0, Jz) × (Bx, By, 0) = (-Jz*By, Jz*Bx, 0)
+                    double fx_JxB = -jz * by;
+                    double fy_JxB = jz * bx;
+                    double fx_MgradB = Mx * dBx_dx + My * dBx_dy;
+                    double fy_MgradB = Mx * dBy_dx + My * dBy_dy;
+
+                    double fx = fx_JxB + fx_MgradB;
+                    double fy = fy_JxB + fy_MgradB;
+
+                    // Volume element in polar coordinates (per unit depth): r * dr * dθ
+                    double dA = r * dr * dtheta;
+
+                    // Check if this pixel belongs to the target material
+                    bool is_material = (mat_mask.at<uchar>(j, i) != 0);
+                    if (!is_material) {
+                        continue;  // Only integrate within material region
+                    }
+
+                    result.pixel_count++;
+
+                    // Accumulate forces within material region only
+                    result.force_x += fx * dA;
+                    result.force_y += fy * dA;
+
+                    // Diagnostic accumulation
+                    if (std::abs(jz) > 1e-10) {
+                        fx_lorentz += fx_JxB * dA;
+                        fy_lorentz += fy_JxB * dA;
+                        pixels_with_current++;
+                    }
+                    if (std::abs(mu_r - 1.0) > 1e-6) {
+                        fx_magnetization += fx_MgradB * dA;
+                        fy_magnetization += fy_MgradB * dA;
+                        pixels_with_magnetization++;
+                    }
+
+                    // Torque about origin: τz = x*fy - y*fx
+                    result.torque_origin += x_c * (fy * dA) - y_c * (fx * dA);
+                    result.torque_center += x_c * (fy * dA) - y_c * (fx * dA);  // Same for polar (center at origin)
+                }
+            }
+        }
+
+        // NOTE: This volume integral computes f = J×B + (M·∇)B
+        // This is INCOMPLETE - missing surface bound current term K_b = M×n
+        //
+        // Full Amperian expression:
+        //   F = ∫_V (J_f + ∇×M)×B dV + ∮_S (K_b×B) dS  where K_b = M×n
+        //
+        // Or from Maxwell stress divergence:
+        //   ∇·T = J_f×B + (M·∇)B - (1/2)∇(M·B)
+        //   The last term becomes a surface integral: -(1/2)∮_S (M·B)n dS
+        //
+        // Current implementation provides VOLUME CONTRIBUTION ONLY.
+        // For accurate total force, also need:
+        // (A) Surface bound current integral (Amperian) - to be implemented
+        // (B) Or use Maxwell stress surface integral (existing EdgeBased method)
+
+        // Calculate force magnitude
+        result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
+        result.torque = result.torque_origin;
+
+        // Output results
+        std::cout << "  Material: " << name << std::endl;
+        std::cout << "    Material pixels: " << result.pixel_count << std::endl;
+        std::cout << "    --- Contribution breakdown ---" << std::endl;
+        std::cout << "      Lorentz (J×B): Fx=" << fx_lorentz << ", Fy=" << fy_lorentz
+                  << " (" << pixels_with_current << " pixels with current)" << std::endl;
+        std::cout << "      Magnetization ((M·∇)B): Fx=" << fx_magnetization << ", Fy=" << fy_magnetization
+                  << " (" << pixels_with_magnetization << " pixels with μr≠1)" << std::endl;
+        std::cout << "    --- Total (volume contribution only, surface term not included) ---" << std::endl;
+        std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
+        std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
+
+        force_results_volume.push_back(result);
+    }
+
+    std::cout << "\nVolume integral force calculation complete!" << std::endl;
+}
+
+
+void MagneticFieldAnalyzer::calculateForceMaxwellStressFaceFlux(int step) {
+    std::cout << "\n=== Calculating Force using Face-Flux Method (Maxwell Stress Divergence) ===" << std::endl;
+    std::cout << "  Method: F = ∫_V ∇·T dV = Σ_faces (T·n) * A_face" << std::endl;
+    std::cout << "  Where T = B⊗H - (1/2)(B·H)I" << std::endl;
+
+    // --- Calculate magnetic field if not already done for this step ---
+    if (current_field_step != step) {
+        if (coordinate_system == "polar") {
+            calculateMagneticFieldPolar();
+        } else {
+            calculateMagneticField();
+        }
+        current_field_step = step;
+    } else {
+        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
+    }
+
+    const double mu0 = MU_0;
+
+    // Physical center for torque calculation
+    double cx_physical = (static_cast<double>(nx) * dx) / 2.0;
+    double cy_physical = (static_cast<double>(ny) * dy) / 2.0;
+
+    // Clear previous flux results
+    force_results_flux.clear();
+
+    // For each material with calc_force=true
+    for (const auto& material : config["materials"]) {
+        std::string name = material.first.as<std::string>();
+        const auto& props = material.second;
+        bool calc_force = props["calc_force"].as<bool>(false);
+        if (!calc_force) continue;
+
+        std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
+
+        // Build material mask from current image (in FDM coordinates, y=0 at bottom)
+        cv::Mat image_flipped;
+        cv::flip(image, image_flipped, 0);
+
+        cv::Mat mat_mask(ny, nx, CV_8U, cv::Scalar(0));
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                cv::Vec3b px = image_flipped.at<cv::Vec3b>(j, i);
+                if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
+                    mat_mask.at<uchar>(j, i) = 255;
+                }
+            }
+        }
+
+        ForceResult result;
+        result.material_name = name;
+        result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
+        result.force_x = result.force_y = result.force_radial = 0.0;
+        result.torque = result.torque_origin = result.torque_center = 0.0;
+        result.pixel_count = 0;
+        result.magnetic_energy = 0.0;
+
+        std::cout << "\nCalculating force for material: " << name << " (face-flux method)" << std::endl;
+
+        if (coordinate_system == "cartesian") {
+            // Cartesian coordinate system implementation
+            // Face-flux method: F_cell = Σ_faces (T·n) * A_face
+            //
+            // For each cell (i,j), we have 4 faces:
+            //   East  (i+1/2, j): n = (+1, 0), area = dy
+            //   West  (i-1/2, j): n = (-1, 0), area = dy
+            //   North (i, j+1/2): n = (0, +1), area = dx
+            //   South (i, j-1/2): n = (0, -1), area = dx
+            //
+            // Maxwell stress tensor T = B⊗H - (1/2)(B·H)I:
+            //   T_xx = Bx*Hx - (1/2)(B·H)
+            //   T_xy = Bx*Hy
+            //   T_yx = By*Hx
+            //   T_yy = By*Hy - (1/2)(B·H)
+            //
+            // Face fluxes:
+            //   East:  T·n = (T_xx, T_yx)
+            //   North: T·n = (T_xy, T_yy)
+
+            // Loop over ALL cells including boundary cells
+            // For domain boundary faces, use one-sided extrapolation (cell's own values)
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    // Check if this cell belongs to the target material
+                    if (mat_mask.at<uchar>(j, i) == 0) {
+                        continue;
+                    }
+
+                    result.pixel_count++;
+
+                    // Physical coordinates of cell center
+                    double x_c = (i + 0.5) * dx;
+                    double y_c = (j + 0.5) * dy;
+
+                    // Compute H at cell center (H = B/μ)
+                    double Bx_c = Bx(j, i);
+                    double By_c = By(j, i);
+                    double Hx_c = Bx_c / mu_map(j, i);
+                    double Hy_c = By_c / mu_map(j, i);
+
+                    // --- East face (i+1/2, j) ---
+                    double Bx_e, By_e, Hx_e, Hy_e;
+                    if (i + 1 < nx) {
+                        // Neighbor exists: interpolate
+                        double Hx_c_e = Bx(j, i + 1) / mu_map(j, i + 1);
+                        double Hy_c_e = By(j, i + 1) / mu_map(j, i + 1);
+                        Hx_e = 0.5 * (Hx_c + Hx_c_e);
+                        Hy_e = 0.5 * (Hy_c + Hy_c_e);
+                        Bx_e = 0.5 * (Bx_c + Bx(j, i + 1));
+                        By_e = 0.5 * (By_c + By(j, i + 1));
+                    } else {
+                        // Domain boundary: use cell's own values
+                        Bx_e = Bx_c; By_e = By_c;
+                        Hx_e = Hx_c; Hy_e = Hy_c;
+                    }
+                    double BdotH_e = Bx_e * Hx_e + By_e * Hy_e;
+                    double T_xx_e = Bx_e * Hx_e - 0.5 * BdotH_e;
+                    double T_yx_e = By_e * Hx_e;
+
+                    // --- West face (i-1/2, j) ---
+                    double Bx_w, By_w, Hx_w, Hy_w;
+                    if (i - 1 >= 0) {
+                        double Hx_c_w = Bx(j, i - 1) / mu_map(j, i - 1);
+                        double Hy_c_w = By(j, i - 1) / mu_map(j, i - 1);
+                        Hx_w = 0.5 * (Hx_c + Hx_c_w);
+                        Hy_w = 0.5 * (Hy_c + Hy_c_w);
+                        Bx_w = 0.5 * (Bx_c + Bx(j, i - 1));
+                        By_w = 0.5 * (By_c + By(j, i - 1));
+                    } else {
+                        Bx_w = Bx_c; By_w = By_c;
+                        Hx_w = Hx_c; Hy_w = Hy_c;
+                    }
+                    double BdotH_w = Bx_w * Hx_w + By_w * Hy_w;
+                    double T_xx_w = Bx_w * Hx_w - 0.5 * BdotH_w;
+                    double T_yx_w = By_w * Hx_w;
+
+                    // --- North face (i, j+1/2) ---
+                    double Bx_n, By_n, Hx_n, Hy_n;
+                    if (j + 1 < ny) {
+                        double Hx_c_n = Bx(j + 1, i) / mu_map(j + 1, i);
+                        double Hy_c_n = By(j + 1, i) / mu_map(j + 1, i);
+                        Hx_n = 0.5 * (Hx_c + Hx_c_n);
+                        Hy_n = 0.5 * (Hy_c + Hy_c_n);
+                        Bx_n = 0.5 * (Bx_c + Bx(j + 1, i));
+                        By_n = 0.5 * (By_c + By(j + 1, i));
+                    } else {
+                        Bx_n = Bx_c; By_n = By_c;
+                        Hx_n = Hx_c; Hy_n = Hy_c;
+                    }
+                    double BdotH_n = Bx_n * Hx_n + By_n * Hy_n;
+                    double T_xy_n = Bx_n * Hy_n;
+                    double T_yy_n = By_n * Hy_n - 0.5 * BdotH_n;
+
+                    // --- South face (i, j-1/2) ---
+                    double Bx_s, By_s, Hx_s, Hy_s;
+                    if (j - 1 >= 0) {
+                        double Hx_c_s = Bx(j - 1, i) / mu_map(j - 1, i);
+                        double Hy_c_s = By(j - 1, i) / mu_map(j - 1, i);
+                        Hx_s = 0.5 * (Hx_c + Hx_c_s);
+                        Hy_s = 0.5 * (Hy_c + Hy_c_s);
+                        Bx_s = 0.5 * (Bx_c + Bx(j - 1, i));
+                        By_s = 0.5 * (By_c + By(j - 1, i));
+                    } else {
+                        Bx_s = Bx_c; By_s = By_c;
+                        Hx_s = Hx_c; Hy_s = Hy_c;
+                    }
+                    double BdotH_s = Bx_s * Hx_s + By_s * Hy_s;
+                    double T_xy_s = Bx_s * Hy_s;
+                    double T_yy_s = By_s * Hy_s - 0.5 * BdotH_s;
+
+                    // --- Discrete divergence: F_cell = Σ_faces (T·n) * A_face ---
+                    // Fx = (T_xx_e - T_xx_w) * dy + (T_xy_n - T_xy_s) * dx
+                    // Fy = (T_yx_e - T_yx_w) * dy + (T_yy_n - T_yy_s) * dx
+                    double fx = (T_xx_e - T_xx_w) * dy + (T_xy_n - T_xy_s) * dx;
+                    double fy = (T_yx_e - T_yx_w) * dy + (T_yy_n - T_yy_s) * dx;
+
+                    // Accumulate forces
+                    result.force_x += fx;
+                    result.force_y += fy;
+
+                    // Torque about origin: τz = x*fy - y*fx
+                    result.torque_origin += x_c * fy - y_c * fx;
+
+                    // Torque about image center
+                    result.torque_center += (x_c - cx_physical) * fy - (y_c - cy_physical) * fx;
+                }
+            }
+        } else {
+            // Polar coordinate system implementation
+            // Face-flux in polar: r-faces and θ-faces
+            //
+            // For cell (ir, jt):
+            //   Outer r-face (ir+1/2, jt): n_r = +1, area = r_outer * dθ
+            //   Inner r-face (ir-1/2, jt): n_r = -1, area = r_inner * dθ
+            //   θ+ face (ir, jt+1/2): n_θ = +1, area = dr
+            //   θ- face (ir, jt-1/2): n_θ = -1, area = dr
+            //
+            // IMPORTANT: Compute H = B/μ at cell centers first, then interpolate to faces
+            // This ensures consistency: avg(H) is used, not avg(B)/avg(μ)
+            //
+            // We work in Cartesian (x,y) for force accumulation
+
+            for (int jt = 1; jt < ntheta - 1; jt++) {
+                for (int ir = 1; ir < nr - 1; ir++) {
+                    // Determine array indices based on r_orientation
+                    int i, j;
+                    if (r_orientation == "horizontal") {
+                        i = ir;
+                        j = jt;
+                    } else {
+                        i = jt;
+                        j = ir;
+                    }
+
+                    // Check if this cell belongs to the target material
+                    if (mat_mask.at<uchar>(j, i) == 0) {
+                        continue;
+                    }
+
+                    result.pixel_count++;
+
+                    // Physical coordinates of cell center
+                    double r = r_coords[ir];
+                    double theta = jt * dtheta;
+                    double x_c = r * std::cos(theta);
+                    double y_c = r * std::sin(theta);
+                    double cos_t = std::cos(theta);
+                    double sin_t = std::sin(theta);
+
+                    // ============================================================
+                    // Step 1: Compute H at all relevant cell centers in Cartesian
+                    // H = B/μ at each cell, then convert to Cartesian coordinates
+                    // ============================================================
+
+                    // Helper lambda to get B and H in Cartesian at a given (ir_idx, jt_idx)
+                    auto getBH_cartesian = [&](int ir_idx, int jt_idx, double theta_val) {
+                        double br_val, bt_val, mu_val;
+                        if (r_orientation == "horizontal") {
+                            br_val = Br(jt_idx, ir_idx);
+                            bt_val = Btheta(jt_idx, ir_idx);
+                            mu_val = mu_map(jt_idx, ir_idx);
+                        } else {
+                            br_val = Br(ir_idx, jt_idx);
+                            bt_val = Btheta(ir_idx, jt_idx);
+                            mu_val = mu_map(ir_idx, jt_idx);
+                        }
+                        // H in polar: Hr = Br/μ, Hθ = Bθ/μ
+                        double hr_val = br_val / mu_val;
+                        double ht_val = bt_val / mu_val;
+                        // Convert to Cartesian
+                        double cos_th = std::cos(theta_val);
+                        double sin_th = std::sin(theta_val);
+                        double bx = br_val * cos_th - bt_val * sin_th;
+                        double by = br_val * sin_th + bt_val * cos_th;
+                        double hx = hr_val * cos_th - ht_val * sin_th;
+                        double hy = hr_val * sin_th + ht_val * cos_th;
+                        return std::make_tuple(bx, by, hx, hy);
+                    };
+
+                    // Current cell (ir, jt)
+                    auto [Bx_c, By_c, Hx_c, Hy_c] = getBH_cartesian(ir, jt, theta);
+
+                    // ============================================================
+                    // Outer r-face (ir+1/2, jt): between cells (ir, jt) and (ir+1, jt)
+                    // ============================================================
+                    double r_outer = 0.5 * (r_coords[ir] + r_coords[ir + 1]);
+                    auto [Bx_c_ro, By_c_ro, Hx_c_ro, Hy_c_ro] = getBH_cartesian(ir + 1, jt, theta);
+                    // Interpolate B and H to face (simple average)
+                    double Bx_ro = 0.5 * (Bx_c + Bx_c_ro);
+                    double By_ro = 0.5 * (By_c + By_c_ro);
+                    double Hx_ro = 0.5 * (Hx_c + Hx_c_ro);
+                    double Hy_ro = 0.5 * (Hy_c + Hy_c_ro);
+                    // Compute stress tensor T = B⊗H - (1/2)(B·H)I
+                    double BdotH_ro = Bx_ro * Hx_ro + By_ro * Hy_ro;
+                    double T_xx_ro = Bx_ro * Hx_ro - 0.5 * BdotH_ro;
+                    double T_xy_ro = Bx_ro * Hy_ro;
+                    double T_yx_ro = By_ro * Hx_ro;
+                    double T_yy_ro = By_ro * Hy_ro - 0.5 * BdotH_ro;
+                    // Face normal in Cartesian: n = (cos_t, sin_t) for radial outward
+                    double flux_x_ro = T_xx_ro * cos_t + T_xy_ro * sin_t;
+                    double flux_y_ro = T_yx_ro * cos_t + T_yy_ro * sin_t;
+                    double A_ro = r_outer * dtheta;  // Face area
+
+                    // ============================================================
+                    // Inner r-face (ir-1/2, jt): between cells (ir, jt) and (ir-1, jt)
+                    // ============================================================
+                    double r_inner = 0.5 * (r_coords[ir] + r_coords[ir - 1]);
+                    auto [Bx_c_ri, By_c_ri, Hx_c_ri, Hy_c_ri] = getBH_cartesian(ir - 1, jt, theta);
+                    double Bx_ri = 0.5 * (Bx_c + Bx_c_ri);
+                    double By_ri = 0.5 * (By_c + By_c_ri);
+                    double Hx_ri = 0.5 * (Hx_c + Hx_c_ri);
+                    double Hy_ri = 0.5 * (Hy_c + Hy_c_ri);
+                    double BdotH_ri = Bx_ri * Hx_ri + By_ri * Hy_ri;
+                    double T_xx_ri = Bx_ri * Hx_ri - 0.5 * BdotH_ri;
+                    double T_xy_ri = Bx_ri * Hy_ri;
+                    double T_yx_ri = By_ri * Hx_ri;
+                    double T_yy_ri = By_ri * Hy_ri - 0.5 * BdotH_ri;
+                    // Face normal: n = (cos_t, sin_t) radial outward (but we'll subtract this face)
+                    double flux_x_ri = T_xx_ri * cos_t + T_xy_ri * sin_t;
+                    double flux_y_ri = T_yx_ri * cos_t + T_yy_ri * sin_t;
+                    double A_ri = r_inner * dtheta;  // Face area
+
+                    // ============================================================
+                    // θ+ face (ir, jt+1/2): between cells (ir, jt) and (ir, jt+1)
+                    // ============================================================
+                    double theta_p = (jt + 0.5) * dtheta;  // Face angle
+                    double cos_tp = std::cos(theta_p);
+                    double sin_tp = std::sin(theta_p);
+                    // Convert each cell's field at its own angle for accuracy
+                    // Then average the Cartesian components at the face
+                    double theta_jt = jt * dtheta;
+                    double theta_jt1 = (jt + 1) * dtheta;
+                    auto [Bx_c_jt, By_c_jt, Hx_c_jt, Hy_c_jt] = getBH_cartesian(ir, jt, theta_jt);
+                    auto [Bx_c_jt1, By_c_jt1, Hx_c_jt1, Hy_c_jt1] = getBH_cartesian(ir, jt + 1, theta_jt1);
+                    double Bx_tp = 0.5 * (Bx_c_jt + Bx_c_jt1);
+                    double By_tp = 0.5 * (By_c_jt + By_c_jt1);
+                    double Hx_tp = 0.5 * (Hx_c_jt + Hx_c_jt1);
+                    double Hy_tp = 0.5 * (Hy_c_jt + Hy_c_jt1);
+                    double BdotH_tp = Bx_tp * Hx_tp + By_tp * Hy_tp;
+                    double T_xx_tp = Bx_tp * Hx_tp - 0.5 * BdotH_tp;
+                    double T_xy_tp = Bx_tp * Hy_tp;
+                    double T_yx_tp = By_tp * Hx_tp;
+                    double T_yy_tp = By_tp * Hy_tp - 0.5 * BdotH_tp;
+                    // θ+ direction in Cartesian: n = (-sin_tp, cos_tp)
+                    double flux_x_tp = T_xx_tp * (-sin_tp) + T_xy_tp * cos_tp;
+                    double flux_y_tp = T_yx_tp * (-sin_tp) + T_yy_tp * cos_tp;
+                    double A_tp = dr;  // Face area
+
+                    // ============================================================
+                    // θ- face (ir, jt-1/2): between cells (ir, jt) and (ir, jt-1)
+                    // ============================================================
+                    double theta_m = (jt - 0.5) * dtheta;  // Face angle
+                    double cos_tm = std::cos(theta_m);
+                    double sin_tm = std::sin(theta_m);
+                    // Convert each cell's field at its own angle for accuracy
+                    double theta_jtm1 = (jt - 1) * dtheta;
+                    auto [Bx_c_jtm1, By_c_jtm1, Hx_c_jtm1, Hy_c_jtm1] = getBH_cartesian(ir, jt - 1, theta_jtm1);
+                    // Reuse Bx_c, By_c, Hx_c, Hy_c from current cell (already at theta = jt*dtheta)
+                    double Bx_tm = 0.5 * (Bx_c + Bx_c_jtm1);
+                    double By_tm = 0.5 * (By_c + By_c_jtm1);
+                    double Hx_tm = 0.5 * (Hx_c + Hx_c_jtm1);
+                    double Hy_tm = 0.5 * (Hy_c + Hy_c_jtm1);
+                    double BdotH_tm = Bx_tm * Hx_tm + By_tm * Hy_tm;
+                    double T_xx_tm = Bx_tm * Hx_tm - 0.5 * BdotH_tm;
+                    double T_xy_tm = Bx_tm * Hy_tm;
+                    double T_yx_tm = By_tm * Hx_tm;
+                    double T_yy_tm = By_tm * Hy_tm - 0.5 * BdotH_tm;
+                    // θ direction: e_θ = (-sin θ, cos θ). We compute T·e_θ and subtract for inward flux.
+                    double flux_x_tm = T_xx_tm * (-sin_tm) + T_xy_tm * cos_tm;
+                    double flux_y_tm = T_yx_tm * (-sin_tm) + T_yy_tm * cos_tm;
+                    double A_tm = dr;  // Face area
+
+                    // ============================================================
+                    // Discrete divergence: sum of face fluxes
+                    // F_cell = (flux_outer - flux_inner) + (flux_θ+ - flux_θ-)
+                    // ============================================================
+                    double fx = flux_x_ro * A_ro - flux_x_ri * A_ri + flux_x_tp * A_tp - flux_x_tm * A_tm;
+                    double fy = flux_y_ro * A_ro - flux_y_ri * A_ri + flux_y_tp * A_tp - flux_y_tm * A_tm;
+
+                    // Accumulate forces
+                    result.force_x += fx;
+                    result.force_y += fy;
+
+                    // Torque about origin: τz = x*fy - y*fx
+                    result.torque_origin += x_c * fy - y_c * fx;
+                    result.torque_center += x_c * fy - y_c * fx;  // Same for polar (center at origin)
+                }
+            }
+        }
+
+        // Calculate force magnitude
+        result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
+        result.torque = result.torque_origin;
+
+        // Output results
+        std::cout << "  Material: " << name << std::endl;
+        std::cout << "    Material pixels: " << result.pixel_count << std::endl;
+        std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
+        std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
+
+        force_results_flux.push_back(result);
+    }
+
+    std::cout << "\nFace-flux force calculation complete!" << std::endl;
+}
+
+
+void MagneticFieldAnalyzer::calculateForceShellIntegration(int step, int shell_thickness) {
+    std::cout << "\n=== Calculating Force using Shell Volume Integration ===" << std::endl;
+    std::cout << "  Method: F = ∫_Ω_shell T · ∇G dS" << std::endl;
+    std::cout << "  Shell thickness: " << shell_thickness << " pixels" << std::endl;
+
+    // --- Calculate magnetic field if not already done for this step ---
+    if (current_field_step != step) {
+        if (coordinate_system == "polar") {
+            calculateMagneticFieldPolar();
+        } else {
+            calculateMagneticField();
+        }
+        current_field_step = step;
+    } else {
+        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
+    }
+
+    const double mu0 = MU_0;
+
+    // Physical center for torque calculation
+    double cx_physical = (static_cast<double>(nx) * dx) / 2.0;
+    double cy_physical = (static_cast<double>(ny) * dy) / 2.0;
+
+    // Clear previous shell results
+    force_results_shell.clear();
+
+    // ============================================================
+    // Detect periodic/anti-periodic boundary conditions
+    // ============================================================
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    bool x_antiperiodic = x_periodic && (bc_left.value < 0 || bc_right.value < 0);
+    bool y_antiperiodic = y_periodic && (bc_bottom.value < 0 || bc_top.value < 0);
+
+    if (x_periodic || y_periodic) {
+        std::cout << "  Periodic boundaries detected: "
+                  << (x_periodic ? (x_antiperiodic ? "X(anti) " : "X ") : "")
+                  << (y_periodic ? (y_antiperiodic ? "Y(anti)" : "Y") : "") << std::endl;
+    }
+
+    // Identify air material (mu_r = 1.0 or very close)
+    // Build air mask from mu_map
+    cv::Mat air_mask(ny, nx, CV_8U, cv::Scalar(0));
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            double mu_r = mu_map(j, i) / mu0;
+            if (std::abs(mu_r - 1.0) < 0.01) {  // Air: mu_r ≈ 1.0
+                air_mask.at<uchar>(j, i) = 255;
+            }
+        }
+    }
+
+    // For each material with calc_force=true
+    for (const auto& material : config["materials"]) {
+        std::string name = material.first.as<std::string>();
+        const auto& props = material.second;
+        bool calc_force = props["calc_force"].as<bool>(false);
+        if (!calc_force) continue;
+
+        std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
+
+        // Build material mask from current image (in FDM coordinates, y=0 at bottom)
+        cv::Mat image_flipped;
+        cv::flip(image, image_flipped, 0);
+
+        cv::Mat mat_mask(ny, nx, CV_8U, cv::Scalar(0));
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                cv::Vec3b px = image_flipped.at<cv::Vec3b>(j, i);
+                if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
+                    mat_mask.at<uchar>(j, i) = 255;
+                }
+            }
+        }
+
+        ForceResult result;
+        result.material_name = name;
+        result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
+        result.force_x = result.force_y = result.force_radial = 0.0;
+        result.torque = result.torque_origin = result.torque_center = 0.0;
+        result.pixel_count = 0;
+        result.magnetic_energy = 0.0;
+
+        std::cout << "\nCalculating force for material: " << name << " (shell integration)" << std::endl;
+
+        // ============================================================
+        // Step 1: Create shell region using morphological dilation
+        // Handle periodic boundaries by padding/wrapping
+        // ============================================================
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+        cv::Mat mat_expanded;
+        cv::Mat air_expanded;  // Also expand air mask for periodic boundary handling
+
+        int pad = shell_thickness + 1;  // Padding size for periodic wrapping
+
+        if (x_periodic || y_periodic) {
+            // Create padded mask for periodic boundary handling
+            int pad_top = y_periodic ? pad : 0;
+            int pad_bottom = y_periodic ? pad : 0;
+            int pad_left = x_periodic ? pad : 0;
+            int pad_right = x_periodic ? pad : 0;
+
+            cv::Mat mat_padded, air_padded;
+            cv::copyMakeBorder(mat_mask, mat_padded, pad_top, pad_bottom, pad_left, pad_right,
+                               cv::BORDER_WRAP);
+            cv::copyMakeBorder(air_mask, air_padded, pad_top, pad_bottom, pad_left, pad_right,
+                               cv::BORDER_WRAP);
+
+            // Dilate on padded image
+            cv::Mat mat_padded_expanded;
+            cv::dilate(mat_padded, mat_padded_expanded, kernel, cv::Point(-1, -1), shell_thickness);
+
+            // Extract center region back to original size
+            mat_expanded = mat_padded_expanded(cv::Rect(pad_left, pad_top, nx, ny)).clone();
+            air_expanded = air_padded(cv::Rect(pad_left, pad_top, nx, ny)).clone();
+        } else {
+            // Standard dilation without periodic wrapping
+            cv::dilate(mat_mask, mat_expanded, kernel, cv::Point(-1, -1), shell_thickness);
+            air_expanded = air_mask.clone();
+        }
+
+        // Shell = expanded - original
+        cv::Mat shell_mask = mat_expanded - mat_mask;
+
+        // ============================================================
+        // Step 2: Check for interference and boundary issues
+        // ============================================================
+        int total_warnings = 0;
+
+        // 2a. Check for non-air material interference
+        cv::Mat shell_in_air;
+        cv::bitwise_and(shell_mask, air_expanded, shell_in_air);
+        int shell_total = cv::countNonZero(shell_mask);
+        int shell_air = cv::countNonZero(shell_in_air);
+
+        if (shell_total != shell_air) {
+            int interference = shell_total - shell_air;
+            std::cerr << "  [WARNING] Shell interferes with non-air material ("
+                      << interference << " pixels). Results may be inaccurate." << std::endl;
+            shell_mask = shell_in_air;  // Use only air portion
+            total_warnings++;
+        }
+
+        // 2b. Check for non-periodic image boundary interference
+        // Count shell pixels at image edges that are not periodic
+        int boundary_interference = 0;
+        for (int j = 0; j < ny; j++) {
+            // Left boundary (i=0)
+            if (!x_periodic && shell_mask.at<uchar>(j, 0) > 0) boundary_interference++;
+            // Right boundary (i=nx-1)
+            if (!x_periodic && shell_mask.at<uchar>(j, nx - 1) > 0) boundary_interference++;
+        }
+        for (int i = 0; i < nx; i++) {
+            // Bottom boundary (j=0)
+            if (!y_periodic && shell_mask.at<uchar>(0, i) > 0) boundary_interference++;
+            // Top boundary (j=ny-1)
+            if (!y_periodic && shell_mask.at<uchar>(ny - 1, i) > 0) boundary_interference++;
+        }
+
+        if (boundary_interference > 0) {
+            std::cerr << "  [WARNING] Shell touches non-periodic image boundary ("
+                      << boundary_interference << " edge pixels). Results may have boundary noise." << std::endl;
+            total_warnings++;
+        }
+
+        int shell_pixels = cv::countNonZero(shell_mask);
+        std::cout << "  Shell pixels: " << shell_pixels;
+        if (total_warnings > 0) {
+            std::cout << " (" << total_warnings << " warning(s))";
+        }
+        std::cout << std::endl;
+
+        if (shell_pixels == 0) {
+            std::cout << "  ERROR: No valid shell region found. Skipping." << std::endl;
+            force_results_shell.push_back(result);
+            continue;
+        }
+
+        // ============================================================
+        // Step 3: Create weight function G using distance transform
+        // G = 1 at material surface, G = 0 at shell outer boundary
+        // For periodic boundaries, use padded distance transform
+        // ============================================================
+        cv::Mat dist_map(ny, nx, CV_32F, cv::Scalar(0.0f));
+
+        if (x_periodic || y_periodic) {
+            // For periodic boundaries, compute distance on padded/tiled image
+            int pad_top = y_periodic ? pad : 0;
+            int pad_bottom = y_periodic ? pad : 0;
+            int pad_left = x_periodic ? pad : 0;
+            int pad_right = x_periodic ? pad : 0;
+
+            cv::Mat mat_padded;
+            cv::copyMakeBorder(mat_mask, mat_padded, pad_top, pad_bottom, pad_left, pad_right,
+                               cv::BORDER_WRAP);
+
+            cv::Mat mat_padded_inv;
+            cv::bitwise_not(mat_padded, mat_padded_inv);
+
+            cv::Mat dist_padded;
+            cv::distanceTransform(mat_padded_inv, dist_padded, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+
+            // Extract center region
+            dist_map = dist_padded(cv::Rect(pad_left, pad_top, nx, ny)).clone();
+        } else {
+            // Standard distance transform
+            cv::Mat mat_mask_inv;
+            cv::bitwise_not(mat_mask, mat_mask_inv);
+            cv::distanceTransform(mat_mask_inv, dist_map, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+        }
+
+        // Find maximum distance within shell (= shell thickness in pixels)
+        double max_dist = 0;
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                if (shell_mask.at<uchar>(j, i) > 0) {
+                    double d = dist_map.at<float>(j, i);
+                    if (d > max_dist) max_dist = d;
+                }
+            }
+        }
+
+        if (max_dist < 1e-10) {
+            std::cout << "  ERROR: max_dist is zero. Skipping." << std::endl;
+            force_results_shell.push_back(result);
+            continue;
+        }
+
+        std::cout << "  Max distance in shell: " << max_dist << " pixels" << std::endl;
+
+        // Create G map with CORRECT values:
+        // - G = 1 inside material (CRITICAL: needed for correct gradient at interface)
+        // - G = 1 - d/max_dist in shell (smooth transition from 1 to 0)
+        // - G = 0 outside shell
+        cv::Mat G_map(ny, nx, CV_64F, cv::Scalar(0.0));
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                if (mat_mask.at<uchar>(j, i) > 0) {
+                    // Inside material: G = 1
+                    G_map.at<double>(j, i) = 1.0;
+                } else if (shell_mask.at<uchar>(j, i) > 0) {
+                    // In shell: G transitions from 1 to 0
+                    double d = dist_map.at<float>(j, i);
+                    double g = 1.0 - d / max_dist;
+                    G_map.at<double>(j, i) = std::max(0.0, std::min(1.0, g));
+                }
+                // Outside shell: G = 0 (default)
+            }
+        }
+
+        // ============================================================
+        // Step 4: Compute gradient of G using central differences
+        // ∇G = (∂G/∂x, ∂G/∂y) in physical coordinates
+        // Using central differences: ∂G/∂x ≈ (G(i+1,j) - G(i-1,j)) / (2*dx)
+        // Handle periodic boundaries with wrapped indices.
+        // ============================================================
+        cv::Mat grad_Gx(ny, nx, CV_64F, cv::Scalar(0.0));
+        cv::Mat grad_Gy(ny, nx, CV_64F, cv::Scalar(0.0));
+
+        // Lambda for wrapped index access
+        auto getG = [&](int j, int i) -> double {
+            // Handle periodic wrapping
+            if (x_periodic) {
+                i = (i + nx) % nx;
+            } else {
+                i = std::max(0, std::min(nx - 1, i));
+            }
+            if (y_periodic) {
+                j = (j + ny) % ny;
+            } else {
+                j = std::max(0, std::min(ny - 1, j));
+            }
+            return G_map.at<double>(j, i);
+        };
+
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                // Skip if not near shell region (optimization)
+                // Compute gradient at all points to capture interface effects
+
+                // Determine if we should compute gradient here
+                // (only needed where shell_mask is 1 or at its boundary)
+                bool compute_here = false;
+                if (shell_mask.at<uchar>(j, i) > 0) {
+                    compute_here = true;
+                } else {
+                    // Check if any neighbor is in shell (for interface gradient)
+                    for (int dj = -1; dj <= 1; dj++) {
+                        for (int di = -1; di <= 1; di++) {
+                            int jj = j + dj;
+                            int ii = i + di;
+                            if (x_periodic) ii = (ii + nx) % nx;
+                            if (y_periodic) jj = (jj + ny) % ny;
+                            if (jj >= 0 && jj < ny && ii >= 0 && ii < nx) {
+                                if (shell_mask.at<uchar>(jj, ii) > 0) {
+                                    compute_here = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (compute_here) break;
+                    }
+                }
+
+                if (!compute_here) continue;
+
+                // Central difference with periodic wrapping
+                double G_ip1 = getG(j, i + 1);
+                double G_im1 = getG(j, i - 1);
+                double G_jp1 = getG(j + 1, i);
+                double G_jm1 = getG(j - 1, i);
+
+                double dGdx = (G_ip1 - G_im1) / (2.0 * dx);
+                double dGdy = (G_jp1 - G_jm1) / (2.0 * dy);
+
+                grad_Gx.at<double>(j, i) = dGdx;
+                grad_Gy.at<double>(j, i) = dGdy;
+            }
+        }
+
+        // ============================================================
+        // Step 5: Compute Maxwell stress tensor in air (using μ₀)
+        // T_xx = (Bx² - By²) / (2μ₀)
+        // T_xy = Bx·By / μ₀
+        // T_yy = (By² - Bx²) / (2μ₀)
+        // ============================================================
+        // Note: In air, H = B/μ₀, so T = B⊗H - (1/2)(B·H)I
+        //   T_xx = Bx·Hx - (1/2)(B·H) = Bx²/μ₀ - (Bx² + By²)/(2μ₀) = (Bx² - By²)/(2μ₀)
+        //   T_xy = Bx·Hy = Bx·By/μ₀
+        //   T_yy = By·Hy - (1/2)(B·H) = By²/μ₀ - (Bx² + By²)/(2μ₀) = (By² - Bx²)/(2μ₀)
+
+        // ============================================================
+        // Step 6: Integrate F = ∫_shell T · ∇G dS
+        // Fx = ∫ (T_xx · ∂G/∂x + T_xy · ∂G/∂y) dS
+        // Fy = ∫ (T_xy · ∂G/∂x + T_yy · ∂G/∂y) dS
+        // ============================================================
+        double dS = dx * dy;  // Area element
+
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                if (shell_mask.at<uchar>(j, i) == 0) continue;
+
+                result.pixel_count++;
+
+                double bx = Bx(j, i);
+                double by = By(j, i);
+
+                // Maxwell stress tensor components (in air, using μ₀)
+                double T_xx = (bx * bx - by * by) / (2.0 * mu0);
+                double T_xy = bx * by / mu0;
+                double T_yy = (by * by - bx * bx) / (2.0 * mu0);
+
+                // Gradient of G
+                double dGdx = grad_Gx.at<double>(j, i);
+                double dGdy = grad_Gy.at<double>(j, i);
+
+                // Force contribution: T · ∇G
+                double fx = (T_xx * dGdx + T_xy * dGdy) * dS;
+                double fy = (T_xy * dGdx + T_yy * dGdy) * dS;
+
+                result.force_x += fx;
+                result.force_y += fy;
+
+                // Torque: τ = r × F
+                // Physical coordinates of this pixel
+                double x_c = (i + 0.5) * dx;
+                double y_c = (j + 0.5) * dy;
+
+                result.torque_origin += x_c * fy - y_c * fx;
+                result.torque_center += (x_c - cx_physical) * fy - (y_c - cy_physical) * fx;
+            }
+        }
+
+        // Calculate force magnitude
+        result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
+        result.torque = result.torque_origin;
+
+        // Output results
+        std::cout << "  Material: " << name << std::endl;
+        std::cout << "    Shell pixels used: " << result.pixel_count << std::endl;
+        std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
+        std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
+        std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
+
+        force_results_shell.push_back(result);
+    }
+
+    std::cout << "\nShell volume integration complete!" << std::endl;
+}
+
+
+void MagneticFieldAnalyzer::calculateForceDistributedAmperian(int step, double sigma_smooth) {
+    std::cout << "\n=== Calculating Force using Distributed Amperian Method ===" << std::endl;
+    std::cout << "  Method: M = B/μ₀ - H, J_b = ∇×M, F = ∫J_b × B dV" << std::endl;
+    std::cout << "  Coordinate system: " << coordinate_system << std::endl;
+    if (sigma_smooth > 0) {
+        std::cout << "  Gaussian smoothing sigma: " << sigma_smooth << " pixels" << std::endl;
+    }
+
+    // --- Calculate magnetic field if not already done for this step ---
+    if (current_field_step != step) {
+        if (coordinate_system == "polar") {
+            calculateMagneticFieldPolar();
+        } else {
+            calculateMagneticField();
+        }
+        current_field_step = step;
+    } else {
+        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
+    }
+
+    const double mu0 = MU_0;
+
+    // Clear previous results
+    force_results_amperian.clear();
+
+    // ============================================================
+    // Branch: Polar vs Cartesian coordinate system
+    // ============================================================
+    if (coordinate_system == "polar") {
+        // ============================================================
+        // POLAR COORDINATE IMPLEMENTATION
+        // ============================================================
+        std::cout << "  Using polar coordinate formulation" << std::endl;
+        std::cout << "  r_orientation: " << r_orientation << std::endl;
+        std::cout << "  nr=" << nr << ", ntheta=" << ntheta << std::endl;
+
+        // Determine theta periodicity
+        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+        bool theta_antiperiodic = (bc_theta_min.type == "anti-periodic" || bc_theta_max.type == "anti-periodic");
+
+        // Grid dimensions for matrix storage (depends on r_orientation)
+        // r_orientation == "horizontal": rows=ntheta, cols=nr, indexing: mat(jt, ir)
+        // r_orientation == "vertical": rows=nr, cols=ntheta, indexing: mat(ir, jt)
+        int grid_rows, grid_cols;
+        if (r_orientation == "horizontal") {
+            grid_rows = ntheta;
+            grid_cols = nr;
+        } else {  // vertical
+            grid_rows = nr;
+            grid_cols = ntheta;
+        }
+        std::cout << "  Grid dimensions: " << grid_rows << " rows x " << grid_cols << " cols" << std::endl;
+
+        // Build r_coords array for physical r values
+        std::vector<double> r_coords(nr);
+        for (int ir = 0; ir < nr; ir++) {
+            r_coords[ir] = r_start + (ir + 0.5) * dr;
+        }
+
+        // ============================================================
+        // Step 1: Calculate magnetization in polar coordinates
+        // M_r = B_r(μ_r - 1)/(μ₀μ_r), M_θ = B_θ(μ_r - 1)/(μ₀μ_r)
+        // In air (μ_r = 1): M = 0 exactly (no ghost force)
+        // ============================================================
+        cv::Mat Mr_map(grid_rows, grid_cols, CV_64F, cv::Scalar(0.0));
+        cv::Mat Mt_map(grid_rows, grid_cols, CV_64F, cv::Scalar(0.0));  // M_theta
+
+        for (int j = 0; j < grid_rows; j++) {
+            for (int i = 0; i < grid_cols; i++) {
+                double mu = mu_map(j, i);
+                double mu_r_val = mu / mu0;
+                double chi = (mu_r_val - 1.0) / mu_r_val;
+
+                // Get Br, Btheta depending on r_orientation
+                // Matrix indexing is always (row, col) = (j, i)
+                // For both orientations, Br and Btheta are stored with consistent indexing
+                double br_val, bt_val;
+                int ir, jt;
+                if (r_orientation == "horizontal") {
+                    ir = i; jt = j;  // col=r, row=theta
+                    br_val = Br(jt, ir);
+                    bt_val = Btheta(jt, ir);
+                } else {
+                    ir = j; jt = i;  // row=r, col=theta
+                    br_val = Br(ir, jt);
+                    bt_val = Btheta(ir, jt);
+                }
+
+                Mr_map.at<double>(j, i) = br_val * chi / mu0;
+                Mt_map.at<double>(j, i) = bt_val * chi / mu0;
+            }
+        }
+
+        // ============================================================
+        // Step 2: Optional Gaussian smoothing of M
+        // ============================================================
+        if (sigma_smooth > 0) {
+            int ksize = static_cast<int>(std::ceil(sigma_smooth * 6)) | 1;
+            if (ksize < 3) ksize = 3;
+            cv::GaussianBlur(Mr_map, Mr_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
+            cv::GaussianBlur(Mt_map, Mt_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
+            std::cout << "  Applied Gaussian smoothing (kernel size: " << ksize << ")" << std::endl;
+        }
+
+        // ============================================================
+        // Step 3: Compute bound current in polar coordinates
+        // J_z = (1/r) ∂(r·M_θ)/∂r - (1/r) ∂M_r/∂θ
+        //     = M_θ/r + ∂M_θ/∂r - (1/r) ∂M_r/∂θ
+        // ============================================================
+        cv::Mat Jz_map(grid_rows, grid_cols, CV_64F, cv::Scalar(0.0));
+
+        // Lambda for wrapped index access with polar boundary handling
+        // Note: Mr_map and Mt_map are stored as cv::Mat with (row, col) = (j, i)
+        // For horizontal: j=theta, i=r → access as (jt, ir)
+        // For vertical: j=r, i=theta → access as (ir, jt)
+        auto getMr = [&](int jt, int ir) -> double {
+            // Handle r boundary (non-periodic)
+            ir = std::max(0, std::min(nr - 1, ir));
+            // Handle theta boundary
+            if (theta_periodic) {
+                jt = (jt + ntheta) % ntheta;
+            } else if (theta_antiperiodic) {
+                if (jt < 0) {
+                    jt = -jt - 1;
+                    if (r_orientation == "horizontal") {
+                        return -Mr_map.at<double>(jt, ir);
+                    } else {
+                        return -Mr_map.at<double>(ir, jt);
+                    }
+                }
+                if (jt >= ntheta) {
+                    jt = 2 * ntheta - jt - 1;
+                    if (r_orientation == "horizontal") {
+                        return -Mr_map.at<double>(jt, ir);
+                    } else {
+                        return -Mr_map.at<double>(ir, jt);
+                    }
+                }
+            } else {
+                jt = std::max(0, std::min(ntheta - 1, jt));
+            }
+            if (r_orientation == "horizontal") {
+                return Mr_map.at<double>(jt, ir);
+            } else {
+                return Mr_map.at<double>(ir, jt);
+            }
+        };
+        auto getMt = [&](int jt, int ir) -> double {
+            ir = std::max(0, std::min(nr - 1, ir));
+            if (theta_periodic) {
+                jt = (jt + ntheta) % ntheta;
+            } else if (theta_antiperiodic) {
+                if (jt < 0) {
+                    jt = -jt - 1;
+                    if (r_orientation == "horizontal") {
+                        return -Mt_map.at<double>(jt, ir);
+                    } else {
+                        return -Mt_map.at<double>(ir, jt);
+                    }
+                }
+                if (jt >= ntheta) {
+                    jt = 2 * ntheta - jt - 1;
+                    if (r_orientation == "horizontal") {
+                        return -Mt_map.at<double>(jt, ir);
+                    } else {
+                        return -Mt_map.at<double>(ir, jt);
+                    }
+                }
+            } else {
+                jt = std::max(0, std::min(ntheta - 1, jt));
+            }
+            if (r_orientation == "horizontal") {
+                return Mt_map.at<double>(jt, ir);
+            } else {
+                return Mt_map.at<double>(ir, jt);
+            }
+        };
+
+        for (int j = 0; j < grid_rows; j++) {
+            for (int i = 0; i < grid_cols; i++) {
+                int ir, jt;
+                if (r_orientation == "horizontal") {
+                    ir = i; jt = j;
+                } else {
+                    ir = j; jt = i;
+                }
+
+                double r = r_coords[ir];
+                if (r < 1e-10) {
+                    // At r=0, curl is undefined; skip or use limit
+                    Jz_map.at<double>(j, i) = 0.0;
+                    continue;
+                }
+
+                // Central differences for derivatives
+                // ∂(r·M_θ)/∂r using central difference
+                double rMt_plus = r_coords[std::min(ir + 1, nr - 1)] * getMt(jt, ir + 1);
+                double rMt_minus = r_coords[std::max(ir - 1, 0)] * getMt(jt, ir - 1);
+                double d_rMt_dr = (rMt_plus - rMt_minus) / (2.0 * dr);
+
+                // ∂M_r/∂θ using central difference
+                double dMr_dtheta = (getMr(jt + 1, ir) - getMr(jt - 1, ir)) / (2.0 * dtheta);
+
+                // J_z = (1/r) ∂(r·M_θ)/∂r - (1/r) ∂M_r/∂θ
+                double jz = (1.0 / r) * d_rMt_dr - (1.0 / r) * dMr_dtheta;
+                Jz_map.at<double>(j, i) = jz;
+            }
+        }
+
+        // ============================================================
+        // Step 4: For each material, integrate F = J_b × B
+        // ============================================================
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+        int dilation_size = 2;
+
+        for (const auto& material : config["materials"]) {
+            std::string name = material.first.as<std::string>();
+            const auto& props = material.second;
+            bool calc_force = props["calc_force"].as<bool>(false);
+            if (!calc_force) continue;
+
+            std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
+
+            // Build material mask
+            cv::Mat image_flipped;
+            cv::flip(image, image_flipped, 0);
+
+            // Debug: Check image dimensions
+            std::cout << "  Image size: " << image_flipped.cols << " x " << image_flipped.rows << std::endl;
+            std::cout << "  Creating mask with size: " << grid_cols << " x " << grid_rows << std::endl;
+
+            cv::Mat mat_mask(grid_rows, grid_cols, CV_8U, cv::Scalar(0));
+            int match_count = 0;
+            for (int jj = 0; jj < grid_rows; jj++) {
+                for (int ii = 0; ii < grid_cols; ii++) {
+                    cv::Vec3b px = image_flipped.at<cv::Vec3b>(jj, ii);
+                    if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
+                        mat_mask.at<uchar>(jj, ii) = 255;
+                        match_count++;
+                    }
+                }
+            }
+            std::cout << "  Material pixels found: " << match_count << std::endl;
+
+            // Dilate material mask with periodic handling for theta
+            // For polar: theta direction is periodic, r direction is not
+            cv::Mat mat_dilated;
+
+            // Check mat_mask validity
+            if (mat_mask.empty() || mat_mask.rows == 0 || mat_mask.cols == 0) {
+                std::cerr << "  ERROR: mat_mask is empty or invalid!" << std::endl;
+                mat_dilated = mat_mask.clone();
+            } else if (theta_periodic) {
+                int pad = dilation_size + 1;
+
+                // For theta-periodic boundary:
+                // r_orientation == "horizontal": rows=ntheta (periodic), cols=nr (non-periodic)
+                // r_orientation == "vertical": rows=nr (non-periodic), cols=ntheta (periodic)
+                cv::Mat mat_padded;
+                if (r_orientation == "horizontal") {
+                    // Rows are theta (periodic), cols are r (non-periodic)
+                    // Pad top/bottom for theta wrap
+                    cv::copyMakeBorder(mat_mask, mat_padded, pad, pad, 0, 0, cv::BORDER_WRAP);
+                    cv::Mat mat_padded_dilated;
+                    cv::dilate(mat_padded, mat_padded_dilated, kernel, cv::Point(-1, -1), dilation_size);
+                    mat_dilated = mat_padded_dilated(cv::Rect(0, pad, grid_cols, grid_rows)).clone();
+                } else {
+                    // Rows are r (non-periodic), cols are theta (periodic)
+                    // Pad left/right for theta wrap
+                    cv::copyMakeBorder(mat_mask, mat_padded, 0, 0, pad, pad, cv::BORDER_WRAP);
+                    cv::Mat mat_padded_dilated;
+                    cv::dilate(mat_padded, mat_padded_dilated, kernel, cv::Point(-1, -1), dilation_size);
+                    mat_dilated = mat_padded_dilated(cv::Rect(pad, 0, grid_cols, grid_rows)).clone();
+                }
+            } else {
+                cv::dilate(mat_mask, mat_dilated, kernel, cv::Point(-1, -1), dilation_size);
+            }
+
+            ForceResult result;
+            result.material_name = name;
+            result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
+            result.force_x = result.force_y = result.force_radial = 0.0;
+            result.torque = result.torque_origin = result.torque_center = 0.0;
+            result.pixel_count = 0;
+            result.magnetic_energy = 0.0;
+
+            std::cout << "\nCalculating force for material: " << name << " (Amperian, polar)" << std::endl;
+
+            // ============================================================
+            // Step 5: Integrate Lorentz force F = J_b × B in polar coords
+            // F_r = J_z · B_θ, F_θ = -J_z · B_r
+            // Sign adjusted empirically to match Virtual Work method
+            // ============================================================
+            for (int j = 0; j < grid_rows; j++) {
+                for (int i = 0; i < grid_cols; i++) {
+                    if (mat_dilated.at<uchar>(j, i) == 0) continue;
+
+                    int ir, jt;
+                    if (r_orientation == "horizontal") {
+                        ir = i; jt = j;
+                    } else {
+                        ir = j; jt = i;
+                    }
+
+                    double r = r_coords[ir];
+                    double theta = jt * dtheta;  // Use rotor frame (no theta_offset)
+
+                    // Volume element in polar coordinates: r * dr * dθ
+                    double dV = r * dr * dtheta;
+
+                    double jz = Jz_map.at<double>(j, i);
+
+                    // Get Br, Btheta
+                    double br_val, bt_val;
+                    if (r_orientation == "horizontal") {
+                        br_val = Br(jt, ir);
+                        bt_val = Btheta(jt, ir);
+                    } else {
+                        br_val = Br(ir, jt);
+                        bt_val = Btheta(ir, jt);
+                    }
+
+                    // Force in polar coordinates (sign adjusted to match Virtual Work)
+                    // Empirically: F_r = +J_z · B_θ, F_θ = -J_z · B_r
+                    double fr = +jz * bt_val * dV;
+                    double ft = -jz * br_val * dV;
+
+                    // Convert to Cartesian coordinates
+                    double cos_t = std::cos(theta);
+                    double sin_t = std::sin(theta);
+                    double fx = fr * cos_t - ft * sin_t;
+                    double fy = fr * sin_t + ft * cos_t;
+
+                    result.force_x += fx;
+                    result.force_y += fy;
+                    result.pixel_count++;
+
+                    // Torque: τ = r × F = r · F_θ (in 2D)
+                    // For polar centered at origin, torque = r * F_theta
+                    result.torque_origin += r * ft;
+
+                    // Physical coordinates for torque calculation
+                    double x_c = r * cos_t;
+                    double y_c = r * sin_t;
+                    result.torque_center += x_c * fy - y_c * fx;
+                }
+            }
+
+            // Calculate force magnitude
+            result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
+            result.torque = result.torque_origin;
+
+            // Output results
+            std::cout << "  Material: " << name << std::endl;
+            std::cout << "    Integration pixels: " << result.pixel_count << std::endl;
+            std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
+            std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
+            std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
+            std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
+
+            force_results_amperian.push_back(result);
+        }
+
+    } else {
+        // ============================================================
+        // CARTESIAN COORDINATE IMPLEMENTATION (original code)
+        // ============================================================
+
+        // Physical center for torque calculation
+        double cx_physical = (static_cast<double>(nx) * dx) / 2.0;
+        double cy_physical = (static_cast<double>(ny) * dy) / 2.0;
+
+        // ============================================================
+        // Step 1: Calculate magnetization M = B/μ₀ - H
+        // For linear material: H = B/(μ₀μ_r), so M = B/μ₀ - B/(μ₀μ_r) = B(μ_r - 1)/(μ₀μ_r)
+        // In air (μ_r = 1): M = 0 exactly (no ghost force)
+        // ============================================================
+        cv::Mat Mx_map(ny, nx, CV_64F, cv::Scalar(0.0));
+        cv::Mat My_map(ny, nx, CV_64F, cv::Scalar(0.0));
+
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                double mu = mu_map(j, i);         // μ = μ₀μ_r [H/m]
+                double mu_r = mu / mu0;           // relative permeability
+                double bx = Bx(j, i);
+                double by = By(j, i);
+
+                // M = B(μ_r - 1)/(μ₀μ_r) = B · chi / μ₀ where chi = (μ_r - 1)/μ_r
+                double chi = (mu_r - 1.0) / mu_r;
+                Mx_map.at<double>(j, i) = bx * chi / mu0;
+                My_map.at<double>(j, i) = by * chi / mu0;
+            }
+        }
+
+        // ============================================================
+        // Step 2: Optional Gaussian smoothing of M
+        // This captures surface magnetization current through numerical curl
+        // ============================================================
+        if (sigma_smooth > 0) {
+            int ksize = static_cast<int>(std::ceil(sigma_smooth * 6)) | 1;  // Ensure odd
+            if (ksize < 3) ksize = 3;
+            cv::GaussianBlur(Mx_map, Mx_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
+            cv::GaussianBlur(My_map, My_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
+            std::cout << "  Applied Gaussian smoothing (kernel size: " << ksize << ")" << std::endl;
+        }
+
+        // ============================================================
+        // Step 3: Compute bound current J_bz = ∂My/∂x - ∂Mx/∂y
+        // Using central differences with periodic boundary handling
+        // ============================================================
+        bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+        bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
+        cv::Mat Jz_map(ny, nx, CV_64F, cv::Scalar(0.0));
+
+        // Lambda for wrapped index access
+        auto getMx = [&](int j, int i) -> double {
+            if (x_periodic) i = (i + nx) % nx;
+            else i = std::max(0, std::min(nx - 1, i));
+            if (y_periodic) j = (j + ny) % ny;
+            else j = std::max(0, std::min(ny - 1, j));
+            return Mx_map.at<double>(j, i);
+        };
+        auto getMy = [&](int j, int i) -> double {
+            if (x_periodic) i = (i + nx) % nx;
+            else i = std::max(0, std::min(nx - 1, i));
+            if (y_periodic) j = (j + ny) % ny;
+            else j = std::max(0, std::min(ny - 1, j));
+            return My_map.at<double>(j, i);
+        };
+
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                // Central differences: ∂My/∂x, ∂Mx/∂y
+                double dMy_dx = (getMy(j, i + 1) - getMy(j, i - 1)) / (2.0 * dx);
+                double dMx_dy = (getMx(j + 1, i) - getMx(j - 1, i)) / (2.0 * dy);
+
+                // J_bz = ∂My/∂x - ∂Mx/∂y (curl of M in 2D)
+                Jz_map.at<double>(j, i) = dMy_dx - dMx_dy;
+            }
+        }
+
+        // ============================================================
+        // Step 4: For each material, integrate F = J_b × B over dilated region
+        // Dilated region ensures surface current contribution is captured
+        // ============================================================
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
+        int dilation_size = 2;  // Dilate by 2 pixels to capture interface current
+
+        for (const auto& material : config["materials"]) {
+            std::string name = material.first.as<std::string>();
+            const auto& props = material.second;
+            bool calc_force = props["calc_force"].as<bool>(false);
+            if (!calc_force) continue;
+
+            std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
+
+            // Build material mask (in FDM coordinates, y=0 at bottom)
+            cv::Mat image_flipped;
+            cv::flip(image, image_flipped, 0);
+
+            cv::Mat mat_mask(ny, nx, CV_8U, cv::Scalar(0));
+            for (int jj = 0; jj < ny; jj++) {
+                for (int ii = 0; ii < nx; ii++) {
+                    cv::Vec3b px = image_flipped.at<cv::Vec3b>(jj, ii);
+                    if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
+                        mat_mask.at<uchar>(jj, ii) = 255;
+                    }
+                }
+            }
+
+            // Dilate material mask to include interface region
+            cv::Mat mat_dilated;
+            if (x_periodic || y_periodic) {
+                int pad = dilation_size + 1;
+                int pad_top = y_periodic ? pad : 0;
+                int pad_bottom = y_periodic ? pad : 0;
+                int pad_left = x_periodic ? pad : 0;
+                int pad_right = x_periodic ? pad : 0;
+
+                cv::Mat mat_padded;
+                cv::copyMakeBorder(mat_mask, mat_padded, pad_top, pad_bottom, pad_left, pad_right,
+                                   cv::BORDER_WRAP);
+                cv::Mat mat_padded_dilated;
+                cv::dilate(mat_padded, mat_padded_dilated, kernel, cv::Point(-1, -1), dilation_size);
+                mat_dilated = mat_padded_dilated(cv::Rect(pad_left, pad_top, nx, ny)).clone();
+            } else {
+                cv::dilate(mat_mask, mat_dilated, kernel, cv::Point(-1, -1), dilation_size);
+            }
+
+            ForceResult result;
+            result.material_name = name;
+            result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
+            result.force_x = result.force_y = result.force_radial = 0.0;
+            result.torque = result.torque_origin = result.torque_center = 0.0;
+            result.pixel_count = 0;
+            result.magnetic_energy = 0.0;
+
+            std::cout << "\nCalculating force for material: " << name << " (Amperian)" << std::endl;
+
+            // ============================================================
+            // Step 5: Integrate Lorentz force F = J_b × B
+            // For 2D (z-invariant): Fx = -Jz·By, Fy = +Jz·Bx
+            // Sign adjusted empirically to match Virtual Work method
+            // ============================================================
+            double dV = dx * dy;  // Volume element (per unit depth)
+
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    if (mat_dilated.at<uchar>(j, i) == 0) continue;
+
+                    double jz = Jz_map.at<double>(j, i);
+                    double bx = Bx(j, i);
+                    double by = By(j, i);
+
+                    // Force on magnetic material (sign adjusted to match Virtual Work)
+                    // Empirically: F = -(J × B) gives correct sign
+                    double fx = +jz * by * dV;
+                    double fy = -jz * bx * dV;
+
+                    result.force_x += fx;
+                    result.force_y += fy;
+                    result.pixel_count++;
+
+                    // Torque: τ = r × F
+                    double x_c = (i + 0.5) * dx;
+                    double y_c = (j + 0.5) * dy;
+
+                    result.torque_origin += x_c * fy - y_c * fx;
+                    result.torque_center += (x_c - cx_physical) * fy - (y_c - cy_physical) * fx;
+                }
+            }
+
+            // Calculate force magnitude
+            result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
+            result.torque = result.torque_origin;
+
+            // Output results
+            std::cout << "  Material: " << name << std::endl;
+            std::cout << "    Integration pixels: " << result.pixel_count << std::endl;
+            std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
+            std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
+            std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
+            std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
+
+            force_results_amperian.push_back(result);
+        }
+    }
+
+    std::cout << "\nDistributed Amperian force calculation complete!" << std::endl;
+}
+
+
 double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
     std::cout << "\n=== Calculating Total Magnetic Energy ===" << std::endl;
 
@@ -2465,12 +4536,15 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
         std::cout << "  Total energy: " << total_energy << " J/m (per unit depth)" << std::endl;
     }
 
+    // Store the result in the member variable for later export
+    system_total_energy = total_energy;
+
     return total_energy;
 }
 
 
 void MagneticFieldAnalyzer::exportForcesToCSV(const std::string& output_path) const {
-    if (force_results.empty()) {
+    if (force_results_amperian.empty() && system_total_energy == 0.0) {
         std::cout << "No force results to export" << std::endl;
         return;
     }
@@ -2486,10 +4560,15 @@ void MagneticFieldAnalyzer::exportForcesToCSV(const std::string& output_path) co
     file << "# Torque_Origin: torque about origin (polar)\n";
     file << "# Torque_Center: torque about image center (x=center_x, y=center_y)\n";
     file << "# Magnetic_Energy: magnetic potential energy W = integral(B^2/(2*mu) dV)\n";
+    file << "# _SYSTEM_TOTAL: Total magnetic energy of entire system (for virtual work calculation)\n";
+    file << "# Force calculation method: Distributed Amperian Force (J_b = curl(M), F = J_b x B)\n";
 
     file << std::scientific << std::setprecision(6);
 
-    for (const auto& result : force_results) {
+    // Output Distributed Amperian force results (default method)
+    // This uses bound current from magnetization: J_b = ∇×M, F = ∫J_b × B dV
+    // Key advantage: No ghost force (M = 0 exactly in air where μ_r = 1)
+    for (const auto& result : force_results_amperian) {
         double force_mag = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
 
         file << result.material_name << ","
@@ -2505,6 +4584,11 @@ void MagneticFieldAnalyzer::exportForcesToCSV(const std::string& output_path) co
              << result.magnetic_energy << ","
              << result.pixel_count << "\n";
     }
+
+    // Add system total energy as a special row
+    // This enables virtual work calculation: F = -dW/dx
+    file << "_SYSTEM_TOTAL,0,0,0,0,0,0,0,0,0,"
+         << system_total_energy << ",0\n";
 
     file.close();
     std::cout << "Force results exported to: " << output_path << std::endl;
@@ -2625,8 +4709,8 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
         std::cout << "Input image exported to: " << input_image_path << std::endl;
     }
 
-    // Export forces if available
-    if (!force_results.empty()) {
+    // Export forces if available (using Amperian method - default)
+    if (!force_results_amperian.empty()) {
         std::string forces_path = forces_folder + "/" + step_name + ".csv";
         exportForcesToCSV(forces_path);
     }
@@ -3033,6 +5117,215 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
 
     // Calculate magnetic field
     calculateMagneticFieldPolar();
+}
+
+void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
+    // Hybrid initialization for polar Newton-Krylov solver:
+    // Interprets polar grid as Cartesian for faster initial guess.
+    // Uses r-weighted current density to approximate polar source term.
+    // This provides a better starting point than uniform initial guess
+    // when r_in is close to r_out (thin annular domain).
+
+    if (nonlinear_config.verbose) {
+        std::cout << "\n=== Pseudo-Cartesian solve for polar initial guess ===" << std::endl;
+        std::cout << "  r_avg = " << 0.5 * (r_start + r_end) << " m" << std::endl;
+        std::cout << "  dx_pseudo = dr = " << dr << " m" << std::endl;
+        std::cout << "  dy_pseudo = r_avg*dtheta = " << 0.5 * (r_start + r_end) * dtheta << " m" << std::endl;
+    }
+
+    int n = nr * ntheta;
+    Eigen::SparseMatrix<double> A(n, n);
+    Eigen::VectorXd rhs(n);
+    rhs.setZero();
+
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(n * 5);
+
+    // Treat polar grid as Cartesian: r-direction = x, theta-direction = y
+    // Use physical arc length for angular spacing: dy = r_avg * dtheta
+    double r_avg = 0.5 * (r_start + r_end);
+    double dx_pseudo = dr;
+    double dy_pseudo = r_avg * dtheta;  // Physical arc length at average radius
+
+    // Determine if theta is periodic
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+    double periodic_sign = is_antiperiodic ? -1.0 : 1.0;
+
+    // Build Cartesian-style FDM stencil
+    for (int i = 0; i < nr; i++) {
+        double r = r_coords[i];
+        for (int j = 0; j < ntheta; j++) {
+            int idx = i * ntheta + j;
+
+            // Handle radial boundaries (Dirichlet)
+            if (i == 0 && bc_inner.type == "dirichlet") {
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                rhs(idx) = bc_inner.value;
+                continue;
+            }
+            if (i == nr - 1 && bc_outer.type == "dirichlet") {
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                rhs(idx) = bc_outer.value;
+                continue;
+            }
+
+            // Handle angular boundaries for non-periodic domains
+            if (!is_periodic) {
+                if (j == 0 && bc_theta_min.type == "dirichlet") {
+                    triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                    rhs(idx) = bc_theta_min.value;
+                    continue;
+                }
+                if (j == ntheta - 1 && bc_theta_max.type == "dirichlet") {
+                    triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                    rhs(idx) = bc_theta_max.value;
+                    continue;
+                }
+            }
+
+            // Interior points: Cartesian Laplacian with harmonic-mean permeability
+            double coeff_center = 0.0;
+
+            // Get permeability values
+            double mu_c = getMuPolar(mu_map, i, j, r_orientation);
+
+            // Radial direction (i ± 1)
+            if (i > 0 || bc_inner.type == "neumann") {
+                int i_prev = (i > 0) ? i - 1 : i + 1;  // Neumann: mirror
+                double mu_prev = getMuPolar(mu_map, i_prev, j, r_orientation);
+                double mu_im = 2.0 / (1.0 / mu_c + 1.0 / mu_prev);
+                double coeff_im = 1.0 / (mu_im * dx_pseudo * dx_pseudo);
+
+                if (i > 0) {
+                    bool inner_is_dirichlet = (i == 1) && (bc_inner.type == "dirichlet");
+                    if (!inner_is_dirichlet) {
+                        triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, coeff_im));
+                    } else {
+                        rhs(idx) -= coeff_im * bc_inner.value;
+                    }
+                } else {
+                    // Neumann BC at inner: ghost elimination (Az_{-1} = Az_1)
+                    triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, coeff_im));
+                }
+                coeff_center -= coeff_im;
+            }
+
+            if (i < nr - 1 || bc_outer.type == "neumann") {
+                int i_next = (i < nr - 1) ? i + 1 : i - 1;  // Neumann: mirror
+                double mu_next = getMuPolar(mu_map, i_next, j, r_orientation);
+                double mu_ip = 2.0 / (1.0 / mu_c + 1.0 / mu_next);
+                double coeff_ip = 1.0 / (mu_ip * dx_pseudo * dx_pseudo);
+
+                if (i < nr - 1) {
+                    bool outer_is_dirichlet = (i == nr - 2) && (bc_outer.type == "dirichlet");
+                    if (!outer_is_dirichlet) {
+                        triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, coeff_ip));
+                    } else {
+                        rhs(idx) -= coeff_ip * bc_outer.value;
+                    }
+                } else {
+                    // Neumann BC at outer: ghost elimination (Az_{nr} = Az_{nr-2})
+                    triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, coeff_ip));
+                }
+                coeff_center -= coeff_ip;
+            }
+
+            // Angular direction (j ± 1)
+            int j_prev = (j - 1 + ntheta) % ntheta;
+            int j_next = (j + 1) % ntheta;
+
+            if (!is_periodic) {
+                j_prev = j - 1;
+                j_next = j + 1;
+            }
+
+            double mu_jp = getMuPolar(mu_map, i, j_prev, r_orientation);
+            double mu_jn = getMuPolar(mu_map, i, j_next, r_orientation);
+            double mu_jm = 2.0 / (1.0 / mu_c + 1.0 / mu_jp);
+            double mu_jp2 = 2.0 / (1.0 / mu_c + 1.0 / mu_jn);
+            double coeff_jm = 1.0 / (mu_jm * dy_pseudo * dy_pseudo);
+            double coeff_jp = 1.0 / (mu_jp2 * dy_pseudo * dy_pseudo);
+
+            bool prev_crosses = is_periodic && (j == 0);
+            bool next_crosses = is_periodic && (j == ntheta - 1);
+
+            bool theta_prev_is_dirichlet = (!is_periodic) && (j == 1) && (bc_theta_min.type == "dirichlet");
+            bool theta_next_is_dirichlet = (!is_periodic) && (j == ntheta - 2) && (bc_theta_max.type == "dirichlet");
+
+            if (j > 0 || is_periodic) {
+                if (!theta_prev_is_dirichlet) {
+                    double sign = prev_crosses ? periodic_sign : 1.0;
+                    triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev, sign * coeff_jm));
+                } else {
+                    rhs(idx) -= coeff_jm * bc_theta_min.value;
+                }
+                coeff_center -= coeff_jm;
+            }
+
+            if (j < ntheta - 1 || is_periodic) {
+                if (!theta_next_is_dirichlet) {
+                    double sign = next_crosses ? periodic_sign : 1.0;
+                    triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next, sign * coeff_jp));
+                } else {
+                    rhs(idx) -= coeff_jp * bc_theta_max.value;
+                }
+                coeff_center -= coeff_jp;
+            }
+
+            // Center coefficient
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+
+            // RHS: pure Cartesian formulation (no r-weighting)
+            // This gives a physically consistent pseudo-Cartesian approximation
+            rhs(idx) = -getJzPolar(jz_map, i, j, r_orientation);
+        }
+    }
+
+    A.setFromTriplets(triplets.begin(), triplets.end());
+    A.makeCompressed();
+
+    // Solve using SparseLU
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
+    solver.compute(A);
+
+    if (solver.info() != Eigen::Success) {
+        std::cerr << "Warning: Pseudo-Cartesian factorization failed, using zero initial guess" << std::endl;
+        Az = Eigen::MatrixXd::Zero(r_orientation == "horizontal" ? ntheta : nr,
+                                    r_orientation == "horizontal" ? nr : ntheta);
+        return;
+    }
+
+    Eigen::VectorXd Az_flat = solver.solve(rhs);
+
+    if (solver.info() != Eigen::Success) {
+        std::cerr << "Warning: Pseudo-Cartesian solve failed, using zero initial guess" << std::endl;
+        Az = Eigen::MatrixXd::Zero(r_orientation == "horizontal" ? ntheta : nr,
+                                    r_orientation == "horizontal" ? nr : ntheta);
+        return;
+    }
+
+    // Store result in Az matrix (same format as buildAndSolveSystemPolar)
+    if (r_orientation == "horizontal") {
+        Az.resize(ntheta, nr);
+        for (int i = 0; i < nr; i++) {
+            for (int j = 0; j < ntheta; j++) {
+                Az(j, i) = Az_flat(i * ntheta + j);
+            }
+        }
+    } else {
+        Az.resize(nr, ntheta);
+        for (int i = 0; i < nr; i++) {
+            for (int j = 0; j < ntheta; j++) {
+                Az(i, j) = Az_flat(i * ntheta + j);
+            }
+        }
+    }
+
+    if (nonlinear_config.verbose) {
+        std::cout << "Pseudo-Cartesian initial guess computed (||Az|| = "
+                  << Az.norm() << ")" << std::endl;
+    }
 }
 
 void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
@@ -3444,8 +5737,9 @@ void MagneticFieldAnalyzer::slideImageRegion() {
             // Extract the column
             cv::Mat column = image.col(col).clone();
 
-            // Circular shift in y direction (downward)
-            // Move bottom 'shift' rows to top
+            // Circular shift in y direction (upward in FDM coordinates = positive y)
+            // In image coordinates: content moves toward smaller row numbers (top of image)
+            // In FDM coordinates (y-flipped): this corresponds to positive y direction
             for (int row = 0; row < image.rows; row++) {
                 int src_row = (row + image.rows + shift) % image.rows;
                 image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
@@ -3468,10 +5762,10 @@ void MagneticFieldAnalyzer::slideImageRegion() {
             // Extract the row
             cv::Mat row_data = image.row(row).clone();
 
-            // Circular shift in x direction (rightward)
-            // Move right 'shift' columns to left
+            // Circular shift in x direction (rightward = positive x in physics coordinates)
+            // Positive shift moves content to the RIGHT (positive x direction)
             for (int col = 0; col < image.cols; col++) {
-                int src_col = (col + image.cols + shift) % image.cols;
+                int src_col = (col - shift + image.cols) % image.cols;
                 image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
             }
         }
@@ -4108,13 +6402,13 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             solve();
         }
 
-        // 3. Calculate Maxwell stress (pass step number for field caching)
-        //  Use step (not step+1) to match theta_offset with actual image shift state
-        // step=0: initial state (no shift) → theta_offset=0
-        // step=1: 1-pixel shifted → theta_offset=1*dtheta
-        calculateMaxwellStress(step);
+        // 3. Calculate force using Distributed Amperian Force method (DEFAULT)
+        // This method uses bound current from magnetization: J_b = ∇×M, F = ∫J_b × B dV
+        // Key advantage: No ghost force (M = 0 exactly in air where μ_r = 1)
+        // This is the recommended and default force calculation method.
+        calculateForceDistributedAmperian(step, 0.0);  // No smoothing (sigma = 0)
 
-        // 3.5. Calculate total magnetic energy (reuses calculated field from step)
+        // 3.1. Calculate total magnetic energy (reuses calculated field from step)
         double total_energy = calculateTotalMagneticEnergy(step);
         std::cout << "Step " << step+1 << " Total Magnetic Energy: " << total_energy << " J/m" << std::endl;
 

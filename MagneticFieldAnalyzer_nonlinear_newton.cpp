@@ -1,18 +1,15 @@
 /**
  * @file MagneticFieldAnalyzer_nonlinear_newton.cpp
- * @brief Complete Newton-Krylov solver for nonlinear materials
+ * @brief Newton-Krylov solver for nonlinear materials
  *
  * Implements:
- * - Jacobian-free Newton-Krylov method
- * - AMGCL preconditioner for inner GMRES
- * - Line search for globalization
- * - Energy-based convergence
+ * - Newton-Krylov method with analytical Jacobian diagonal correction
+ * - Armijo backtracking line search for globalization
+ * - Optional Anderson acceleration for improved convergence
  *
  * Theory:
  * PDE: R(Az) = ∇·(ν(H(Az)) ∇Az) + Jz = 0
  * where ν = 1/μ, H = |B|/μ, B = ∇×Az
- *
- * Jacobian action: J[δA] = ∇·(ν ∇δA) + ∇·((dν/dH)(dH/d|B|)(B·(∇×δA)/|B|) ∇A)
  */
 
 #include "MagneticFieldAnalyzer.h"
@@ -22,281 +19,6 @@
 #include <fstream>
 #include <cmath>
 #include <Eigen/Dense>
-#include <amgcl/make_solver.hpp>
-#include <amgcl/solver/gmres.hpp>
-#include <amgcl/amg.hpp>
-#include <amgcl/coarsening/smoothed_aggregation.hpp>
-#include <amgcl/relaxation/spai0.hpp>
-#include <amgcl/adapter/crs_tuple.hpp>
-
-// ============================================
-// Helper Functions for Newton-Krylov
-// ============================================
-
-namespace {
-    const double EPSILON_B = 1e-9;  // Regularization for |B| = 0
-    const double MU_0 = 4.0 * M_PI * 1e-7;
-
-    /**
-     * @brief Compute magnetic energy E = 0.5 ∫ ν |∇A|^2 dΩ - ∫ A·J dΩ
-     */
-    double computeMagneticEnergy(const MagneticFieldAnalyzer& analyzer) {
-        // This is simplified - actual implementation would integrate over domain
-        // For now, return a placeholder (will be computed properly in Phase 4)
-        return 0.0;
-    }
-}
-
-// ============================================
-// Newton-Krylov Solver Implementation
-// ============================================
-
-/**
- * @brief Apply Jacobian-vector product J·v (matrix-free)
- *
- * Theory:
- * J[δA] = ∇·(ν ∇δA) + ∇·(coeff * ∇A)
- * where coeff = (dν/dH) * (dH/d|B|) * (B·(∇×δA) / |B|)
- *             = -(dμ/dH)/μ² * (1/μ) * (B·(∇×δA) / |B|)
- *
- * Steps:
- * 1. first_term = ∇·(ν ∇δA)  [linear operator]
- * 2. δB = ∇×δA  [curl of perturbation]
- * 3. s = B·δB  [dot product]
- * 4. t = s / max(|B|, ε)  [regularized division]
- * 5. coeff = (dν/dH) * (1/μ) * t
- * 6. second_term = ∇·(coeff * ∇A)
- * 7. Jv = first_term + second_term
- *
- * @param deltaA Perturbation vector (flattened Az)
- * @param Jv Output: J·deltaA
- */
-void applyJacobianVector_Cartesian(
-    const MagneticFieldAnalyzer& analyzer,
-    const Eigen::MatrixXd& Az,
-    const Eigen::MatrixXd& Bx,
-    const Eigen::MatrixXd& By,
-    const Eigen::MatrixXd& nu_map,
-    const Eigen::MatrixXd& H_map,
-    const std::map<std::string, MagneticFieldAnalyzer::MuValue>& material_mu,
-    const cv::Mat& image,
-    const YAML::Node& config,
-    const Eigen::VectorXd& deltaA,
-    Eigen::VectorXd& Jv,
-    int nx, int ny, double dx, double dy)
-{
-    // Reshape deltaA to matrix form
-    Eigen::MatrixXd deltaAz = Eigen::Map<const Eigen::MatrixXd>(deltaA.data(), ny, nx);
-
-    // ===== Step 1: First term = ∇·(ν ∇δA) =====
-    // This is a standard Laplacian with coefficient ν
-    // We'll compute it using finite differences
-
-    Eigen::MatrixXd first_term = Eigen::MatrixXd::Zero(ny, nx);
-
-    for (int j = 1; j < ny - 1; j++) {
-        for (int i = 1; i < nx - 1; i++) {
-            // Centered differences for ∇δA
-            double d2_dx2 = (deltaAz(j, i+1) - 2.0*deltaAz(j, i) + deltaAz(j, i-1)) / (dx * dx);
-            double d2_dy2 = (deltaAz(j+1, i) - 2.0*deltaAz(j, i) + deltaAz(j-1, i)) / (dy * dy);
-
-            // Coefficient at interfaces (harmonic mean for ν)
-            double nu_center = nu_map(j, i);
-
-            first_term(j, i) = nu_center * (d2_dx2 + d2_dy2);
-        }
-    }
-
-    // ===== Step 2: Compute δB = ∇×δA =====
-    Eigen::MatrixXd deltaBx = Eigen::MatrixXd::Zero(ny, nx);
-    Eigen::MatrixXd deltaBy = Eigen::MatrixXd::Zero(ny, nx);
-
-    for (int j = 1; j < ny - 1; j++) {
-        for (int i = 1; i < nx - 1; i++) {
-            // δBx = ∂δA/∂y
-            deltaBx(j, i) = (deltaAz(j+1, i) - deltaAz(j-1, i)) / (2.0 * dy);
-            // δBy = -∂δA/∂x
-            deltaBy(j, i) = -(deltaAz(j, i+1) - deltaAz(j, i-1)) / (2.0 * dx);
-        }
-    }
-
-    // ===== Step 3-6: Second term = ∇·(coeff * ∇A) =====
-    Eigen::MatrixXd coeff = Eigen::MatrixXd::Zero(ny, nx);
-
-    // Compute ∇A (gradient of current solution)
-    Eigen::MatrixXd gradAx = Eigen::MatrixXd::Zero(ny, nx);
-    Eigen::MatrixXd gradAy = Eigen::MatrixXd::Zero(ny, nx);
-
-    for (int j = 1; j < ny - 1; j++) {
-        for (int i = 1; i < nx - 1; i++) {
-            gradAx(j, i) = (Az(j, i+1) - Az(j, i-1)) / (2.0 * dx);
-            gradAy(j, i) = (Az(j+1, i) - Az(j-1, i)) / (2.0 * dy);
-        }
-    }
-
-    // Compute coefficient: coeff = (dν/dH) * (1/μ) * (B·δB / |B|)
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            double B_mag = std::sqrt(Bx(j, i)*Bx(j, i) + By(j, i)*By(j, i));
-            B_mag = std::max(B_mag, EPSILON_B);  // Regularization
-
-            // s = B·δB
-            double s = Bx(j, i) * deltaBx(j, i) + By(j, i) * deltaBy(j, i);
-
-            // t = s / |B|
-            double t = s / B_mag;
-
-            // Find material at this pixel and get dμ/dH
-            double dmu_dH = 0.0;
-            double mu_val = nu_map(j, i) * MU_0;  // Convert ν back to μ
-
-            // Look up material
-            cv::Vec3b pixel = image.at<cv::Vec3b>(j, i);
-            cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
-
-            for (const auto& mat : config["materials"]) {
-                std::string name = mat.first.as<std::string>();
-                YAML::Node props = mat.second;
-                if (!props["rgb"]) continue;
-
-                auto yaml_rgb = props["rgb"];
-                cv::Scalar mat_rgb(
-                    yaml_rgb[0].as<int>(),
-                    yaml_rgb[1].as<int>(),
-                    yaml_rgb[2].as<int>()
-                );
-
-                if (rgb == mat_rgb) {
-                    auto it = material_mu.find(name);
-                    if (it != material_mu.end()) {
-                        double H_mag = H_map(j, i);
-                        dmu_dH = const_cast<MagneticFieldAnalyzer&>(analyzer).evaluateMuDerivative(it->second, H_mag);
-                    }
-                    break;
-                }
-            }
-
-            // dν/dH = -(dμ/dH) / μ²
-            double dnu_dH = -(dmu_dH * MU_0) / (mu_val * mu_val);
-
-            // coeff = (dν/dH) * (dH/d|B|) * t
-            // Note: dH/d|B| = 1/μ
-            coeff(j, i) = dnu_dH * (1.0 / mu_val) * t;
-        }
-    }
-
-    // Compute ∇·(coeff * ∇A)
-    Eigen::MatrixXd second_term = Eigen::MatrixXd::Zero(ny, nx);
-
-    for (int j = 1; j < ny - 1; j++) {
-        for (int i = 1; i < nx - 1; i++) {
-            // Compute d/dx(coeff * dA/dx) + d/dy(coeff * dA/dy)
-            double flux_x_right = coeff(j, i) * gradAx(j, i);
-            double flux_x_left = coeff(j, i) * gradAx(j, i);
-            double flux_y_top = coeff(j, i) * gradAy(j, i);
-            double flux_y_bottom = coeff(j, i) * gradAy(j, i);
-
-            double div_flux_x = (flux_x_right - flux_x_left) / dx;
-            double div_flux_y = (flux_y_top - flux_y_bottom) / dy;
-
-            second_term(j, i) = div_flux_x + div_flux_y;
-        }
-    }
-
-    // ===== Step 7: Jv = first_term + second_term =====
-    Eigen::MatrixXd Jv_matrix = first_term + second_term;
-
-    // Flatten back to vector
-    Jv = Eigen::Map<Eigen::VectorXd>(Jv_matrix.data(), Jv_matrix.size());
-}
-
-/**
- * @brief Jacobian-free GMRES solver with AMGCL preconditioner
- *
- * Implements flexible GMRES that uses:
- * - Matrix-free Jacobian-vector product via applyJacobianVector_Cartesian
- * - AMGCL preconditioner (approximate inverse of L matrix)
- *
- * Algorithm: Preconditioned Richardson iteration (simple but effective)
- *   x_{k+1} = x_k + M^{-1}(b - J·x_k)
- * where M^{-1} ≈ L^{-1} (AMGCL solver)
- */
-void solveLinearSystem_JacobianFreeGMRES(
-    const MagneticFieldAnalyzer& analyzer,
-    const Eigen::MatrixXd& Az,
-    const Eigen::MatrixXd& Bx,
-    const Eigen::MatrixXd& By,
-    const Eigen::MatrixXd& nu_map,
-    const Eigen::MatrixXd& H_map,
-    const std::map<std::string, MagneticFieldAnalyzer::MuValue>& material_mu,
-    const cv::Mat& image,
-    const YAML::Node& config,
-    const Eigen::SparseMatrix<double>& L_matrix,
-    const Eigen::VectorXd& rhs,
-    Eigen::VectorXd& solution,
-    int nx, int ny, double dx, double dy,
-    double tolerance,
-    int max_iterations)
-{
-    int n = rhs.size();
-    solution = Eigen::VectorXd::Zero(n);
-
-    // Build direct solver as preconditioner (for debugging Jacobian-free method)
-    // TODO: Replace with AMGCL once Jacobian-free Richardson is verified
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> precond;
-    precond.compute(L_matrix);
-    if (precond.info() != Eigen::Success) {
-        std::cerr << "ERROR: Preconditioner factorization failed!" << std::endl;
-        return;
-    }
-
-    // Preconditioned Richardson iteration: x_{k+1} = x_k + M^{-1}(b - J·x_k)
-    for (int iter = 0; iter < max_iterations; iter++) {
-        // Compute residual: r = b - J·x
-        Eigen::VectorXd Jx;
-        applyJacobianVector_Cartesian(
-            analyzer, Az, Bx, By, nu_map, H_map, material_mu,
-            image, config, solution, Jx, nx, ny, dx, dy
-        );
-        Eigen::VectorXd residual = rhs - Jx;
-
-        // Check convergence
-        double res_norm = residual.norm();
-        double rhs_norm = rhs.norm();
-        double rel_res = res_norm / (rhs_norm + 1e-12);
-
-        // DEBUG
-        if (iter == 0) {
-            std::cout << "    [GMRES iter 0] ||r||/||b|| = " << rel_res
-                      << ", ||b|| = " << rhs_norm
-                      << ", ||Jx|| = " << Jx.norm() << std::endl;
-        }
-
-        if (rel_res < tolerance) {
-            std::cout << "    [GMRES converged] iter = " << iter << ", rel_res = " << rel_res << std::endl;
-            return;  // Converged
-        }
-
-        // Apply preconditioner: z = M^{-1} r
-        Eigen::VectorXd z = precond.solve(residual);
-
-        if (iter < 3) {
-            std::cout << "    [GMRES iter " << iter << "] ||z|| = " << z.norm()
-                      << ", ||x_old|| = " << solution.norm();
-        }
-
-        // Update: x = x + z
-        solution += z;
-
-        if (iter < 3) {
-            std::cout << ", ||x_new|| = " << solution.norm() << std::endl;
-        }
-    }
-    std::cout << "    [GMRES] max iterations reached" << std::endl;
-
-    // Log minimized for transient analysis (can be re-enabled for debugging)
-    // std::cout << "  Jacobian-free GMRES: " << max_iterations << " iterations" << std::endl;
-}
 
 /**
  * @brief Main Newton-Krylov solver
@@ -317,15 +39,27 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     const bool VERBOSE = nonlinear_config.verbose;
     const bool is_polar = (coordinate_system != "cartesian");
 
+    // Anderson acceleration settings (shared config)
+    const bool USE_ANDERSON = nonlinear_config.anderson.enabled;
+    const int m_AA = nonlinear_config.anderson.depth;
+    const double beta_AA = nonlinear_config.anderson.beta;
+
     if (VERBOSE) {
         std::cout << "\n=== Newton-Krylov Solver (Jacobian-free + AMGCL) ===" << std::endl;
         std::cout << "Coordinate system: " << coordinate_system << std::endl;
         std::cout << "Max outer iterations: " << MAX_ITER << std::endl;
         std::cout << "Tolerance: " << TOL << std::endl;
+        if (USE_ANDERSON) {
+            std::cout << "Anderson acceleration: enabled (depth=" << m_AA << ", beta=" << beta_AA << ")" << std::endl;
+        }
     }
 
     std::vector<double> residual_history;
     double alpha_prev = nonlinear_config.line_search_alpha_init;  // Previous step length for adaptive algorithm
+
+    // Anderson acceleration storage
+    std::vector<Eigen::VectorXd> Az_history;      // Az^(k) history
+    std::vector<Eigen::VectorXd> g_history;       // g^(k) = Az^(k+1) - Az^(k) history
 
     // Initial guess: solve linear problem with initial μ distribution
     if (VERBOSE) {
@@ -644,14 +378,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             }
         }
 
-        // Apply conservative damping for polar coordinates (Quasi-Newton is less accurate)
-        if (is_polar && iter < 5) {
-            // First few iterations: be very conservative
-            alpha_init *= 0.5;
-        } else if (is_polar) {
-            // Later iterations: moderate damping
-            alpha_init *= 0.7;
-        }
+        // Note: Previous conservative damping for polar coordinates was too aggressive
+        // and caused extremely slow convergence (α=0.05-0.07).
+        // The diagonal Jacobian correction should handle nonlinearity adequately.
+        // If divergence occurs, consider improving the Jacobian approximation instead.
 
         double alpha = alpha_init;
         const double c = nonlinear_config.line_search_c;
@@ -775,7 +505,80 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // Update previous step length for next iteration's adaptive algorithm
         alpha_prev = alpha;
 
-        // ===== Step 7: Report iteration statistics =====
+        // ===== Step 7: Anderson Acceleration =====
+        if (USE_ANDERSON && m_AA > 0) {
+            Eigen::VectorXd g_k = Az_vec - Az_vec_0;  // Actual update
+
+            if (iter >= 1 && g_history.size() > 0) {
+                int m_k = std::min(m_AA, static_cast<int>(g_history.size()));
+
+                // Build matrix of residual differences: ΔG = [g_{k-m_k} - g_k, ..., g_{k-1} - g_k]
+                Eigen::MatrixXd DG(g_k.size(), m_k);
+                for (int j = 0; j < m_k; j++) {
+                    int idx = g_history.size() - m_k + j;
+                    DG.col(j) = g_history[idx] - g_k;
+                }
+
+                // Solve least-squares: min ||DG * θ + g_k||²
+                // Using normal equations: (DG^T * DG) * θ = -DG^T * g_k
+                Eigen::MatrixXd DTD = DG.transpose() * DG;
+                // Add regularization for stability
+                DTD.diagonal().array() += 1e-10;
+                Eigen::VectorXd theta = DTD.ldlt().solve(-DG.transpose() * g_k);
+
+                // Anderson update: Az_new = Az_new + Σ θ_j * (Az_{k-m_k+j} - Az_k + g_{k-m_k+j} - g_k)
+                //                        = Az_new + Σ θ_j * ((Az_{k-m_k+j} + g_{k-m_k+j}) - (Az_k + g_k))
+                // Simplified: Az_AA = (1-Σθ) * Az_new + Σ θ_j * (Az_{k-m_k+j} + g_{k-m_k+j})
+                Eigen::VectorXd Az_anderson = Az_vec;
+                for (int j = 0; j < m_k; j++) {
+                    int idx = g_history.size() - m_k + j;
+                    // Add correction: θ_j * ((x_j + g_j) - (x_k + g_k)) = θ_j * (DX_j + DG_j)
+                    Eigen::VectorXd DX_j = Az_history[idx] - Az_vec_0;
+                    Az_anderson += theta(j) * (DX_j + DG.col(j));
+                }
+
+                // Apply mixing parameter β
+                Az_vec = beta_AA * Az_anderson + (1.0 - beta_AA) * Az_vec;
+
+                // Update Az matrix from Az_vec
+                if (is_polar) {
+                    if (r_orientation == "horizontal") {
+                        for (int i = 0; i < nr; i++) {
+                            for (int j = 0; j < ntheta; j++) {
+                                int idx = i * ntheta + j;
+                                Az(j, i) = Az_vec(idx);
+                            }
+                        }
+                    } else {
+                        for (int i = 0; i < nr; i++) {
+                            for (int j = 0; j < ntheta; j++) {
+                                int idx = i * ntheta + j;
+                                Az(i, j) = Az_vec(idx);
+                            }
+                        }
+                    }
+                } else {
+                    for (int j = 0; j < ny; j++) {
+                        for (int i = 0; i < nx; i++) {
+                            int idx = j * nx + i;
+                            Az(j, i) = Az_vec(idx);
+                        }
+                    }
+                }
+            }
+
+            // Store history
+            Az_history.push_back(Az_vec_0);
+            g_history.push_back(g_k);
+
+            // Limit history size
+            if (static_cast<int>(Az_history.size()) > m_AA + 1) {
+                Az_history.erase(Az_history.begin());
+                g_history.erase(g_history.begin());
+            }
+        }
+
+        // ===== Step 8: Report iteration statistics =====
         double delta_norm = delta_A.norm();
         double Az_norm = Az_vec_0.norm();
 
