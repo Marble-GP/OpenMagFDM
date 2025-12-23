@@ -1436,7 +1436,7 @@ const plotDefinitions = {
     h_magnitude: { name: '|H| Distribution', render: renderHMagnitude },
     mu_distribution: { name: 'Permeability', render: renderMuDistribution },
     energy_density: { name: 'Energy Density', render: renderEnergyDensity },
-    az_boundary: { name: 'Field Lines + Boundary', render: renderAzBoundary },
+    az_boundary: { name: 'Field Lines (on Material)', render: renderAzBoundary },
     step_input_image: { name: 'Step Input Image', render: renderStepInputImage },
     force_x_time: { name: 'Force X-axis', render: renderForceXTime },
     force_y_time: { name: 'Force Y-axis', render: renderForceYTime },
@@ -2508,8 +2508,8 @@ async function renderAzBoundary(containerId, step) {
         // Load Az data with caching
         const azData = await loadCsvData('Az', step);
 
-        // Get boundary image URL
-        const boundaryImgUrl = `/api/get-boundary-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        // Get input image URL (material image as background for field lines)
+        const inputImgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
         container.innerHTML = '';
         const size = getContainerSize(container);
@@ -2528,8 +2528,8 @@ async function renderAzBoundary(containerId, step) {
             // Step 2: Apply dilation to thicken lines (prevent breakage during transformation)
             dilateImage(contourCanvas, 1);
 
-            // Step 3: Load boundary image to canvas
-            const boundaryCanvas = await loadImageToCanvas(boundaryImgUrl);
+            // Step 3: Load input image (material image) to canvas
+            const inputCanvas = await loadImageToCanvas(inputImgUrl);
 
             // Step 4: Transform both images to cartesian coordinates
             // For contour: preserveColors=false (convert black to transparent)
@@ -2540,16 +2540,16 @@ async function renderAzBoundary(containerId, step) {
                 false
             );
 
-            // For boundary: preserveColors=true (keep original colors, only black becomes transparent)
-            const boundaryCartesian = transformPolarImageToCartesian(
-                boundaryCanvas,
+            // For input image: preserveColors=true (keep material colors, only black becomes transparent)
+            const inputCartesian = transformPolarImageToCartesian(
+                inputCanvas,
                 AppState.analysisConditions,
                 AppState.polarFullModel,
                 true
             );
 
-            // Step 5: Merge images (overlay contour lines on boundary)
-            const mergedCanvas = mergeImages(contourCartesian, boundaryCartesian);
+            // Step 5: Merge images (overlay contour lines on material image)
+            const mergedCanvas = mergeImages(contourCartesian, inputCartesian);
 
             // Step 6: Display as image in Plotly
             const mergedImageUrl = mergedCanvas.toDataURL('image/png');
@@ -2598,7 +2598,7 @@ async function renderAzBoundary(containerId, step) {
         } else {
             // Original Plotly contour approach for non-transformed coordinates
             const azFlipped = flipVertical(azData);
-            const transparentBoundaryUrl = await makeBlackTransparent(boundaryImgUrl);
+            const transparentInputUrl = await makeBlackTransparent(inputImgUrl);
 
             const rows = azFlipped.length;
             const cols = azFlipped[0].length;
@@ -2694,7 +2694,7 @@ async function renderAzBoundary(containerId, step) {
                     range: [yMin, yMax]
                 },
                 images: [{
-                    source: transparentBoundaryUrl,
+                    source: transparentInputUrl,
                     xref: 'x',
                     yref: 'y',
                     x: xMin,
@@ -2715,7 +2715,7 @@ async function renderAzBoundary(containerId, step) {
             setupZoomTracking(containerId);
         }
     } catch (error) {
-        console.error('Az+Boundary render error:', error);
+        console.error('Field Lines + Material Image render error:', error);
         container.innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
     }
 }
