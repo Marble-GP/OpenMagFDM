@@ -103,17 +103,17 @@ jobs:
 
     - name: Install dependencies
       run: |
-        brew install cmake
-        brew install eigen
-        brew install opencv
-        brew install yaml-cpp
+        brew install cmake eigen opencv yaml-cpp
 
     - name: Configure CMake
       run: |
-        # Set CMAKE_PREFIX_PATH to help find Homebrew packages
-        export CMAKE_PREFIX_PATH="$(brew --prefix)"
+        # Set paths for Homebrew packages (works for both Intel and ARM)
+        BREW_PREFIX=$(brew --prefix)
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
+          -DCMAKE_PREFIX_PATH="$BREW_PREFIX" \
+          -DCMAKE_INCLUDE_PATH="$BREW_PREFIX/include" \
+          -DCMAKE_LIBRARY_PATH="$BREW_PREFIX/lib" \
+          -Dyaml-cpp_DIR="$BREW_PREFIX/lib/cmake/yaml-cpp"
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
