@@ -61,7 +61,7 @@ jobs:
 
     - name: Install dependencies via vcpkg
       run: |
-        vcpkg install eigen3 opencv yaml-cpp --triplet x64-windows
+        vcpkg install --triplet x64-windows
 
     - name: Configure CMake
       run: |
