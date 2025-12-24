@@ -26,7 +26,9 @@ const AppState = {
     polarFullModel: false,  // Expand to full model
     polarFullModelMultiplier: 1,  // Multiplier for full model (N in 2π/N)
     // Plot zoom state preservation
-    plotZoomStates: {}  // { containerId: { xaxis: { range: [min, max] }, yaxis: { range: [min, max] } } }
+    plotZoomStates: {},  // { containerId: { xaxis: { range: [min, max] }, yaxis: { range: [min, max] } } }
+    // Plotly mode bar visibility
+    showPlotlyModeBar: false  // Show/hide Plotly mode bar for all plots
 };
 
 // ===== Utility Functions =====
@@ -862,6 +864,9 @@ async function loadSelectedResult() {
 
         // Load and display log.txt
         await loadResultLog(resultPath);
+
+        // Auto-reload dashboard plots when result selection changes
+        await updateAllPlots();
     } catch (error) {
         showStatus('solverStatus', `Error loading result: ${error.message}`, 'error');
     }
@@ -1437,6 +1442,7 @@ const plotDefinitions = {
     mu_distribution: { name: 'Permeability', render: renderMuDistribution },
     energy_density: { name: 'Energy Density', render: renderEnergyDensity },
     az_boundary: { name: 'Field Lines (on Material)', render: renderAzBoundary },
+    az_edge: { name: 'Field Lines (on Edge)', render: renderAzEdge },
     step_input_image: { name: 'Step Input Image', render: renderStepInputImage },
     force_x_time: { name: 'Force X-axis', render: renderForceXTime },
     force_y_time: { name: 'Force Y-axis', render: renderForceYTime },
@@ -1456,7 +1462,8 @@ function initializeDashboard() {
         column: 12,
         acceptWidgets: true,
         removable: false,
-        float: true
+        float: true,
+        handle: '.plot-header'  // Only allow dragging from header bar
     }, '#dashboard-grid');
 
     AppState.gridStack = grid;
@@ -1694,12 +1701,70 @@ function toggleInteractionMode(plotId, containerId, button) {
     }
 }
 
+// ===== Reset Interaction Mode =====
+function resetInteractionMode(containerId) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    // Find the interaction mode button
+    const contentElement = container.closest('.grid-stack-item-content');
+    if (!contentElement) return;
+
+    const button = contentElement.querySelector('.interaction-mode-btn');
+    if (!button) return;
+
+    // Reset to Move mode (disabled)
+    button.dataset.mode = 'disabled';
+    button.title = 'Mode: Move';
+
+    // Update button icon
+    const img = button.querySelector('img');
+    if (img) {
+        img.src = '/icon/window.svg';
+    }
+
+    // Update Plotly dragmode to false (allows tile movement)
+    if (container._fullLayout || container.layout) {
+        Plotly.relayout(container, { dragmode: false }).catch(err => {
+            console.error('Failed to reset drag mode:', err);
+        });
+    }
+
+    // Enable GridStack tile movability
+    const widgetEl = container.closest('.grid-stack-item');
+    if (widgetEl && AppState.gridStack) {
+        AppState.gridStack.movable(widgetEl, true);
+    }
+}
+
 // ===== Reset Plot Zoom =====
 function resetPlotZoom(containerId) {
     const container = document.getElementById(containerId);
     if (!container) return;
 
-    if (container.data && container.layout) {
+    // Clear saved zoom state
+    delete AppState.plotZoomStates[containerId];
+
+    // Reset interaction mode to Move
+    resetInteractionMode(containerId);
+
+    // Find plot type from parent element and re-render to reset
+    const contentElement = container.closest('.grid-stack-item-content');
+    if (contentElement) {
+        const plotType = contentElement.dataset.plotType;
+        const plotDef = plotDefinitions[plotType];
+
+        if (plotDef && plotDef.render) {
+            // Re-render the plot to reset to initial state
+            plotDef.render(containerId, AppState.currentStep).catch(err => {
+                console.error('Plot re-render error:', err);
+            });
+            return;
+        }
+    }
+
+    // Fallback to relayout method (for plots without render function)
+    if (container._fullLayout || container.layout) {
         Plotly.relayout(container, {
             'xaxis.autorange': true,
             'yaxis.autorange': true
@@ -1713,12 +1778,59 @@ function resetPlotZoom(containerId) {
 function resetAllPlots() {
     const containers = document.querySelectorAll('.plot-container[id^="container-"]');
     containers.forEach(container => {
-        if (container.data && container.layout) {
+        // Clear saved zoom state
+        if (container.id) {
+            delete AppState.plotZoomStates[container.id];
+        }
+
+        // Reset interaction mode to Move
+        resetInteractionMode(container.id);
+
+        // Find plot type from parent element and re-render to reset
+        const contentElement = container.closest('.grid-stack-item-content');
+        if (contentElement) {
+            const plotType = contentElement.dataset.plotType;
+            const plotDef = plotDefinitions[plotType];
+
+            if (plotDef && plotDef.render) {
+                // Re-render the plot to reset to initial state
+                plotDef.render(container.id, AppState.currentStep).catch(err => {
+                    console.error('Plot re-render error:', err);
+                });
+                return;
+            }
+        }
+
+        // Fallback to relayout method (for plots without render function)
+        if (container._fullLayout || container.layout) {
             Plotly.relayout(container, {
                 'xaxis.autorange': true,
                 'yaxis.autorange': true
             }).catch(err => {
                 console.error('Plotly reset zoom error:', err);
+            });
+        }
+    });
+}
+
+// ===== Toggle Plotly Mode Bar =====
+function togglePlotlyModeBar(show) {
+    AppState.showPlotlyModeBar = show;
+
+    // Update all existing plots
+    const containers = document.querySelectorAll('.plot-container[id^="container-"]');
+    containers.forEach(container => {
+        // Check if this is a Plotly plot
+        if (container._fullLayout) {
+            // Update mode bar visibility using Plotly.relayout
+            Plotly.relayout(container, {
+                'modebar.orientation': 'v'  // Trigger relayout
+            }).then(() => {
+                // Force mode bar visibility update
+                const config = { displayModeBar: show };
+                Plotly.react(container, container.data, container.layout, config);
+            }).catch(err => {
+                console.error('Failed to toggle mode bar:', err);
             });
         }
     });
@@ -2093,6 +2205,121 @@ async function makeBlackTransparent(url, threshold = 30) {
 
         img.onerror = function() {
             reject(new Error('Failed to load boundary image for transparency conversion'));
+        };
+
+        img.src = url;
+    });
+}
+
+/**
+ * Apply Sobel edge detection to an image URL
+ * Returns a canvas with white background and black edges
+ * @param {string} url - Image URL
+ * @returns {Promise<HTMLCanvasElement>} - Canvas with edge detection result
+ */
+async function applySobelEdgeDetection(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'Anonymous';
+
+        img.onload = function() {
+            const width = img.width;
+            const height = img.height;
+
+            // Create canvases
+            const srcCanvas = document.createElement('canvas');
+            srcCanvas.width = width;
+            srcCanvas.height = height;
+            const srcCtx = srcCanvas.getContext('2d');
+
+            const dstCanvas = document.createElement('canvas');
+            dstCanvas.width = width;
+            dstCanvas.height = height;
+            const dstCtx = dstCanvas.getContext('2d');
+
+            // Draw source image
+            srcCtx.drawImage(img, 0, 0);
+            const srcData = srcCtx.getImageData(0, 0, width, height);
+            const src = srcData.data;
+
+            // Prepare output with white background
+            const dstData = dstCtx.createImageData(width, height);
+            const dst = dstData.data;
+
+            // Convert to grayscale first (inline)
+            const gray = new Float32Array(width * height);
+            for (let i = 0; i < width * height; i++) {
+                const idx = i * 4;
+                gray[i] = 0.299 * src[idx] + 0.587 * src[idx + 1] + 0.114 * src[idx + 2];
+            }
+
+            // Sobel kernels
+            const sobelX = [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]];
+            const sobelY = [[-1, -2, -1], [0, 0, 0], [1, 2, 1]];
+
+            // Apply Sobel filter
+            for (let y = 1; y < height - 1; y++) {
+                for (let x = 1; x < width - 1; x++) {
+                    let gx = 0, gy = 0;
+
+                    for (let ky = -1; ky <= 1; ky++) {
+                        for (let kx = -1; kx <= 1; kx++) {
+                            const pixel = gray[(y + ky) * width + (x + kx)];
+                            gx += pixel * sobelX[ky + 1][kx + 1];
+                            gy += pixel * sobelY[ky + 1][kx + 1];
+                        }
+                    }
+
+                    // Calculate gradient magnitude
+                    const magnitude = Math.sqrt(gx * gx + gy * gy);
+
+                    const dstIdx = (y * width + x) * 4;
+                    const srcIdx = (y * width + x) * 4;
+                    const threshold = 30;
+
+                    if (magnitude > threshold) {
+                        // Edge: keep original pixel color
+                        dst[dstIdx] = src[srcIdx];          // R
+                        dst[dstIdx + 1] = src[srcIdx + 1];  // G
+                        dst[dstIdx + 2] = src[srcIdx + 2];  // B
+                    } else {
+                        // Uniform area: white background
+                        dst[dstIdx] = 255;      // R
+                        dst[dstIdx + 1] = 255;  // G
+                        dst[dstIdx + 2] = 255;  // B
+                    }
+                    dst[dstIdx + 3] = 255;  // A (opaque)
+                }
+            }
+
+            // Handle edges (set to white)
+            for (let x = 0; x < width; x++) {
+                // Top row
+                let idx = x * 4;
+                dst[idx] = dst[idx + 1] = dst[idx + 2] = 255;
+                dst[idx + 3] = 255;
+                // Bottom row
+                idx = ((height - 1) * width + x) * 4;
+                dst[idx] = dst[idx + 1] = dst[idx + 2] = 255;
+                dst[idx + 3] = 255;
+            }
+            for (let y = 0; y < height; y++) {
+                // Left column
+                let idx = (y * width) * 4;
+                dst[idx] = dst[idx + 1] = dst[idx + 2] = 255;
+                dst[idx + 3] = 255;
+                // Right column
+                idx = (y * width + width - 1) * 4;
+                dst[idx] = dst[idx + 1] = dst[idx + 2] = 255;
+                dst[idx + 3] = 255;
+            }
+
+            dstCtx.putImageData(dstData, 0, 0);
+            resolve(dstCanvas);
+        };
+
+        img.onerror = function() {
+            reject(new Error('Failed to load image for edge detection'));
         };
 
         img.src = url;
@@ -2567,8 +2794,7 @@ async function renderAzBoundary(containerId, step) {
                 xaxis: {
                     title: 'X [mm]',
                     range: [xMin, xMax],
-                    scaleanchor: 'y',
-                    scaleratio: 1
+                    ...(AppState.polarFullModel && { scaleanchor: 'y', scaleratio: 1 })
                 },
                 yaxis: {
                     title: 'Y [mm]',
@@ -2592,7 +2818,7 @@ async function renderAzBoundary(containerId, step) {
             // Restore saved zoom state if exists
             layout = restoreZoomState(containerId, layout);
 
-            await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: false });
+            await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
             setupZoomTracking(containerId);
 
         } else {
@@ -2703,7 +2929,7 @@ async function renderAzBoundary(containerId, step) {
                     sizey: yMax - yMin,
                     sizing: 'stretch',
                     opacity: 1.0,
-                    layer: 'above'
+                    layer: 'below'
                 }],
                 dragmode: false
             };
@@ -2711,11 +2937,226 @@ async function renderAzBoundary(containerId, step) {
             // Restore saved zoom state if exists
             layout = restoreZoomState(containerId, layout);
 
-            await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: false });
+            await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
             setupZoomTracking(containerId);
         }
     } catch (error) {
         console.error('Field Lines + Material Image render error:', error);
+        container.innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+    }
+}
+
+/**
+ * Render field lines (Az contours) overlaid on edge-detected boundary image
+ * Uses Sobel edge detection on input image for clearer boundary visualization
+ */
+async function renderAzEdge(containerId, step) {
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    try {
+        // Load Az data with caching
+        const azData = await loadCsvData('Az', step);
+
+        // Get input image URL
+        const inputImgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        const coordSys = AppState.analysisConditions?.coordinate_system || 'cartesian';
+
+        // Apply Sobel edge detection to input image
+        const edgeCanvas = await applySobelEdgeDetection(inputImgUrl);
+        const edgeImgUrl = edgeCanvas.toDataURL('image/png');
+
+        // Check if polar coordinate transformation is enabled
+        if (coordSys === 'polar' && AppState.polarCartesianTransform) {
+            // Image-based approach for polar transformation
+            console.log('Using edge detection with polar coordinate transformation');
+
+            // Step 1: Draw contour lines to canvas (in polar coordinates)
+            const contourCanvas = drawContourToCanvas(azData);
+
+            // Step 2: Apply dilation to thicken lines
+            dilateImage(contourCanvas, 1);
+
+            // Step 3: Transform edge image to cartesian coordinates
+            const edgeCartesian = transformPolarImageToCartesian(
+                edgeCanvas,
+                AppState.analysisConditions,
+                AppState.polarFullModel,
+                true
+            );
+
+            // Step 4: Transform contour to cartesian coordinates
+            const contourCartesian = transformPolarImageToCartesian(
+                contourCanvas,
+                AppState.analysisConditions,
+                AppState.polarFullModel,
+                false
+            );
+
+            // Step 5: Merge images (overlay contour lines on edge image)
+            const mergedCanvas = mergeImages(contourCartesian, edgeCartesian);
+            const mergedImageUrl = mergedCanvas.toDataURL('image/png');
+
+            const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
+            const xMin = -r_o * 1000;
+            const xMax = r_o * 1000;
+            const yMin = -r_o * 1000;
+            const yMax = r_o * 1000;
+
+            let layout = {
+                width: size.width,
+                height: size.height,
+                margin: { l: 35, r: 10, t: 10, b: 35 },
+                xaxis: {
+                    title: 'X [mm]',
+                    range: [xMin, xMax],
+                    ...(AppState.polarFullModel && { scaleanchor: 'y', scaleratio: 1 })
+                },
+                yaxis: {
+                    title: 'Y [mm]',
+                    range: [yMin, yMax]
+                },
+                images: [{
+                    source: mergedImageUrl,
+                    xref: 'x',
+                    yref: 'y',
+                    x: xMin,
+                    y: yMax,
+                    sizex: xMax - xMin,
+                    sizey: yMax - yMin,
+                    sizing: 'stretch',
+                    opacity: 1.0,
+                    layer: 'above'
+                }],
+                dragmode: false
+            };
+
+            layout = restoreZoomState(containerId, layout);
+            await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+            setupZoomTracking(containerId);
+
+        } else {
+            // Original Plotly contour approach with edge-detected background
+            const azFlipped = flipVertical(azData);
+
+            const rows = azFlipped.length;
+            const cols = azFlipped[0].length;
+
+            let xVals, yVals, zVals, xTitle, yTitle, xMin, xMax, yMin, yMax;
+
+            if (coordSys === 'polar') {
+                const theta_start = AppState.analysisConditions.theta_start || 0;
+                const dr = AppState.analysisConditions.dr || 0.001;
+                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                const r_orientation = AppState.analysisConditions.polar?.r_orientation || 'horizontal';
+
+                let nr, ntheta;
+                if (r_orientation === 'horizontal') {
+                    nr = cols;
+                    ntheta = rows;
+                } else {
+                    nr = rows;
+                    ntheta = cols;
+                }
+
+                const rVals = Array.from({ length: nr }, (_, i) => i * dr * 1000);
+                const thetaVals = Array.from({ length: ntheta }, (_, i) => theta_start + i * dtheta);
+                zVals = azFlipped;
+
+                if (r_orientation === 'horizontal') {
+                    xVals = rVals;
+                    yVals = thetaVals;
+                    xTitle = 'r - r_start [mm]';
+                    yTitle = 'θ [rad]';
+                    xMin = 0;
+                    xMax = (nr - 1) * dr * 1000;
+                    yMin = theta_start;
+                    yMax = theta_start + (ntheta - 1) * dtheta;
+                } else {
+                    xVals = thetaVals;
+                    yVals = rVals;
+                    xTitle = 'θ [rad]';
+                    yTitle = 'r - r_start [mm]';
+                    xMin = theta_start;
+                    xMax = theta_start + (ntheta - 1) * dtheta;
+                    yMin = 0;
+                    yMax = (nr - 1) * dr * 1000;
+                }
+            } else if (AppState.analysisConditions) {
+                const dx = AppState.analysisConditions.dx || 0.001;
+                const dy = AppState.analysisConditions.dy || 0.001;
+                xVals = Array.from({ length: cols }, (_, i) => i * dx * 1000);
+                yVals = Array.from({ length: rows }, (_, i) => i * dy * 1000);
+                zVals = azFlipped;
+                xTitle = 'X [mm]';
+                yTitle = 'Y [mm]';
+                xMin = 0;
+                xMax = (cols - 1) * dx * 1000;
+                yMin = 0;
+                yMax = (rows - 1) * dy * 1000;
+            } else {
+                xVals = Array.from({ length: cols }, (_, i) => i);
+                yVals = Array.from({ length: rows }, (_, i) => i);
+                zVals = azFlipped;
+                xTitle = 'X [pixels]';
+                yTitle = 'Y [pixels]';
+                xMin = 0;
+                xMax = cols - 1;
+                yMin = 0;
+                yMax = rows - 1;
+            }
+
+            const traces = [{
+                z: zVals,
+                x: xVals,
+                y: yVals,
+                type: 'contour',
+                colorscale: 'Viridis',
+                contours: { coloring: 'lines' },
+                showscale: false,
+                name: 'Az'
+            }];
+
+            let layout = {
+                width: size.width,
+                height: size.height,
+                margin: { l: 35, r: 10, t: 10, b: 35 },
+                xaxis: {
+                    title: xTitle,
+                    range: [xMin, xMax]
+                },
+                yaxis: {
+                    title: yTitle,
+                    range: [yMin, yMax]
+                },
+                images: [{
+                    source: edgeImgUrl,
+                    xref: 'x',
+                    yref: 'y',
+                    x: xMin,
+                    y: yMax,
+                    sizex: xMax - xMin,
+                    sizey: yMax - yMin,
+                    sizing: 'stretch',
+                    opacity: 1.0,
+                    layer: 'below'
+                }],
+                dragmode: false
+            };
+
+            layout = restoreZoomState(containerId, layout);
+            await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+            setupZoomTracking(containerId);
+        }
+    } catch (error) {
+        console.error('Field Lines + Edge render error:', error);
         container.innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
     }
 }
@@ -2813,7 +3254,7 @@ async function renderMaterialImage(containerId, step) {
         // Restore saved zoom state if exists
         layout = restoreZoomState(containerId, layout);
 
-        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: false });
+        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
         setupZoomTracking(containerId);
     } catch (error) {
         console.error('Material image load error:', error);
@@ -2914,7 +3355,7 @@ async function renderStepInputImage(containerId, step) {
         // Restore saved zoom state if exists
         layout = restoreZoomState(containerId, layout);
 
-        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: false });
+        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
         setupZoomTracking(containerId);
     } catch (error) {
         console.error('Step input image load error:', error);
@@ -3153,7 +3594,7 @@ async function renderForceXTime(containerId) {
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: false });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Force X time plot error:', error);
         const container = document.getElementById(containerId);
@@ -3260,7 +3701,7 @@ async function renderForceYTime(containerId) {
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: false });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Force Y time plot error:', error);
         const container = document.getElementById(containerId);
@@ -3367,7 +3808,7 @@ async function renderTorqueTime(containerId) {
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: false });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Torque time plot error:', error);
         const container = document.getElementById(containerId);
@@ -3492,7 +3933,7 @@ async function renderEnergyTime(containerId) {
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: false });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Energy time plot error:', error);
         const container = document.getElementById(containerId);
@@ -3567,7 +4008,7 @@ async function renderSystemEnergyTime(containerId) {
             yaxis: { title: 'System Energy [J/m]' },
             showlegend: false,
             dragmode: false
-        }, { responsive: true, displayModeBar: false });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('System energy time plot error:', error);
         const container = document.getElementById(containerId);
@@ -3715,7 +4156,7 @@ async function renderVirtualWork(containerId) {
             yaxis: { title: yAxisTitle },
             showlegend: false,
             dragmode: false
-        }, { responsive: true, displayModeBar: false });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Virtual work plot error:', error);
         const container = document.getElementById(containerId);
@@ -3843,7 +4284,7 @@ function plotContour(elementId, data, title, usePhysicalAxes = false) {
         dragmode: false
     };
 
-    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false });
+    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
 }
 
 // ===== Plot Zoom State Management =====
@@ -3961,8 +4402,7 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
             xaxis = {
                 title: 'X [mm]',
                 range: [-r_o * 1000, r_o * 1000],
-                scaleanchor: 'y',
-                scaleratio: 1
+                ...(AppState.polarFullModel && { scaleanchor: 'y', scaleratio: 1 })
             };
             yaxis = {
                 title: 'Y [mm]',
@@ -4039,7 +4479,7 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
     // Restore saved zoom state if exists
     layout = restoreZoomState(elementId, layout);
 
-    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: false }).then(() => {
+    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }).then(() => {
         setupZoomTracking(elementId);
     });
 }
@@ -4074,7 +4514,7 @@ function plotForceGraph(elementId, data, title) {
     // Restore saved zoom state if exists
     layout = restoreZoomState(elementId, layout);
 
-    Plotly.newPlot(elementId, [trace], layout, { responsive: true, displayModeBar: false }).then(() => {
+    Plotly.newPlot(elementId, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }).then(() => {
         setupZoomTracking(elementId);
     });
 }
@@ -4300,8 +4740,9 @@ function toggleCartesianTransform() {
     const checkbox = document.getElementById('polarCartesianTransform');
     AppState.polarCartesianTransform = checkbox.checked;
 
-    // Refresh all plots
+    // Refresh all plots including dashboard
     refreshAllPlots();
+    updateAllPlots();
 }
 
 /**
@@ -4317,8 +4758,9 @@ function toggleFullModel() {
         AppState.polarCartesianTransform = true;
     }
 
-    // Refresh all plots
+    // Refresh all plots including dashboard
     refreshAllPlots();
+    updateAllPlots();
 }
 
 /**

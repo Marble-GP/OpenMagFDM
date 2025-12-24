@@ -656,6 +656,9 @@
                         <div class="palette-item" draggable="true" data-plot-type="az_boundary">
                             <span class="palette-name">Field Lines (on Material)</span>
                         </div>
+                        <div class="palette-item" draggable="true" data-plot-type="az_edge">
+                            <span class="palette-name">Field Lines (on Edge)</span>
+                        </div>
                         <div class="palette-item" draggable="true" data-plot-type="step_input_image">
                             <span class="palette-name">Input Image</span>
                         </div>
@@ -687,6 +690,10 @@
                         <button class="btn-secondary" onclick="clearDashboard()">Clear All</button>
                         <button class="btn-secondary" onclick="resetAllPlots()">Reset All Zoom</button>
                         <button class="btn-secondary" onclick="saveLayout()">Save Layout</button>
+                        <label style="margin-left: 10px; cursor: pointer;">
+                            <input type="checkbox" id="showPlotlyModeBar" onchange="togglePlotlyModeBar(this.checked)" style="margin-right: 5px;">
+                            Show Plotly Mode Bar
+                        </label>
                         <div style="flex: 1;"></div>
 
                         <!-- Animation Controls -->
