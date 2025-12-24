@@ -1,6 +1,15 @@
 #ifndef MAGNETICFIELDANALYZER_H
 #define MAGNETICFIELDANALYZER_H
 
+// Define _USE_MATH_DEFINES before cmath for M_PI on Windows MSVC
+#define _USE_MATH_DEFINES
+#include <cmath>
+
+// Define M_PI if not available (Windows MSVC compatibility)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #include <Eigen/Sparse>
 #include <opencv2/opencv.hpp>
 #include <yaml-cpp/yaml.h>
