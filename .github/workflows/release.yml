@@ -56,14 +56,19 @@ jobs:
 
     - name: Setup vcpkg
       uses: lukka/run-vcpkg@v11
-      with:
-        vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6'
 
     - name: Install dependencies via vcpkg
       run: |
-        vcpkg install eigen3:x64-windows
-        vcpkg install opencv[core,imgcodecs,imgproc]:x64-windows
-        vcpkg install yaml-cpp:x64-windows
+        # Update vcpkg to latest version
+        cd ${{github.workspace}}/vcpkg
+        git pull
+        ./bootstrap-vcpkg.bat
+        cd ${{github.workspace}}
+
+        # Install dependencies with retry logic
+        vcpkg install eigen3:x64-windows --recurse
+        vcpkg install opencv[core,imgcodecs,imgproc]:x64-windows --recurse
+        vcpkg install yaml-cpp:x64-windows --recurse
 
     - name: Configure CMake
       run: |
@@ -151,8 +156,8 @@ jobs:
         # Install pkg globally
         npm install -g pkg
 
-        # Create standalone executables
-        pkg server.js --targets node20-linux-x64,node20-win-x64,node20-macos-x64 --output ../release/webui-server
+        # Create standalone executables (using node18 as node20 is not yet supported by pkg)
+        pkg server.js --targets node18-linux-x64,node18-win-x64,node18-macos-x64 --output ../release/webui-server
 
     - name: Create WebUI packages
       run: |
