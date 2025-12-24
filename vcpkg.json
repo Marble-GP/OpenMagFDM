@@ -3,11 +3,7 @@
   "version": "1.1.0",
   "dependencies": [
     "eigen3",
-    {
-      "name": "opencv",
-      "default-features": false,
-      "features": ["imgcodecs", "imgproc"]
-    },
+    "opencv4",
     "yaml-cpp"
   ],
   "builtin-baseline": "5d57f5a0a5469a23e005fc79a7c1814ab4fc967e"
