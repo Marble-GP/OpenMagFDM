@@ -103,17 +103,22 @@ jobs:
 
     - name: Install dependencies
       run: |
-        brew install cmake eigen opencv yaml-cpp
+        brew install cmake eigen opencv yaml-cpp pkg-config
 
     - name: Configure CMake
       run: |
-        # Set paths for Homebrew packages (works for both Intel and ARM)
-        BREW_PREFIX=$(brew --prefix)
+        # Use pkg-config to get proper paths for Homebrew packages
+        export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig"
+        export CMAKE_PREFIX_PATH="$(brew --prefix)"
+
+        # Get include/lib flags from pkg-config
+        YAML_CFLAGS=$(pkg-config --cflags yaml-cpp 2>/dev/null || echo "-I$(brew --prefix yaml-cpp)/include")
+        YAML_LIBS=$(pkg-config --libs yaml-cpp 2>/dev/null || echo "-L$(brew --prefix yaml-cpp)/lib -lyaml-cpp")
+
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCMAKE_PREFIX_PATH="$BREW_PREFIX" \
-          -DCMAKE_INCLUDE_PATH="$BREW_PREFIX/include" \
-          -DCMAKE_LIBRARY_PATH="$BREW_PREFIX/lib" \
-          -Dyaml-cpp_DIR="$BREW_PREFIX/lib/cmake/yaml-cpp"
+          -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+          -DCMAKE_CXX_FLAGS="$YAML_CFLAGS" \
+          -DCMAKE_EXE_LINKER_FLAGS="$YAML_LIBS"
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
