@@ -59,16 +59,8 @@ jobs:
 
     - name: Install dependencies via vcpkg
       run: |
-        # Update vcpkg to latest version
-        cd ${{github.workspace}}/vcpkg
-        git pull
-        ./bootstrap-vcpkg.bat
-        cd ${{github.workspace}}
-
-        # Install dependencies with retry logic
-        vcpkg install eigen3:x64-windows --recurse
-        vcpkg install opencv[core,imgcodecs,imgproc]:x64-windows --recurse
-        vcpkg install yaml-cpp:x64-windows --recurse
+        # Install dependencies from vcpkg.json
+        vcpkg install --triplet x64-windows
 
     - name: Configure CMake
       run: |

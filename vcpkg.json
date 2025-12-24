@@ -1,0 +1,14 @@
+{
+  "name": "openmagfdm",
+  "version": "1.1.0",
+  "dependencies": [
+    "eigen3",
+    {
+      "name": "opencv",
+      "default-features": false,
+      "features": ["core", "imgcodecs", "imgproc"]
+    },
+    "yaml-cpp"
+  ],
+  "builtin-baseline": "4a600e9fea71bd7872080cbb716797e04d30e6d3"
+}
