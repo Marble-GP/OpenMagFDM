@@ -56,11 +56,12 @@ jobs:
 
     - name: Setup vcpkg
       uses: lukka/run-vcpkg@v11
+      with:
+        vcpkgGitCommitId: '4a600e9fea71bd7872080cbb716797e04d30e6d3'
 
     - name: Install dependencies via vcpkg
       run: |
-        # Install dependencies from vcpkg.json
-        vcpkg install --triplet x64-windows
+        vcpkg install eigen3 opencv yaml-cpp --triplet x64-windows
 
     - name: Configure CMake
       run: |
@@ -108,7 +109,11 @@ jobs:
         brew install yaml-cpp
 
     - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
+      run: |
+        # Set CMAKE_PREFIX_PATH to help find Homebrew packages
+        export CMAKE_PREFIX_PATH="$(brew --prefix)"
+        cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
+          -DCMAKE_PREFIX_PATH="$CMAKE_PREFIX_PATH"
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
