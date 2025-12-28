@@ -48,8 +48,9 @@ message(STATUS "OpenCV libraries: ${OpenCV_LIBS}")
 message(STATUS "yaml-cpp version: ${yaml-cpp_VERSION}")
 
 # ライブラリのリンク
+# yaml-cpp::yaml-cpp はモダンCMakeターゲットで、インクルードパスも自動設定される
 target_link_libraries(MagFDMsolver
     Eigen3::Eigen
     ${OpenCV_LIBS}
-    yaml-cpp
+    yaml-cpp::yaml-cpp
 )

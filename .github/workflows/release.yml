@@ -192,12 +192,10 @@ jobs:
 
     - name: Configure CMake
       run: |
-        # Set up paths for Homebrew packages (works on both Intel and ARM Macs)
+        # Set up CMAKE_PREFIX_PATH for Homebrew packages (works on both Intel and ARM Macs)
         BREW_PREFIX=$(brew --prefix)
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCMAKE_PREFIX_PATH="${BREW_PREFIX}/opt/opencv;${BREW_PREFIX}/opt/yaml-cpp;${BREW_PREFIX}/opt/eigen" \
-          -DCMAKE_CXX_FLAGS="-I${BREW_PREFIX}/opt/yaml-cpp/include -I${BREW_PREFIX}/opt/eigen/include/eigen3" \
-          -DCMAKE_EXE_LINKER_FLAGS="-L${BREW_PREFIX}/opt/yaml-cpp/lib"
+          -DCMAKE_PREFIX_PATH="${BREW_PREFIX};${BREW_PREFIX}/opt/opencv;${BREW_PREFIX}/opt/yaml-cpp;${BREW_PREFIX}/opt/eigen"
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
