@@ -57,22 +57,50 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Setup vcpkg
-      uses: lukka/run-vcpkg@v11
+    - name: Cache vcpkg
+      uses: actions/cache@v4
       with:
-        vcpkgGitCommitId: '5d57f5a0a5469a23e005fc79a7c1814ab4fc967e'
+        path: |
+          vcpkg_installed
+          vcpkg/installed
+          vcpkg/packages
+        key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}-v3
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-
 
-    - name: Install dependencies via vcpkg
+    - name: Setup vcpkg
       run: |
-        vcpkg install --triplet x64-windows
+        # Check if vcpkg repository is properly set up (not just an empty directory from cache)
+        if (-not (Test-Path "vcpkg/bootstrap-vcpkg.bat")) {
+          Write-Host "vcpkg repository not found or incomplete, setting up..."
+          if (Test-Path "vcpkg") {
+            Write-Host "Removing incomplete vcpkg directory"
+            Remove-Item -Recurse -Force vcpkg
+          }
+          Write-Host "Cloning vcpkg..."
+          git clone https://github.com/Microsoft/vcpkg.git
+        } else {
+          Write-Host "vcpkg repository exists, skipping clone"
+        }
+
+        cd vcpkg
+
+        if (-not (Test-Path "vcpkg.exe")) {
+          Write-Host "Bootstrapping vcpkg..."
+          .\bootstrap-vcpkg.bat
+        } else {
+          Write-Host "vcpkg.exe already exists, skipping bootstrap"
+        }
 
     - name: Configure CMake
       run: |
         cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} `
-          -DCMAKE_TOOLCHAIN_FILE=${{github.workspace}}/vcpkg/scripts/buildsystems/vcpkg.cmake
+          -DCMAKE_TOOLCHAIN_FILE="${{github.workspace}}\vcpkg\scripts\buildsystems\vcpkg.cmake"
 
     - name: Build
-      run: cmake --build build --config ${{env.BUILD_TYPE}} --parallel
+      run: |
+        $jobs = $env:NUMBER_OF_PROCESSORS
+        cmake --build build --config ${{env.BUILD_TYPE}} -j $jobs
 
     - name: Create release package
       run: |
@@ -82,12 +110,63 @@ jobs:
         Copy-Item -Recurse webui release/OpenMagFDM-Windows/
         Copy-Item sample_config.yaml release/OpenMagFDM-Windows/
 
-        # Copy necessary DLLs from vcpkg
-        $VCPKG_ROOT = "${{github.workspace}}/vcpkg/installed/x64-windows/bin"
-        Copy-Item "$VCPKG_ROOT/opencv_core4*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
-        Copy-Item "$VCPKG_ROOT/opencv_imgcodecs4*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
-        Copy-Item "$VCPKG_ROOT/opencv_imgproc4*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
-        Copy-Item "$VCPKG_ROOT/yaml-cpp*.dll" release/OpenMagFDM-Windows/ -ErrorAction SilentlyContinue
+        # Debug: Show directory structure
+        Write-Host "=== Workspace structure ==="
+        Get-ChildItem "${{github.workspace}}" -Directory | Select-Object Name | Format-Table
+
+        Write-Host "=== Looking for vcpkg directories ==="
+        if (Test-Path "${{github.workspace}}/vcpkg_installed") {
+          Write-Host "vcpkg_installed exists:"
+          Get-ChildItem "${{github.workspace}}/vcpkg_installed" -Recurse -Directory | Where-Object { $_.Name -eq "bin" } | Select-Object FullName
+        }
+        if (Test-Path "${{github.workspace}}/vcpkg") {
+          Write-Host "vcpkg exists, checking installed:"
+          Get-ChildItem "${{github.workspace}}/vcpkg" -Recurse -Directory | Where-Object { $_.Name -eq "bin" } | Select-Object FullName
+        }
+        if (Test-Path "build/vcpkg_installed") {
+          Write-Host "build/vcpkg_installed exists:"
+          Get-ChildItem "build/vcpkg_installed" -Recurse -Directory | Where-Object { $_.Name -eq "bin" } | Select-Object FullName
+        }
+
+        # Find vcpkg installed directory (manifest mode uses vcpkg_installed)
+        $VCPKG_BIN_PATHS = @(
+          "${{github.workspace}}/vcpkg_installed/x64-windows/bin",
+          "${{github.workspace}}/build/vcpkg_installed/x64-windows/bin",
+          "${{github.workspace}}/vcpkg/installed/x64-windows/bin"
+        )
+
+        $VCPKG_BIN = $null
+        foreach ($path in $VCPKG_BIN_PATHS) {
+          Write-Host "Checking path: $path"
+          if (Test-Path $path) {
+            $VCPKG_BIN = $path
+            Write-Host "Found vcpkg bin directory: $VCPKG_BIN"
+            break
+          }
+        }
+
+        if (-not $VCPKG_BIN) {
+          Write-Host "=== Searching for opencv DLLs recursively ==="
+          Get-ChildItem "${{github.workspace}}" -Filter "opencv_core*.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+          Write-Error "Could not find vcpkg bin directory"
+          exit 1
+        }
+
+        Write-Host "Searching for DLLs in: $VCPKG_BIN"
+        Get-ChildItem $VCPKG_BIN -Filter "*.dll" | Select-Object -First 10 | ForEach-Object { Write-Host "  Found: $($_.Name)" }
+
+        # Copy all required DLLs
+        Get-ChildItem $VCPKG_BIN -Filter "opencv_*.dll" | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+        Get-ChildItem $VCPKG_BIN -Filter "yaml-cpp.dll" | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+
+        # Copy OpenCV dependencies (jpeg, png, tiff, zlib, etc.)
+        $dependencies = @("jpeg*.dll", "libpng*.dll", "tiff*.dll", "zlib*.dll", "lzma*.dll", "webp*.dll")
+        foreach ($dep in $dependencies) {
+          Get-ChildItem $VCPKG_BIN -Filter $dep -ErrorAction SilentlyContinue | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+        }
+
+        Write-Host "DLLs copied to release package:"
+        Get-ChildItem release/OpenMagFDM-Windows -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.Name)" }
 
         cd release
         Compress-Archive -Path OpenMagFDM-Windows -DestinationPath OpenMagFDM-Windows-x86_64.zip
@@ -106,22 +185,17 @@ jobs:
 
     - name: Install dependencies
       run: |
-        brew install cmake eigen opencv yaml-cpp pkg-config
+        brew install cmake
+        brew install eigen
+        brew install opencv
+        brew install yaml-cpp
 
     - name: Configure CMake
       run: |
-        # Use pkg-config to get proper paths for Homebrew packages
-        export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig"
-        export CMAKE_PREFIX_PATH="$(brew --prefix)"
+        # Set up paths for Homebrew packages
+        export CMAKE_PREFIX_PATH="$(brew --prefix):$(brew --prefix opencv):$(brew --prefix yaml-cpp):$(brew --prefix eigen)"
 
-        # Get include/lib flags from pkg-config
-        YAML_CFLAGS=$(pkg-config --cflags yaml-cpp 2>/dev/null || echo "-I$(brew --prefix yaml-cpp)/include")
-        YAML_LIBS=$(pkg-config --libs yaml-cpp 2>/dev/null || echo "-L$(brew --prefix yaml-cpp)/lib -lyaml-cpp")
-
-        cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} \
-          -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
-          -DCMAKE_CXX_FLAGS="$YAML_CFLAGS" \
-          -DCMAKE_EXE_LINKER_FLAGS="$YAML_LIBS"
+        cmake -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}}
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
@@ -151,18 +225,19 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '20'
+        node-version: '18'
 
     - name: Install dependencies and create standalone package
       run: |
         cd webui
         npm install
-
-        # Install pkg globally
         npm install -g pkg
+        mkdir -p ../release
 
-        # Create standalone executables (using node18 as node20 is not yet supported by pkg)
-        pkg server.js --targets node18-linux-x64,node18-win-x64,node18-macos-x64 --output ../release/webui-server
+        # Create standalone executables for each platform
+        pkg package.json --targets node18-linux-x64 --output ../release/webui-server-linux
+        pkg package.json --targets node18-win-x64 --output ../release/webui-server-win.exe
+        pkg package.json --targets node18-macos-x64 --output ../release/webui-server-macos
 
     - name: Create WebUI packages
       run: |
@@ -235,23 +310,46 @@ jobs:
 
         Name "`${PRODUCT_NAME} `${PRODUCT_VERSION}"
         OutFile "OpenMagFDM-Installer-Windows-x86_64.exe"
-        InstallDir "`$PROGRAMFILES64\OpenMagFDM"
+
+        # Install to user directory (no admin rights required)
+        InstallDir "`$PROFILE\OpenMagFDM"
+        RequestExecutionLevel user
 
         Section "MainSection" SEC01
           SetOutPath "`$INSTDIR"
           File /r "installer-source\OpenMagFDM-Windows\*.*"
           File /r "installer-source\OpenMagFDM-WebUI-Windows\*.*"
 
+          # Create shortcuts
           CreateDirectory "`$SMPROGRAMS\OpenMagFDM"
-          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM Solver.lnk" "`$INSTDIR\MagFDMsolver.exe"
-          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM WebUI.lnk" "`$INSTDIR\webui-server.exe"
-          CreateShortcut "`$DESKTOP\OpenMagFDM.lnk" "`$INSTDIR\MagFDMsolver.exe"
+          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM Solver.lnk" "`$INSTDIR\MagFDMsolver.exe" "" "`$INSTDIR\MagFDMsolver.exe" 0 SW_SHOWNORMAL "" "Magnetic Field FDM Solver"
+          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\OpenMagFDM WebUI.lnk" "`$INSTDIR\webui-server.exe" "" "`$INSTDIR\webui-server.exe" 0 SW_SHOWNORMAL "" "Web UI for OpenMagFDM"
+          CreateShortcut "`$SMPROGRAMS\OpenMagFDM\Uninstall.lnk" "`$INSTDIR\Uninstall.exe"
+          CreateShortcut "`$DESKTOP\OpenMagFDM.lnk" "`$INSTDIR\webui-server.exe" "" "`$INSTDIR\webui-server.exe" 0 SW_SHOWNORMAL "" "OpenMagFDM WebUI"
+
+          # Write uninstaller
+          WriteUninstaller "`$INSTDIR\Uninstall.exe"
+
+          # Add to Windows Add/Remove Programs
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "DisplayName" "OpenMagFDM"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "UninstallString" "`$INSTDIR\Uninstall.exe"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "DisplayVersion" "`${PRODUCT_VERSION}"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "Publisher" "`${PRODUCT_PUBLISHER}"
+          WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "URLInfoAbout" "`${PRODUCT_WEB_SITE}"
+          WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "NoModify" 1
+          WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM" "NoRepair" 1
         SectionEnd
 
         Section "Uninstall"
+          # Remove shortcuts
           Delete "`$SMPROGRAMS\OpenMagFDM\*.*"
           RMDir "`$SMPROGRAMS\OpenMagFDM"
           Delete "`$DESKTOP\OpenMagFDM.lnk"
+
+          # Remove registry entries
+          DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\OpenMagFDM"
+
+          # Remove installation directory
           RMDir /r "`$INSTDIR"
         SectionEnd
         "@ | Out-File -FilePath installer.nsi -Encoding UTF8
