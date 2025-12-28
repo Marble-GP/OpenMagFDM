@@ -6,6 +6,23 @@
 #include <cmath>
 #include <chrono>
 
+#ifdef _WIN32
+#include <direct.h>
+#define MKDIR(path) _mkdir(path)
+#else
+#include <sys/stat.h>
+#define MKDIR(path) mkdir(path, 0755)
+#endif
+
+// Cross-platform directory creation (like mkdir -p)
+static void createDirectory(const std::string& path) {
+#ifdef _WIN32
+    system(("mkdir \"" + path + "\" 2>nul").c_str());
+#else
+    system(("mkdir -p \"" + path + "\"").c_str());
+#endif
+}
+
 constexpr double MU_0 = 4.0 * M_PI * 1e-7;  // Vacuum permeability [H/m]
 
 MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
@@ -4650,9 +4667,8 @@ void MagneticFieldAnalyzer::exportBoundaryImage(const std::string& output_path) 
 }
 
 void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int step_number) {
-    // Create base folder
-    std::string mkdir_cmd = "mkdir -p \"" + base_folder + "\"";
-    system(mkdir_cmd.c_str());
+    // Create base folder (cross-platform)
+    createDirectory(base_folder);
 
     // Create subfolders
     std::string az_folder = base_folder + "/Az";
@@ -4664,14 +4680,14 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     std::string input_image_folder = base_folder + "/InputImg";
     std::string energy_density_folder = base_folder + "/EnergyDensity";
 
-    system(("mkdir -p \"" + az_folder + "\"").c_str());
-    system(("mkdir -p \"" + mu_folder + "\"").c_str());
-    system(("mkdir -p \"" + h_folder + "\"").c_str());
-    system(("mkdir -p \"" + jz_folder + "\"").c_str());
-    system(("mkdir -p \"" + boundary_folder + "\"").c_str());
-    system(("mkdir -p \"" + forces_folder + "\"").c_str());
-    system(("mkdir -p \"" + input_image_folder + "\"").c_str());
-    system(("mkdir -p \"" + energy_density_folder + "\"").c_str());
+    createDirectory(az_folder);
+    createDirectory(mu_folder);
+    createDirectory(h_folder);
+    createDirectory(jz_folder);
+    createDirectory(boundary_folder);
+    createDirectory(forces_folder);
+    createDirectory(input_image_folder);
+    createDirectory(energy_density_folder);
 
     // Format step number with leading zeros (e.g., step_0001)
     std::ostringstream step_str;

@@ -357,8 +357,12 @@ int main(int argc, char* argv[]) {
         std::cout << "\nOutput folder not specified. Using timestamp: " << base_folder << std::endl;
     }
 
-    // Create output folder if it doesn't exist
+    // Create output folder if it doesn't exist (cross-platform)
+#ifdef _WIN32
+    system(("mkdir \"" + base_folder + "\" 2>nul").c_str());
+#else
     system(("mkdir -p \"" + base_folder + "\"").c_str());
+#endif
 
     // Setup log file output (tee to both console and file)
     std::ofstream log_file(base_folder + "/log.txt");

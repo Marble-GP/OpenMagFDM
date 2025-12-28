@@ -269,12 +269,14 @@ jobs:
         cp webui-server-linux OpenMagFDM-WebUI-Linux/webui-server
         chmod +x OpenMagFDM-WebUI-Linux/webui-server
         cp -r ../webui/public OpenMagFDM-WebUI-Linux/
+        cp -r ../webui/icon OpenMagFDM-WebUI-Linux/
         tar -czf OpenMagFDM-WebUI-Linux.tar.gz OpenMagFDM-WebUI-Linux
 
         # Windows
         mkdir -p OpenMagFDM-WebUI-Windows
         cp webui-server-win.exe OpenMagFDM-WebUI-Windows/webui-server.exe
         cp -r ../webui/public OpenMagFDM-WebUI-Windows/
+        cp -r ../webui/icon OpenMagFDM-WebUI-Windows/
         zip -r OpenMagFDM-WebUI-Windows.zip OpenMagFDM-WebUI-Windows
 
         # macOS
@@ -282,6 +284,7 @@ jobs:
         cp webui-server-macos OpenMagFDM-WebUI-macOS/webui-server
         chmod +x OpenMagFDM-WebUI-macOS/webui-server
         cp -r ../webui/public OpenMagFDM-WebUI-macOS/
+        cp -r ../webui/icon OpenMagFDM-WebUI-macOS/
         tar -czf OpenMagFDM-WebUI-macOS.tar.gz OpenMagFDM-WebUI-macOS
 
     - name: Upload artifacts
