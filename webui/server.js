@@ -1,6 +1,7 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const yaml = require('js-yaml');
@@ -8,17 +9,39 @@ const yaml = require('js-yaml');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// アップロードディレクトリの設定
-const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
-const SOLVER_PATH = path.join(__dirname, '..', 'build', 'MagFDMsolver');
-const CONFIG_PATH = path.join(__dirname, '..', 'sample_config.yaml');
-const USER_CONFIGS_DIR = path.join(__dirname, '..', 'configs');
-const OUTPUTS_DIR = path.join(__dirname, '..', 'outputs');
+// pkg実行時は実行ファイルのディレクトリを使用、通常時は__dirnameの親を使用
+const isPkg = typeof process.pkg !== 'undefined';
+const BASE_DIR = isPkg ? path.dirname(process.execPath) : path.join(__dirname, '..');
 
-// ディレクトリの作成
-fs.mkdir(UPLOAD_DIR, { recursive: true }).catch(console.error);
-fs.mkdir(USER_CONFIGS_DIR, { recursive: true }).catch(console.error);
-fs.mkdir(OUTPUTS_DIR, { recursive: true }).catch(console.error);
+// アップロードディレクトリの設定
+const UPLOAD_DIR = path.join(BASE_DIR, 'uploads');
+const SOLVER_PATH = isPkg
+    ? path.join(BASE_DIR, 'MagFDMsolver.exe')  // pkg版ではexeが同じディレクトリにある
+    : path.join(BASE_DIR, 'build', 'MagFDMsolver');
+const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
+const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
+const OUTPUTS_DIR = path.join(BASE_DIR, 'outputs');
+
+// 基本ディレクトリを同期的に作成（Multerが使用する前に必要）
+try {
+    if (!fsSync.existsSync(UPLOAD_DIR)) fsSync.mkdirSync(UPLOAD_DIR, { recursive: true });
+    if (!fsSync.existsSync(USER_CONFIGS_DIR)) fsSync.mkdirSync(USER_CONFIGS_DIR, { recursive: true });
+    if (!fsSync.existsSync(OUTPUTS_DIR)) fsSync.mkdirSync(OUTPUTS_DIR, { recursive: true });
+} catch (error) {
+    console.error('Error creating base directories:', error);
+}
+
+// ディレクトリの作成（非同期初期化関数で確実に作成）
+async function initializeDirectories() {
+    try {
+        await fs.mkdir(UPLOAD_DIR, { recursive: true });
+        await fs.mkdir(USER_CONFIGS_DIR, { recursive: true });
+        await fs.mkdir(OUTPUTS_DIR, { recursive: true });
+        console.log('Directories initialized successfully');
+    } catch (error) {
+        console.error('Error creating directories:', error);
+    }
+}
 
 // Image management constants
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -83,7 +106,7 @@ app.use(express.static('public'));
 app.use('/icon', express.static(path.join(__dirname, 'icon')));
 
 // 親ディレクトリのCSVファイルへのアクセス
-app.use('/data', express.static(path.join(__dirname, '..')));
+app.use('/data', express.static(BASE_DIR));
 
 // ユーザーごとのアップロード画像へのアクセス
 app.use('/uploads', express.static(UPLOAD_DIR));
@@ -137,6 +160,7 @@ async function initializeUserDir(userId) {
 async function enforceFileLimit(userId) {
     const userDir = getUserDir(userId);
     try {
+        await ensureDir(userDir);
         const files = await fs.readdir(userDir);
         const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
 
@@ -201,10 +225,25 @@ async function enforceImageLimit(userId) {
     }
 }
 
+// Helper: Ensure directory exists, create if not
+async function ensureDir(dirPath) {
+    try {
+        await fs.mkdir(dirPath, { recursive: true });
+    } catch (error) {
+        if (error.code !== 'EEXIST') {
+            console.error(`Error creating directory ${dirPath}:`, error);
+        }
+    }
+}
+
 // Helper: Clean up expired user directories (run on server start)
 async function cleanupExpiredUsers() {
     try {
         const expiryTime = Date.now() - (USER_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+
+        // Ensure directories exist before reading
+        await ensureDir(USER_CONFIGS_DIR);
+        await ensureDir(UPLOAD_DIR);
 
         // Clean up config directories
         const configUsers = await fs.readdir(USER_CONFIGS_DIR);
@@ -234,8 +273,8 @@ async function cleanupExpiredUsers() {
     }
 }
 
-// Run cleanup on server start
-cleanupExpiredUsers();
+// Run initialization and cleanup on server start
+initializeDirectories().then(() => cleanupExpiredUsers());
 
 // Get list of YAML files for a user
 app.get('/api/config/list', async (req, res) => {
@@ -513,7 +552,7 @@ app.post('/api/solve', async (req, res) => {
 
         // ソルバーの実行
         exec(command, {
-            cwd: path.join(__dirname, '..'),
+            cwd: BASE_DIR,
             maxBuffer: 10 * 1024 * 1024 // 10MB
         }, (error, stdout, stderr) => {
             if (error) {
@@ -585,7 +624,7 @@ app.post('/api/solve-stream', async (req, res) => {
 
         // spawnを使用してリアルタイムで出力を取得（第3引数に出力パスを追加）
         const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], {
-            cwd: path.join(__dirname, '..'),
+            cwd: BASE_DIR,
         });
 
         // プロセスをマップに登録
@@ -1026,7 +1065,7 @@ app.listen(PORT, () => {
     console.log('='.repeat(60));
     console.log(`Server running at: http://localhost:${PORT}`);
     console.log(`Serving files from: ${path.join(__dirname, 'public')}`);
-    console.log(`CSV data directory: ${path.join(__dirname, '..')}`);
+    console.log(`CSV data directory: ${BASE_DIR}`);
     console.log(`Upload directory: ${UPLOAD_DIR}`);
     console.log(`Solver path: ${SOLVER_PATH}`);
     console.log(`Config file: ${CONFIG_PATH}`);
@@ -1050,7 +1089,7 @@ app.listen(PORT, () => {
 // 解析に使用された画像ファイルを取得
 app.get('/api/get-material-image', async (req, res) => {
     try {
-        const parentDir = path.join(__dirname, '..');
+        const parentDir = BASE_DIR;
 
         const potentialImageNames = [];
 
@@ -1106,7 +1145,7 @@ app.get('/api/detect-steps', async (req, res) => {
             return res.json({ success: false, error: 'Result path required' });
         }
 
-        const azFolder = path.join(__dirname, '..', resultPath, 'Az');
+        const azFolder = path.join(BASE_DIR, resultPath, 'Az');
         const files = await fs.readdir(azFolder);
 
         // step_XXXX.csv 形式のファイルをカウント
@@ -1131,7 +1170,7 @@ app.get('/api/load-csv', async (req, res) => {
             return res.json({ success: false, error: 'Missing parameters' });
         }
 
-        const filePath = path.join(__dirname, '..', resultPath, file);
+        const filePath = path.join(BASE_DIR, resultPath, file);
         const content = await fs.readFile(filePath, 'utf8');
 
         // CSVをパース
@@ -1158,7 +1197,7 @@ app.get('/api/load-csv-raw', async (req, res) => {
             return res.status(400).send('Missing parameters');
         }
 
-        const filePath = path.join(__dirname, '..', resultPath, file);
+        const filePath = path.join(BASE_DIR, resultPath, file);
         const content = await fs.readFile(filePath, 'utf8');
 
         // 生のテキストとして返す
@@ -1177,7 +1216,7 @@ app.get('/api/load-conditions', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const conditionsPath = path.join(__dirname, '..', resultPath, 'conditions.json');
+        const conditionsPath = path.join(BASE_DIR, resultPath, 'conditions.json');
 
         // ファイルが存在するか確認
         await fs.access(conditionsPath);
@@ -1202,7 +1241,7 @@ app.get('/api/get-boundary-image', async (req, res) => {
         }
 
         const stepName = `step_${String(step).padStart(4, '0')}`;
-        const imagePath = path.join(__dirname, '..', resultPath, 'BoundaryImg', `${stepName}.png`);
+        const imagePath = path.join(BASE_DIR, resultPath, 'BoundaryImg', `${stepName}.png`);
 
         // ファイルが存在するか確認
         await fs.access(imagePath);
@@ -1225,7 +1264,7 @@ app.get('/api/get-step-input-image', async (req, res) => {
         }
 
         const stepName = `step_${String(step).padStart(4, '0')}`;
-        const imagePath = path.join(__dirname, '..', resultPath, 'InputImg', `${stepName}.png`);
+        const imagePath = path.join(BASE_DIR, resultPath, 'InputImg', `${stepName}.png`);
 
         // ファイルが存在するか確認
         await fs.access(imagePath);
@@ -1246,7 +1285,7 @@ app.get('/api/get-log', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const logPath = path.join(__dirname, '..', resultPath, 'log.txt');
+        const logPath = path.join(BASE_DIR, resultPath, 'log.txt');
 
         // Check if file exists
         await fs.access(logPath);
@@ -1268,7 +1307,7 @@ app.get('/api/get-conditions', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const conditionsPath = path.join(__dirname, '..', resultPath, 'conditions.json');
+        const conditionsPath = path.join(BASE_DIR, resultPath, 'conditions.json');
 
         // Check if file exists
         await fs.access(conditionsPath);

@@ -160,7 +160,7 @@ jobs:
         Get-ChildItem $VCPKG_BIN -Filter "yaml-cpp.dll" | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
 
         # Copy OpenCV dependencies (jpeg, png, tiff, zlib, etc.)
-        $dependencies = @("jpeg*.dll", "libpng*.dll", "tiff*.dll", "zlib*.dll", "lzma*.dll", "webp*.dll")
+        $dependencies = @("jpeg*.dll", "libpng*.dll", "tiff*.dll", "zlib*.dll", "lzma*.dll", "webp*.dll", "libwebp*.dll", "libsharpyuv*.dll")
         foreach ($dep in $dependencies) {
           Get-ChildItem $VCPKG_BIN -Filter $dep -ErrorAction SilentlyContinue | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
         }
