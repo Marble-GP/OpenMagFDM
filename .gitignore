@@ -103,3 +103,6 @@ uploads/*.jpg
 # Node modules
 webui/node_modules/
 configs/
+
+CLAUDE.md
+technical_report.md

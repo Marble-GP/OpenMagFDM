@@ -159,10 +159,31 @@ jobs:
         Get-ChildItem $VCPKG_BIN -Filter "opencv_*.dll" | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
         Get-ChildItem $VCPKG_BIN -Filter "yaml-cpp.dll" | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
 
-        # Copy OpenCV dependencies (jpeg, png, tiff, zlib, etc.)
-        $dependencies = @("jpeg*.dll", "libpng*.dll", "tiff*.dll", "zlib*.dll", "lzma*.dll", "liblzma*.dll", "webp*.dll", "libwebp*.dll", "libsharpyuv*.dll")
+        # Copy OpenCV dependencies (jpeg, png, tiff, zlib, lzma, webp, etc.)
+        Write-Host "=== All DLLs in vcpkg bin ==="
+        Get-ChildItem $VCPKG_BIN -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.Name)" }
+
+        $dependencies = @(
+          "jpeg*.dll",
+          "libpng*.dll",
+          "tiff*.dll",
+          "zlib*.dll",
+          "zlib1*.dll",
+          "lzma*.dll",
+          "liblzma*.dll",
+          "xz*.dll",
+          "webp*.dll",
+          "libwebp*.dll",
+          "libsharpyuv*.dll"
+        )
+        Write-Host "=== Copying dependencies ==="
         foreach ($dep in $dependencies) {
-          Get-ChildItem $VCPKG_BIN -Filter $dep -ErrorAction SilentlyContinue | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+          $found = Get-ChildItem $VCPKG_BIN -Filter $dep -ErrorAction SilentlyContinue
+          if ($found) {
+            $found | Copy-Item -Destination release/OpenMagFDM-Windows/ -Verbose
+          } else {
+            Write-Host "  Pattern '$dep' - no matches found"
+          }
         }
 
         Write-Host "DLLs copied to release package:"

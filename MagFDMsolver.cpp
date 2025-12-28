@@ -8,6 +8,10 @@
 #include <yaml-cpp/yaml.h>
 #include "json.hpp"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 using json = nlohmann::json;
 
 /**
@@ -315,6 +319,12 @@ void exportConditionsJSON(const std::string& output_path,
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    // Set console output to UTF-8 for proper encoding in Web UI
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
     std::cout << "========================================" << std::endl;
     std::cout << "2D Magnetic Field Analyzer (FDM)" << std::endl;
     std::cout << "Cartesian Coordinate System" << std::endl;
