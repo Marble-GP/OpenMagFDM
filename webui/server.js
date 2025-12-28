@@ -101,9 +101,11 @@ const upload = multer({ storage: storage });
 // JSONボディパーサー
 app.use(express.json());
 
-// 静的ファイルの提供
-app.use(express.static('public'));
-app.use('/icon', express.static(path.join(__dirname, 'icon')));
+// 静的ファイルの提供 (use BASE_DIR for pkg compatibility)
+const PUBLIC_DIR = isPkg ? path.join(BASE_DIR, 'public') : path.join(__dirname, 'public');
+const ICON_DIR = isPkg ? path.join(BASE_DIR, 'icon') : path.join(__dirname, 'icon');
+app.use(express.static(PUBLIC_DIR));
+app.use('/icon', express.static(ICON_DIR));
 
 // 親ディレクトリのCSVファイルへのアクセス
 app.use('/data', express.static(BASE_DIR));
@@ -1055,7 +1057,7 @@ app.delete('/api/user-outputs/:folderName', async (req, res) => {
 
 // ルートへのアクセス
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
 });
 
 // サーバー起動
@@ -1064,7 +1066,7 @@ app.listen(PORT, () => {
     console.log('MagFDM Visualizer Server (Integrated)');
     console.log('='.repeat(60));
     console.log(`Server running at: http://localhost:${PORT}`);
-    console.log(`Serving files from: ${path.join(__dirname, 'public')}`);
+    console.log(`Serving files from: ${PUBLIC_DIR}`);
     console.log(`CSV data directory: ${BASE_DIR}`);
     console.log(`Upload directory: ${UPLOAD_DIR}`);
     console.log(`Solver path: ${SOLVER_PATH}`);
