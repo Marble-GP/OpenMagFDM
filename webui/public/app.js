@@ -4061,7 +4061,7 @@ async function renderVirtualWork(containerId) {
 
         // Determine displacement per step and units based on coordinate system and slide direction
         let displacementPerStep = 1;  // default
-        let yAxisTitle = '-dW/dx [N/m]';
+        let yAxisTitle = '+dW/dx [N/m]';
         let isAngular = false;
 
         if (AppState.analysisConditions) {
@@ -4088,12 +4088,12 @@ async function renderVirtualWork(containerId) {
                     (rOrientation === 'vertical' && slideDirection === 'horizontal')) {
                     // Theta direction sliding → torque
                     displacementPerStep = slidePixelsPerStep * dtheta;  // [rad]
-                    yAxisTitle = '-dW/dθ (Torque) [N·m/m]';
+                    yAxisTitle = '+dW/dθ (Torque) [N·m/m]';
                     isAngular = true;
                 } else {
                     // R direction sliding → force
                     displacementPerStep = slidePixelsPerStep * dr;  // [m]
-                    yAxisTitle = '-dW/dr [N/m]';
+                    yAxisTitle = '+dW/dr [N/m]';
                 }
             } else {
                 // Cartesian coordinates
@@ -4102,33 +4102,34 @@ async function renderVirtualWork(containerId) {
 
                 if (slideDirection === 'horizontal') {
                     displacementPerStep = slidePixelsPerStep * dx;  // [m]
-                    yAxisTitle = '-dW/dx [N/m]';
+                    yAxisTitle = '+dW/dx [N/m]';
                 } else {
                     displacementPerStep = slidePixelsPerStep * dy;  // [m]
-                    yAxisTitle = '-dW/dy [N/m]';
+                    yAxisTitle = '+dW/dy [N/m]';
                 }
             }
         }
 
-        // Calculate virtual work: F = -dW/dx (central difference for interior points)
+        // Calculate virtual work: F = +dW/dx for constant-current systems (Jz specified)
+        // Note: For constant-flux systems, F = -dW/dx. OpenMagFDM uses constant current.
         const virtualWorkData = [];
         for (let i = 0; i < AppState.totalSteps; i++) {
             if (i === 0) {
                 // Forward difference for first point
                 if (AppState.totalSteps > 1) {
                     const dW = energyData[1] - energyData[0];
-                    virtualWorkData.push(-dW / displacementPerStep);
+                    virtualWorkData.push(dW / displacementPerStep);
                 } else {
                     virtualWorkData.push(0);
                 }
             } else if (i === AppState.totalSteps - 1) {
                 // Backward difference for last point
                 const dW = energyData[i] - energyData[i - 1];
-                virtualWorkData.push(-dW / displacementPerStep);
+                virtualWorkData.push(dW / displacementPerStep);
             } else {
                 // Central difference for interior points
                 const dW = energyData[i + 1] - energyData[i - 1];
-                virtualWorkData.push(-dW / (2 * displacementPerStep));
+                virtualWorkData.push(dW / (2 * displacementPerStep));
             }
         }
 

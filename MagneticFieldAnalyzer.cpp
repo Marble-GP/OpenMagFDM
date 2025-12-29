@@ -4207,9 +4207,15 @@ void MagneticFieldAnalyzer::calculateForceDistributedAmperian(int step, double s
             std::cout << "\nCalculating force for material: " << name << " (Amperian, polar)" << std::endl;
 
             // ============================================================
-            // Step 5: Integrate Lorentz force F = J_b × B in polar coords
-            // F_r = J_z · B_θ, F_θ = -J_z · B_r
-            // Sign adjusted empirically to match Virtual Work method
+            // Step 5: Integrate Lorentz force F = J × B in polar coords
+            // For J = (0, 0, Jz) and B = (Br, Bθ, 0) in cylindrical:
+            //   J × B = (-Jz·Bθ, +Jz·Br, 0) in (r, θ, z) components
+            //   => Fr = -Jz·Bθ, Fθ = +Jz·Br
+            //
+            // Physics note: For constant-current sources (Jz specified),
+            // the force is F = +∂W'/∂x where W' is magnetic co-energy.
+            // For linear materials, W = W' numerically, so F = +∂W/∂x.
+            // The Lorentz formula F = J × B is always valid.
             // ============================================================
             for (int j = 0; j < grid_rows; j++) {
                 for (int i = 0; i < grid_cols; i++) {
@@ -4240,10 +4246,11 @@ void MagneticFieldAnalyzer::calculateForceDistributedAmperian(int step, double s
                         bt_val = Btheta(ir, jt);
                     }
 
-                    // Force in polar coordinates (sign adjusted to match Virtual Work)
-                    // Empirically: F_r = +J_z · B_θ, F_θ = -J_z · B_r
-                    double fr = +jz * bt_val * dV;
-                    double ft = -jz * br_val * dV;
+                    // Force: F = J × B (Lorentz force in polar coordinates)
+                    // Fr = (J × B)_r = -Jz·Bθ
+                    // Fθ = (J × B)_θ = +Jz·Br
+                    double fr = -jz * bt_val * dV;
+                    double ft = +jz * br_val * dV;
 
                     // Convert to Cartesian coordinates
                     double cos_t = std::cos(theta);
@@ -4419,9 +4426,15 @@ void MagneticFieldAnalyzer::calculateForceDistributedAmperian(int step, double s
             std::cout << "\nCalculating force for material: " << name << " (Amperian)" << std::endl;
 
             // ============================================================
-            // Step 5: Integrate Lorentz force F = J_b × B
-            // For 2D (z-invariant): Fx = -Jz·By, Fy = +Jz·Bx
-            // Sign adjusted empirically to match Virtual Work method
+            // Step 5: Integrate Lorentz force F = J × B
+            // For 2D with J = (0, 0, Jz) and B = (Bx, By, 0):
+            //   J × B = (-Jz·By, +Jz·Bx, 0)
+            //   => Fx = -Jz·By, Fy = +Jz·Bx
+            //
+            // Physics note: For constant-current sources (Jz specified),
+            // the force is F = +∂W'/∂x where W' is magnetic co-energy.
+            // For linear materials, W = W' numerically, so F = +∂W/∂x.
+            // The Lorentz formula F = J × B is always valid.
             // ============================================================
             double dV = dx * dy;  // Volume element (per unit depth)
 
@@ -4433,10 +4446,11 @@ void MagneticFieldAnalyzer::calculateForceDistributedAmperian(int step, double s
                     double bx = Bx(j, i);
                     double by = By(j, i);
 
-                    // Force on magnetic material (sign adjusted to match Virtual Work)
-                    // Empirically: F = -(J × B) gives correct sign
-                    double fx = +jz * by * dV;
-                    double fy = -jz * bx * dV;
+                    // Force: F = J × B (Lorentz force)
+                    // Fx = (J × B)_x = -Jz·By
+                    // Fy = (J × B)_y = +Jz·Bx
+                    double fx = -jz * by * dV;
+                    double fy = +jz * bx * dV;
 
                     result.force_x += fx;
                     result.force_y += fy;
@@ -4496,7 +4510,7 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
     double total_energy = 0.0;
 
     if (coordinate_system == "cartesian") {
-        // Cartesian coordinates: use Eigen array operations for efficiency
+        // Cartesian coordinates
         int rows = Bx.rows();
         int cols = Bx.cols();
 
@@ -4507,20 +4521,29 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
             return 0.0;
         }
 
-        // Calculate B² using Eigen array operations (element-wise)
-        Eigen::ArrayXXd B_squared = Bx.array().square() + By.array().square();
-
-        // Calculate energy density: w = B²/(2μ) [J/m³]
-        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
-
-        // Sum all energy densities and multiply by volume element
+        // Calculate magnetic co-energy density W' = ∫₀^H B(H') dH'
+        // For current-source systems (Jz specified): F = +∂W'/∂x|_I
+        // For linear materials: W' = W = B²/(2μ)
+        // For nonlinear materials: W' = ∫B dH using Simpson integration
+        double max_coenergy_density = 0.0;
         double dV = dx * dy;  // [m²] per unit depth
-        total_energy = energy_density.sum() * dV;  // [J/m]
+
+        for (int j = 0; j < rows; ++j) {
+            for (int i = 0; i < cols; ++i) {
+                double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
+                double w = calculateCoEnergyDensity(j, i, B_mag);
+                total_energy += w * dV;
+                if (w > max_coenergy_density) max_coenergy_density = w;
+            }
+        }
 
         std::cout << "  Grid size: " << rows << " x " << cols << std::endl;
         std::cout << "  dx = " << dx << " m, dy = " << dy << " m" << std::endl;
-        std::cout << "  Max energy density: " << energy_density.maxCoeff() << " J/m³" << std::endl;
-        std::cout << "  Total energy: " << total_energy << " J/m (per unit depth)" << std::endl;
+        std::cout << "  Max co-energy density: " << max_coenergy_density << " J/m³" << std::endl;
+        std::cout << "  Total co-energy: " << total_energy << " J/m (per unit depth)" << std::endl;
+        if (has_nonlinear_materials) {
+            std::cout << "  (Using magnetic co-energy W' = ∫B dH for nonlinear materials)" << std::endl;
+        }
 
     } else {
         // Polar coordinates
@@ -4532,25 +4555,29 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
             return 0.0;
         }
 
-        // Calculate B² = Br² + Bθ²
-        Eigen::ArrayXXd B_squared = Br.array().square() + Btheta.array().square();
+        // Calculate magnetic co-energy density W' = ∫₀^H B(H') dH'
+        // For current-source systems (Jz specified): F = +∂W'/∂x|_I
+        // For linear materials: W' = W = B²/(2μ)
+        // For nonlinear materials: W' = ∫B dH using Simpson integration
+        for (int j = 0; j < rows; ++j) {
+            for (int i = 0; i < cols; ++i) {
+                double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
+                double w = calculateCoEnergyDensity(j, i, B_mag);
 
-        // Calculate energy density
-        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
-
-        // Sum with polar volume element: dV = r * dr * dθ
-        for (int i = 0; i < rows; ++i) {
-            for (int j = 0; j < cols; ++j) {
-                int ir = (r_orientation == "horizontal") ? j : i;
+                // Polar volume element: dV = r * dr * dθ
+                int ir = (r_orientation == "horizontal") ? i : j;
                 ir = std::clamp(ir, 0, nr - 1);
                 double r = r_coords[ir];
                 double dV = r * dr * dtheta;
-                total_energy += energy_density(i, j) * dV;
+                total_energy += w * dV;
             }
         }
 
         std::cout << "  Grid size (r x theta): " << rows << " x " << cols << std::endl;
-        std::cout << "  Total energy: " << total_energy << " J/m (per unit depth)" << std::endl;
+        std::cout << "  Total co-energy: " << total_energy << " J/m (per unit depth)" << std::endl;
+        if (has_nonlinear_materials) {
+            std::cout << "  (Using magnetic co-energy W' = ∫B dH for nonlinear materials)" << std::endl;
+        }
     }
 
     // Store the result in the member variable for later export
@@ -4602,8 +4629,14 @@ void MagneticFieldAnalyzer::exportForcesToCSV(const std::string& output_path) co
              << result.pixel_count << "\n";
     }
 
-    // Add system total energy as a special row
-    // This enables virtual work calculation: F = -dW/dx
+    // Add system total co-energy as a special row
+    // This enables virtual work calculation:
+    //   - Constant flux (λ): F = -∂W/∂x|_λ (use energy W)
+    //   - Constant current (I or Jz): F = +∂W'/∂x|_I (use co-energy W')
+    // Since OpenMagFDM uses specified Jz (constant current), we compute co-energy W'.
+    // For linear materials: W' = W = B²/(2μ)
+    // For nonlinear materials: W' = ∫B dH ≠ W = ∫H dB (Simpson integration used)
+    // Virtual Work F = +∂W'/∂x is now accurate for both linear and nonlinear materials.
     file << "_SYSTEM_TOTAL,0,0,0,0,0,0,0,0,0,"
          << system_total_energy << ",0\n";
 
@@ -4739,44 +4772,49 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     //     exportBoundaryStressVectors(stress_vectors_path);
     // }
 
-    // Export energy density distribution
+    // Export co-energy density distribution (magnetic co-energy W' = ∫B dH)
+    // For current-source systems (Jz specified): F = +∂W'/∂x|_I
     if (coordinate_system == "cartesian" && Bx.size() > 0 && By.size() > 0 && mu_map.size() > 0) {
-        // Calculate B² and energy density
-        Eigen::ArrayXXd B_squared = Bx.array().square() + By.array().square();
-        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
+        int rows = Bx.rows();
+        int cols = Bx.cols();
 
         // Export to CSV
         std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
         std::ofstream file(energy_density_path);
         if (file.is_open()) {
-            for (int j = 0; j < energy_density.rows(); ++j) {
-                for (int i = 0; i < energy_density.cols(); ++i) {
-                    file << energy_density(j, i);
-                    if (i < energy_density.cols() - 1) file << ",";
+            for (int j = 0; j < rows; ++j) {
+                for (int i = 0; i < cols; ++i) {
+                    // Calculate co-energy density W' = ∫₀^H B(H') dH'
+                    double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
+                    double w = calculateCoEnergyDensity(j, i, B_mag);
+                    file << w;
+                    if (i < cols - 1) file << ",";
                 }
                 file << "\n";
             }
             file.close();
-            std::cout << "Energy density exported to: " << energy_density_path << std::endl;
+            std::cout << "Co-energy density exported to: " << energy_density_path << std::endl;
         }
     } else if (coordinate_system == "polar" && Br.size() > 0 && Btheta.size() > 0 && mu_map.size() > 0) {
-        // Polar coordinates: Calculate B² and energy density
-        Eigen::ArrayXXd B_squared = Br.array().square() + Btheta.array().square();
-        Eigen::ArrayXXd energy_density = B_squared / (2.0 * mu_map.array());
+        int rows = Br.rows();
+        int cols = Br.cols();
 
         // Export to CSV
         std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
         std::ofstream file(energy_density_path);
         if (file.is_open()) {
-            for (int j = 0; j < energy_density.rows(); ++j) {
-                for (int i = 0; i < energy_density.cols(); ++i) {
-                    file << energy_density(j, i);
-                    if (i < energy_density.cols() - 1) file << ",";
+            for (int j = 0; j < rows; ++j) {
+                for (int i = 0; i < cols; ++i) {
+                    // Calculate co-energy density W' = ∫₀^H B(H') dH'
+                    double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
+                    double w = calculateCoEnergyDensity(j, i, B_mag);
+                    file << w;
+                    if (i < cols - 1) file << ",";
                 }
                 file << "\n";
             }
             file.close();
-            std::cout << "Energy density (polar) exported to: " << energy_density_path << std::endl;
+            std::cout << "Co-energy density (polar) exported to: " << energy_density_path << std::endl;
         }
     }
 

@@ -210,16 +210,30 @@ public:
      * - Results closely match Virtual Work principle (energy-based) method
      *
      * For 2D (z-invariant): J_bz = ∂My/∂x - ∂Mx/∂y
-     *                       Fx = +Jz·By, Fy = -Jz·Bx (sign adjusted to match Virtual Work)
+     *                       F = J × B where J = (0, 0, Jz), B = (Bx, By, 0)
+     *                       => Fx = -Jz·By, Fy = +Jz·Bx
+     *
+     * Physics note: For constant-current sources (Jz specified), the force is
+     * F = +∂W'/∂x|_I (co-energy derivative). For linear materials W' = W.
+     *
+     * Note on nonlinear materials: The Amperian method F = J × B is robust because
+     * it only depends on J and B, not on the B(H) constitutive relation. The code
+     * uses secant permeability μr := B/(H·μ0), so B = μr·μ0·H at each point.
+     * Virtual Work now computes true co-energy W' = ∫B dH for nonlinear materials.
      *
      * Results are stored in force_results_amperian member.
      */
     void calculateForceDistributedAmperian(int step = -1, double sigma_smooth = 0.0);
 
     /**
-     * @brief Calculate total magnetic energy of the system
+     * @brief Calculate total magnetic co-energy of the system
+     *
+     * For current-source systems (Jz specified): F = +∂W'/∂x|_I
+     * Co-energy W' = ∫B dH (for nonlinear materials, Simpson integration)
+     * For linear materials: W' = W = B²/(2μ)
+     *
      * @param step Step number for field caching (-1 for static analysis)
-     * @return Total magnetic energy [J/m] (per unit depth)
+     * @return Total magnetic co-energy [J/m] (per unit depth)
      */
     double calculateTotalMagneticEnergy(int step = -1);
 
@@ -501,6 +515,8 @@ private:
     void validateMuTable(const std::vector<double>& H_vals, const std::vector<double>& mu_vals, const std::string& material_name);
     double interpolateH_from_B(const BHTable& table, double B_magnitude);
     double interpolateB_from_H(const BHTable& table, double H_magnitude);
+    double integrateMagneticCoEnergy(const BHTable& table, double H_magnitude);  // W' = ∫₀^H B(H') dH'
+    double calculateCoEnergyDensity(int j, int i, double B_magnitude);  // Co-energy density w' [J/m³]
     void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
     void updateMuDistribution();  // Update mu_map based on current H_map
 

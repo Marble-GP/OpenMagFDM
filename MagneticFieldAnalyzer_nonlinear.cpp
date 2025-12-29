@@ -702,6 +702,150 @@ double MagneticFieldAnalyzer::interpolateB_from_H(const BHTable& table, double H
 }
 
 /**
+ * @brief Integrate magnetic co-energy density W' = ∫₀^H B(H') dH' using Simpson's rule
+ *
+ * For current-source systems (Jz specified), the force is given by F = +∂W'/∂x|_I
+ * where W' is the magnetic co-energy (Legendre transform of energy W).
+ *
+ * Co-energy is computed by integrating B as a function of H from 0 to H_magnitude.
+ * This uses composite Simpson's rule with adaptive subdivision.
+ *
+ * For linear materials with μ = const, W' = W = B²/(2μ) = μH²/2.
+ * For nonlinear materials, W' ≠ W in general.
+ *
+ * @param table B-H table for the nonlinear material
+ * @param H_magnitude Target magnetic field intensity |H| [A/m]
+ * @return Magnetic co-energy density W' [J/m³]
+ */
+double MagneticFieldAnalyzer::integrateMagneticCoEnergy(const BHTable& table, double H_magnitude) {
+    if (!table.is_valid || table.H_values.empty()) {
+        // Fallback: linear approximation using secant permeability
+        double mu = (table.mu_values.empty()) ? (4.0 * M_PI * 1e-7) : table.mu_values.front();
+        return 0.5 * mu * H_magnitude * H_magnitude;  // W' = μH²/2
+    }
+
+    if (H_magnitude <= 0.0) {
+        return 0.0;
+    }
+
+    // Number of subintervals for Simpson's rule (must be even)
+    // Use more points for larger H to maintain accuracy
+    int n = 100;  // Default: 100 subintervals (101 points)
+    if (H_magnitude > table.H_values.back()) {
+        n = 200;  // More points for extrapolation region
+    }
+
+    double h = H_magnitude / n;  // Step size
+
+    // Simpson's rule: W' = (h/3) * [B(0) + 4*B(h) + 2*B(2h) + 4*B(3h) + ... + B(H)]
+    double sum = 0.0;
+
+    // B(0) term
+    double B0 = interpolateB_from_H(table, 0.0);
+    sum += B0;
+
+    // Intermediate terms
+    for (int i = 1; i < n; i++) {
+        double H_i = i * h;
+        double B_i = interpolateB_from_H(table, H_i);
+        if (i % 2 == 1) {
+            sum += 4.0 * B_i;  // Odd indices: coefficient 4
+        } else {
+            sum += 2.0 * B_i;  // Even indices: coefficient 2
+        }
+    }
+
+    // B(H_magnitude) term
+    double B_n = interpolateB_from_H(table, H_magnitude);
+    sum += B_n;
+
+    double coenergy = (h / 3.0) * sum;
+
+    return coenergy;
+}
+
+/**
+ * @brief Calculate magnetic co-energy density at grid point (j, i)
+ *
+ * For current-source systems (Jz specified), force is F = +∂W'/∂x|_I
+ * where W' is the magnetic co-energy.
+ *
+ * For nonlinear materials: W' = ∫₀^H B(H') dH' using Simpson integration
+ * For linear materials: W' = W = B²/(2μ) = μH²/2
+ *
+ * NOTE: This function uses a static cached flipped image for efficiency.
+ * The cache is invalidated when the image dimensions change.
+ *
+ * @param j Row index in grid
+ * @param i Column index in grid
+ * @param B_magnitude Magnetic flux density |B| at this point [T]
+ * @return Co-energy density W' [J/m³]
+ */
+double MagneticFieldAnalyzer::calculateCoEnergyDensity(int j, int i, double B_magnitude) {
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+
+    // Default: linear material with mu from mu_map
+    double mu = mu_map(j, i);
+    if (mu < 1e-20) mu = MU_0;  // Safety check
+
+    // Check if this pixel belongs to a nonlinear material
+    if (!has_nonlinear_materials || !config["materials"]) {
+        // No nonlinear materials: use linear formula (W' = W for linear)
+        return B_magnitude * B_magnitude / (2.0 * mu);
+    }
+
+    // Use cached flipped image for efficiency (avoid repeated cv::flip calls)
+    // Static cache with dimensions check
+    static cv::Mat cached_image_flipped;
+    static int cached_rows = -1, cached_cols = -1;
+
+    if (cached_rows != image.rows || cached_cols != image.cols) {
+        cv::flip(image, cached_image_flipped, 0);
+        cached_rows = image.rows;
+        cached_cols = image.cols;
+    }
+
+    // Bounds check
+    if (j < 0 || j >= cached_image_flipped.rows || i < 0 || i >= cached_image_flipped.cols) {
+        return B_magnitude * B_magnitude / (2.0 * mu);
+    }
+
+    cv::Vec3b pixel = cached_image_flipped.at<cv::Vec3b>(j, i);
+    cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
+
+    // Find matching material
+    for (const auto& mat : config["materials"]) {
+        std::string name = mat.first.as<std::string>();
+        YAML::Node props = mat.second;
+
+        if (!props["rgb"]) continue;
+
+        auto yaml_rgb = props["rgb"];
+        cv::Scalar mat_rgb(
+            yaml_rgb[0].as<int>(),
+            yaml_rgb[1].as<int>(),
+            yaml_rgb[2].as<int>()
+        );
+
+        if (rgb == mat_rgb) {
+            // Found matching material - check if it has a B-H table
+            auto bh_it = material_bh_tables.find(name);
+            if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                // Nonlinear material: compute H from B, then integrate W' = ∫B dH
+                double H_magnitude = interpolateH_from_B(bh_it->second, B_magnitude);
+                return integrateMagneticCoEnergy(bh_it->second, H_magnitude);
+            } else {
+                // Linear material: W' = W = B²/(2μ)
+                return B_magnitude * B_magnitude / (2.0 * mu);
+            }
+        }
+    }
+
+    // Material not found: use linear formula
+    return B_magnitude * B_magnitude / (2.0 * mu);
+}
+
+/**
  * @brief Calculate |H| field from Bx, By (or Br, Btheta in polar)
  */
 void MagneticFieldAnalyzer::calculateHField() {
