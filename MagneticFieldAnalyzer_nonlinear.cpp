@@ -794,16 +794,11 @@ double MagneticFieldAnalyzer::calculateCoEnergyDensity(int j, int i, double B_ma
         return B_magnitude * B_magnitude / (2.0 * mu);
     }
 
-    // Use cached flipped image for efficiency (avoid repeated cv::flip calls)
-    // Static cache with dimensions check
-    static cv::Mat cached_image_flipped;
-    static int cached_rows = -1, cached_cols = -1;
-
-    if (cached_rows != image.rows || cached_cols != image.cols) {
-        cv::flip(image, cached_image_flipped, 0);
-        cached_rows = image.rows;
-        cached_cols = image.cols;
-    }
+    // Flip image for each call to ensure consistency with current image content
+    // Note: For sliding simulations, image content changes while dimensions stay same,
+    // so we cannot use static caching based on dimensions alone.
+    cv::Mat cached_image_flipped;
+    cv::flip(image, cached_image_flipped, 0);
 
     // Bounds check
     if (j < 0 || j >= cached_image_flipped.rows || i < 0 || i >= cached_image_flipped.cols) {

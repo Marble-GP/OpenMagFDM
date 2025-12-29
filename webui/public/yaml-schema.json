@@ -135,7 +135,7 @@
       "description": "Enable feature (true/false)",
       "type": "boolean",
       "example": "enabled: true",
-      "validParents": ["transient", "nonlinear_solver"]
+      "validParents": ["transient", "nonlinear_solver", "anderson"]
     },
     "enable_sliding": {
       "description": "Enable image sliding for rotor motion simulation (true/false)",

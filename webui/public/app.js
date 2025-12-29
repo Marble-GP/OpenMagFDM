@@ -180,16 +180,16 @@ async function initializeConfigEditor() {
                         availableKeywords = parentInfo.childrenProperties;
                     }
                 }
+                // Normal parent with defined children (e.g., anderson has children: ["enabled", "depth", "beta"])
+                else if (parentInfo && parentInfo.children) {
+                    availableKeywords = parentInfo.children;
+                }
                 // Check if grandparent accepts any child (we're inside a specific material)
                 else if (grandparentContext) {
                     const grandparentInfo = keywords[grandparentContext];
                     if (grandparentInfo && grandparentInfo.acceptsAnyChild && grandparentInfo.childrenProperties) {
                         availableKeywords = grandparentInfo.childrenProperties;
                     }
-                }
-                // Normal parent with defined children
-                else if (parentInfo && parentInfo.children) {
-                    availableKeywords = parentInfo.children;
                 } else {
                     // Parent doesn't have specific children, show all
                     availableKeywords = Object.keys(keywords);

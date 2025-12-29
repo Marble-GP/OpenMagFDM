@@ -328,7 +328,7 @@ jobs:
       run: |
         @"
         !define PRODUCT_NAME "OpenMagFDM"
-        !define PRODUCT_VERSION "1.1.1"
+        !define PRODUCT_VERSION "1.1.2"
         !define PRODUCT_PUBLISHER "OpenMagFDM Project"
         !define PRODUCT_WEB_SITE "https://github.com/Marble-GP/OpenMagFDM"
 
