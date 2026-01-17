@@ -124,6 +124,10 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                 }
             }
         }
+
+        // Parse flux linkage paths
+        parseFluxLinkagePaths();
+
     } catch (const YAML::Exception& e) {
         throw std::runtime_error("Failed to load YAML config: " + std::string(e.what()));
     }
@@ -856,6 +860,172 @@ double MagneticFieldAnalyzer::interpolateAntialiasedMu(const cv::Vec3b& pixel, d
     }
 
     return best_mu;
+}
+
+// ============================================================================
+// Flux linkage calculation methods
+// ============================================================================
+
+void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
+    flux_linkage_paths.clear();
+    flux_linkage_results.clear();
+
+    if (!config["flux_linkage"]) {
+        return;  // No flux linkage paths defined
+    }
+
+    std::cout << "Parsing flux linkage paths..." << std::endl;
+
+    for (const auto& path_node : config["flux_linkage"]) {
+        FluxLinkagePath path;
+
+        if (!path_node["name"]) {
+            std::cerr << "Warning: flux_linkage entry missing 'name', skipping" << std::endl;
+            continue;
+        }
+        path.name = path_node["name"].as<std::string>();
+
+        if (!path_node["start"] || !path_node["end"]) {
+            std::cerr << "Warning: flux_linkage '" << path.name << "' missing start/end, skipping" << std::endl;
+            continue;
+        }
+
+        auto start = path_node["start"].as<std::vector<double>>();
+        auto end = path_node["end"].as<std::vector<double>>();
+
+        if (start.size() < 2 || end.size() < 2) {
+            std::cerr << "Warning: flux_linkage '" << path.name << "' invalid start/end format, skipping" << std::endl;
+            continue;
+        }
+
+        path.x_start = start[0];
+        path.y_start = start[1];
+        path.x_end = end[0];
+        path.y_end = end[1];
+
+        flux_linkage_paths.push_back(path);
+        flux_linkage_results[path.name] = std::vector<double>();  // Initialize empty results
+
+        std::cout << "  Flux linkage path '" << path.name << "': ("
+                  << path.x_start << ", " << path.y_start << ") -> ("
+                  << path.x_end << ", " << path.y_end << ")" << std::endl;
+    }
+
+    std::cout << "Loaded " << flux_linkage_paths.size() << " flux linkage path(s)" << std::endl;
+}
+
+double MagneticFieldAnalyzer::interpolateAz(double x_phys, double y_phys) const {
+    // Bilinear interpolation of Az at physical coordinates
+    // x_phys, y_phys are in meters
+
+    // Convert physical coordinates to grid indices (floating point)
+    double i_float = x_phys / dx;
+    double j_float = y_phys / dy;
+
+    // Get integer grid indices
+    int i0 = static_cast<int>(std::floor(i_float));
+    int j0 = static_cast<int>(std::floor(j_float));
+
+    // Clamp to valid range
+    i0 = std::max(0, std::min(i0, nx - 2));
+    j0 = std::max(0, std::min(j0, ny - 2));
+
+    // Fractional parts
+    double fx = i_float - i0;
+    double fy = j_float - j0;
+
+    // Clamp fractions to [0, 1]
+    fx = std::max(0.0, std::min(1.0, fx));
+    fy = std::max(0.0, std::min(1.0, fy));
+
+    // Bilinear interpolation
+    // Az is stored as Az(j, i) where j=row, i=col
+    double Az00 = Az(j0, i0);
+    double Az10 = Az(j0, i0 + 1);
+    double Az01 = Az(j0 + 1, i0);
+    double Az11 = Az(j0 + 1, i0 + 1);
+
+    double Az_interp = (1.0 - fx) * (1.0 - fy) * Az00
+                     + fx * (1.0 - fy) * Az10
+                     + (1.0 - fx) * fy * Az01
+                     + fx * fy * Az11;
+
+    return Az_interp;
+}
+
+double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) const {
+    // Flux linkage Φ = Az(end) - Az(start) [Wb/m]
+    // In 2D analysis, this gives flux per unit depth
+
+    double Az_start = interpolateAz(path.x_start, path.y_start);
+    double Az_end = interpolateAz(path.x_end, path.y_end);
+
+    return Az_end - Az_start;
+}
+
+void MagneticFieldAnalyzer::calculateAllFluxLinkages(int step) {
+    if (flux_linkage_paths.empty()) {
+        return;
+    }
+
+    for (const auto& path : flux_linkage_paths) {
+        double phi = calculateFluxLinkage(path);
+        flux_linkage_results[path.name].push_back(phi);
+
+        std::cout << "Flux linkage [" << path.name << "] step " << step
+                  << ": " << phi << " Wb/m" << std::endl;
+    }
+}
+
+void MagneticFieldAnalyzer::exportFluxLinkageCSV(const std::string& output_dir) const {
+    if (flux_linkage_paths.empty() || flux_linkage_results.empty()) {
+        return;
+    }
+
+    // Create FluxLinkage subdirectory
+    std::string flux_dir = output_dir + "/FluxLinkage";
+    createDirectory(flux_dir);
+
+    std::string csv_path = flux_dir + "/flux_linkage.csv";
+    std::ofstream file(csv_path);
+
+    if (!file.is_open()) {
+        std::cerr << "Warning: Could not create flux linkage CSV: " << csv_path << std::endl;
+        return;
+    }
+
+    // Write header
+    file << "step";
+    for (const auto& path : flux_linkage_paths) {
+        file << "," << path.name;
+    }
+    file << "\n";
+
+    // Determine number of steps from first path's results
+    size_t num_steps = 0;
+    if (!flux_linkage_paths.empty()) {
+        auto it = flux_linkage_results.find(flux_linkage_paths[0].name);
+        if (it != flux_linkage_results.end()) {
+            num_steps = it->second.size();
+        }
+    }
+
+    // Write data rows
+    for (size_t step = 0; step < num_steps; ++step) {
+        file << step;
+        for (const auto& path : flux_linkage_paths) {
+            auto it = flux_linkage_results.find(path.name);
+            if (it != flux_linkage_results.end() && step < it->second.size()) {
+                file << "," << std::scientific << std::setprecision(10) << it->second[step];
+            } else {
+                file << ",";
+            }
+        }
+        file << "\n";
+    }
+
+    file.close();
+    std::cout << "Flux linkage results exported to: " << csv_path << std::endl;
 }
 
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {
@@ -6815,6 +6985,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         double total_energy = calculateTotalMagneticEnergy(step);
         std::cout << "Step " << step+1 << " Total Magnetic Energy: " << total_energy << " J/m" << std::endl;
 
+        // 3.2. Calculate flux linkage for all defined paths
+        calculateAllFluxLinkages(step);
+
         // 4. Export results for this step
         exportResults(output_dir, step);
 
@@ -6841,4 +7014,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
     std::cout << "\n=== Transient Analysis Complete ===" << std::endl;
     std::cout << "Total analysis time: " << total_duration.count() << " s ("
               << total_duration_ms.count() << " ms)" << std::endl;
+
+    // Export flux linkage results to CSV (if any paths were defined)
+    exportFluxLinkageCSV(output_dir);
 }

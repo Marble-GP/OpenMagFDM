@@ -417,6 +417,17 @@ private:
     cv::Mat boundary_image;  // Cached boundary detection visualization
     double system_total_energy;  // Total magnetic energy of the entire system [J/m]
 
+    // Flux linkage calculation path
+    struct FluxLinkagePath {
+        std::string name;           // Path identifier (e.g., "coil_A")
+        double x_start, y_start;    // Start point [m] (physical coordinates)
+        double x_end, y_end;        // End point [m] (physical coordinates)
+    };
+
+    // Flux linkage calculation
+    std::vector<FluxLinkagePath> flux_linkage_paths;  // Defined paths for flux linkage
+    std::map<std::string, std::vector<double>> flux_linkage_results;  // Results per path per step
+
     // Boundary detection optimization for transient analysis (incremental update)
     cv::Mat cached_boundaries;  // Cached boundary detection result (binary mask)
     bool boundary_cache_valid;  // Whether the cache is valid
@@ -538,6 +549,13 @@ private:
     double calculateRGBDistance(const cv::Vec3b& a, const cv::Vec3b& b) const;
     bool isPointOnLineSegment(const cv::Vec3b& pixel, const cv::Vec3b& a, const cv::Vec3b& b, double tolerance = 15.0) const;
     double interpolateAntialiasedMu(const cv::Vec3b& pixel, double& out_mu_r) const;
+
+    // Flux linkage calculation methods
+    void parseFluxLinkagePaths();           // Parse flux_linkage section from YAML
+    double interpolateAz(double x_phys, double y_phys) const;  // Bilinear interpolation of Az
+    double calculateFluxLinkage(const FluxLinkagePath& path) const;  // Φ = Az(end) - Az(start)
+    void calculateAllFluxLinkages(int step);  // Calculate and store all flux linkages
+    void exportFluxLinkageCSV(const std::string& output_dir) const;  // Export to CSV
 
     // Nonlinear solver methods
     void solveNonlinear();  // Main nonlinear Picard iteration solver
