@@ -493,6 +493,7 @@ private:
     std::map<std::string, BHTable> material_bh_tables;  // B-H tables per nonlinear material
     std::map<std::string, MaterialPixelInfo> material_pixel_info;  // Pixel count and area per material
     std::vector<AntialiasableMaterial> antialias_materials;  // Materials with antialias enabled
+    std::map<std::string, YAML::Node> material_presets;  // Material presets (reusable B-H curves/properties)
 
     // User-defined variables (from YAML "variables" section)
     std::map<std::string, double> user_variables;  // Variable name -> evaluated value

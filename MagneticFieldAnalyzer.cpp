@@ -125,6 +125,18 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
             }
         }
 
+        // Parse material presets (reusable B-H curves/properties)
+        material_presets.clear();
+        if (config["material_presets"]) {
+            std::cout << "Parsing material presets..." << std::endl;
+            for (const auto& preset : config["material_presets"]) {
+                std::string preset_name = preset.first.as<std::string>();
+                material_presets[preset_name] = YAML::Clone(preset.second);
+                std::cout << "  Loaded preset: " << preset_name << std::endl;
+            }
+            std::cout << "Loaded " << material_presets.size() << " material preset(s)" << std::endl;
+        }
+
         // Parse flux linkage paths
         parseFluxLinkagePaths();
 
@@ -475,7 +487,27 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
     // =========================================================================
     for (const auto& material : config["materials"]) {
         std::string name = material.first.as<std::string>();
-        const auto& props = material.second;
+        YAML::Node props = material.second;
+
+        // Resolve preset if specified (preset properties are merged, material-specific overrides)
+        if (props["preset"]) {
+            std::string preset_name = props["preset"].as<std::string>();
+            auto preset_it = material_presets.find(preset_name);
+            if (preset_it == material_presets.end()) {
+                throw std::runtime_error("Material '" + name + "' references unknown preset: " + preset_name);
+            }
+
+            // Start with preset properties, then override with material-specific properties
+            YAML::Node merged = YAML::Clone(preset_it->second);
+            for (auto it = props.begin(); it != props.end(); ++it) {
+                std::string key = it->first.as<std::string>();
+                if (key != "preset") {  // Don't copy the preset reference itself
+                    merged[key] = it->second;
+                }
+            }
+            props = merged;
+            std::cout << "Material '" << name << "' using preset '" << preset_name << "'" << std::endl;
+        }
 
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
@@ -6229,7 +6261,23 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
 
     for (const auto& material : config["materials"]) {
         std::string name = material.first.as<std::string>();
-        const auto& props = material.second;
+        YAML::Node props = material.second;
+
+        // Resolve preset if specified (preset properties are merged, material-specific overrides)
+        if (props["preset"]) {
+            std::string preset_name = props["preset"].as<std::string>();
+            auto preset_it = material_presets.find(preset_name);
+            if (preset_it != material_presets.end()) {
+                YAML::Node merged = YAML::Clone(preset_it->second);
+                for (auto it = props.begin(); it != props.end(); ++it) {
+                    std::string key = it->first.as<std::string>();
+                    if (key != "preset") {
+                        merged[key] = it->second;
+                    }
+                }
+                props = merged;
+            }
+        }
 
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
