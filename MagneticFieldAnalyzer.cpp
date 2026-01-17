@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <chrono>
+#include <set>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -522,6 +523,16 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         // Evaluate mu_r for initial state (H=0)
         double mu_r = evaluateMu(mu_value, 0.0);
 
+        // Parse antialias flag and add to antialias_materials if enabled
+        bool antialias_enabled = props["antialias"].as<bool>(false);
+        if (antialias_enabled) {
+            AntialiasableMaterial aa_mat;
+            aa_mat.name = name;
+            aa_mat.rgb = cv::Vec3b(rgb[0], rgb[1], rgb[2]);
+            aa_mat.mu_r = mu_r;
+            antialias_materials.push_back(aa_mat);
+        }
+
         // Parse Jz value (static, formula, or array)
         JzValue jz_value = parseJzValue(props["jz"]);
         material_jz[name] = jz_value;
@@ -579,7 +590,88 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         }
 
         std::cout << "Material '" << name << "': mu_r=" << mu_r << ", Jz=" << jz << " A/m^2, pixels=" << pix_info.pixel_count
-                  << ", area=" << pix_info.area << " m^2" << std::endl;
+                  << ", area=" << pix_info.area << " m^2"
+                  << (antialias_enabled ? ", antialias=on" : "") << std::endl;
+    }
+
+    // =========================================================================
+    // PASS 3: Apply anti-aliasing interpolation to gradient pixels
+    // Only if at least 2 materials have antialias enabled
+    // =========================================================================
+    if (antialias_materials.size() >= 2) {
+        std::cout << "Anti-aliasing: " << antialias_materials.size() << " materials enabled, processing gradient pixels..." << std::endl;
+
+        // Build a set of exact RGB values for quick lookup
+        std::set<uint32_t> exact_rgb_set;
+        for (const auto& material : config["materials"]) {
+            std::vector<int> rgb = material.second["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
+            uint32_t key = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+            exact_rgb_set.insert(key);
+        }
+
+        int antialias_count = 0;
+
+        if (coordinate_system == "polar") {
+            if (r_orientation == "horizontal") {
+                for (int j = 0; j < ntheta; j++) {
+                    for (int i = 0; i < nr; i++) {
+                        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                        uint32_t pixel_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
+
+                        // Skip if exact match exists
+                        if (exact_rgb_set.count(pixel_key) > 0) {
+                            continue;
+                        }
+
+                        // Try antialias interpolation
+                        double out_mu_r;
+                        double mu_interp = interpolateAntialiasedMu(pixel, out_mu_r);
+                        if (mu_interp > 0) {
+                            mu_map(j, i) = mu_interp;
+                            antialias_count++;
+                        }
+                    }
+                }
+            } else {  // vertical
+                for (int j = 0; j < nr; j++) {
+                    for (int i = 0; i < ntheta; i++) {
+                        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                        uint32_t pixel_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
+
+                        if (exact_rgb_set.count(pixel_key) > 0) {
+                            continue;
+                        }
+
+                        double out_mu_r;
+                        double mu_interp = interpolateAntialiasedMu(pixel, out_mu_r);
+                        if (mu_interp > 0) {
+                            mu_map(j, i) = mu_interp;
+                            antialias_count++;
+                        }
+                    }
+                }
+            }
+        } else {  // Cartesian
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                    uint32_t pixel_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
+
+                    if (exact_rgb_set.count(pixel_key) > 0) {
+                        continue;
+                    }
+
+                    double out_mu_r;
+                    double mu_interp = interpolateAntialiasedMu(pixel, out_mu_r);
+                    if (mu_interp > 0) {
+                        mu_map(j, i) = mu_interp;
+                        antialias_count++;
+                    }
+                }
+            }
+        }
+
+        std::cout << "Anti-aliasing: " << antialias_count << " gradient pixels interpolated" << std::endl;
     }
 }
 
@@ -650,6 +742,120 @@ void MagneticFieldAnalyzer::validateBoundaryConditions() {
         std::cout << " (alpha=" << bc_top.alpha << ", beta=" << bc_top.beta << ", gamma=" << bc_top.gamma << ")";
     }
     std::cout << std::endl;
+}
+
+// ============================================================================
+// Anti-aliasing interpolation methods
+// ============================================================================
+
+double MagneticFieldAnalyzer::calculateRGBDistance(const cv::Vec3b& a, const cv::Vec3b& b) const {
+    double dr = static_cast<double>(a[0]) - static_cast<double>(b[0]);
+    double dg = static_cast<double>(a[1]) - static_cast<double>(b[1]);
+    double db = static_cast<double>(a[2]) - static_cast<double>(b[2]);
+    return std::sqrt(dr * dr + dg * dg + db * db);
+}
+
+bool MagneticFieldAnalyzer::isPointOnLineSegment(const cv::Vec3b& pixel,
+                                                   const cv::Vec3b& a,
+                                                   const cv::Vec3b& b,
+                                                   double tolerance) const {
+    // Check if pixel lies on the line segment between a and b in RGB space
+    // Calculate distance from pixel to line segment AB
+
+    double dist_ab = calculateRGBDistance(a, b);
+    if (dist_ab < 1e-6) {
+        // a and b are the same color
+        return calculateRGBDistance(pixel, a) < tolerance;
+    }
+
+    // Calculate distance from pixel to point A and to point B
+    double dist_pa = calculateRGBDistance(pixel, a);
+    double dist_pb = calculateRGBDistance(pixel, b);
+
+    // If pixel is outside the segment endpoints (with tolerance), reject
+    if (dist_pa > dist_ab + tolerance || dist_pb > dist_ab + tolerance) {
+        return false;
+    }
+
+    // Calculate perpendicular distance from pixel to line AB
+    // Using cross product in 3D RGB space: |PA × AB| / |AB|
+    cv::Vec3d pa(pixel[0] - a[0], pixel[1] - a[1], pixel[2] - a[2]);
+    cv::Vec3d ab(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+
+    // Cross product PA × AB
+    cv::Vec3d cross(
+        pa[1] * ab[2] - pa[2] * ab[1],
+        pa[2] * ab[0] - pa[0] * ab[2],
+        pa[0] * ab[1] - pa[1] * ab[0]
+    );
+
+    double cross_mag = std::sqrt(cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]);
+    double perp_dist = cross_mag / dist_ab;
+
+    return perp_dist < tolerance;
+}
+
+double MagneticFieldAnalyzer::interpolateAntialiasedMu(const cv::Vec3b& pixel, double& out_mu_r) const {
+    // Find the two closest antialias-enabled materials that the pixel lies between
+    // Returns the interpolated mu value (absolute, not relative) or -1 if not applicable
+
+    if (antialias_materials.size() < 2) {
+        return -1.0;  // Need at least 2 antialias materials
+    }
+
+    // Try all pairs of antialias materials
+    double best_mu = -1.0;
+    double min_perp_dist = 1e9;
+
+    for (size_t i = 0; i < antialias_materials.size(); ++i) {
+        for (size_t j = i + 1; j < antialias_materials.size(); ++j) {
+            const auto& mat_a = antialias_materials[i];
+            const auto& mat_b = antialias_materials[j];
+
+            // Check if pixel lies on the line segment between mat_a and mat_b
+            if (!isPointOnLineSegment(pixel, mat_a.rgb, mat_b.rgb)) {
+                continue;
+            }
+
+            // Calculate the interpolation ratio (how far along A->B is the pixel)
+            double dist_ab = calculateRGBDistance(mat_a.rgb, mat_b.rgb);
+            double dist_pa = calculateRGBDistance(pixel, mat_a.rgb);
+
+            // Project pixel onto line AB to get accurate ratio
+            cv::Vec3d pa(pixel[0] - mat_a.rgb[0], pixel[1] - mat_a.rgb[1], pixel[2] - mat_a.rgb[2]);
+            cv::Vec3d ab(mat_b.rgb[0] - mat_a.rgb[0], mat_b.rgb[1] - mat_a.rgb[1], mat_b.rgb[2] - mat_a.rgb[2]);
+
+            double dot = pa[0] * ab[0] + pa[1] * ab[1] + pa[2] * ab[2];
+            double ratio = dot / (dist_ab * dist_ab);
+
+            // Clamp ratio to [0, 1]
+            ratio = std::max(0.0, std::min(1.0, ratio));
+
+            // Calculate perpendicular distance for tie-breaking
+            cv::Vec3d cross(
+                pa[1] * ab[2] - pa[2] * ab[1],
+                pa[2] * ab[0] - pa[0] * ab[2],
+                pa[0] * ab[1] - pa[1] * ab[0]
+            );
+            double cross_mag = std::sqrt(cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]);
+            double perp_dist = cross_mag / dist_ab;
+
+            // Use the pair with smallest perpendicular distance
+            if (perp_dist < min_perp_dist) {
+                min_perp_dist = perp_dist;
+
+                // Harmonic mean interpolation (series magnetic circuit model)
+                // μ_interp = 1 / ((1-ratio)/μ_A + ratio/μ_B)
+                double mu_a = mat_a.mu_r;
+                double mu_b = mat_b.mu_r;
+
+                out_mu_r = 1.0 / ((1.0 - ratio) / mu_a + ratio / mu_b);
+                best_mu = out_mu_r * MU_0;  // Return absolute permeability
+            }
+        }
+    }
+
+    return best_mu;
 }
 
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {

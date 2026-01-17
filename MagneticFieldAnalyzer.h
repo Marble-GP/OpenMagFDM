@@ -335,6 +335,13 @@ private:
         MaterialPixelInfo() : pixel_count(0), area(0.0) {}
     };
 
+    // Anti-aliasing material information (for gradient pixel interpolation)
+    struct AntialiasableMaterial {
+        std::string name;       // Material name
+        cv::Vec3b rgb;          // Material RGB color
+        double mu_r;            // Relative permeability (linear or last evaluated)
+    };
+
     // Anderson acceleration configuration (shared by Picard and Newton-Krylov)
     struct AndersonConfig {
         bool enabled;       // Enable Anderson acceleration (default: false)
@@ -474,6 +481,7 @@ private:
     std::map<std::string, MuValue> material_mu;  // Nonlinear permeability values per material
     std::map<std::string, BHTable> material_bh_tables;  // B-H tables per nonlinear material
     std::map<std::string, MaterialPixelInfo> material_pixel_info;  // Pixel count and area per material
+    std::vector<AntialiasableMaterial> antialias_materials;  // Materials with antialias enabled
 
     // User-defined variables (from YAML "variables" section)
     std::map<std::string, double> user_variables;  // Variable name -> evaluated value
@@ -525,6 +533,11 @@ private:
     double calculateCoEnergyDensity(int j, int i, double B_magnitude);  // Co-energy density w' [J/m³]
     void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
     void updateMuDistribution();  // Update mu_map based on current H_map
+
+    // Anti-aliasing interpolation methods
+    double calculateRGBDistance(const cv::Vec3b& a, const cv::Vec3b& b) const;
+    bool isPointOnLineSegment(const cv::Vec3b& pixel, const cv::Vec3b& a, const cv::Vec3b& b, double tolerance = 15.0) const;
+    double interpolateAntialiasedMu(const cv::Vec3b& pixel, double& out_mu_r) const;
 
     // Nonlinear solver methods
     void solveNonlinear();  // Main nonlinear Picard iteration solver
