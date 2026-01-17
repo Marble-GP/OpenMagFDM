@@ -260,25 +260,39 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
     if (config["polar_boundary_conditions"]) {
         auto bc_cfg = config["polar_boundary_conditions"];
 
+        // Helper lambda to parse Robin parameters for polar BC
+        auto parsePolarRobinParams = [](const YAML::Node& node, BoundaryCondition& bc_out) {
+            bc_out.type = node["type"].as<std::string>("dirichlet");
+            bc_out.value = node["value"].as<double>(0.0);
+
+            // Parse Robin BC parameters if type is "robin"
+            if (bc_out.type == "robin") {
+                bc_out.alpha = node["alpha"].as<double>(1.0);
+                bc_out.beta = node["beta"].as<double>(0.0);
+                bc_out.gamma = node["gamma"].as<double>(0.0);
+
+                // Validate: alpha and beta cannot both be zero
+                if (std::abs(bc_out.alpha) < 1e-15 && std::abs(bc_out.beta) < 1e-15) {
+                    throw std::runtime_error("Robin BC: alpha and beta cannot both be zero");
+                }
+            }
+        };
+
         if (bc_cfg["inner"]) {
-            bc_inner.type = bc_cfg["inner"]["type"].as<std::string>("dirichlet");
-            bc_inner.value = bc_cfg["inner"]["value"].as<double>(0.0);
+            parsePolarRobinParams(bc_cfg["inner"], bc_inner);
         }
 
         if (bc_cfg["outer"]) {
-            bc_outer.type = bc_cfg["outer"]["type"].as<std::string>("dirichlet");
-            bc_outer.value = bc_cfg["outer"]["value"].as<double>(0.0);
+            parsePolarRobinParams(bc_cfg["outer"], bc_outer);
         }
 
         // Theta direction boundary conditions (angular boundaries)
         if (bc_cfg["theta_min"]) {
-            bc_theta_min.type = bc_cfg["theta_min"]["type"].as<std::string>("dirichlet");
-            bc_theta_min.value = bc_cfg["theta_min"]["value"].as<double>(0.0);
+            parsePolarRobinParams(bc_cfg["theta_min"], bc_theta_min);
         }
 
         if (bc_cfg["theta_max"]) {
-            bc_theta_max.type = bc_cfg["theta_max"]["type"].as<std::string>("dirichlet");
-            bc_theta_max.value = bc_cfg["theta_max"]["value"].as<double>(0.0);
+            parsePolarRobinParams(bc_cfg["theta_max"], bc_theta_max);
         }
     }
 
@@ -577,35 +591,65 @@ void MagneticFieldAnalyzer::validateBoundaryConditions() {
 
     auto bc = config["boundary_conditions"];
 
+    // Helper lambda to parse Robin parameters
+    auto parseRobinParams = [](const YAML::Node& node, BoundaryCondition& bc_out) {
+        bc_out.type = node["type"].as<std::string>("dirichlet");
+        bc_out.value = node["value"].as<double>(0.0);
+
+        // Parse Robin BC parameters if type is "robin"
+        if (bc_out.type == "robin") {
+            bc_out.alpha = node["alpha"].as<double>(1.0);
+            bc_out.beta = node["beta"].as<double>(0.0);
+            bc_out.gamma = node["gamma"].as<double>(0.0);
+
+            // Validate: alpha and beta cannot both be zero
+            if (std::abs(bc_out.alpha) < 1e-15 && std::abs(bc_out.beta) < 1e-15) {
+                throw std::runtime_error("Robin BC: alpha and beta cannot both be zero");
+            }
+        }
+    };
+
     // Left boundary
     if (bc["left"]) {
-        bc_left.type = bc["left"]["type"].as<std::string>("dirichlet");
-        bc_left.value = bc["left"]["value"].as<double>(0.0);
+        parseRobinParams(bc["left"], bc_left);
     }
 
     // Right boundary
     if (bc["right"]) {
-        bc_right.type = bc["right"]["type"].as<std::string>("dirichlet");
-        bc_right.value = bc["right"]["value"].as<double>(0.0);
+        parseRobinParams(bc["right"], bc_right);
     }
 
     // Bottom boundary
     if (bc["bottom"]) {
-        bc_bottom.type = bc["bottom"]["type"].as<std::string>("dirichlet");
-        bc_bottom.value = bc["bottom"]["value"].as<double>(0.0);
+        parseRobinParams(bc["bottom"], bc_bottom);
     }
 
     // Top boundary
     if (bc["top"]) {
-        bc_top.type = bc["top"]["type"].as<std::string>("dirichlet");
-        bc_top.value = bc["top"]["value"].as<double>(0.0);
+        parseRobinParams(bc["top"], bc_top);
     }
 
     std::cout << "Boundary conditions:" << std::endl;
-    std::cout << "  Left: " << bc_left.type << std::endl;
-    std::cout << "  Right: " << bc_right.type << std::endl;
-    std::cout << "  Bottom: " << bc_bottom.type << std::endl;
-    std::cout << "  Top: " << bc_top.type << std::endl;
+    std::cout << "  Left: " << bc_left.type;
+    if (bc_left.type == "robin") {
+        std::cout << " (alpha=" << bc_left.alpha << ", beta=" << bc_left.beta << ", gamma=" << bc_left.gamma << ")";
+    }
+    std::cout << std::endl;
+    std::cout << "  Right: " << bc_right.type;
+    if (bc_right.type == "robin") {
+        std::cout << " (alpha=" << bc_right.alpha << ", beta=" << bc_right.beta << ", gamma=" << bc_right.gamma << ")";
+    }
+    std::cout << std::endl;
+    std::cout << "  Bottom: " << bc_bottom.type;
+    if (bc_bottom.type == "robin") {
+        std::cout << " (alpha=" << bc_bottom.alpha << ", beta=" << bc_bottom.beta << ", gamma=" << bc_bottom.gamma << ")";
+    }
+    std::cout << std::endl;
+    std::cout << "  Top: " << bc_top.type;
+    if (bc_top.type == "robin") {
+        std::cout << " (alpha=" << bc_top.alpha << ", beta=" << bc_top.beta << ", gamma=" << bc_top.gamma << ")";
+    }
+    std::cout << std::endl;
 }
 
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {
@@ -789,6 +833,56 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
             } else if (is_top && bc_top.type == "dirichlet") {
                 triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_top.value;
+                continue;
+            }
+
+            // Robin boundary conditions: alpha*Az + beta*(dAz/dn) = gamma
+            // Left boundary (i=0): outward normal is -x direction
+            // dAz/dn = -dAz/dx ≈ (Az(0,j) - Az(1,j))/dx
+            // => (alpha + beta/dx)*Az(0,j) - (beta/dx)*Az(1,j) = gamma
+            if (is_left && bc_left.type == "robin") {
+                double a = bc_left.alpha;
+                double b = bc_left.beta;
+                double g = bc_left.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
+                triplets.push_back(Eigen::Triplet<double>(idx, idx + 1, -b/dx));
+                rhs(idx) = g;
+                continue;
+            }
+            // Right boundary (i=nx-1): outward normal is +x direction
+            // dAz/dn = dAz/dx ≈ (Az(nx-1,j) - Az(nx-2,j))/dx
+            // => (alpha + beta/dx)*Az(nx-1,j) - (beta/dx)*Az(nx-2,j) = gamma
+            else if (is_right && bc_right.type == "robin") {
+                double a = bc_right.alpha;
+                double b = bc_right.beta;
+                double g = bc_right.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
+                triplets.push_back(Eigen::Triplet<double>(idx, idx - 1, -b/dx));
+                rhs(idx) = g;
+                continue;
+            }
+            // Bottom boundary (j=0): outward normal is -y direction
+            // dAz/dn = -dAz/dy ≈ (Az(i,0) - Az(i,1))/dy
+            // => (alpha + beta/dy)*Az(i,0) - (beta/dy)*Az(i,1) = gamma
+            else if (is_bottom && bc_bottom.type == "robin") {
+                double a = bc_bottom.alpha;
+                double b = bc_bottom.beta;
+                double g = bc_bottom.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
+                triplets.push_back(Eigen::Triplet<double>(idx, idx + nx, -b/dy));
+                rhs(idx) = g;
+                continue;
+            }
+            // Top boundary (j=ny-1): outward normal is +y direction
+            // dAz/dn = dAz/dy ≈ (Az(i,ny-1) - Az(i,ny-2))/dy
+            // => (alpha + beta/dy)*Az(i,ny-1) - (beta/dy)*Az(i,ny-2) = gamma
+            else if (is_top && bc_top.type == "robin") {
+                double a = bc_top.alpha;
+                double b = bc_top.beta;
+                double g = bc_top.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
+                triplets.push_back(Eigen::Triplet<double>(idx, idx - nx, -b/dy));
+                rhs(idx) = g;
                 continue;
             }
 
@@ -4922,6 +5016,33 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 continue;
             }
 
+            // Robin boundary conditions for radial direction
+            // Inner boundary (i=0): outward normal is -r direction
+            // dAz/dn = -dAz/dr ≈ (Az(0,j) - Az(1,j))/dr
+            // => (alpha + beta/dr)*Az(0,j) - (beta/dr)*Az(1,j) = gamma
+            if (i == 0 && bc_inner.type == "robin") {
+                double a = bc_inner.alpha;
+                double b = bc_inner.beta;
+                double g = bc_inner.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
+                rhs(idx) = g;
+                continue;
+            }
+
+            // Outer boundary (i=nr-1): outward normal is +r direction
+            // dAz/dn = dAz/dr ≈ (Az(nr-1,j) - Az(nr-2,j))/dr
+            // => (alpha + beta/dr)*Az(nr-1,j) - (beta/dr)*Az(nr-2,j) = gamma
+            if (i == nr - 1 && bc_outer.type == "robin") {
+                double a = bc_outer.alpha;
+                double b = bc_outer.beta;
+                double g = bc_outer.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
+                rhs(idx) = g;
+                continue;
+            }
+
             // Interior points and Neumann boundary points (using ghost-elimination)
             // Polar Poisson equation with variable permeability (divergence form):
             // (1/r) ∂/∂r(r · (1/μ) · ∂Az/∂r) + (1/r²) ∂/∂θ((1/μ) · ∂Az/∂θ) = -Jz
@@ -5221,6 +5342,28 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
             if (i == nr - 1 && bc_outer.type == "dirichlet") {
                 triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_outer.value;
+                continue;
+            }
+
+            // Handle radial boundaries (Robin)
+            // Inner boundary (i=0): outward normal is -r direction
+            if (i == 0 && bc_inner.type == "robin") {
+                double a = bc_inner.alpha;
+                double b = bc_inner.beta;
+                double g = bc_inner.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
+                rhs(idx) = g;
+                continue;
+            }
+            // Outer boundary (i=nr-1): outward normal is +r direction
+            if (i == nr - 1 && bc_outer.type == "robin") {
+                double a = bc_outer.alpha;
+                double b = bc_outer.beta;
+                double g = bc_outer.gamma;
+                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
+                rhs(idx) = g;
                 continue;
             }
 

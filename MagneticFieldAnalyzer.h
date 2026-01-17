@@ -416,10 +416,16 @@ private:
 
     // Boundary conditions structure
     struct BoundaryCondition {
-        std::string type;     // "dirichlet" or "neumann"
+        std::string type;     // "dirichlet", "neumann", "periodic", or "robin"
         double value;         // Boundary value for Dirichlet
 
-        BoundaryCondition() : type("dirichlet"), value(0.0) {}
+        // Robin BC parameters: alpha*Az + beta*(dAz/dn) = gamma
+        double alpha;         // Coefficient for Az (default: 1.0)
+        double beta;          // Coefficient for dAz/dn (default: 0.0)
+        double gamma;         // RHS value (default: 0.0)
+
+        BoundaryCondition() : type("dirichlet"), value(0.0),
+                              alpha(1.0), beta(0.0), gamma(0.0) {}
     };
 
     // Configuration and input
