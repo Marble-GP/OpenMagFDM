@@ -94,6 +94,9 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
     parseUserVariables();  // Parse user-defined variables before material properties
     setupMaterialProperties();  // This may set has_nonlinear_materials = true
     validateBoundaryConditions();
+
+    // Generate adaptive mesh coarsening mask (if any material has coarsening enabled)
+    generateCoarseningMask();
 }
 
 void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
@@ -424,6 +427,10 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
     cv::Mat image_flipped;
     cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
 
+    // Initialize adaptive mesh coarsening
+    coarsening_enabled = false;
+    material_coarsen.clear();
+
     // =========================================================================
     // PASS 1: Count pixels and calculate area for each material
     // This populates material_pixel_info so that $N and $A can be used in formulas
@@ -567,6 +574,16 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             aa_mat.rgb = cv::Vec3b(rgb[0], rgb[1], rgb[2]);
             aa_mat.mu_r = mu_r;
             antialias_materials.push_back(aa_mat);
+        }
+
+        // Parse coarsening settings for adaptive mesh
+        CoarsenConfig coarsen_cfg;
+        coarsen_cfg.enabled = props["coarsen"].as<bool>(false);
+        coarsen_cfg.ratio = props["coarsen_ratio"].as<int>(2);  // Default ratio = 2
+        material_coarsen[name] = coarsen_cfg;
+        if (coarsen_cfg.enabled) {
+            coarsening_enabled = true;
+            std::cout << "  Coarsening enabled: ratio = " << coarsen_cfg.ratio << std::endl;
         }
 
         // Parse Jz value (static, formula, or array)
@@ -1058,6 +1075,263 @@ void MagneticFieldAnalyzer::exportFluxLinkageCSV(const std::string& output_dir) 
 
     file.close();
     std::cout << "Flux linkage results exported to: " << csv_path << std::endl;
+}
+
+// ============================================================================
+// Adaptive mesh coarsening methods
+// ============================================================================
+
+cv::Mat MagneticFieldAnalyzer::detectMaterialBoundaries() {
+    // Detect material boundaries using Canny edge detection
+    // Returns a binary mask where boundaries are marked as white (255)
+
+    cv::Mat gray, edges;
+
+    // Convert to grayscale for edge detection
+    cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
+
+    // Apply Canny edge detection
+    cv::Canny(gray, edges, 50, 150);
+
+    // Dilate edges to create a protection zone around boundaries
+    // This ensures cells near boundaries are not coarsened
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+    cv::dilate(edges, edges, kernel);
+
+    // Flip to match analysis coordinate system (y up)
+    cv::Mat edges_flipped;
+    cv::flip(edges, edges_flipped, 0);
+
+    return edges_flipped;
+}
+
+void MagneticFieldAnalyzer::generateCoarseningMask() {
+    // Generate mask of active cells based on material coarsening settings
+    // Cells on or near boundaries are always kept active
+
+    if (!coarsening_enabled) {
+        // No coarsening - all cells are active
+        active_cells.resize(ny, nx);
+        active_cells.setConstant(true);
+        n_active_cells = nx * ny;
+        return;
+    }
+
+    std::cout << "Generating coarsening mask..." << std::endl;
+
+    // Detect material boundaries
+    cv::Mat boundaries = detectMaterialBoundaries();
+
+    // Initialize all cells as active
+    active_cells.resize(ny, nx);
+    active_cells.setConstant(true);
+
+    // Flip image for coordinate matching
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    int coarsened_count = 0;
+
+    // Mark cells for coarsening based on material settings
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            // Skip boundary cells - always keep them active
+            if (boundaries.at<uchar>(j, i) > 0) {
+                continue;
+            }
+
+            // Skip cells on domain boundary
+            if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1) {
+                continue;
+            }
+
+            // Find which material this cell belongs to
+            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+
+            // Look up material coarsening settings
+            for (const auto& mat_pair : material_coarsen) {
+                const auto& cfg = mat_pair.second;
+                if (!cfg.enabled || cfg.ratio <= 1) {
+                    continue;
+                }
+
+                // Check if this material matches by looking up its RGB
+                // We need to match the pixel to a material
+                for (const auto& material : config["materials"]) {
+                    std::string mat_name = material.first.as<std::string>();
+                    if (mat_name != mat_pair.first) continue;
+
+                    auto rgb = material.second["rgb"].as<std::vector<int>>();
+                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                        // This cell belongs to a coarsen-enabled material
+                        // Keep only cells at coarsening grid positions
+                        if (i % cfg.ratio != 0 || j % cfg.ratio != 0) {
+                            active_cells(j, i) = false;
+                            coarsened_count++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::cout << "Coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+
+    // Build index mappings
+    buildCoarseIndexMaps();
+}
+
+void MagneticFieldAnalyzer::buildCoarseIndexMaps() {
+    // Build mappings between coarse indices and fine grid coordinates
+
+    coarse_to_fine.clear();
+    fine_to_coarse.clear();
+    n_active_cells = 0;
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            if (active_cells(j, i)) {
+                coarse_to_fine.push_back({i, j});
+                fine_to_coarse[{i, j}] = n_active_cells;
+                n_active_cells++;
+            }
+        }
+    }
+
+    std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)
+              << " (" << std::fixed << std::setprecision(1)
+              << (100.0 * n_active_cells / (nx * ny)) << "%)" << std::endl;
+
+    // Calculate local mesh spacing for active cells
+    calculateLocalMeshSpacing();
+}
+
+void MagneticFieldAnalyzer::calculateLocalMeshSpacing() {
+    // Calculate local mesh spacing (h_minus, h_plus) for each active cell
+    // This is needed for the non-uniform FDM stencil
+
+    local_dx.resize(ny, nx);
+    local_dy.resize(ny, nx);
+    local_dx.setZero();
+    local_dy.setZero();
+
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+
+        // Find distance to next active cell in +x direction
+        int i_next = findNextActiveX(i, j, +1);
+        local_dx(j, i) = (i_next - i) * dx;
+
+        // Find distance to next active cell in +y direction
+        int j_next = findNextActiveY(i, j, +1);
+        local_dy(j, i) = (j_next - j) * dy;
+    }
+}
+
+int MagneticFieldAnalyzer::findNextActiveX(int i, int j, int direction) const {
+    // Find the next active cell in X direction
+    // direction: +1 for right, -1 for left
+
+    int i_next = i + direction;
+    while (i_next >= 0 && i_next < nx) {
+        if (active_cells(j, i_next)) {
+            return i_next;
+        }
+        i_next += direction;
+    }
+    // Reached boundary
+    return (direction > 0) ? nx - 1 : 0;
+}
+
+int MagneticFieldAnalyzer::findNextActiveY(int i, int j, int direction) const {
+    // Find the next active cell in Y direction
+    // direction: +1 for up, -1 for down
+
+    int j_next = j + direction;
+    while (j_next >= 0 && j_next < ny) {
+        if (active_cells(j_next, i)) {
+            return j_next;
+        }
+        j_next += direction;
+    }
+    // Reached boundary
+    return (direction > 0) ? ny - 1 : 0;
+}
+
+std::pair<int, int> MagneticFieldAnalyzer::findActiveNeighbor(int i, int j, int di, int dj) const {
+    // Find the nearest active neighbor cell in direction (di, dj)
+    // Returns (i_neighbor, j_neighbor)
+
+    int i_next = i + di;
+    int j_next = j + dj;
+
+    while (i_next >= 0 && i_next < nx && j_next >= 0 && j_next < ny) {
+        if (active_cells(j_next, i_next)) {
+            return {i_next, j_next};
+        }
+        i_next += di;
+        j_next += dj;
+    }
+
+    // Return boundary position if no active cell found
+    i_next = std::max(0, std::min(nx - 1, i_next));
+    j_next = std::max(0, std::min(ny - 1, j_next));
+    return {i_next, j_next};
+}
+
+double MagneticFieldAnalyzer::bilinearInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const {
+    // Bilinear interpolation for inactive cells from surrounding active cells
+
+    // Find surrounding active cells
+    int i_left = i, i_right = i, j_bottom = j, j_top = j;
+
+    // Search left
+    while (i_left > 0 && !active_cells(j, i_left)) i_left--;
+    // Search right
+    while (i_right < nx - 1 && !active_cells(j, i_right)) i_right++;
+    // Search down
+    while (j_bottom > 0 && !active_cells(j_bottom, i)) j_bottom--;
+    // Search up
+    while (j_top < ny - 1 && !active_cells(j_top, i)) j_top++;
+
+    // If we found active cells on all sides, use bilinear interpolation
+    if (active_cells(j, i_left) && active_cells(j, i_right) &&
+        active_cells(j_bottom, i) && active_cells(j_top, i)) {
+
+        // Get coarse indices
+        auto it_left = fine_to_coarse.find({i_left, j});
+        auto it_right = fine_to_coarse.find({i_right, j});
+        auto it_bottom = fine_to_coarse.find({i, j_bottom});
+        auto it_top = fine_to_coarse.find({i, j_top});
+
+        if (it_left != fine_to_coarse.end() && it_right != fine_to_coarse.end()) {
+            // Interpolate in x direction first
+            double fx = (i_right > i_left) ? double(i - i_left) / (i_right - i_left) : 0.5;
+            double Az_x = (1.0 - fx) * Az_coarse(it_left->second) + fx * Az_coarse(it_right->second);
+
+            if (it_bottom != fine_to_coarse.end() && it_top != fine_to_coarse.end()) {
+                double fy = (j_top > j_bottom) ? double(j - j_bottom) / (j_top - j_bottom) : 0.5;
+                double Az_y = (1.0 - fy) * Az_coarse(it_bottom->second) + fy * Az_coarse(it_top->second);
+                return 0.5 * (Az_x + Az_y);  // Average of x and y interpolations
+            }
+            return Az_x;
+        }
+    }
+
+    // Fallback: use nearest active neighbor
+    for (int dj = -1; dj <= 1; dj++) {
+        for (int di = -1; di <= 1; di++) {
+            int ni = i + di, nj = j + dj;
+            if (ni >= 0 && ni < nx && nj >= 0 && nj < ny && active_cells(nj, ni)) {
+                auto it = fine_to_coarse.find({ni, nj});
+                if (it != fine_to_coarse.end()) {
+                    return Az_coarse(it->second);
+                }
+            }
+        }
+    }
+
+    return 0.0;  // Should not reach here
 }
 
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {

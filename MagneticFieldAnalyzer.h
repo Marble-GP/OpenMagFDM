@@ -495,6 +495,23 @@ private:
     std::vector<AntialiasableMaterial> antialias_materials;  // Materials with antialias enabled
     std::map<std::string, YAML::Node> material_presets;  // Material presets (reusable B-H curves/properties)
 
+    // Adaptive mesh coarsening configuration
+    struct CoarsenConfig {
+        bool enabled;       // Enable coarsening for this material
+        int ratio;          // Coarsening ratio (e.g., 4 means 4x4 -> 1 cell)
+
+        CoarsenConfig() : enabled(false), ratio(1) {}
+    };
+    std::map<std::string, CoarsenConfig> material_coarsen;  // Coarsening config per material
+
+    // Adaptive mesh coarsening data
+    Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> active_cells;  // True if cell is active (not coarsened)
+    Eigen::MatrixXd local_dx, local_dy;  // Local mesh spacing at each active cell
+    std::vector<std::pair<int, int>> coarse_to_fine;  // coarse_idx -> (i, j) in full grid
+    std::map<std::pair<int, int>, int> fine_to_coarse;  // (i, j) -> coarse_idx
+    int n_active_cells;  // Number of active cells in coarsened mesh
+    bool coarsening_enabled;  // Global flag: true if any material has coarsening enabled
+
     // User-defined variables (from YAML "variables" section)
     std::map<std::string, double> user_variables;  // Variable name -> evaluated value
 
@@ -557,6 +574,16 @@ private:
     double calculateFluxLinkage(const FluxLinkagePath& path) const;  // Φ = Az(end) - Az(start)
     void calculateAllFluxLinkages(int step);  // Calculate and store all flux linkages
     void exportFluxLinkageCSV(const std::string& output_dir) const;  // Export to CSV
+
+    // Adaptive mesh coarsening methods
+    cv::Mat detectMaterialBoundaries();  // Detect material boundaries using edge detection
+    void generateCoarseningMask();       // Generate mask of active/inactive cells
+    void buildCoarseIndexMaps();         // Build coarse <-> fine index mappings
+    void calculateLocalMeshSpacing();    // Calculate h_minus/h_plus for each active cell
+    int findNextActiveX(int i, int j, int direction) const;  // Find next active cell in X
+    int findNextActiveY(int i, int j, int direction) const;  // Find next active cell in Y
+    std::pair<int, int> findActiveNeighbor(int i, int j, int di, int dj) const;  // Find active neighbor
+    double bilinearInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // Interpolate inactive cell
 
     // Nonlinear solver methods
     void solveNonlinear();  // Main nonlinear Picard iteration solver
