@@ -54,23 +54,23 @@
     },
     "inner": {
       "description": "Inner boundary condition (at r=r_start)",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "outer": {
       "description": "Outer boundary condition (at r=r_end)",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "theta_min": {
       "description": "Boundary condition at θ=0 (angular start boundary)",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "theta_max": {
       "description": "Boundary condition at θ=theta_range (angular end boundary)",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "type": {
-      "description": "Boundary condition type: 'dirichlet', 'neumann', or 'periodic'. For periodic BC with value<0, anti-periodic BC is applied (f(θ=0) = -f(θ=θ_range))",
-      "values": ["dirichlet", "neumann", "periodic"],
+      "description": "Boundary condition type: 'dirichlet', 'neumann', 'periodic', or 'robin'. For periodic BC with value<0, anti-periodic BC is applied (f(θ=0) = -f(θ=θ_range))",
+      "values": ["dirichlet", "neumann", "periodic", "robin"],
       "example": "type: dirichlet"
     },
     "value": {
@@ -78,30 +78,42 @@
       "type": "number",
       "example": "value: 0.0"
     },
+    "alpha": {
+      "description": "Robin BC: coefficient for Az term (α·Az + β·∂Az/∂n = γ). Default: 1.0 (Dirichlet-like when β=0)",
+      "type": "number",
+      "example": "alpha: 1.0",
+      "validParents": ["left", "right", "top", "bottom", "inner", "outer", "theta_min", "theta_max"]
+    },
+    "gamma": {
+      "description": "Robin BC: right-hand side value (α·Az + β·∂Az/∂n = γ). Default: 0.0",
+      "type": "number",
+      "example": "gamma: 0.0",
+      "validParents": ["left", "right", "top", "bottom", "inner", "outer", "theta_min", "theta_max"]
+    },
     "boundary_conditions": {
       "description": "Boundary conditions for Cartesian coordinates (4 edges)",
       "children": ["left", "right", "top", "bottom"]
     },
     "left": {
       "description": "Left boundary condition",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "right": {
       "description": "Right boundary condition",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "top": {
       "description": "Top boundary condition",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "bottom": {
       "description": "Bottom boundary condition",
-      "children": ["type", "value"]
+      "children": ["type", "value", "alpha", "beta", "gamma"]
     },
     "materials": {
       "description": "Material definitions (any material name is allowed)",
       "acceptsAnyChild": true,
-      "childrenProperties": ["rgb", "mu_r", "jz", "calc_force"]
+      "childrenProperties": ["rgb", "mu_r", "jz", "calc_force", "anti_aliasing", "coarsen", "coarsen_ratio", "preset"]
     },
     "rgb": {
       "description": "RGB color for material identification in input image [R, G, B]",
@@ -126,6 +138,59 @@
       "type": "boolean",
       "example": "calc_force: true",
       "validParents": ["materials"]
+    },
+    "anti_aliasing": {
+      "description": "Enable anti-aliasing interpolation for gradient pixels at material boundaries. Uses harmonic mean of μ based on RGB distance ratio",
+      "type": "boolean",
+      "example": "anti_aliasing: true",
+      "validParents": ["materials"]
+    },
+    "coarsen": {
+      "description": "Enable adaptive mesh coarsening for this material region (reduces mesh resolution in uniform areas)",
+      "type": "boolean",
+      "example": "coarsen: true",
+      "validParents": ["materials"]
+    },
+    "coarsen_ratio": {
+      "description": "Coarsening ratio (e.g., 4 means 4x4 pixels → 1 cell). Only used when coarsen: true",
+      "type": "integer",
+      "example": "coarsen_ratio: 4",
+      "validParents": ["materials"]
+    },
+    "preset": {
+      "description": "Reference to a material preset defined in material_presets section",
+      "type": "string",
+      "example": "preset: my_steel",
+      "validParents": ["materials"]
+    },
+    "material_presets": {
+      "description": "User-defined material presets for reuse. Define B-H curves or formulas once, reference by name",
+      "acceptsAnyChild": true,
+      "childrenProperties": ["mu_r"],
+      "example": "material_presets:\n  my_steel:\n    mu_r: [[0, 100, 500], [5000, 4500, 3000]]"
+    },
+    "flux_linkage": {
+      "description": "Flux linkage calculation paths. Each path defines start/end points for Φ = Az(end) - Az(start)",
+      "type": "array",
+      "example": "flux_linkage:\n  - name: coil_A\n    start: [0.01, 0.05]\n    end: [0.01, 0.15]"
+    },
+    "name": {
+      "description": "Name identifier for flux linkage path",
+      "type": "string",
+      "example": "name: coil_A",
+      "validParents": ["flux_linkage"]
+    },
+    "start": {
+      "description": "Start point coordinates [x, y] in physical units [m] for flux linkage calculation",
+      "type": "array",
+      "example": "start: [0.01, 0.05]",
+      "validParents": ["flux_linkage"]
+    },
+    "end": {
+      "description": "End point coordinates [x, y] in physical units [m] for flux linkage calculation",
+      "type": "array",
+      "example": "end: [0.01, 0.15]",
+      "validParents": ["flux_linkage"]
     },
     "transient": {
       "description": "Transient analysis configuration",
@@ -189,10 +254,10 @@
       "validParents": ["anderson"]
     },
     "beta": {
-      "description": "Anderson mixing parameter (0.0-1.0, 1.0 = full Anderson, smaller = more conservative)",
+      "description": "Anderson: mixing parameter (0.0-1.0, 1.0 = full Anderson). Robin BC: coefficient for ∂Az/∂n term (α·Az + β·∂Az/∂n = γ), set >0 for external reluctance",
       "type": "number",
       "example": "beta: 1.0",
-      "validParents": ["anderson"]
+      "validParents": ["anderson", "left", "right", "top", "bottom", "inner", "outer", "theta_min", "theta_max"]
     },
     "max_iterations": {
       "description": "Maximum number of nonlinear iterations",
@@ -288,6 +353,11 @@
       "trigger": "type",
       "snippet": "type: periodic\nvalue: -1.0"
     },
+    "boundary_robin": {
+      "name": "Robin Boundary (α·Az + β·∂Az/∂n = γ)",
+      "trigger": "type",
+      "snippet": "type: robin\nalpha: 1.0\nbeta: 0.001\ngamma: 0.0"
+    },
     "theta_min_periodic": {
       "name": "θ_min Periodic Boundary",
       "trigger": "theta_min",
@@ -322,6 +392,31 @@
       "name": "Material Definition Template",
       "trigger": "material",
       "snippet": "rgb: [255, 255, 255]\nmu_r: 1.0\njz: 0.0\ncalc_force: false"
+    },
+    "material_with_antialias": {
+      "name": "Material with Anti-aliasing",
+      "trigger": "material",
+      "snippet": "rgb: [128, 128, 128]\nmu_r: 1000.0\njz: 0.0\nanti_aliasing: true"
+    },
+    "material_with_coarsening": {
+      "name": "Material with Adaptive Mesh Coarsening",
+      "trigger": "material",
+      "snippet": "rgb: [255, 255, 255]\nmu_r: 1.0\njz: 0.0\ncoarsen: true\ncoarsen_ratio: 4"
+    },
+    "material_from_preset": {
+      "name": "Material from Preset",
+      "trigger": "material",
+      "snippet": "rgb: [128, 128, 128]\npreset: my_steel\njz: 0.0"
+    },
+    "material_presets_template": {
+      "name": "Material Presets Section",
+      "trigger": "material_presets",
+      "snippet": "my_steel:\n  mu_r: [[0, 100, 500, 1000], [5000, 4500, 3000, 2000]]\nmy_formula:\n  mu_r: \"5000 / (1 + ($H/500)^2)\""
+    },
+    "flux_linkage_template": {
+      "name": "Flux Linkage Paths",
+      "trigger": "flux_linkage",
+      "snippet": "- name: coil_A\n  start: [0.01, 0.05]\n  end: [0.01, 0.15]\n- name: coil_B\n  start: [0.02, 0.05]\n  end: [0.02, 0.15]"
     },
     "transient_template": {
       "name": "Transient Analysis Template",
