@@ -1444,6 +1444,9 @@ const plotDefinitions = {
     az_boundary: { name: 'Field Lines (on Material)', render: renderAzBoundary },
     az_edge: { name: 'Field Lines (on Edge)', render: renderAzEdge },
     step_input_image: { name: 'Step Input Image', render: renderStepInputImage },
+    coarsening_mask: { name: 'Coarsening Mask', render: renderCoarseningMask },
+    line_profile: { name: 'Line Profile', render: renderLineProfile },
+    flux_linkage_interactive: { name: 'Flux Linkage', render: renderFluxLinkageInteractive },
     force_x_time: { name: 'Force X-axis', render: renderForceXTime },
     force_y_time: { name: 'Force Y-axis', render: renderForceYTime },
     torque_time: { name: 'Torque', render: renderTorqueTime },
@@ -1646,8 +1649,35 @@ function removePlot(plotId) {
 // ===== Interaction Mode Toggle =====
 function toggleInteractionMode(plotId, containerId, button) {
     const container = document.getElementById(containerId);
-    if (!container || !container.data || !container.layout) {
-        console.warn('No Plotly plot found');
+    if (!container) {
+        console.warn('Container not found');
+        return;
+    }
+
+    // Find the actual Plotly container (may be in sub-container for special plots)
+    let plotlyContainers = [];
+    if (container.data && container.layout) {
+        // Direct Plotly plot
+        plotlyContainers.push(container);
+    } else {
+        // Check for special plots with sub-containers
+        if (container._lineProfileImageDiv) {
+            plotlyContainers.push(container._lineProfileImageDiv);
+        }
+        if (container._fluxLinkagePlotDiv) {
+            plotlyContainers.push(container._fluxLinkagePlotDiv);
+        }
+        // Also check for sub-divs with Plotly data
+        const subDivs = container.querySelectorAll('div[id]');
+        subDivs.forEach(div => {
+            if (div.data && div.layout && !plotlyContainers.includes(div)) {
+                plotlyContainers.push(div);
+            }
+        });
+    }
+
+    if (plotlyContainers.length === 0) {
+        console.warn('No Plotly plot found in container');
         return;
     }
 
@@ -1686,18 +1716,17 @@ function toggleInteractionMode(plotId, containerId, button) {
         img.src = newIcon;
     }
 
-    // Update Plotly dragmode
-    Plotly.relayout(container, { dragmode: dragmode }).catch(err => {
-        console.error('Failed to update drag mode:', err);
+    // Update Plotly dragmode for all found containers
+    plotlyContainers.forEach(plotContainer => {
+        Plotly.relayout(plotContainer, { dragmode: dragmode }).catch(err => {
+            console.error('Failed to update drag mode:', err);
+        });
     });
 
     // Update GridStack tile movability
-    // Find the grid-stack-item element that contains this plot
-    const containerEl = document.getElementById(containerId);
-    const widgetEl = containerEl ? containerEl.closest('.grid-stack-item') : null;
+    const widgetEl = container.closest('.grid-stack-item');
     if (widgetEl && AppState.gridStack) {
         AppState.gridStack.movable(widgetEl, tileMovable);
-        console.log(`Tile movability for ${plotId}: ${tileMovable}`);
     }
 }
 
@@ -1753,6 +1782,21 @@ function resetPlotZoom(containerId) {
     if (contentElement) {
         const plotType = contentElement.dataset.plotType;
         const plotDef = plotDefinitions[plotType];
+
+        // Reset special widget states
+        if (plotType === 'line_profile' && lineProfileState[containerId]) {
+            lineProfileState[containerId].startPoint = null;
+            lineProfileState[containerId].endPoint = null;
+            lineProfileState[containerId].selectingStart = true;
+            lineProfileState[containerId].zoomRange = null;  // Reset zoom
+        }
+        if (plotType === 'flux_linkage_interactive' && fluxLinkageState[containerId]) {
+            fluxLinkageState[containerId].startPoint = null;
+            fluxLinkageState[containerId].endPoint = null;
+            fluxLinkageState[containerId].selectingStart = true;
+            fluxLinkageState[containerId].fluxValue = null;
+            fluxLinkageState[containerId].zoomRange = null;  // Reset zoom
+        }
 
         if (plotDef && plotDef.render) {
             // Re-render the plot to reset to initial state
@@ -2205,6 +2249,86 @@ async function makeBlackTransparent(url, threshold = 30) {
 
         img.onerror = function() {
             reject(new Error('Failed to load boundary image for transparency conversion'));
+        };
+
+        img.src = url;
+    });
+}
+
+// Helper: Flip an image URL vertically (for image coordinate to analysis coordinate conversion)
+async function flipImageVertical(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'Anonymous';
+
+        img.onload = function() {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+
+            // Flip vertically: translate to bottom, scale y by -1
+            ctx.translate(0, img.height);
+            ctx.scale(1, -1);
+            ctx.drawImage(img, 0, 0);
+
+            // Return as Data URL
+            resolve(canvas.toDataURL('image/png'));
+        };
+
+        img.onerror = function() {
+            reject(new Error('Failed to load image for vertical flip'));
+        };
+
+        img.src = url;
+    });
+}
+
+// Helper: Flip an image URL vertically AND make black pixels transparent
+async function flipAndMakeBlackTransparent(url, threshold = 30) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'Anonymous';
+
+        img.onload = function() {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+
+            // Flip vertically: translate to bottom, scale y by -1
+            ctx.translate(0, img.height);
+            ctx.scale(1, -1);
+            ctx.drawImage(img, 0, 0);
+
+            // Reset transform for getImageData
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+            // Get pixel data
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const pixels = imageData.data;
+
+            // Convert black pixels (RGB values below threshold) to transparent
+            for (let i = 0; i < pixels.length; i += 4) {
+                const r = pixels[i];
+                const g = pixels[i + 1];
+                const b = pixels[i + 2];
+
+                // If RGB sum is below threshold, make transparent
+                if (r + g + b <= threshold * 3) {
+                    pixels[i + 3] = 0;  // Set alpha channel to 0 (transparent)
+                }
+            }
+
+            // Put modified pixel data back
+            ctx.putImageData(imageData, 0, 0);
+
+            // Return as Data URL
+            resolve(canvas.toDataURL('image/png'));
+        };
+
+        img.onerror = function() {
+            reject(new Error('Failed to load image for flip and transparency conversion'));
         };
 
         img.src = url;
@@ -2798,7 +2922,7 @@ async function renderAzBoundary(containerId, step) {
                 },
                 yaxis: {
                     title: 'Y [mm]',
-                    range: [yMin, yMax]
+                    range: [yMax, yMin]  // Reversed to match image coordinates (y=0 at top)
                 },
                 images: [{
                     source: mergedImageUrl,
@@ -2824,7 +2948,8 @@ async function renderAzBoundary(containerId, step) {
         } else {
             // Original Plotly contour approach for non-transformed coordinates
             const azFlipped = flipVertical(azData);
-            const transparentInputUrl = await makeBlackTransparent(inputImgUrl);
+            // Flip image vertically to match analysis coordinates (y=0 at bottom)
+            const transparentInputUrl = await flipAndMakeBlackTransparent(inputImgUrl);
 
             const rows = azFlipped.length;
             const cols = azFlipped[0].length;
@@ -3021,7 +3146,7 @@ async function renderAzEdge(containerId, step) {
                 },
                 yaxis: {
                     title: 'Y [mm]',
-                    range: [yMin, yMax]
+                    range: [yMax, yMin]  // Reversed to match image coordinates (y=0 at top)
                 },
                 images: [{
                     source: mergedImageUrl,
@@ -3045,6 +3170,8 @@ async function renderAzEdge(containerId, step) {
         } else {
             // Original Plotly contour approach with edge-detected background
             const azFlipped = flipVertical(azData);
+            // Flip edge image to match analysis coordinates (y=0 at bottom)
+            const flippedEdgeImgUrl = await flipImageVertical(edgeImgUrl);
 
             const rows = azFlipped.length;
             const cols = azFlipped[0].length;
@@ -3137,7 +3264,7 @@ async function renderAzEdge(containerId, step) {
                     range: [yMin, yMax]
                 },
                 images: [{
-                    source: edgeImgUrl,
+                    source: flippedEdgeImgUrl,
                     xref: 'x',
                     yref: 'y',
                     x: xMin,
@@ -3231,7 +3358,7 @@ async function renderMaterialImage(containerId, step) {
             },
             yaxis: {
                 title: yTitle,
-                range: [yMin, yMax],
+                range: [yMax, yMin],  // Reversed to match image coordinates (y=0 at top)
                 showgrid: false
             },
             images: [
@@ -3332,7 +3459,7 @@ async function renderStepInputImage(containerId, step) {
             },
             yaxis: {
                 title: yTitle,
-                range: [yMin, yMax],
+                range: [yMax, yMin],  // Reversed to match image coordinates (y=0 at top)
                 showgrid: false
             },
             images: [
@@ -3360,6 +3487,764 @@ async function renderStepInputImage(containerId, step) {
     } catch (error) {
         console.error('Step input image load error:', error);
         container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading image</div>';
+    }
+}
+
+async function renderCoarseningMask(containerId, step) {
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) throw new Error('No result selected');
+
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    try {
+        // Get coarsening mask image (does not change per step)
+        const imgUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&t=${Date.now()}`;
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // Load image to get dimensions
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = () => reject(new Error('Coarsening mask not available (adaptive mesh may not be enabled)'));
+            img.src = imgUrl;
+        });
+
+        const rows = img.height;
+        const cols = img.width;
+
+        // Generate physical coordinates if available
+        let xTitle, yTitle, xMin, xMax, yMin, yMax;
+        if (AppState.analysisConditions) {
+            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+            if (coordSys === 'polar') {
+                const theta_start = AppState.analysisConditions.theta_start || 0;
+                const dr = AppState.analysisConditions.dr || 0.001;
+                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                xTitle = 'r - r_start [mm]';
+                yTitle = 'θ [rad]';
+                xMin = 0;
+                xMax = (cols - 1) * dr * 1000;
+                yMin = theta_start;
+                yMax = theta_start + (rows - 1) * dtheta;
+            } else {
+                const dx = AppState.analysisConditions.dx || 0.001;
+                const dy = AppState.analysisConditions.dy || 0.001;
+                xTitle = 'X [mm]';
+                yTitle = 'Y [mm]';
+                xMin = 0;
+                xMax = (cols - 1) * dx * 1000;
+                yMin = 0;
+                yMax = (rows - 1) * dy * 1000;
+            }
+        } else {
+            xTitle = 'X [pixels]';
+            yTitle = 'Y [pixels]';
+            xMin = 0;
+            xMax = cols - 1;
+            yMin = 0;
+            yMax = rows - 1;
+        }
+
+        // Display image using Plotly
+        let layout = {
+            width: size.width,
+            height: size.height,
+            margin: { l: 35, r: 10, t: 25, b: 35 },
+            title: {
+                text: 'Coarsening Mask (black = coarsened)',
+                font: { size: 12 }
+            },
+            xaxis: {
+                title: xTitle,
+                range: [xMin, xMax],
+                showgrid: false
+            },
+            yaxis: {
+                title: yTitle,
+                range: [yMax, yMin],  // Reversed to match image coordinates (y=0 at top)
+                showgrid: false
+            },
+            images: [
+                {
+                    source: imgUrl,
+                    xref: 'x',
+                    yref: 'y',
+                    x: xMin,
+                    y: yMax,
+                    sizex: xMax - xMin,
+                    sizey: yMax - yMin,
+                    sizing: 'stretch',
+                    opacity: 1.0,
+                    layer: 'below'
+                }
+            ],
+            dragmode: false
+        };
+
+        // Restore saved zoom state if exists
+        layout = restoreZoomState(containerId, layout);
+
+        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        setupZoomTracking(containerId);
+    } catch (error) {
+        console.error('Coarsening mask load error:', error);
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">Coarsening mask not available<br><small>(Adaptive mesh may not be enabled for this result)</small></div>';
+    }
+}
+
+// ===== Interactive Plot Functions =====
+
+// State for interactive line profile
+const lineProfileState = {};
+
+async function renderLineProfile(containerId, step) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) {
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No result selected</div>';
+        return;
+    }
+
+    // Initialize state for this container
+    if (!lineProfileState[containerId]) {
+        lineProfileState[containerId] = {
+            startPoint: null,
+            endPoint: null,
+            selectingStart: true,
+            displayField: 'az',  // 'az', 'mu', 'bn', 'bt', 'hn', 'ht'
+            zoomRange: null  // { xRange: [min, max], yRange: [min, max] } - preserved across re-renders
+        };
+    }
+
+    const state = lineProfileState[containerId];
+
+    try {
+        // Load Az and Mu data
+        const azData = await loadCsvData('Az', step);
+        const muData = await loadCsvData('Mu', step);
+
+        if (!azData || azData.length === 0) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No data available</div>';
+            return;
+        }
+
+        const dx = AppState.analysisConditions?.dx || 0.001;
+        const dy = AppState.analysisConditions?.dy || 0.001;
+
+        // Flip data for display (analysis y-up to image y-down)
+        const azFlipped = flipVertical(azData);
+        const muFlipped = flipVertical(muData);
+
+        // Calculate B and H with components
+        const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+
+        const rows = azFlipped.length;
+        const cols = azFlipped[0].length;
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // Create compact control bar (use panel header for mode toggle)
+        const controlBar = document.createElement('div');
+        controlBar.style.cssText = 'display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: #f8f8f8; border-bottom: 1px solid #eee; font-size: 11px;';
+        controlBar.innerHTML = `
+            <span style="color: #666;">Display:</span>
+            <select id="${containerId}-field-select" style="padding: 2px 4px; font-size: 11px; border: 1px solid #ccc; border-radius: 3px;" onchange="setLineProfileField('${containerId}', this.value)">
+                <option value="az" ${state.displayField === 'az' ? 'selected' : ''}>Az [Wb/m]</option>
+                <option value="mu" ${state.displayField === 'mu' ? 'selected' : ''}>μ [H/m]</option>
+                <option value="bn" ${state.displayField === 'bn' ? 'selected' : ''}>Bn [T]</option>
+                <option value="bt" ${state.displayField === 'bt' ? 'selected' : ''}>Bt [T]</option>
+                <option value="hn" ${state.displayField === 'hn' ? 'selected' : ''}>Hn [A/m]</option>
+                <option value="ht" ${state.displayField === 'ht' ? 'selected' : ''}>Ht [A/m]</option>
+            </select>
+        `;
+        container.appendChild(controlBar);
+
+        // Create main content area
+        const contentArea = document.createElement('div');
+        contentArea.style.cssText = 'display: flex; height: calc(100% - 28px);';
+
+        // Create two subplots: input image (left) and profile (right)
+        const imageDiv = document.createElement('div');
+        imageDiv.id = containerId + '-image';
+        imageDiv.style.cssText = 'width: 50%; height: 100%;';
+
+        const profileDiv = document.createElement('div');
+        profileDiv.id = containerId + '-profile';
+        profileDiv.style.cssText = 'width: 50%; height: 100%;';
+
+        contentArea.appendChild(imageDiv);
+        contentArea.appendChild(profileDiv);
+        container.appendChild(contentArea);
+
+        // Get input image URL and flip for correct orientation
+        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await flipImageVertical(imgUrlRaw);
+
+        // Create X and Y coordinate arrays
+        const xCoords = Array.from({ length: cols }, (_, i) => i * dx * 1000); // mm
+        const yCoords = Array.from({ length: rows }, (_, j) => j * dy * 1000); // mm
+
+        // Build traces for input image with line overlay
+        const traces = [];
+
+        // Add line trace if both points are selected
+        if (state.startPoint && state.endPoint) {
+            traces.push({
+                x: [state.startPoint.x, state.endPoint.x],
+                y: [state.startPoint.y, state.endPoint.y],
+                mode: 'lines+markers',
+                type: 'scatter',
+                line: { color: 'lime', width: 3 },
+                marker: { size: 10, color: ['green', 'red'] },
+                name: 'Profile Line',
+                showlegend: false
+            });
+        }
+
+        // Add markers for selected points
+        if (state.startPoint && !state.endPoint) {
+            traces.push({
+                x: [state.startPoint.x],
+                y: [state.startPoint.y],
+                mode: 'markers',
+                type: 'scatter',
+                marker: { size: 14, color: 'green', symbol: 'circle', line: { color: 'white', width: 2 } },
+                showlegend: false
+            });
+        }
+
+        const xMax = (cols - 1) * dx * 1000;
+        const yMax = (rows - 1) * dy * 1000;
+
+        // Status text for point selection (use Move mode in panel header to click)
+        const statusText = state.selectingStart ? 'Move mode: click START' : 'Move mode: click END';
+        const statusColor = state.selectingStart ? 'green' : 'red';
+
+        // Use saved zoom range if available, otherwise use full range
+        const xRangeToUse = state.zoomRange?.xRange || [0, xMax];
+        const yRangeToUse = state.zoomRange?.yRange || [0, yMax];
+
+        const imageLayout = {
+            width: (size.width / 2) - 5,
+            height: size.height - 30,
+            margin: { l: 50, r: 10, t: 25, b: 40 },
+            title: { text: statusText, font: { size: 10, color: statusColor } },
+            xaxis: { title: 'X [mm]', range: xRangeToUse },
+            yaxis: { title: 'Y [mm]', range: yRangeToUse },
+            images: [{
+                source: imgUrl,
+                xref: 'x', yref: 'y',
+                x: 0, y: yMax,
+                sizex: xMax, sizey: yMax,
+                sizing: 'stretch',
+                opacity: 1.0,
+                layer: 'below'
+            }],
+            dragmode: false  // Default to move/click mode for point selection
+        };
+
+        await Plotly.newPlot(imageDiv, traces, imageLayout, { responsive: true, displayModeBar: false });
+
+        // Store reference in main container for panel header toggle
+        container._lineProfileImageDiv = imageDiv;
+
+        // Setup click handler using DOM event (works at any zoom level)
+        // Remove existing handler if any
+        if (imageDiv._clickHandler) {
+            imageDiv.removeEventListener('click', imageDiv._clickHandler);
+        }
+        imageDiv._clickHandler = (evt) => {
+            // Check if in move mode (dragmode: false)
+            const currentDragmode = imageDiv.layout?.dragmode;
+            if (currentDragmode && currentDragmode !== false) {
+                return;  // Don't handle clicks in zoom/pan mode
+            }
+
+            // Get plot area bounding box
+            const plotArea = imageDiv.querySelector('.nsewdrag');
+            if (!plotArea) return;
+
+            const rect = plotArea.getBoundingClientRect();
+            const mouseX = evt.clientX - rect.left;
+            const mouseY = evt.clientY - rect.top;
+
+            // Check if click is within plot area
+            if (mouseX < 0 || mouseX > rect.width || mouseY < 0 || mouseY > rect.height) {
+                return;
+            }
+
+            // Convert pixel coordinates to data coordinates using current axis ranges
+            const xaxis = imageDiv._fullLayout?.xaxis;
+            const yaxis = imageDiv._fullLayout?.yaxis;
+            if (!xaxis || !yaxis) return;
+
+            const xRange = xaxis.range;
+            const yRange = yaxis.range;
+
+            const clickedX = xRange[0] + (mouseX / rect.width) * (xRange[1] - xRange[0]);
+            const clickedY = yRange[1] - (mouseY / rect.height) * (yRange[1] - yRange[0]);  // Y is inverted
+
+            // Save current zoom range before re-rendering
+            state.zoomRange = {
+                xRange: [...xRange],
+                yRange: [...yRange]
+            };
+
+            if (state.selectingStart) {
+                state.startPoint = { x: clickedX, y: clickedY };
+                state.selectingStart = false;
+                state.endPoint = null;
+            } else {
+                state.endPoint = { x: clickedX, y: clickedY };
+                state.selectingStart = true;
+            }
+
+            renderLineProfile(containerId, AppState.currentStep);
+        };
+        imageDiv.addEventListener('click', imageDiv._clickHandler);
+
+        // Profile plot
+        if (state.startPoint && state.endPoint) {
+            // Calculate line direction for normal/tangent decomposition
+            const lineVecX = state.endPoint.x - state.startPoint.x;
+            const lineVecY = state.endPoint.y - state.startPoint.y;
+            const lineLen = Math.sqrt(lineVecX * lineVecX + lineVecY * lineVecY);
+            const tangentX = lineVecX / lineLen;  // Tangent unit vector
+            const tangentY = lineVecY / lineLen;
+            const normalX = -tangentY;  // Normal unit vector (perpendicular)
+            const normalY = tangentX;
+
+            // Extract profile data with vector decomposition
+            const profileData = extractLineProfileEnhanced(
+                state.startPoint, state.endPoint,
+                azFlipped, muFlipped, Bx, By, Hx, Hy,
+                normalX, normalY, tangentX, tangentY,
+                dx, dy
+            );
+
+            // Select which data to display based on dropdown
+            let yData, yLabel, yColor;
+            switch (state.displayField) {
+                case 'az':
+                    yData = profileData.az;
+                    yLabel = 'Az [Wb/m]';
+                    yColor = '#1f77b4';
+                    break;
+                case 'mu':
+                    yData = profileData.mu;
+                    yLabel = 'μ [H/m]';
+                    yColor = '#ff7f0e';
+                    break;
+                case 'bn':
+                    yData = profileData.bn;
+                    yLabel = 'Bn (normal) [T]';
+                    yColor = '#2ca02c';
+                    break;
+                case 'bt':
+                    yData = profileData.bt;
+                    yLabel = 'Bt (tangent) [T]';
+                    yColor = '#d62728';
+                    break;
+                case 'hn':
+                    yData = profileData.hn;
+                    yLabel = 'Hn (normal) [A/m]';
+                    yColor = '#9467bd';
+                    break;
+                case 'ht':
+                    yData = profileData.ht;
+                    yLabel = 'Ht (tangent) [A/m]';
+                    yColor = '#8c564b';
+                    break;
+                default:
+                    yData = profileData.az;
+                    yLabel = 'Az [Wb/m]';
+                    yColor = '#1f77b4';
+            }
+
+            const profileTraces = [{
+                x: profileData.distance,
+                y: yData,
+                name: yLabel,
+                type: 'scatter',
+                mode: 'lines',
+                line: { color: yColor, width: 2 }
+            }];
+
+            const profileLayout = {
+                width: (size.width / 2) - 5,
+                height: size.height - 40,
+                margin: { l: 60, r: 20, t: 30, b: 40 },
+                title: { text: 'Line Profile', font: { size: 11 } },
+                xaxis: { title: 'Distance [mm]' },
+                yaxis: { title: yLabel },
+                showlegend: false
+            };
+
+            await Plotly.newPlot(profileDiv, profileTraces, profileLayout, { responsive: true, displayModeBar: false });
+        } else {
+            // Show instructions
+            profileDiv.innerHTML = `
+                <div style="padding: 20px; text-align: center; color: #666; height: 100%; display: flex; flex-direction: column; justify-content: center;">
+                    <p><strong>Line Profile</strong></p>
+                    <p style="font-size: 0.85em; margin-top: 10px;">1. Set mode to "Select"</p>
+                    <p style="font-size: 0.85em;">2. Click on image to set START point (green)</p>
+                    <p style="font-size: 0.85em;">3. Click again to set END point (red)</p>
+                    <p style="font-size: 0.85em; margin-top: 15px;">Choose field from dropdown:</p>
+                    <p style="font-size: 0.8em; color: #888;">Az, μ, Bn/Bt (B normal/tangent), Hn/Ht (H normal/tangent)</p>
+                </div>
+            `;
+        }
+    } catch (error) {
+        console.error('Line profile error:', error);
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading data</div>';
+    }
+}
+
+// Line profile control functions
+function setLineProfileField(containerId, field) {
+    if (lineProfileState[containerId]) {
+        lineProfileState[containerId].displayField = field;
+        renderLineProfile(containerId, AppState.currentStep);
+    }
+}
+
+function resetLineProfilePoints(containerId) {
+    if (lineProfileState[containerId]) {
+        lineProfileState[containerId].startPoint = null;
+        lineProfileState[containerId].endPoint = null;
+        lineProfileState[containerId].selectingStart = true;
+        renderLineProfile(containerId, AppState.currentStep);
+    }
+}
+
+// Helper: Extract field values along a line with vector decomposition
+function extractLineProfileEnhanced(start, end, azData, muData, Bx, By, Hx, Hy, normalX, normalY, tangentX, tangentY, dx, dy) {
+    const result = { distance: [], az: [], mu: [], bn: [], bt: [], hn: [], ht: [] };
+
+    const rows = azData.length;
+    const cols = azData[0].length;
+
+    // Convert mm to pixel indices
+    const x0 = Math.round(start.x / (dx * 1000));
+    const y0 = Math.round(start.y / (dy * 1000));
+    const x1 = Math.round(end.x / (dx * 1000));
+    const y1 = Math.round(end.y / (dy * 1000));
+
+    // Bresenham's line algorithm
+    const points = [];
+    let x = x0, y = y0;
+    const dx_line = Math.abs(x1 - x0);
+    const dy_line = Math.abs(y1 - y0);
+    const sx = x0 < x1 ? 1 : -1;
+    const sy = y0 < y1 ? 1 : -1;
+    let err = dx_line - dy_line;
+
+    while (true) {
+        if (x >= 0 && x < cols && y >= 0 && y < rows) {
+            points.push({ x, y });
+        }
+
+        if (x === x1 && y === y1) break;
+
+        const e2 = 2 * err;
+        if (e2 > -dy_line) {
+            err -= dy_line;
+            x += sx;
+        }
+        if (e2 < dx_line) {
+            err += dx_line;
+            y += sy;
+        }
+    }
+
+    // Extract values at each point
+    let cumDist = 0;
+    for (let i = 0; i < points.length; i++) {
+        const pt = points[i];
+
+        if (i > 0) {
+            const prev = points[i - 1];
+            const ddx = (pt.x - prev.x) * dx * 1000;
+            const ddy = (pt.y - prev.y) * dy * 1000;
+            cumDist += Math.sqrt(ddx * ddx + ddy * ddy);
+        }
+
+        result.distance.push(cumDist);
+        result.az.push(azData[pt.y][pt.x]);
+        result.mu.push(muData[pt.y][pt.x]);
+
+        // Get B and H components at this point
+        const bx = Bx[pt.y] ? Bx[pt.y][pt.x] || 0 : 0;
+        const by = By[pt.y] ? By[pt.y][pt.x] || 0 : 0;
+        const hx = Hx[pt.y] ? Hx[pt.y][pt.x] || 0 : 0;
+        const hy = Hy[pt.y] ? Hy[pt.y][pt.x] || 0 : 0;
+
+        // Decompose into normal and tangent components
+        // Normal: projection onto normal vector
+        // Tangent: projection onto tangent vector
+        result.bn.push(bx * normalX + by * normalY);
+        result.bt.push(bx * tangentX + by * tangentY);
+        result.hn.push(hx * normalX + hy * normalY);
+        result.ht.push(hx * tangentX + hy * tangentY);
+    }
+
+    return result;
+}
+
+// State for interactive flux linkage
+const fluxLinkageState = {};
+
+async function renderFluxLinkageInteractive(containerId, step) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) {
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No result selected</div>';
+        return;
+    }
+
+    // Initialize state for this container
+    if (!fluxLinkageState[containerId]) {
+        fluxLinkageState[containerId] = {
+            startPoint: null,
+            endPoint: null,
+            selectingStart: true,
+            fluxValue: null,
+            zoomRange: null  // { xRange: [min, max], yRange: [min, max] } - preserved across re-renders
+        };
+    }
+
+    const state = fluxLinkageState[containerId];
+
+    try {
+        // Load Az data
+        const azData = await loadCsvData('Az', step);
+
+        if (!azData || azData.length === 0) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No data available</div>';
+            return;
+        }
+
+        const dx = AppState.analysisConditions?.dx || 0.001;
+        const dy = AppState.analysisConditions?.dy || 0.001;
+
+        // Flip data for display
+        const azFlipped = flipVertical(azData);
+        const rows = azFlipped.length;
+        const cols = azFlipped[0].length;
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // Create compact control bar (use panel header for mode toggle)
+        const controlBar = document.createElement('div');
+        controlBar.style.cssText = 'display: flex; align-items: center; gap: 8px; padding: 4px 8px; background: #f8f8f8; border-bottom: 1px solid #eee; font-size: 11px;';
+        controlBar.innerHTML = `
+            <span style="color: #666;">Φ = Az(end) - Az(start)</span>
+        `;
+        container.appendChild(controlBar);
+
+        // Create plot area
+        const plotDiv = document.createElement('div');
+        plotDiv.id = containerId + '-plot';
+        plotDiv.style.cssText = 'width: 100%; height: calc(100% - 28px);';
+        container.appendChild(plotDiv);
+
+        // Get input image URL and flip for correct orientation
+        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await flipImageVertical(imgUrlRaw);
+
+        // Create X and Y coordinate arrays
+        const xCoords = Array.from({ length: cols }, (_, i) => i * dx * 1000); // mm
+        const yCoords = Array.from({ length: rows }, (_, j) => j * dy * 1000); // mm
+
+        const xMax = (cols - 1) * dx * 1000;
+        const yMax = (rows - 1) * dy * 1000;
+
+        // Build traces for input image with point overlay
+        const traces = [];
+
+        // Add line between points if both selected
+        if (state.startPoint && state.endPoint) {
+            traces.push({
+                x: [state.startPoint.x, state.endPoint.x],
+                y: [state.startPoint.y, state.endPoint.y],
+                mode: 'lines+markers',
+                type: 'scatter',
+                line: { color: 'yellow', width: 3 },
+                marker: { size: 12, color: ['green', 'red'] },
+                showlegend: false
+            });
+        } else {
+            // Add individual markers
+            if (state.startPoint) {
+                traces.push({
+                    x: [state.startPoint.x],
+                    y: [state.startPoint.y],
+                    mode: 'markers',
+                    type: 'scatter',
+                    marker: { size: 14, color: 'green', symbol: 'circle', line: { color: 'white', width: 2 } },
+                    showlegend: false
+                });
+            }
+        }
+
+        // Calculate flux linkage if both points are set
+        let fluxText = '';
+        if (state.startPoint && state.endPoint) {
+            // Convert mm to pixel indices
+            const i0 = Math.round(state.startPoint.x / (dx * 1000));
+            const j0 = Math.round(state.startPoint.y / (dy * 1000));
+            const i1 = Math.round(state.endPoint.x / (dx * 1000));
+            const j1 = Math.round(state.endPoint.y / (dy * 1000));
+
+            // Clamp to valid range
+            const i0c = Math.max(0, Math.min(cols - 1, i0));
+            const j0c = Math.max(0, Math.min(rows - 1, j0));
+            const i1c = Math.max(0, Math.min(cols - 1, i1));
+            const j1c = Math.max(0, Math.min(rows - 1, j1));
+
+            const azStart = azFlipped[j0c][i0c];
+            const azEnd = azFlipped[j1c][i1c];
+            const fluxLinkage = azEnd - azStart;
+
+            state.fluxValue = fluxLinkage;
+
+            fluxText = `Φ = ${fluxLinkage.toExponential(4)} Wb/m`;
+        }
+
+        // Status text (use Move mode in panel header to click)
+        let statusText = '';
+        let statusColor = '#666';
+        if (state.startPoint && state.endPoint) {
+            statusText = fluxText;
+            statusColor = '#333';
+        } else {
+            statusText = state.selectingStart ? 'Move mode: click START' : 'Move mode: click END';
+            statusColor = state.selectingStart ? 'green' : 'red';
+        }
+
+        // Use saved zoom range if available, otherwise use full range
+        const xRangeToUse = state.zoomRange?.xRange || [0, xMax];
+        const yRangeToUse = state.zoomRange?.yRange || [0, yMax];
+
+        const layout = {
+            width: size.width,
+            height: size.height - 32,
+            margin: { l: 50, r: 20, t: 30, b: 50 },
+            title: {
+                text: statusText,
+                font: { size: 11, color: statusColor }
+            },
+            xaxis: { title: 'X [mm]', range: xRangeToUse },
+            yaxis: { title: 'Y [mm]', range: yRangeToUse },
+            showlegend: false,
+            images: [{
+                source: imgUrl,
+                xref: 'x', yref: 'y',
+                x: 0, y: yMax,
+                sizex: xMax, sizey: yMax,
+                sizing: 'stretch',
+                opacity: 1.0,
+                layer: 'below'
+            }],
+            dragmode: false,  // Default to move/click mode for point selection
+            annotations: state.startPoint && state.endPoint ? [
+                {
+                    x: (state.startPoint.x + state.endPoint.x) / 2,
+                    y: (state.startPoint.y + state.endPoint.y) / 2 + (yMax * 0.03),
+                    text: fluxText,
+                    showarrow: false,
+                    font: { size: 14, color: 'white' },
+                    bgcolor: 'rgba(0,0,0,0.7)',
+                    borderpad: 4
+                }
+            ] : []
+        };
+
+        await Plotly.newPlot(plotDiv, traces, layout, { responsive: true, displayModeBar: false });
+
+        // Store reference in main container for panel header toggle
+        container._fluxLinkagePlotDiv = plotDiv;
+
+        // Setup click handler using DOM event (works at any zoom level)
+        // Remove existing handler if any
+        if (plotDiv._clickHandler) {
+            plotDiv.removeEventListener('click', plotDiv._clickHandler);
+        }
+        plotDiv._clickHandler = (evt) => {
+            // Check if in move mode (dragmode: false)
+            const currentDragmode = plotDiv.layout?.dragmode;
+            if (currentDragmode && currentDragmode !== false) {
+                return;  // Don't handle clicks in zoom/pan mode
+            }
+
+            // Get plot area bounding box
+            const plotArea = plotDiv.querySelector('.nsewdrag');
+            if (!plotArea) return;
+
+            const rect = plotArea.getBoundingClientRect();
+            const mouseX = evt.clientX - rect.left;
+            const mouseY = evt.clientY - rect.top;
+
+            // Check if click is within plot area
+            if (mouseX < 0 || mouseX > rect.width || mouseY < 0 || mouseY > rect.height) {
+                return;
+            }
+
+            // Convert pixel coordinates to data coordinates using current axis ranges
+            const xaxis = plotDiv._fullLayout?.xaxis;
+            const yaxis = plotDiv._fullLayout?.yaxis;
+            if (!xaxis || !yaxis) return;
+
+            const xRange = xaxis.range;
+            const yRange = yaxis.range;
+
+            const clickedX = xRange[0] + (mouseX / rect.width) * (xRange[1] - xRange[0]);
+            const clickedY = yRange[1] - (mouseY / rect.height) * (yRange[1] - yRange[0]);  // Y is inverted
+
+            // Save current zoom range before re-rendering
+            state.zoomRange = {
+                xRange: [...xRange],
+                yRange: [...yRange]
+            };
+
+            if (state.selectingStart) {
+                state.startPoint = { x: clickedX, y: clickedY };
+                state.selectingStart = false;
+                state.endPoint = null;
+                state.fluxValue = null;
+            } else {
+                state.endPoint = { x: clickedX, y: clickedY };
+                state.selectingStart = true;
+            }
+
+            // Re-render to update
+            renderFluxLinkageInteractive(containerId, AppState.currentStep);
+        };
+        plotDiv.addEventListener('click', plotDiv._clickHandler);
+
+    } catch (error) {
+        console.error('Flux linkage interactive error:', error);
+        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading data</div>';
+    }
+}
+
+// Flux linkage control function
+function resetFluxLinkagePoints(containerId) {
+    if (fluxLinkageState[containerId]) {
+        fluxLinkageState[containerId].startPoint = null;
+        fluxLinkageState[containerId].endPoint = null;
+        fluxLinkageState[containerId].selectingStart = true;
+        fluxLinkageState[containerId].fluxValue = null;
+        renderFluxLinkageInteractive(containerId, AppState.currentStep);
     }
 }
 
