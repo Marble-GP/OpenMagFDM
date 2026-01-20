@@ -2902,8 +2902,9 @@ async function renderAzBoundary(containerId, step) {
             // Step 5: Merge images (overlay contour lines on material image)
             const mergedCanvas = mergeImages(contourCartesian, inputCartesian);
 
-            // Step 6: Display as image in Plotly
-            const mergedImageUrl = mergedCanvas.toDataURL('image/png');
+            // Step 6: Display as image in Plotly (flip for correct orientation)
+            const mergedImageUrlRaw = mergedCanvas.toDataURL('image/png');
+            const mergedImageUrl = await flipImageVertical(mergedImageUrlRaw);
 
             const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
             const xMin = -r_o * 1000;
@@ -2922,7 +2923,7 @@ async function renderAzBoundary(containerId, step) {
                 },
                 yaxis: {
                     title: 'Y [mm]',
-                    range: [yMax, yMin]  // Reversed to match image coordinates (y=0 at top)
+                    range: [yMin, yMax]
                 },
                 images: [{
                     source: mergedImageUrl,
@@ -3125,9 +3126,10 @@ async function renderAzEdge(containerId, step) {
                 false
             );
 
-            // Step 5: Merge images (overlay contour lines on edge image)
+            // Step 5: Merge images (overlay contour lines on edge image) and flip for correct orientation
             const mergedCanvas = mergeImages(contourCartesian, edgeCartesian);
-            const mergedImageUrl = mergedCanvas.toDataURL('image/png');
+            const mergedImageUrlRaw = mergedCanvas.toDataURL('image/png');
+            const mergedImageUrl = await flipImageVertical(mergedImageUrlRaw);
 
             const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
             const xMin = -r_o * 1000;
@@ -3146,7 +3148,7 @@ async function renderAzEdge(containerId, step) {
                 },
                 yaxis: {
                     title: 'Y [mm]',
-                    range: [yMax, yMin]  // Reversed to match image coordinates (y=0 at top)
+                    range: [yMin, yMax]
                 },
                 images: [{
                     source: mergedImageUrl,
@@ -3296,18 +3298,19 @@ async function renderMaterialImage(containerId, step) {
     if (!container) return;
 
     try {
-        // Get step input image (from InputImage folder)
-        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        // Get step input image (from InputImage folder) and flip for correct orientation
+        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await flipImageVertical(imgUrlRaw);
 
         container.innerHTML = '';
         const size = getContainerSize(container);
 
-        // Load image to get dimensions
+        // Load original image to get dimensions (before flip)
         const img = new Image();
         await new Promise((resolve, reject) => {
             img.onload = resolve;
             img.onerror = reject;
-            img.src = imgUrl;
+            img.src = imgUrlRaw;
         });
 
         const rows = img.height;
@@ -3358,7 +3361,7 @@ async function renderMaterialImage(containerId, step) {
             },
             yaxis: {
                 title: yTitle,
-                range: [yMax, yMin],  // Reversed to match image coordinates (y=0 at top)
+                range: [yMin, yMax],
                 showgrid: false
             },
             images: [
@@ -3397,18 +3400,19 @@ async function renderStepInputImage(containerId, step) {
     if (!container) return;
 
     try {
-        // Get step input image
-        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        // Get step input image and flip for correct orientation
+        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await flipImageVertical(imgUrlRaw);
 
         container.innerHTML = '';
         const size = getContainerSize(container);
 
-        // Load image to get dimensions
+        // Load original image to get dimensions (before flip)
         const img = new Image();
         await new Promise((resolve, reject) => {
             img.onload = resolve;
             img.onerror = reject;
-            img.src = imgUrl;
+            img.src = imgUrlRaw;
         });
 
         const rows = img.height;
@@ -3459,7 +3463,7 @@ async function renderStepInputImage(containerId, step) {
             },
             yaxis: {
                 title: yTitle,
-                range: [yMax, yMin],  // Reversed to match image coordinates (y=0 at top)
+                range: [yMin, yMax],
                 showgrid: false
             },
             images: [
@@ -3498,8 +3502,9 @@ async function renderCoarseningMask(containerId, step) {
     if (!container) return;
 
     try {
-        // Get coarsening mask image (does not change per step)
-        const imgUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&t=${Date.now()}`;
+        // Get coarsening mask image (does not change per step) and flip for correct orientation
+        const imgUrlRaw = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&t=${Date.now()}`;
+        const imgUrl = await flipImageVertical(imgUrlRaw);
 
         container.innerHTML = '';
         const size = getContainerSize(container);
@@ -3564,7 +3569,7 @@ async function renderCoarseningMask(containerId, step) {
             },
             yaxis: {
                 title: yTitle,
-                range: [yMax, yMin],  // Reversed to match image coordinates (y=0 at top)
+                range: [yMin, yMax],
                 showgrid: false
             },
             images: [
