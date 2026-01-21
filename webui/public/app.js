@@ -5701,26 +5701,29 @@ async function renderFileManagerPreview(resultPath) {
 
     if (!plot1 || !plot2) return;
 
-    try {
-        // Load step 1 data for preview
-        const step = 1;
+    // Load step 1 data for preview
+    const step = 1;
 
-        // Plot 1: Az heatmap
+    // Plot 1: Az heatmap
+    try {
         const azData = await loadCsvData('Az', step, resultPath);
         const azFlipped = flipVertical(azData);
         plot1.innerHTML = '';
         await plotHeatmapInDiv(plot1, azFlipped, 'Az [Wb/m]', true, false);
+    } catch (error) {
+        console.error('Error loading Az data:', error);
+        plot1.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">Az data not available</div>';
+    }
 
-        // Plot 2: B magnitude
+    // Plot 2: B magnitude
+    try {
         const bData = await loadCsvData('B_magnitude', step, resultPath);
         const bFlipped = flipVertical(bData);
         plot2.innerHTML = '';
         await plotHeatmapInDiv(plot2, bFlipped, '|B| [T]', true, false);
-
     } catch (error) {
-        console.error('Error rendering preview:', error);
-        plot1.innerHTML = '<div style="padding: 20px; text-align: center;">Preview not available</div>';
-        plot2.innerHTML = '';
+        console.error('Error loading B magnitude data:', error);
+        plot2.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">B magnitude data not available</div>';
     }
 }
 
