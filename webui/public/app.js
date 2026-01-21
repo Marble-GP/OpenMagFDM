@@ -28,7 +28,9 @@ const AppState = {
     // Plot zoom state preservation
     plotZoomStates: {},  // { containerId: { xaxis: { range: [min, max] }, yaxis: { range: [min, max] } } }
     // Plotly mode bar visibility
-    showPlotlyModeBar: false  // Show/hide Plotly mode bar for all plots
+    showPlotlyModeBar: false,  // Show/hide Plotly mode bar for all plots
+    // Plot configuration (ranges, colorscales, etc.)
+    plotConfigs: {}  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
 };
 
 // ===== Utility Functions =====
@@ -5308,16 +5310,25 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
         colorbarTitle = unitMatch[2]; // [Unit]
     }
 
+    // Get plot configuration if available
+    const plotConfig = AppState.plotConfigs[elementId] || {};
+
     const trace = {
         z: data,
         type: 'heatmap',
-        colorscale: 'Viridis',
+        colorscale: plotConfig.colorscale || 'Viridis',
         colorbar: {
             title: colorbarTitle,
             thickness: colorbarThickness,
             len: 1.0
         }
     };
+
+    // Apply z-range (colorscale range) if configured
+    if (plotConfig.zRange && plotConfig.zRange !== 'auto') {
+        trace.zmin = plotConfig.zRange[0];
+        trace.zmax = plotConfig.zRange[1];
+    }
 
     // Generate physical axes if requested and conditions are available
     let xaxis, yaxis;
@@ -5417,8 +5428,18 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
         dragmode: false
     };
 
-    // Restore saved zoom state if exists
-    layout = restoreZoomState(elementId, layout);
+    // Apply plot configuration ranges if specified
+    if (plotConfig.xRange && plotConfig.xRange !== 'auto') {
+        layout.xaxis.range = plotConfig.xRange;
+    }
+    if (plotConfig.yRange && plotConfig.yRange !== 'auto') {
+        layout.yaxis.range = plotConfig.yRange;
+    }
+
+    // Restore saved zoom state if exists (only if no fixed range configured)
+    if (!plotConfig.xRange || plotConfig.xRange === 'auto') {
+        layout = restoreZoomState(elementId, layout);
+    }
 
     Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }).then(() => {
         setupZoomTracking(elementId);
@@ -5876,6 +5897,214 @@ async function editDescription(folderName) {
         console.error('Error editing description:', error);
         alert(`Error: ${error.message}`);
     }
+}
+
+// ===== Plot Configure Functions =====
+
+/**
+ * Open plot configuration modal
+ */
+function openPlotConfigModal() {
+    const modal = document.getElementById('plotConfigModal');
+    const listDiv = document.getElementById('plotConfigList');
+
+    // Get dashboard plots
+    const items = AppState.gridStack ? AppState.gridStack.getGridItems() : [];
+
+    if (items.length === 0) {
+        listDiv.innerHTML = '<p>No plots on dashboard</p>';
+        modal.style.display = 'flex';
+        return;
+    }
+
+    let html = '';
+    items.forEach(item => {
+        const plotId = item.getAttribute('data-plot-id');
+        const plotType = item.getAttribute('data-plot-type');
+        const title = plotDefinitions[plotType]?.name || plotType;
+
+        const config = AppState.plotConfigs[plotId] || {};
+        const isHeatmap = ['az_heatmap', 'b_magnitude', 'h_magnitude', 'mu_distribution', 'energy_density', 'jz_distribution'].includes(plotType);
+        const isTimeSeries = ['force_x_time', 'force_y_time', 'torque_time', 'energy_time', 'virtual_work'].includes(plotType);
+
+        html += `
+            <div class="plot-config-item" data-plot-id="${plotId}">
+                <h4>${title}</h4>
+
+                <!-- X-axis range -->
+                <div class="config-row">
+                    <label>X-axis:</label>
+                    <input type="radio" name="xRange_${plotId}" value="auto" ${!config.xRange || config.xRange === 'auto' ? 'checked' : ''}
+                           onchange="toggleRangeInputs('${plotId}', 'x', 'auto')">
+                    <label>Auto</label>
+                    <input type="radio" name="xRange_${plotId}" value="fixed" ${config.xRange && config.xRange !== 'auto' ? 'checked' : ''}
+                           onchange="toggleRangeInputs('${plotId}', 'x', 'fixed')">
+                    <label>Fixed:</label>
+                    <input type="number" id="xMin_${plotId}" value="${config.xRange && config.xRange !== 'auto' ? config.xRange[0] : ''}"
+                           placeholder="min" ${!config.xRange || config.xRange === 'auto' ? 'disabled' : ''}>
+                    <span>to</span>
+                    <input type="number" id="xMax_${plotId}" value="${config.xRange && config.xRange !== 'auto' ? config.xRange[1] : ''}"
+                           placeholder="max" ${!config.xRange || config.xRange === 'auto' ? 'disabled' : ''}>
+                </div>
+
+                <!-- Y-axis range -->
+                <div class="config-row">
+                    <label>Y-axis:</label>
+                    <input type="radio" name="yRange_${plotId}" value="auto" ${!config.yRange || config.yRange === 'auto' ? 'checked' : ''}
+                           onchange="toggleRangeInputs('${plotId}', 'y', 'auto')">
+                    <label>Auto</label>
+                    <input type="radio" name="yRange_${plotId}" value="fixed" ${config.yRange && config.yRange !== 'auto' ? 'checked' : ''}
+                           onchange="toggleRangeInputs('${plotId}', 'y', 'fixed')">
+                    <label>Fixed:</label>
+                    <input type="number" id="yMin_${plotId}" value="${config.yRange && config.yRange !== 'auto' ? config.yRange[0] : ''}"
+                           placeholder="min" ${!config.yRange || config.yRange === 'auto' ? 'disabled' : ''}>
+                    <span>to</span>
+                    <input type="number" id="yMax_${plotId}" value="${config.yRange && config.yRange !== 'auto' ? config.yRange[1] : ''}"
+                           placeholder="max" ${!config.yRange || config.yRange === 'auto' ? 'disabled' : ''}>
+                </div>
+        `;
+
+        if (isHeatmap) {
+            html += `
+                <!-- Z-axis (colorscale) range -->
+                <div class="config-row">
+                    <label>Color scale:</label>
+                    <input type="radio" name="zRange_${plotId}" value="auto" ${!config.zRange || config.zRange === 'auto' ? 'checked' : ''}
+                           onchange="toggleRangeInputs('${plotId}', 'z', 'auto')">
+                    <label>Auto</label>
+                    <input type="radio" name="zRange_${plotId}" value="fixed" ${config.zRange && config.zRange !== 'auto' ? 'checked' : ''}
+                           onchange="toggleRangeInputs('${plotId}', 'z', 'fixed')">
+                    <label>Fixed:</label>
+                    <input type="number" id="zMin_${plotId}" value="${config.zRange && config.zRange !== 'auto' ? config.zRange[0] : ''}"
+                           placeholder="min" ${!config.zRange || config.zRange === 'auto' ? 'disabled' : ''}>
+                    <span>to</span>
+                    <input type="number" id="zMax_${plotId}" value="${config.zRange && config.zRange !== 'auto' ? config.zRange[1] : ''}"
+                           placeholder="max" ${!config.zRange || config.zRange === 'auto' ? 'disabled' : ''}>
+                </div>
+
+                <!-- Colorscale theme -->
+                <div class="config-row">
+                    <label>Color theme:</label>
+                    <select id="colorscale_${plotId}">
+                        <option value="Viridis" ${config.colorscale === 'Viridis' || !config.colorscale ? 'selected' : ''}>Viridis</option>
+                        <option value="Jet" ${config.colorscale === 'Jet' ? 'selected' : ''}>Jet</option>
+                        <option value="Hot" ${config.colorscale === 'Hot' ? 'selected' : ''}>Hot</option>
+                        <option value="Cool" ${config.colorscale === 'Cool' ? 'selected' : ''}>Cool</option>
+                        <option value="Bluered" ${config.colorscale === 'Bluered' ? 'selected' : ''}>Blue-Red</option>
+                        <option value="RdBu" ${config.colorscale === 'RdBu' ? 'selected' : ''}>RdBu</option>
+                        <option value="Portland" ${config.colorscale === 'Portland' ? 'selected' : ''}>Portland</option>
+                        <option value="Picnic" ${config.colorscale === 'Picnic' ? 'selected' : ''}>Picnic</option>
+                    </select>
+                </div>
+            `;
+        }
+
+        html += `
+            </div>
+        `;
+    });
+
+    listDiv.innerHTML = html;
+    modal.style.display = 'flex';
+}
+
+/**
+ * Close plot configuration modal
+ */
+function closePlotConfigModal() {
+    const modal = document.getElementById('plotConfigModal');
+    modal.style.display = 'none';
+}
+
+/**
+ * Toggle range input fields based on auto/fixed selection
+ */
+function toggleRangeInputs(plotId, axis, mode) {
+    const minInput = document.getElementById(`${axis}Min_${plotId}`);
+    const maxInput = document.getElementById(`${axis}Max_${plotId}`);
+
+    if (mode === 'auto') {
+        minInput.disabled = true;
+        maxInput.disabled = true;
+    } else {
+        minInput.disabled = false;
+        maxInput.disabled = false;
+    }
+}
+
+/**
+ * Apply plot configurations
+ */
+function applyPlotConfigs() {
+    const items = AppState.gridStack ? AppState.gridStack.getGridItems() : [];
+
+    items.forEach(item => {
+        const plotId = item.getAttribute('data-plot-id');
+        const plotType = item.getAttribute('data-plot-type');
+
+        const config = {};
+
+        // X-axis range
+        const xRangeMode = document.querySelector(`input[name="xRange_${plotId}"]:checked`)?.value;
+        if (xRangeMode === 'fixed') {
+            const xMin = parseFloat(document.getElementById(`xMin_${plotId}`)?.value);
+            const xMax = parseFloat(document.getElementById(`xMax_${plotId}`)?.value);
+            if (!isNaN(xMin) && !isNaN(xMax)) {
+                config.xRange = [xMin, xMax];
+            }
+        } else {
+            config.xRange = 'auto';
+        }
+
+        // Y-axis range
+        const yRangeMode = document.querySelector(`input[name="yRange_${plotId}"]:checked`)?.value;
+        if (yRangeMode === 'fixed') {
+            const yMin = parseFloat(document.getElementById(`yMin_${plotId}`)?.value);
+            const yMax = parseFloat(document.getElementById(`yMax_${plotId}`)?.value);
+            if (!isNaN(yMin) && !isNaN(yMax)) {
+                config.yRange = [yMin, yMax];
+            }
+        } else {
+            config.yRange = 'auto';
+        }
+
+        // Z-axis range (heatmaps only)
+        const isHeatmap = ['az_heatmap', 'b_magnitude', 'h_magnitude', 'mu_distribution', 'energy_density', 'jz_distribution'].includes(plotType);
+        if (isHeatmap) {
+            const zRangeMode = document.querySelector(`input[name="zRange_${plotId}"]:checked`)?.value;
+            if (zRangeMode === 'fixed') {
+                const zMin = parseFloat(document.getElementById(`zMin_${plotId}`)?.value);
+                const zMax = parseFloat(document.getElementById(`zMax_${plotId}`)?.value);
+                if (!isNaN(zMin) && !isNaN(zMax)) {
+                    config.zRange = [zMin, zMax];
+                }
+            } else {
+                config.zRange = 'auto';
+            }
+
+            // Colorscale
+            const colorscale = document.getElementById(`colorscale_${plotId}`)?.value;
+            config.colorscale = colorscale || 'Viridis';
+        }
+
+        // Save config
+        AppState.plotConfigs[plotId] = config;
+    });
+
+    // Refresh all plots with new configurations
+    refreshAllPlots();
+
+    // Close modal
+    closePlotConfigModal();
+}
+
+/**
+ * Reset all plot configurations to auto
+ */
+function resetAllPlotConfigs() {
+    AppState.plotConfigs = {};
+    refreshAllPlots();
+    closePlotConfigModal();
 }
 
 // ===== Polar Coordinate Transform Functions =====

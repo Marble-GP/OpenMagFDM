@@ -531,6 +531,102 @@
             padding: 5px 10px;
             font-size: 0.8rem;
         }
+
+        /* Modal Styles */
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+
+        .modal-header h3 {
+            margin: 0;
+        }
+
+        .modal-body {
+            padding: 20px;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .modal-footer {
+            padding: 15px 20px;
+            border-top: 1px solid #e0e0e0;
+            display: flex;
+            justify-content: flex-end;
+            gap: 10px;
+        }
+
+        .plot-config-item {
+            margin-bottom: 25px;
+            padding: 15px;
+            border: 1px solid #e0e0e0;
+            border-radius: 5px;
+            background: #f8f9fa;
+        }
+
+        .plot-config-item h4 {
+            margin: 0 0 15px 0;
+            color: #333;
+        }
+
+        .config-row {
+            display: flex;
+            align-items: center;
+            margin-bottom: 12px;
+            gap: 10px;
+        }
+
+        .config-row label {
+            min-width: 100px;
+            font-weight: 500;
+        }
+
+        .config-row input[type="radio"] {
+            margin-right: 5px;
+        }
+
+        .config-row input[type="number"] {
+            width: 100px;
+            padding: 5px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+        }
+
+        .config-row input[type="number"]:disabled {
+            background: #e9ecef;
+            color: #6c757d;
+        }
+
+        .config-row select {
+            padding: 5px 10px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            background: white;
+        }
     </style>
 </head>
 <body>
@@ -740,7 +836,7 @@
                     <div class="dashboard-controls">
                         <button class="btn-secondary" onclick="clearDashboard()">Clear All</button>
                         <button class="btn-secondary" onclick="resetAllPlots()">Reset All Zoom</button>
-                        <button class="btn-secondary" onclick="saveLayout()">Save Layout</button>
+                        <button class="btn-secondary" onclick="openPlotConfigModal()">Plot Configure</button>
                         <label style="margin-left: 10px; cursor: pointer;">
                             <input type="checkbox" id="showPlotlyModeBar" onchange="togglePlotlyModeBar(this.checked)" style="margin-right: 5px;">
                             Show Plotly Mode Bar
@@ -807,6 +903,23 @@
                         <div class="result-plot" id="filePreviewPlot2"></div>
                     </div>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Plot Configure Modal -->
+    <div id="plotConfigModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 800px; max-height: 80vh; overflow-y: auto;">
+            <div class="modal-header">
+                <h3>Plot Configuration</h3>
+                <button onclick="closePlotConfigModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
+            </div>
+            <div class="modal-body" id="plotConfigList">
+                <!-- Dynamic content will be inserted here -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="resetAllPlotConfigs()">Reset All to Auto</button>
+                <button class="btn-primary" onclick="applyPlotConfigs()">Apply</button>
             </div>
         </div>
     </div>
