@@ -1074,6 +1074,91 @@ app.delete('/api/user-outputs/:folderName', async (req, res) => {
     }
 });
 
+// Rename an output folder
+app.put('/api/user-outputs/:folderName/rename', async (req, res) => {
+    try {
+        const { folderName } = req.params;
+        const { userId, newName } = req.body;
+        const userIdKey = userId || 'default';
+
+        // Sanitize inputs
+        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeFolderName = path.basename(folderName);
+        const safeNewName = path.basename(newName).replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+
+        // Validate new name
+        if (!safeNewName || safeNewName.length === 0 || safeNewName.length > 100) {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid folder name (1-100 characters, alphanumeric and _-. only)'
+            });
+        }
+
+        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
+        const oldPath = path.join(userOutputDir, safeFolderName);
+        const newPath = path.join(userOutputDir, safeNewName);
+
+        // Security check
+        const resolvedOldPath = path.resolve(oldPath);
+        const resolvedNewPath = path.resolve(newPath);
+        const resolvedUserOutputDir = path.resolve(userOutputDir);
+
+        if (!resolvedOldPath.startsWith(resolvedUserOutputDir) ||
+            !resolvedNewPath.startsWith(resolvedUserOutputDir)) {
+            return res.status(403).json({
+                success: false,
+                error: 'Access denied: Path traversal detected'
+            });
+        }
+
+        // Check if old folder exists and is an analysis result
+        try {
+            await fs.access(oldPath);
+        } catch {
+            return res.status(404).json({
+                success: false,
+                error: 'Output folder not found'
+            });
+        }
+
+        if (!await isAnalysisResult(oldPath)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Not an analysis result folder'
+            });
+        }
+
+        // Check if new name already exists
+        try {
+            await fs.access(newPath);
+            return res.status(409).json({
+                success: false,
+                error: 'Folder with this name already exists'
+            });
+        } catch {
+            // Good - new path doesn't exist
+        }
+
+        // Rename folder
+        await fs.rename(oldPath, newPath);
+
+        console.log(`Renamed output folder: ${safeUserId}/${safeFolderName} -> ${safeNewName}`);
+
+        res.json({
+            success: true,
+            message: 'Folder renamed successfully',
+            newName: safeNewName
+        });
+
+    } catch (error) {
+        console.error('Error renaming output folder:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // ルートへのアクセス
 app.get('/', (req, res) => {
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
