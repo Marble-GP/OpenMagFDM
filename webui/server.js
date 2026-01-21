@@ -1254,6 +1254,153 @@ app.delete('/api/user-outputs/bulk', async (req, res) => {
     }
 });
 
+// Get description for an output folder
+app.get('/api/user-outputs/:folderName/description', async (req, res) => {
+    try {
+        const { folderName } = req.params;
+        const { userId } = req.query;
+        const userIdKey = userId || 'default';
+
+        // Sanitize inputs
+        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeFolderName = path.basename(folderName);
+
+        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
+        const folderPath = path.join(userOutputDir, safeFolderName);
+        const descPath = path.join(folderPath, 'description.txt');
+
+        // Security check
+        const resolvedFolderPath = path.resolve(folderPath);
+        const resolvedUserOutputDir = path.resolve(userOutputDir);
+
+        if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
+            return res.status(403).json({
+                success: false,
+                error: 'Access denied: Path traversal detected'
+            });
+        }
+
+        // Check if folder exists
+        try {
+            await fs.access(folderPath);
+        } catch {
+            return res.status(404).json({
+                success: false,
+                error: 'Output folder not found'
+            });
+        }
+
+        // Verify it's an analysis result
+        if (!await isAnalysisResult(folderPath)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Not an analysis result folder'
+            });
+        }
+
+        // Read description file (if exists)
+        let description = '';
+        try {
+            description = await fs.readFile(descPath, 'utf8');
+        } catch {
+            // File doesn't exist - return empty string
+            description = '';
+        }
+
+        res.json({
+            success: true,
+            description: description
+        });
+
+    } catch (error) {
+        console.error('Error reading description:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Update description for an output folder
+app.put('/api/user-outputs/:folderName/description', async (req, res) => {
+    try {
+        const { folderName } = req.params;
+        const { userId, description } = req.body;
+        const userIdKey = userId || 'default';
+
+        // Sanitize inputs
+        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeFolderName = path.basename(folderName);
+
+        // Validate description length
+        if (description && description.length > 10000) {
+            return res.status(400).json({
+                success: false,
+                error: 'Description too long (max 10000 characters)'
+            });
+        }
+
+        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
+        const folderPath = path.join(userOutputDir, safeFolderName);
+        const descPath = path.join(folderPath, 'description.txt');
+
+        // Security check
+        const resolvedFolderPath = path.resolve(folderPath);
+        const resolvedUserOutputDir = path.resolve(userOutputDir);
+
+        if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
+            return res.status(403).json({
+                success: false,
+                error: 'Access denied: Path traversal detected'
+            });
+        }
+
+        // Check if folder exists
+        try {
+            await fs.access(folderPath);
+        } catch {
+            return res.status(404).json({
+                success: false,
+                error: 'Output folder not found'
+            });
+        }
+
+        // Verify it's an analysis result
+        if (!await isAnalysisResult(folderPath)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Not an analysis result folder'
+            });
+        }
+
+        // Write or delete description file
+        if (description && description.trim().length > 0) {
+            await fs.writeFile(descPath, description, 'utf8');
+            console.log(`Updated description for: ${safeUserId}/${safeFolderName}`);
+        } else {
+            // Delete file if description is empty
+            try {
+                await fs.unlink(descPath);
+                console.log(`Deleted description for: ${safeUserId}/${safeFolderName}`);
+            } catch {
+                // File doesn't exist - ignore
+            }
+        }
+
+        res.json({
+            success: true,
+            message: 'Description updated successfully'
+        });
+
+    } catch (error) {
+        console.error('Error updating description:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // ルートへのアクセス
 app.get('/', (req, res) => {
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
