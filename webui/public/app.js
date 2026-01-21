@@ -2093,8 +2093,8 @@ function formatStepFilename(step) {
 }
 
 // Helper function to load CSV data with caching
-async function loadCsvData(dataType, step) {
-    const resultPath = getCurrentResultPath();
+async function loadCsvData(dataType, step, providedResultPath = null) {
+    const resultPath = providedResultPath || getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
 
     // Check cache first
@@ -5987,6 +5987,12 @@ function openPlotConfigModal() {
                     <label>Color theme:</label>
                     <select id="colorscale_${plotId}">
                         <option value="Viridis" ${config.colorscale === 'Viridis' || !config.colorscale ? 'selected' : ''}>Viridis</option>
+                        <option value="Plasma" ${config.colorscale === 'Plasma' ? 'selected' : ''}>Plasma</option>
+                        <option value="Inferno" ${config.colorscale === 'Inferno' ? 'selected' : ''}>Inferno</option>
+                        <option value="Magma" ${config.colorscale === 'Magma' ? 'selected' : ''}>Magma</option>
+                        <option value="Cividis" ${config.colorscale === 'Cividis' ? 'selected' : ''}>Cividis</option>
+                        <option value="Turbo" ${config.colorscale === 'Turbo' ? 'selected' : ''}>Turbo</option>
+                        <option value="Rainbow" ${config.colorscale === 'Rainbow' ? 'selected' : ''}>Rainbow</option>
                         <option value="Jet" ${config.colorscale === 'Jet' ? 'selected' : ''}>Jet</option>
                         <option value="Hot" ${config.colorscale === 'Hot' ? 'selected' : ''}>Hot</option>
                         <option value="Cool" ${config.colorscale === 'Cool' ? 'selected' : ''}>Cool</option>
@@ -5994,6 +6000,8 @@ function openPlotConfigModal() {
                         <option value="RdBu" ${config.colorscale === 'RdBu' ? 'selected' : ''}>RdBu</option>
                         <option value="Portland" ${config.colorscale === 'Portland' ? 'selected' : ''}>Portland</option>
                         <option value="Picnic" ${config.colorscale === 'Picnic' ? 'selected' : ''}>Picnic</option>
+                        <option value="Electric" ${config.colorscale === 'Electric' ? 'selected' : ''}>Electric</option>
+                        <option value="Blackbody" ${config.colorscale === 'Blackbody' ? 'selected' : ''}>Blackbody</option>
                     </select>
                 </div>
             `;
