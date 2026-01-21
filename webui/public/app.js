@@ -5683,6 +5683,18 @@ async function showOutputPreview(folderName) {
 
         // Render preview plots (similar to Run & Preview)
         const resultPath = `outputs/${AppState.userId}/${folderName}`;
+
+        // Load analysis conditions for this result
+        try {
+            const conditionsResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
+            if (conditionsResponse.ok) {
+                const conditionsText = await conditionsResponse.text();
+                AppState.analysisConditions = JSON.parse(conditionsText);
+            }
+        } catch (error) {
+            console.warn('Could not load analysis conditions:', error);
+        }
+
         await renderFileManagerPreview(resultPath);
 
     } catch (error) {
@@ -5704,26 +5716,72 @@ async function renderFileManagerPreview(resultPath) {
     // Load step 1 data for preview
     const step = 1;
 
-    // Plot 1: Az heatmap
+    // Plot 1: Input image
     try {
-        const azData = await loadCsvData('Az', step, resultPath);
-        const azFlipped = flipVertical(azData);
+        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+
         plot1.innerHTML = '';
-        await plotHeatmapInDiv(plot1, azFlipped, 'Az [Wb/m]', true, false);
+        const size1 = getContainerSize(plot1);
+
+        // Load image to get dimensions
+        const img = new Image();
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = () => reject(new Error('Failed to load image'));
+            img.src = imgUrl;
+        });
+
+        // Display image with Plotly
+        const trace = {
+            source: imgUrl,
+            type: 'image',
+            xref: 'x',
+            yref: 'y',
+            x: 0,
+            y: 0,
+            sizex: img.width,
+            sizey: img.height,
+            sizing: 'stretch',
+            layer: 'below'
+        };
+
+        const layout = {
+            width: size1.width,
+            height: size1.height,
+            title: 'Input Image',
+            xaxis: { title: 'X [pixels]', range: [0, img.width] },
+            yaxis: { title: 'Y [pixels]', range: [0, img.height], scaleanchor: 'x' },
+            margin: { t: 40, r: 20, b: 40, l: 60 },
+            dragmode: false
+        };
+
+        const tempId1 = 'temp_' + Math.random().toString(36).substring(2, 9);
+        plot1.id = tempId1;
+        await Plotly.newPlot(tempId1, [trace], layout, { responsive: true, displayModeBar: false });
     } catch (error) {
-        console.error('Error loading Az data:', error);
-        plot1.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">Az data not available</div>';
+        console.error('Error loading input image:', error);
+        plot1.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">Input image not available</div>';
     }
 
-    // Plot 2: B magnitude
+    // Plot 2: B magnitude (calculated from Az and Mu)
     try {
-        const bData = await loadCsvData('B_magnitude', step, resultPath);
-        const bFlipped = flipVertical(bData);
+        const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
+        const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
+
+        const azData = await loadCsvData('Az', step, resultPath);
+        const muData = await loadCsvData('Mu', step, resultPath);
+
+        // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
+        const azFlipped = flipVertical(azData);
+        const muFlipped = flipVertical(muData);
+
+        const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+
         plot2.innerHTML = '';
-        await plotHeatmapInDiv(plot2, bFlipped, '|B| [T]', true, false);
+        await plotHeatmapInDiv(plot2, B, '|B| [T]', true, false);
     } catch (error) {
-        console.error('Error loading B magnitude data:', error);
-        plot2.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">B magnitude data not available</div>';
+        console.error('Error calculating B magnitude:', error);
+        plot2.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">B magnitude not available</div>';
     }
 }
 
@@ -5924,7 +5982,12 @@ function openPlotConfigModal() {
     items.forEach(item => {
         const plotId = item.getAttribute('data-plot-id');
         const plotType = item.getAttribute('data-plot-type');
-        const title = plotDefinitions[plotType]?.name || plotType;
+        const title = plotDefinitions[plotType]?.name || plotType || 'Unknown Plot';
+
+        // Debug: log if plotType is undefined
+        if (!plotType) {
+            console.warn('Plot type not found for item:', item);
+        }
 
         const config = AppState.plotConfigs[plotId] || {};
         const isHeatmap = ['az_heatmap', 'b_magnitude', 'h_magnitude', 'mu_distribution', 'energy_density', 'jz_distribution'].includes(plotType);
