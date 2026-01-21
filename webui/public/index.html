@@ -437,6 +437,28 @@
         }
 
         /* File Manager Styles */
+        .file-manager-container {
+            display: flex;
+            gap: 20px;
+            height: 100%;
+            overflow: hidden;
+        }
+
+        .file-list-panel {
+            flex: 0 0 600px;
+            max-width: 600px;
+            overflow-y: auto;
+            padding-right: 10px;
+        }
+
+        .file-preview-panel {
+            flex: 1;
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+            overflow-y: auto;
+        }
+
         .output-item {
             background: #f8f9fa;
             border: 1px solid #dee2e6;
@@ -447,11 +469,22 @@
             justify-content: space-between;
             align-items: center;
             transition: all 0.2s ease;
+            cursor: pointer;
         }
 
         .output-item:hover {
             background: #e9ecef;
             border-color: #667eea;
+        }
+
+        .output-item.active {
+            background: #e3f2fd;
+            border-color: #2196F3;
+        }
+
+        .output-checkbox {
+            margin-right: 10px;
+            cursor: pointer;
         }
 
         .output-info {
@@ -472,7 +505,7 @@
 
         .output-actions {
             display: flex;
-            gap: 10px;
+            gap: 5px;
         }
 
         .btn-delete {
@@ -492,6 +525,11 @@
 
         .btn-delete:active {
             background: #bd2130;
+        }
+
+        .btn-small {
+            padding: 5px 10px;
+            font-size: 0.8rem;
         }
     </style>
 </head>
@@ -662,6 +700,9 @@
                         <div class="palette-item" draggable="true" data-plot-type="step_input_image">
                             <span class="palette-name">Input Image</span>
                         </div>
+                        <div class="palette-item" draggable="true" data-plot-type="coarsening_mask">
+                            <span class="palette-name">Coarsening Mask</span>
+                        </div>
                     </div>
 
                     <div class="palette-section">
@@ -680,6 +721,16 @@
                         </div>
                         <div class="palette-item" draggable="true" data-plot-type="virtual_work">
                             <span class="palette-name">Virtual Work</span>
+                        </div>
+                    </div>
+
+                    <div class="palette-section">
+                        <div class="palette-section-title">Interactive</div>
+                        <div class="palette-item" draggable="true" data-plot-type="line_profile">
+                            <span class="palette-name">Line Profile</span>
+                        </div>
+                        <div class="palette-item" draggable="true" data-plot-type="flux_linkage_interactive">
+                            <span class="palette-name">Flux Linkage</span>
                         </div>
                     </div>
                 </div>
@@ -725,18 +776,36 @@
 
         <!-- Tab 4: File Manager -->
         <div class="tab-content" id="tab-files">
-            <div class="config-section">
-                <h2>Output File Manager</h2>
-                <p style="color: #666; margin-bottom: 20px;">
-                    Manage analysis results for user: <strong id="fileManagerUserId"></strong>
-                </p>
-
-                <div class="button-group" style="margin-bottom: 20px;">
-                    <button class="btn-primary" onclick="refreshOutputsList()">Refresh List</button>
+            <div class="file-manager-container">
+                <!-- Left Panel: Results List -->
+                <div class="file-list-panel">
+                    <h2>Output File Manager</h2>
+                    <p style="color: #666; margin-bottom: 15px;">
+                        User: <strong id="fileManagerUserId"></strong>
+                    </p>
+                    <div class="button-group" style="margin-bottom: 15px;">
+                        <button class="btn-primary" onclick="refreshOutputsList()">Refresh</button>
+                        <button class="btn-danger" onclick="bulkDeleteOutputs()" id="bulkDeleteBtn" disabled>
+                            Delete Selected (<span id="selectedCount">0</span>)
+                        </button>
+                        <label style="margin-left: 10px; cursor: pointer;">
+                            <input type="checkbox" id="selectAllOutputs" onchange="toggleSelectAll()" style="margin-right: 5px;">
+                            Select All
+                        </label>
+                    </div>
+                    <div id="outputsList">
+                        <p style="color: #666;">Loading...</p>
+                    </div>
                 </div>
 
-                <div id="outputsList" style="margin-top: 20px;">
-                    <p style="color: #666;">Loading...</p>
+                <!-- Right Panel: Preview -->
+                <div class="file-preview-panel" id="filePreviewPanel" style="display: none;">
+                    <h3>Result Preview</h3>
+                    <div id="previewDescription" style="margin-bottom: 15px; padding: 10px; background: white; border-radius: 5px; border: 1px solid #dee2e6;"></div>
+                    <div class="result-grid" id="filePreviewGrid">
+                        <div class="result-plot" id="filePreviewPlot1"></div>
+                        <div class="result-plot" id="filePreviewPlot2"></div>
+                    </div>
                 </div>
             </div>
         </div>
