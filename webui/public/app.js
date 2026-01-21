@@ -2199,7 +2199,8 @@ async function renderMuDistribution(containerId, step) {
     const data = await loadCsvData('Mu', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, flipped, 'μ [H/m]', true);
+    // Use harmonic mean for permeability interpolation (series magnetic circuit)
+    plotHeatmap(containerId, flipped, 'μ [H/m]', true, true);
 }
 
 async function renderEnergyDensity(containerId, step) {
@@ -5276,7 +5277,7 @@ function setupZoomTracking(containerId) {
 }
 
 // ===== Plotting Functions =====
-function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
+function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmonicMean = false) {
     const container = document.getElementById(elementId);
     if (!container) {
         console.error(`plotHeatmap: Container not found: ${elementId}`);
@@ -5330,7 +5331,8 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false) {
             const transformedData = transformPolarToCartesian(
                 data,
                 AppState.analysisConditions,
-                AppState.polarFullModel
+                AppState.polarFullModel,
+                useHarmonicMean
             );
 
             trace.x = transformedData.x;
@@ -5983,7 +5985,7 @@ function toggleFullModel() {
  * @param {boolean} fullModel - If true, replicate to full 360 degrees
  * @returns {object} - {x: Array, y: Array, z: Array} for Plotly heatmap
  */
-function transformPolarToCartesian(polarData, conditions, fullModel = false) {
+function transformPolarToCartesian(polarData, conditions, fullModel = false, useHarmonicMean = false) {
     // Extract polar parameters (check both nested and top-level locations)
     const r_i = conditions.polar?.r_start || conditions.r_i || 0;
     const r_o = conditions.polar?.r_end || conditions.r_o || 1;
@@ -6061,7 +6063,10 @@ function transformPolarToCartesian(polarData, conditions, fullModel = false) {
             const theta_idx = theta / thetaRange * (ntheta - 1);
 
             // Bilinear interpolation with periodic/anti-periodic BC support
-            const value = bilinearInterpolate(polarData, theta_idx, r_idx, thetaPeriodic, thetaAntiperiodic, r_orientation);
+            // Use harmonic mean for permeability (series magnetic circuit), arithmetic mean otherwise
+            const value = useHarmonicMean
+                ? bilinearInterpolateHarmonic(polarData, theta_idx, r_idx, thetaPeriodic, thetaAntiperiodic, r_orientation)
+                : bilinearInterpolate(polarData, theta_idx, r_idx, thetaPeriodic, thetaAntiperiodic, r_orientation);
             row_z.push(value);
         }
 
@@ -6152,6 +6157,107 @@ function bilinearInterpolate(data, theta_idx, r_idx, thetaPeriodic = false, thet
     const v1 = v10 * (1 - dr) + v11 * dr;  // at theta=i1
 
     return v0 * (1 - dt) + v1 * dt;
+}
+
+/**
+ * Bilinear interpolation using harmonic mean (for permeability in series magnetic circuits)
+ * Formula: 1/μ_eff = (1-t)/μ_A + t/μ_B  =>  μ_eff = 1 / ((1-t)/μ_A + t/μ_B)
+ * @param {Array<Array<number>>} data - 2D array [ntheta][nr] or [nr][ntheta] depending on r_orientation
+ * @param {number} theta_idx - Theta index (fractional)
+ * @param {number} r_idx - R index (fractional)
+ * @param {boolean} thetaPeriodic - If true, wrap theta index periodically
+ * @param {boolean} thetaAntiperiodic - If true, apply sign flip when crossing theta boundary
+ * @param {string} r_orientation - 'horizontal' (data[theta][r]) or 'vertical' (data[r][theta])
+ * @returns {number} - Interpolated value using harmonic mean
+ */
+function bilinearInterpolateHarmonic(data, theta_idx, r_idx, thetaPeriodic = false, thetaAntiperiodic = false, r_orientation = 'horizontal') {
+    // Safety checks
+    if (!data || data.length === 0 || !data[0] || data[0].length === 0) {
+        return 1.0; // Default to mu_r = 1 (air) if no data
+    }
+
+    let ntheta, nr;
+    if (r_orientation === 'horizontal') {
+        // data[theta_idx][r_idx]: rows = ntheta, cols = nr
+        ntheta = data.length;
+        nr = data[0].length;
+    } else {
+        // data[r_idx][theta_idx]: rows = nr, cols = ntheta
+        nr = data.length;
+        ntheta = data[0].length;
+    }
+
+    // Clamp r index to valid range
+    r_idx = Math.max(0, Math.min(nr - 1.001, r_idx));
+
+    // Handle theta index based on periodicity
+    let crossesBoundary = false;
+    let i0, i1, dt;
+
+    if (thetaPeriodic) {
+        // Wrap theta index periodically
+        theta_idx = ((theta_idx % ntheta) + ntheta) % ntheta;
+        i0 = Math.floor(theta_idx);
+        i1 = (i0 + 1) % ntheta;
+        dt = theta_idx - i0;
+        // Check if interpolation crosses the theta boundary
+        crossesBoundary = (i1 < i0);
+    } else {
+        // Clamp theta index
+        theta_idx = Math.max(0, Math.min(ntheta - 1.001, theta_idx));
+        i0 = Math.floor(theta_idx);
+        i1 = Math.min(i0 + 1, ntheta - 1);
+        dt = theta_idx - i0;
+    }
+
+    const j0 = Math.floor(r_idx);
+    const j1 = Math.min(j0 + 1, nr - 1);
+    const dr = r_idx - j0;
+
+    // Get corner values with safety checks (handle r_orientation)
+    let v00, v01, v10, v11;
+    if (r_orientation === 'horizontal') {
+        // data[theta_idx][r_idx]
+        v00 = (data[i0] && data[i0][j0] !== undefined) ? data[i0][j0] : 1.0;
+        v01 = (data[i0] && data[i0][j1] !== undefined) ? data[i0][j1] : 1.0;
+        v10 = (data[i1] && data[i1][j0] !== undefined) ? data[i1][j0] : 1.0;
+        v11 = (data[i1] && data[i1][j1] !== undefined) ? data[i1][j1] : 1.0;
+    } else {
+        // data[r_idx][theta_idx]
+        v00 = (data[j0] && data[j0][i0] !== undefined) ? data[j0][i0] : 1.0;
+        v01 = (data[j1] && data[j1][i0] !== undefined) ? data[j1][i0] : 1.0;
+        v10 = (data[j0] && data[j0][i1] !== undefined) ? data[j0][i1] : 1.0;
+        v11 = (data[j1] && data[j1][i1] !== undefined) ? data[j1][i1] : 1.0;
+    }
+
+    // Apply sign flip for anti-periodic BC when crossing boundary
+    // Note: Harmonic mean doesn't work with negative values, so we take absolute values
+    // and restore sign at the end (though this is unusual for permeability)
+    let signFlip = 1.0;
+    if (thetaAntiperiodic && crossesBoundary) {
+        signFlip = -1.0;
+        v10 = Math.abs(v10);
+        v11 = Math.abs(v11);
+    }
+
+    // Ensure no zero or negative values (permeability must be positive)
+    const epsilon = 1e-10;
+    v00 = Math.max(epsilon, Math.abs(v00));
+    v01 = Math.max(epsilon, Math.abs(v01));
+    v10 = Math.max(epsilon, Math.abs(v10));
+    v11 = Math.max(epsilon, Math.abs(v11));
+
+    // Harmonic mean interpolation in r direction
+    // 1/v0 = (1-dr)/v00 + dr/v01
+    const v0 = 1.0 / ((1.0 - dr) / v00 + dr / v01);  // at theta=i0
+    // 1/v1 = (1-dr)/v10 + dr/v11
+    const v1 = 1.0 / ((1.0 - dr) / v10 + dr / v11);  // at theta=i1
+
+    // Harmonic mean interpolation in theta direction
+    // 1/result = (1-dt)/v0 + dt/v1
+    const result = 1.0 / ((1.0 - dt) / v0 + dt / v1);
+
+    return result * signFlip;
 }
 
 /**
