@@ -2902,9 +2902,8 @@ async function renderAzBoundary(containerId, step) {
             // Step 5: Merge images (overlay contour lines on material image)
             const mergedCanvas = mergeImages(contourCartesian, inputCartesian);
 
-            // Step 6: Display as image in Plotly (flip for correct orientation)
-            const mergedImageUrlRaw = mergedCanvas.toDataURL('image/png');
-            const mergedImageUrl = await flipImageVertical(mergedImageUrlRaw);
+            // Step 6: Display as image in Plotly
+            const mergedImageUrl = mergedCanvas.toDataURL('image/png');
 
             const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
             const xMin = -r_o * 1000;
@@ -2949,8 +2948,7 @@ async function renderAzBoundary(containerId, step) {
         } else {
             // Original Plotly contour approach for non-transformed coordinates
             const azFlipped = flipVertical(azData);
-            // Flip image vertically to match analysis coordinates (y=0 at bottom)
-            const transparentInputUrl = await flipAndMakeBlackTransparent(inputImgUrl);
+            const transparentInputUrl = await makeBlackTransparent(inputImgUrl);
 
             const rows = azFlipped.length;
             const cols = azFlipped[0].length;
@@ -3126,10 +3124,9 @@ async function renderAzEdge(containerId, step) {
                 false
             );
 
-            // Step 5: Merge images (overlay contour lines on edge image) and flip for correct orientation
+            // Step 5: Merge images (overlay contour lines on edge image)
             const mergedCanvas = mergeImages(contourCartesian, edgeCartesian);
-            const mergedImageUrlRaw = mergedCanvas.toDataURL('image/png');
-            const mergedImageUrl = await flipImageVertical(mergedImageUrlRaw);
+            const mergedImageUrl = mergedCanvas.toDataURL('image/png');
 
             const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
             const xMin = -r_o * 1000;
@@ -3172,8 +3169,6 @@ async function renderAzEdge(containerId, step) {
         } else {
             // Original Plotly contour approach with edge-detected background
             const azFlipped = flipVertical(azData);
-            // Flip edge image to match analysis coordinates (y=0 at bottom)
-            const flippedEdgeImgUrl = await flipImageVertical(edgeImgUrl);
 
             const rows = azFlipped.length;
             const cols = azFlipped[0].length;
@@ -3266,7 +3261,7 @@ async function renderAzEdge(containerId, step) {
                     range: [yMin, yMax]
                 },
                 images: [{
-                    source: flippedEdgeImgUrl,
+                    source: edgeImgUrl,
                     xref: 'x',
                     yref: 'y',
                     x: xMin,
@@ -3298,19 +3293,18 @@ async function renderMaterialImage(containerId, step) {
     if (!container) return;
 
     try {
-        // Get step input image (from InputImage folder) and flip for correct orientation
-        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-        const imgUrl = await flipImageVertical(imgUrlRaw);
+        // Get step input image (from InputImage folder)
+        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
         container.innerHTML = '';
         const size = getContainerSize(container);
 
-        // Load original image to get dimensions (before flip)
+        // Load image to get dimensions
         const img = new Image();
         await new Promise((resolve, reject) => {
             img.onload = resolve;
             img.onerror = reject;
-            img.src = imgUrlRaw;
+            img.src = imgUrl;
         });
 
         const rows = img.height;
@@ -3400,19 +3394,18 @@ async function renderStepInputImage(containerId, step) {
     if (!container) return;
 
     try {
-        // Get step input image and flip for correct orientation
-        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-        const imgUrl = await flipImageVertical(imgUrlRaw);
+        // Get step input image
+        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
         container.innerHTML = '';
         const size = getContainerSize(container);
 
-        // Load original image to get dimensions (before flip)
+        // Load image to get dimensions
         const img = new Image();
         await new Promise((resolve, reject) => {
             img.onload = resolve;
             img.onerror = reject;
-            img.src = imgUrlRaw;
+            img.src = imgUrl;
         });
 
         const rows = img.height;
@@ -3502,23 +3495,69 @@ async function renderCoarseningMask(containerId, step) {
     if (!container) return;
 
     try {
-        // Get coarsening mask image (does not change per step) and flip for correct orientation
-        const imgUrlRaw = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&t=${Date.now()}`;
-        const imgUrl = await flipImageVertical(imgUrlRaw);
+        // Get step-specific coarsening mask (binary: 0=coarsened, 255=active)
+        const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        // Get step-specific input image
+        const inputUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
         container.innerHTML = '';
         const size = getContainerSize(container);
 
-        // Load image to get dimensions
-        const img = new Image();
-        await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = () => reject(new Error('Coarsening mask not available (adaptive mesh may not be enabled)'));
-            img.src = imgUrl;
-        });
+        // Load both images
+        const [maskImg, inputImg] = await Promise.all([
+            loadImage(maskUrl).catch(() => null),
+            loadImage(inputUrl).catch(() => null)
+        ]);
 
-        const rows = img.height;
-        const cols = img.width;
+        if (!maskImg) {
+            throw new Error('Coarsening mask not available');
+        }
+
+        const rows = maskImg.height;
+        const cols = maskImg.width;
+
+        // Compute product of input image and mask
+        let resultImgUrl;
+        if (inputImg && inputImg.width === cols && inputImg.height === rows) {
+            // Create canvas for pixel manipulation
+            const canvas = document.createElement('canvas');
+            canvas.width = cols;
+            canvas.height = rows;
+            const ctx = canvas.getContext('2d');
+
+            // Draw input image first
+            ctx.drawImage(inputImg, 0, 0);
+            const inputData = ctx.getImageData(0, 0, cols, rows);
+
+            // Draw mask image to get mask data
+            ctx.drawImage(maskImg, 0, 0);
+            const maskData = ctx.getImageData(0, 0, cols, rows);
+
+            // Compute product: output = input * (mask / 255)
+            // mask is grayscale, so all channels have same value
+            const outputData = ctx.createImageData(cols, rows);
+            for (let i = 0; i < inputData.data.length; i += 4) {
+                const maskValue = maskData.data[i]; // R channel (all channels same for grayscale)
+                if (maskValue > 128) {
+                    // Active cell: show input image pixel
+                    outputData.data[i] = inputData.data[i];       // R
+                    outputData.data[i + 1] = inputData.data[i + 1]; // G
+                    outputData.data[i + 2] = inputData.data[i + 2]; // B
+                    outputData.data[i + 3] = 255;                   // A
+                } else {
+                    // Coarsened cell: show black
+                    outputData.data[i] = 0;
+                    outputData.data[i + 1] = 0;
+                    outputData.data[i + 2] = 0;
+                    outputData.data[i + 3] = 255;
+                }
+            }
+            ctx.putImageData(outputData, 0, 0);
+            resultImgUrl = canvas.toDataURL('image/png');
+        } else {
+            // Fallback: just show mask if input image unavailable or size mismatch
+            resultImgUrl = maskUrl;
+        }
 
         // Generate physical coordinates if available
         let xTitle, yTitle, xMin, xMax, yMin, yMax;
@@ -3574,7 +3613,7 @@ async function renderCoarseningMask(containerId, step) {
             },
             images: [
                 {
-                    source: imgUrl,
+                    source: resultImgUrl,
                     xref: 'x',
                     yref: 'y',
                     x: xMin,
@@ -3598,6 +3637,17 @@ async function renderCoarseningMask(containerId, step) {
         console.error('Coarsening mask load error:', error);
         container.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">Coarsening mask not available<br><small>(Adaptive mesh may not be enabled for this result)</small></div>';
     }
+}
+
+// Helper function to load an image and return a promise
+function loadImage(url) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'Anonymous';
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('Failed to load image: ' + url));
+        img.src = url;
+    });
 }
 
 // ===== Interactive Plot Functions =====
@@ -3687,9 +3737,8 @@ async function renderLineProfile(containerId, step) {
         contentArea.appendChild(profileDiv);
         container.appendChild(contentArea);
 
-        // Get input image URL and flip for correct orientation
-        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-        const imgUrl = await flipImageVertical(imgUrlRaw);
+        // Get input image URL
+        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
         // Create X and Y coordinate arrays
         const xCoords = Array.from({ length: cols }, (_, i) => i * dx * 1000); // mm
@@ -4062,9 +4111,8 @@ async function renderFluxLinkageInteractive(containerId, step) {
         plotDiv.style.cssText = 'width: 100%; height: calc(100% - 28px);';
         container.appendChild(plotDiv);
 
-        // Get input image URL and flip for correct orientation
-        const imgUrlRaw = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-        const imgUrl = await flipImageVertical(imgUrlRaw);
+        // Get input image URL
+        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
         // Create X and Y coordinate arrays
         const xCoords = Array.from({ length: cols }, (_, i) => i * dx * 1000); // mm
@@ -5494,9 +5542,14 @@ async function refreshOutputsList() {
         let html = '';
         for (const output of result.outputs) {
             const date = new Date(output.created).toLocaleString('ja-JP');
+            // Escape output name for safe HTML embedding
+            const escapedName = output.name.replace(/'/g, "\\'");
 
             html += `
-                <div class="output-item">
+                <div class="output-item" onclick="selectOutput('${escapedName}', event)">
+                    <input type="checkbox" class="output-checkbox"
+                           data-folder="${escapedName}"
+                           onclick="event.stopPropagation(); updateSelectedCount()">
                     <div class="output-info">
                         <div class="output-name">${output.name}</div>
                         <div class="output-details">
@@ -5504,15 +5557,18 @@ async function refreshOutputsList() {
                         </div>
                     </div>
                     <div class="output-actions">
-                        <button class="btn-delete" onclick="deleteOutput('${output.name}')">
-                            Delete
-                        </button>
+                        <button class="btn-secondary btn-small" onclick="event.stopPropagation(); renameOutput('${escapedName}')">Rename</button>
+                        <button class="btn-secondary btn-small" onclick="event.stopPropagation(); editDescription('${escapedName}')">Memo</button>
+                        <button class="btn-delete btn-small" onclick="event.stopPropagation(); deleteOutput('${escapedName}')">Delete</button>
                     </div>
                 </div>
             `;
         }
 
         outputsList.innerHTML = html;
+
+        // Reset selection count
+        updateSelectedCount();
 
     } catch (error) {
         console.error('Error loading outputs:', error);
@@ -5550,6 +5606,272 @@ async function deleteOutput(folderName) {
 
     } catch (error) {
         console.error('Error deleting output:', error);
+        alert(`Error: ${error.message}`);
+    }
+}
+
+/**
+ * Select an output and show preview
+ * @param {string} folderName - Folder name
+ * @param {Event} event - Click event
+ */
+async function selectOutput(folderName, event) {
+    // Skip if clicking checkbox
+    if (event.target.type === 'checkbox') {
+        return;
+    }
+
+    // Highlight selected item
+    document.querySelectorAll('.output-item').forEach(el => el.classList.remove('active'));
+    event.currentTarget.classList.add('active');
+
+    // Show preview panel
+    await showOutputPreview(folderName);
+}
+
+/**
+ * Show output preview in right panel
+ * @param {string} folderName - Folder name
+ */
+async function showOutputPreview(folderName) {
+    const previewPanel = document.getElementById('filePreviewPanel');
+    const descDiv = document.getElementById('previewDescription');
+
+    if (!previewPanel || !descDiv) return;
+
+    previewPanel.style.display = 'block';
+
+    try {
+        // Fetch description
+        const descResponse = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`);
+        const descResult = await descResponse.json();
+
+        if (descResult.success && descResult.description) {
+            // Escape HTML and convert newlines to <br>
+            const escapedDesc = descResult.description
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/\n/g, '<br>');
+            descDiv.innerHTML = `<strong>Description:</strong><br>${escapedDesc}`;
+        } else {
+            descDiv.innerHTML = '<em>No description</em>';
+        }
+
+        // Render preview plots (similar to Run & Preview)
+        const resultPath = `outputs/${AppState.userId}/${folderName}`;
+        await renderFileManagerPreview(resultPath);
+
+    } catch (error) {
+        console.error('Error loading preview:', error);
+        descDiv.innerHTML = `<em style="color: #dc3545;">Error loading description</em>`;
+    }
+}
+
+/**
+ * Render preview plots for File Manager
+ * @param {string} resultPath - Result path
+ */
+async function renderFileManagerPreview(resultPath) {
+    const plot1 = document.getElementById('filePreviewPlot1');
+    const plot2 = document.getElementById('filePreviewPlot2');
+
+    if (!plot1 || !plot2) return;
+
+    try {
+        // Load step 1 data for preview
+        const step = 1;
+
+        // Plot 1: Az heatmap
+        const azData = await loadCsvData('Az', step, resultPath);
+        const azFlipped = flipVertical(azData);
+        plot1.innerHTML = '';
+        await plotHeatmapInDiv(plot1, azFlipped, 'Az [Wb/m]', true, false);
+
+        // Plot 2: B magnitude
+        const bData = await loadCsvData('B_magnitude', step, resultPath);
+        const bFlipped = flipVertical(bData);
+        plot2.innerHTML = '';
+        await plotHeatmapInDiv(plot2, bFlipped, '|B| [T]', true, false);
+
+    } catch (error) {
+        console.error('Error rendering preview:', error);
+        plot1.innerHTML = '<div style="padding: 20px; text-align: center;">Preview not available</div>';
+        plot2.innerHTML = '';
+    }
+}
+
+/**
+ * Plot heatmap in a specific div
+ * @param {HTMLElement} container - Container element
+ * @param {Array} data - Data array
+ * @param {string} title - Plot title
+ * @param {boolean} usePhysicalAxes - Use physical axes
+ * @param {boolean} useHarmonicMean - Use harmonic mean for interpolation
+ */
+async function plotHeatmapInDiv(container, data, title, usePhysicalAxes, useHarmonicMean) {
+    // Use a temporary unique ID
+    const tempId = 'temp_' + Math.random().toString(36).substr(2, 9);
+    container.id = tempId;
+    await plotHeatmap(tempId, data, title, usePhysicalAxes, useHarmonicMean);
+}
+
+/**
+ * Update selected count display
+ */
+function updateSelectedCount() {
+    const checkboxes = document.querySelectorAll('.output-checkbox:checked');
+    const count = checkboxes.length;
+    const countSpan = document.getElementById('selectedCount');
+    const deleteBtn = document.getElementById('bulkDeleteBtn');
+
+    if (countSpan) {
+        countSpan.textContent = count;
+    }
+
+    if (deleteBtn) {
+        deleteBtn.disabled = count === 0;
+    }
+}
+
+/**
+ * Toggle select all checkboxes
+ */
+function toggleSelectAll() {
+    const selectAll = document.getElementById('selectAllOutputs');
+    const checkboxes = document.querySelectorAll('.output-checkbox');
+
+    if (!selectAll) return;
+
+    checkboxes.forEach(cb => {
+        cb.checked = selectAll.checked;
+    });
+
+    updateSelectedCount();
+}
+
+/**
+ * Delete multiple selected outputs
+ */
+async function bulkDeleteOutputs() {
+    const checkboxes = document.querySelectorAll('.output-checkbox:checked');
+    const folderNames = Array.from(checkboxes).map(cb => cb.dataset.folder);
+
+    if (folderNames.length === 0) return;
+
+    const confirmMsg = `Delete ${folderNames.length} folder(s)?\n\nThis action cannot be undone.`;
+    if (!confirm(confirmMsg)) {
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/user-outputs/bulk', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, folderNames })
+        });
+
+        const result = await response.json();
+
+        if (!response.ok || !result.success) {
+            throw new Error(result.error || 'Bulk delete failed');
+        }
+
+        // Show result
+        const failed = result.results.filter(r => !r.success).length;
+        if (failed > 0) {
+            alert(`Deleted ${result.results.length - failed} folders.\n${failed} folders failed.`);
+        } else {
+            alert(`Successfully deleted ${result.results.length} folders.`);
+        }
+
+        // Refresh list
+        refreshOutputsList();
+
+        // Hide preview panel
+        const previewPanel = document.getElementById('filePreviewPanel');
+        if (previewPanel) {
+            previewPanel.style.display = 'none';
+        }
+
+    } catch (error) {
+        console.error('Error in bulk delete:', error);
+        alert(`Error: ${error.message}`);
+    }
+}
+
+/**
+ * Rename an output folder
+ * @param {string} folderName - Current folder name
+ */
+async function renameOutput(folderName) {
+    const newName = prompt('Enter new folder name:', folderName);
+    if (!newName || newName === folderName) return;
+
+    try {
+        const response = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/rename`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, newName })
+        });
+
+        const result = await response.json();
+
+        if (!response.ok || !result.success) {
+            throw new Error(result.error || 'Failed to rename');
+        }
+
+        alert('Folder renamed successfully');
+        refreshOutputsList();
+        refreshResultsList();  // Update Run & Preview tab list
+
+    } catch (error) {
+        console.error('Error renaming:', error);
+        alert(`Error: ${error.message}`);
+    }
+}
+
+/**
+ * Edit description for an output folder
+ * @param {string} folderName - Folder name
+ */
+async function editDescription(folderName) {
+    try {
+        // Fetch current description
+        const response = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`);
+        const result = await response.json();
+
+        if (!response.ok || !result.success) {
+            throw new Error('Failed to load description');
+        }
+
+        const newDesc = prompt('Enter description/memo:', result.description || '');
+        if (newDesc === null) return;  // Cancelled
+
+        // Update description
+        const updateResponse = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, description: newDesc })
+        });
+
+        const updateResult = await updateResponse.json();
+
+        if (!updateResponse.ok || !updateResult.success) {
+            throw new Error('Failed to update description');
+        }
+
+        // Update preview if currently showing this folder
+        const activeItem = document.querySelector('.output-item.active');
+        if (activeItem) {
+            const checkbox = activeItem.querySelector('.output-checkbox');
+            if (checkbox && checkbox.dataset.folder === folderName) {
+                await showOutputPreview(folderName);
+            }
+        }
+
+    } catch (error) {
+        console.error('Error editing description:', error);
         alert(`Error: ${error.message}`);
     }
 }
