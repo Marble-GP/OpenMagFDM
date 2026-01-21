@@ -67,6 +67,25 @@ function generateTimestampFolderName() {
 }
 
 /**
+ * Check if a folder is an analysis result
+ * @param {string} folderPath - Full path to the folder
+ * @returns {Promise<boolean>} True if folder contains Az subfolder and conditions.json
+ */
+async function isAnalysisResult(folderPath) {
+    try {
+        // Check for Az subfolder
+        await fs.access(path.join(folderPath, 'Az'));
+
+        // Check for conditions.json
+        await fs.access(path.join(folderPath, 'conditions.json'));
+
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
  * Get or create user-specific output directory
  * @param {string} userId - User ID
  * @returns {Promise<string>} Full path to user's output directory for this run
@@ -824,33 +843,30 @@ app.get('/api/results', async (req, res) => {
 
         const files = await fs.readdir(userOutputDir, { withFileTypes: true });
 
-        // output_* フォルダを検出
+        // Analysis result folders (detected by Az + conditions.json)
         const resultFolders = [];
 
         for (const file of files) {
             if (file.isDirectory()) {
                 const folderName = file.name;
-                // output_で始まるフォルダ
-                if (folderName.startsWith('output_')) {
-                    const folderPath = path.join(userOutputDir, folderName);
+                const folderPath = path.join(userOutputDir, folderName);
 
-                    // Azフォルダの存在確認
+                // Check if this is an analysis result folder
+                if (await isAnalysisResult(folderPath)) {
                     try {
+                        // Count steps
                         const azFolder = path.join(folderPath, 'Az');
-                        await fs.access(azFolder);
-
-                        // ステップ数をカウント
                         const azFiles = await fs.readdir(azFolder);
                         const stepFiles = azFiles.filter(f => /^step_\d{4}\.csv$/.test(f));
 
                         resultFolders.push({
                             name: folderName,
                             path: `outputs/${userIdKey}/${folderName}`,
-                            timestamp: folderName.replace('output_', ''),
+                            timestamp: folderName.replace('output_', ''), // Extract timestamp if present
                             steps: stepFiles.length
                         });
                     } catch {
-                        // Azフォルダがない場合はスキップ
+                        // Skip if cannot read Az folder
                         continue;
                     }
                 }
@@ -941,37 +957,40 @@ app.get('/api/user-outputs', async (req, res) => {
         const outputFolders = [];
 
         for (const item of items) {
-            if (item.isDirectory() && item.name.startsWith('output_')) {
+            if (item.isDirectory()) {
                 const folderPath = path.join(userOutputDir, item.name);
 
-                try {
-                    // Get folder stats
-                    const stats = await fs.stat(folderPath);
-
-                    // Calculate folder size
-                    const size = await getDirectorySize(folderPath);
-
-                    // Count steps
-                    let stepCount = 0;
+                // Check if this is an analysis result folder
+                if (await isAnalysisResult(folderPath)) {
                     try {
-                        const azFolder = path.join(folderPath, 'Az');
-                        const azFiles = await fs.readdir(azFolder);
-                        stepCount = azFiles.filter(f => /^step_\d{4}\.csv$/.test(f)).length;
-                    } catch {
-                        // Az folder might not exist
-                        stepCount = 0;
-                    }
+                        // Get folder stats
+                        const stats = await fs.stat(folderPath);
 
-                    outputFolders.push({
-                        name: item.name,
-                        timestamp: item.name.replace('output_', ''),
-                        created: stats.birthtime.toISOString(),
-                        size: size,
-                        sizeFormatted: formatBytes(size),
-                        steps: stepCount
-                    });
-                } catch (error) {
-                    console.error(`Error processing folder ${item.name}:`, error);
+                        // Calculate folder size
+                        const size = await getDirectorySize(folderPath);
+
+                        // Count steps
+                        let stepCount = 0;
+                        try {
+                            const azFolder = path.join(folderPath, 'Az');
+                            const azFiles = await fs.readdir(azFolder);
+                            stepCount = azFiles.filter(f => /^step_\d{4}\.csv$/.test(f)).length;
+                        } catch {
+                            // Az folder might not exist
+                            stepCount = 0;
+                        }
+
+                        outputFolders.push({
+                            name: item.name,
+                            timestamp: item.name.replace('output_', ''), // Extract timestamp if present
+                            created: stats.birthtime.toISOString(),
+                            size: size,
+                            sizeFormatted: formatBytes(size),
+                            steps: stepCount
+                        });
+                    } catch (error) {
+                        console.error(`Error processing folder ${item.name}:`, error);
+                    }
                 }
             }
         }
@@ -1004,14 +1023,6 @@ app.delete('/api/user-outputs/:folderName', async (req, res) => {
         const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
         const safeFolderName = path.basename(folderName); // Prevent path traversal
 
-        // Validate folder name format
-        if (!safeFolderName.startsWith('output_')) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid folder name format'
-            });
-        }
-
         const userOutputDir = path.join(OUTPUTS_DIR, `${safeUserId}`);
         const folderPath = path.join(userOutputDir, safeFolderName);
 
@@ -1026,13 +1037,21 @@ app.delete('/api/user-outputs/:folderName', async (req, res) => {
             });
         }
 
-        // Check if folder exists
+        // Check if folder exists and is an analysis result
         try {
             await fs.access(folderPath);
         } catch {
             return res.status(404).json({
                 success: false,
                 error: 'Output folder not found'
+            });
+        }
+
+        // Verify it's an analysis result folder
+        if (!await isAnalysisResult(folderPath)) {
+            return res.status(400).json({
+                success: false,
+                error: 'Not an analysis result folder'
             });
         }
 
@@ -1275,6 +1294,31 @@ app.get('/api/get-step-input-image', async (req, res) => {
         res.sendFile(imagePath);
     } catch (error) {
         res.status(404).send(`Step input image not found: ${error.message}`);
+    }
+});
+
+// Get coarsening mask image (if adaptive mesh was used)
+// Now supports per-step masks: /api/get-coarsening-mask?result=...&step=1
+app.get('/api/get-coarsening-mask', async (req, res) => {
+    try {
+        const resultPath = req.query.result;
+        const step = parseInt(req.query.step) || 1;
+
+        if (!resultPath) {
+            return res.status(400).send('Missing result parameter');
+        }
+
+        // Format step number with leading zeros (step_0001.png)
+        const stepStr = String(step).padStart(4, '0');
+        const maskPath = path.join(BASE_DIR, resultPath, 'CoarseningMask', `step_${stepStr}.png`);
+
+        // Check if file exists
+        await fs.access(maskPath);
+
+        // Send image file
+        res.sendFile(maskPath);
+    } catch (error) {
+        res.status(404).send(`Coarsening mask not found: ${error.message}`);
     }
 });
 
