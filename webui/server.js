@@ -1159,6 +1159,101 @@ app.put('/api/user-outputs/:folderName/rename', async (req, res) => {
     }
 });
 
+// Delete multiple output folders (bulk delete)
+app.delete('/api/user-outputs/bulk', async (req, res) => {
+    try {
+        const { userId, folderNames } = req.body;
+        const userIdKey = userId || 'default';
+
+        // Validate inputs
+        if (!Array.isArray(folderNames) || folderNames.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'folderNames must be a non-empty array'
+            });
+        }
+
+        if (folderNames.length > 100) {
+            return res.status(400).json({
+                success: false,
+                error: 'Cannot delete more than 100 folders at once'
+            });
+        }
+
+        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
+        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
+        const resolvedUserOutputDir = path.resolve(userOutputDir);
+
+        const results = [];
+
+        for (const folderName of folderNames) {
+            const result = { name: folderName };
+
+            try {
+                const safeFolderName = path.basename(folderName);
+                const folderPath = path.join(userOutputDir, safeFolderName);
+                const resolvedFolderPath = path.resolve(folderPath);
+
+                // Security check
+                if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
+                    result.success = false;
+                    result.error = 'Path traversal detected';
+                    results.push(result);
+                    continue;
+                }
+
+                // Check if exists
+                try {
+                    await fs.access(folderPath);
+                } catch {
+                    result.success = false;
+                    result.error = 'Folder not found';
+                    results.push(result);
+                    continue;
+                }
+
+                // Verify it's an analysis result
+                if (!await isAnalysisResult(folderPath)) {
+                    result.success = false;
+                    result.error = 'Not an analysis result folder';
+                    results.push(result);
+                    continue;
+                }
+
+                // Delete folder
+                await fs.rm(folderPath, { recursive: true, force: true });
+
+                console.log(`Bulk deleted: ${safeUserId}/${safeFolderName}`);
+
+                result.success = true;
+                results.push(result);
+
+            } catch (error) {
+                result.success = false;
+                result.error = error.message;
+                results.push(result);
+            }
+        }
+
+        // Check if any failed
+        const failedCount = results.filter(r => !r.success).length;
+        const successCount = results.filter(r => r.success).length;
+
+        res.json({
+            success: true,
+            message: `Deleted ${successCount} folder(s), ${failedCount} failed`,
+            results: results
+        });
+
+    } catch (error) {
+        console.error('Error in bulk delete:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // ルートへのアクセス
 app.get('/', (req, res) => {
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
