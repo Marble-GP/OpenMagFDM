@@ -4532,7 +4532,13 @@ async function renderForceXTime(containerId) {
             ? `Force X [N/m] (×${forceMultiplier})`
             : 'Force X [N/m]';
 
-        await Plotly.newPlot(container, traces, {
+        // Get plot configuration if available
+        const plotId = containerId.replace('container-', '');
+        const plotConfig = AppState.plotConfigs[plotId] || {};
+
+        console.log(`renderForceXTime: containerId=${containerId}, plotId=${plotId}, config=`, plotConfig);
+
+        const layout = {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
@@ -4541,7 +4547,17 @@ async function renderForceXTime(containerId) {
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        };
+
+        // Apply plot configuration ranges if specified
+        if (plotConfig.xRange && plotConfig.xRange !== 'auto') {
+            layout.xaxis.range = plotConfig.xRange;
+        }
+        if (plotConfig.yRange && plotConfig.yRange !== 'auto') {
+            layout.yaxis.range = plotConfig.yRange;
+        }
+
+        await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Force X time plot error:', error);
         const container = document.getElementById(containerId);
@@ -4639,7 +4655,11 @@ async function renderForceYTime(containerId) {
             ? `Force Y [N/m] (×${forceMultiplier})`
             : 'Force Y [N/m]';
 
-        await Plotly.newPlot(container, traces, {
+        // Get plot configuration if available
+        const plotId = containerId.replace('container-', '');
+        const plotConfig = AppState.plotConfigs[plotId] || {};
+
+        const layout = {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
@@ -4648,7 +4668,17 @@ async function renderForceYTime(containerId) {
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        };
+
+        // Apply plot configuration ranges if specified
+        if (plotConfig.xRange && plotConfig.xRange !== 'auto') {
+            layout.xaxis.range = plotConfig.xRange;
+        }
+        if (plotConfig.yRange && plotConfig.yRange !== 'auto') {
+            layout.yaxis.range = plotConfig.yRange;
+        }
+
+        await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Force Y time plot error:', error);
         const container = document.getElementById(containerId);
@@ -4746,7 +4776,11 @@ async function renderTorqueTime(containerId) {
             ? `Torque [Nm/m] (×${torqueMultiplier})`
             : 'Torque [Nm/m]';
 
-        await Plotly.newPlot(container, traces, {
+        // Get plot configuration if available
+        const plotId = containerId.replace('container-', '');
+        const plotConfig = AppState.plotConfigs[plotId] || {};
+
+        const layout = {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
@@ -4755,7 +4789,17 @@ async function renderTorqueTime(containerId) {
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        };
+
+        // Apply plot configuration ranges if specified
+        if (plotConfig.xRange && plotConfig.xRange !== 'auto') {
+            layout.xaxis.range = plotConfig.xRange;
+        }
+        if (plotConfig.yRange && plotConfig.yRange !== 'auto') {
+            layout.yaxis.range = plotConfig.yRange;
+        }
+
+        await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Torque time plot error:', error);
         const container = document.getElementById(containerId);
@@ -5317,7 +5361,11 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
     }
 
     // Get plot configuration if available
-    const plotConfig = AppState.plotConfigs[elementId] || {};
+    // elementId might be "container-plot-1", but plotConfigs uses "plot-1"
+    const plotId = elementId.replace('container-', '');
+    const plotConfig = AppState.plotConfigs[plotId] || {};
+
+    console.log(`plotHeatmap: elementId=${elementId}, plotId=${plotId}, config=`, plotConfig);
 
     const trace = {
         z: data,
@@ -5459,6 +5507,12 @@ function plotForceGraph(elementId, data, title) {
         return;
     }
 
+    // Get plot configuration if available
+    const plotId = elementId.replace('container-', '');
+    const plotConfig = AppState.plotConfigs[plotId] || {};
+
+    console.log(`plotForceGraph: elementId=${elementId}, plotId=${plotId}, config=`, plotConfig);
+
     // Assuming first row is header, rest is data
     const headers = data[0];
     const values = data.slice(1);
@@ -5479,8 +5533,18 @@ function plotForceGraph(elementId, data, title) {
         dragmode: false
     };
 
-    // Restore saved zoom state if exists
-    layout = restoreZoomState(elementId, layout);
+    // Apply plot configuration ranges if specified
+    if (plotConfig.xRange && plotConfig.xRange !== 'auto') {
+        layout.xaxis.range = plotConfig.xRange;
+    }
+    if (plotConfig.yRange && plotConfig.yRange !== 'auto') {
+        layout.yaxis.range = plotConfig.yRange;
+    }
+
+    // Restore saved zoom state if exists (only if no fixed range configured)
+    if (!plotConfig.xRange || plotConfig.xRange === 'auto') {
+        layout = restoreZoomState(elementId, layout);
+    }
 
     Plotly.newPlot(elementId, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }).then(() => {
         setupZoomTracking(elementId);
@@ -6597,19 +6661,34 @@ function bilinearInterpolateHarmonic(data, theta_idx, r_idx, thetaPeriodic = fal
  * Refresh all plots in the dashboard (for when polar transform settings change)
  */
 function refreshAllPlots() {
+    console.log('refreshAllPlots: Starting plot refresh');
+
     // Refresh all gridstack items
     if (AppState.gridStack) {
         const items = AppState.gridStack.getGridItems();
+        console.log(`refreshAllPlots: Found ${items.length} items`);
+
         items.forEach(item => {
             const plotId = item.getAttribute('data-plot-id');
             const plotType = item.getAttribute('data-plot-type');
 
+            console.log(`refreshAllPlots: Item plotId=${plotId}, plotType=${plotType}`);
+
             if (plotId && plotType) {
-                // Find the plot div inside the item
-                const plotDiv = item.querySelector('[id^="plot-"]');
-                if (plotDiv) {
-                    // Re-render the plot
-                    renderPlot(plotDiv.id, plotType);
+                // Find the container inside the item (id starts with "container-")
+                const container = item.querySelector('[id^="container-"]');
+                if (container && plotDefinitions[plotType]) {
+                    const containerId = container.id;
+                    console.log(`refreshAllPlots: Re-rendering ${plotType} in ${containerId}`);
+
+                    // Re-render the plot using plotDefinitions
+                    try {
+                        plotDefinitions[plotType].render(containerId, AppState.currentStep);
+                    } catch (error) {
+                        console.error(`refreshAllPlots: Error rendering ${plotType}:`, error);
+                    }
+                } else {
+                    console.warn(`refreshAllPlots: Container or plotDefinition not found for plotType=${plotType}`);
                 }
             }
         });
