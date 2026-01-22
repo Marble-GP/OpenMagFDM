@@ -5759,9 +5759,21 @@ async function renderFileManagerPreview(resultPath) {
 
     // Plot 2: B magnitude (calculated from Az and Mu)
     try {
-        const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
-        const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
-        console.log('Using dx:', dx, 'dy:', dy);
+        // Get grid spacing (handle both Cartesian and Polar coordinate systems)
+        let dx = 0.001;
+        let dy = 0.001;
+
+        if (AppState.analysisConditions) {
+            if (AppState.analysisConditions.coordinate_system === 'polar') {
+                dx = AppState.analysisConditions.dr || 0.001;
+                dy = AppState.analysisConditions.dtheta || 0.001;
+            } else {
+                dx = AppState.analysisConditions.dx || 0.001;
+                dy = AppState.analysisConditions.dy || 0.001;
+            }
+        }
+
+        console.log('Using dx:', dx, 'dy:', dy, 'coordinate_system:', AppState.analysisConditions?.coordinate_system);
 
         const azData = await loadCsvData('Az', step, resultPath);
         const muData = await loadCsvData('Mu', step, resultPath);
@@ -5792,10 +5804,19 @@ async function renderFileManagerPreview(resultPath) {
  * @param {boolean} useHarmonicMean - Use harmonic mean for interpolation
  */
 async function plotHeatmapInDiv(container, data, title, usePhysicalAxes, useHarmonicMean) {
-    // Use a temporary unique ID
+    // Save original ID
+    const originalId = container.id;
+
+    // Use a temporary unique ID for Plotly
     const tempId = 'temp_' + Math.random().toString(36).substr(2, 9);
     container.id = tempId;
-    await plotHeatmap(tempId, data, title, usePhysicalAxes, useHarmonicMean);
+
+    try {
+        await plotHeatmap(tempId, data, title, usePhysicalAxes, useHarmonicMean);
+    } finally {
+        // Restore original ID
+        container.id = originalId;
+    }
 }
 
 /**
