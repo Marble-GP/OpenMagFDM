@@ -53,6 +53,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initializeTabs();
     await initializeConfigEditor();
     initializeDashboard();
+    initCustomSelect();
     await refreshConfigList();
     await loadConfig();
     await refreshImageList();
@@ -776,18 +777,84 @@ async function refreshResultsList() {
 
         const result = await response.json();
         const select = document.getElementById('resultSelect');
+        const customOptions = document.getElementById('resultSelectOptions');
         const currentValue = select.value;
 
+        // Clear both native and custom selects
         select.innerHTML = '<option value="">Select result...</option>';
-        result.results.forEach(res => {
+        customOptions.innerHTML = '';
+
+        // Add default option to custom select
+        const defaultOption = document.createElement('div');
+        defaultOption.className = 'custom-select-option';
+        defaultOption.setAttribute('data-value', '');
+        defaultOption.innerHTML = '<div class="custom-select-option-main">Select result...</div>';
+        customOptions.appendChild(defaultOption);
+
+        // Fetch descriptions for all results in parallel
+        const resultsWithDescriptions = await Promise.all(
+            result.results.map(async (res) => {
+                try {
+                    const folderName = res.path.split('/').pop();
+                    const descResponse = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`);
+                    const descData = await descResponse.json();
+                    return {
+                        ...res,
+                        description: descData.description || ''
+                    };
+                } catch (error) {
+                    console.error(`Failed to fetch description for ${res.name}:`, error);
+                    return {
+                        ...res,
+                        description: ''
+                    };
+                }
+            })
+        );
+
+        resultsWithDescriptions.forEach(res => {
+            // Add to native select (for compatibility)
             const option = document.createElement('option');
             option.value = res.path;
             option.textContent = `${res.name} (${res.steps} steps)`;
             select.appendChild(option);
+
+            // Add to custom select with styled description
+            const customOption = document.createElement('div');
+            customOption.className = 'custom-select-option';
+            customOption.setAttribute('data-value', res.path);
+
+            const mainText = document.createElement('div');
+            mainText.className = 'custom-select-option-main';
+            mainText.textContent = `${res.name} (${res.steps} steps)`;
+
+            customOption.appendChild(mainText);
+
+            // Add description if available
+            if (res.description && res.description.trim()) {
+                const descText = document.createElement('div');
+                descText.className = 'custom-select-option-description';
+
+                // Truncate description if too long (max 60 characters)
+                let description = res.description.trim();
+                if (description.length > 60) {
+                    description = description.substring(0, 57) + '...';
+                }
+                descText.textContent = description;
+
+                // Add full description as title (shows on hover)
+                customOption.title = res.description;
+
+                customOption.appendChild(descText);
+            }
+
+            customOptions.appendChild(customOption);
         });
 
+        // Restore selection if it still exists
         if (result.results.map(r => r.path).includes(currentValue)) {
             select.value = currentValue;
+            updateCustomSelectDisplay(currentValue);
         }
 
         // Return the results for use in loadResults()
@@ -796,6 +863,77 @@ async function refreshResultsList() {
         console.error('Error loading results list:', error);
         return [];
     }
+}
+
+// Update custom select display to match selected value
+function updateCustomSelectDisplay(value) {
+    const display = document.getElementById('resultSelectDisplay');
+    const options = document.querySelectorAll('#resultSelectOptions .custom-select-option');
+
+    // Remove 'selected' class from all options
+    options.forEach(opt => opt.classList.remove('selected'));
+
+    if (!value) {
+        display.textContent = 'Select result...';
+        return;
+    }
+
+    // Find and mark the selected option
+    const selectedOption = Array.from(options).find(opt => opt.getAttribute('data-value') === value);
+    if (selectedOption) {
+        selectedOption.classList.add('selected');
+        // Get the main text (without description)
+        const mainText = selectedOption.querySelector('.custom-select-option-main');
+        display.textContent = mainText ? mainText.textContent : 'Select result...';
+    }
+}
+
+// Initialize custom select event handlers
+function initCustomSelect() {
+    const container = document.getElementById('resultSelectContainer');
+    const trigger = document.getElementById('resultSelectTrigger');
+    const options = document.getElementById('resultSelectOptions');
+    const nativeSelect = document.getElementById('resultSelect');
+
+    // Toggle dropdown on trigger click
+    trigger.addEventListener('click', (e) => {
+        e.stopPropagation();
+        container.classList.toggle('open');
+    });
+
+    // Handle option selection
+    options.addEventListener('click', (e) => {
+        const option = e.target.closest('.custom-select-option');
+        if (option) {
+            const value = option.getAttribute('data-value');
+
+            // Update native select
+            nativeSelect.value = value;
+
+            // Update custom select display
+            updateCustomSelectDisplay(value);
+
+            // Close dropdown
+            container.classList.remove('open');
+
+            // Trigger change event on native select
+            nativeSelect.dispatchEvent(new Event('change'));
+        }
+    });
+
+    // Close dropdown when clicking outside
+    document.addEventListener('click', (e) => {
+        if (!container.contains(e.target)) {
+            container.classList.remove('open');
+        }
+    });
+
+    // Close on Escape key
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && container.classList.contains('open')) {
+            container.classList.remove('open');
+        }
+    });
 }
 
 async function loadSelectedResult() {

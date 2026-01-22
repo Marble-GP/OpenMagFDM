@@ -627,6 +627,88 @@
             border-radius: 3px;
             background: white;
         }
+
+        /* Custom Select Dropdown Styles */
+        .custom-select {
+            position: relative;
+            user-select: none;
+        }
+
+        .custom-select-trigger {
+            padding: 8px 12px;
+            border: 1px solid #dee2e6;
+            border-radius: 3px;
+            background: white;
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            min-height: 38px;
+        }
+
+        .custom-select-trigger:hover {
+            border-color: #adb5bd;
+        }
+
+        .custom-select.open .custom-select-trigger {
+            border-color: #007bff;
+        }
+
+        .custom-select-arrow {
+            font-size: 0.7em;
+            color: #6c757d;
+            transition: transform 0.2s;
+        }
+
+        .custom-select.open .custom-select-arrow {
+            transform: rotate(180deg);
+        }
+
+        .custom-select-options {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            max-height: 300px;
+            overflow-y: auto;
+            background: white;
+            border: 1px solid #dee2e6;
+            border-radius: 3px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            z-index: 1000;
+            display: none;
+            margin-top: 2px;
+        }
+
+        .custom-select.open .custom-select-options {
+            display: block;
+        }
+
+        .custom-select-option {
+            padding: 10px 12px;
+            cursor: pointer;
+            transition: background-color 0.15s;
+        }
+
+        .custom-select-option:hover {
+            background-color: #f8f9fa;
+        }
+
+        .custom-select-option.selected {
+            background-color: #e7f3ff;
+        }
+
+        .custom-select-option-main {
+            font-size: 14px;
+            color: #212529;
+            margin-bottom: 2px;
+        }
+
+        .custom-select-option-description {
+            font-size: 11px;
+            color: #6c757d;
+            font-style: italic;
+        }
     </style>
 </head>
 <body>
@@ -693,7 +775,17 @@
                     <h3>Solver Control</h3>
                     <div style="margin-bottom: 10px;">
                         <label>Result:</label>
-                        <select id="resultSelect" style="width: 100%; padding: 8px; margin-top: 5px; border: 1px solid #dee2e6; border-radius: 3px;">
+                        <div id="resultSelectContainer" class="custom-select" style="width: 100%; margin-top: 5px;">
+                            <div class="custom-select-trigger" id="resultSelectTrigger">
+                                <span id="resultSelectDisplay">Select result...</span>
+                                <span class="custom-select-arrow">▼</span>
+                            </div>
+                            <div class="custom-select-options" id="resultSelectOptions">
+                                <div class="custom-select-option" data-value="">Select result...</div>
+                            </div>
+                        </div>
+                        <!-- Hidden select for compatibility -->
+                        <select id="resultSelect" style="display: none;">
                             <option value="">Select result...</option>
                         </select>
                     </div>
