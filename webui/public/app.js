@@ -1585,6 +1585,12 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
         id: plotId
     });
 
+    // Set data attributes on the grid-stack-item element for Plot Configure
+    if (widget) {
+        widget.setAttribute('data-plot-id', plotId);
+        widget.setAttribute('data-plot-type', plotType);
+    }
+
     // Set initial tile movability (default is move mode, so movable is true)
     if (widget && AppState.gridStack) {
         AppState.gridStack.movable(widget, true);
@@ -6003,9 +6009,14 @@ function openPlotConfigModal() {
         const plotType = item.getAttribute('data-plot-type');
         const title = plotDefinitions[plotType]?.name || plotType || 'Unknown Plot';
 
-        // Debug: log if plotType is undefined
-        if (!plotType) {
-            console.warn('Plot type not found for item:', item);
+        // Debug: log if plotType or plotId is undefined
+        if (!plotType || !plotId) {
+            console.warn('Missing attributes for item:', {
+                plotId: plotId,
+                plotType: plotType,
+                element: item,
+                allAttributes: Array.from(item.attributes).map(a => `${a.name}="${a.value}"`)
+            });
         }
 
         const config = AppState.plotConfigs[plotId] || {};
