@@ -5569,7 +5569,7 @@ async function refreshOutputsList() {
             const escapedName = output.name.replace(/'/g, "\\'");
 
             html += `
-                <div class="output-item" onclick="selectOutput('${escapedName}', event)">
+                <div class="output-item" data-folder="${escapedName}" onclick="selectOutput('${escapedName}', event)">
                     <input type="checkbox" class="output-checkbox"
                            data-folder="${escapedName}"
                            onclick="event.stopPropagation(); updateSelectedCount()">
@@ -5639,14 +5639,25 @@ async function deleteOutput(folderName) {
  * @param {Event} event - Click event
  */
 async function selectOutput(folderName, event) {
-    // Skip if clicking checkbox
-    if (event.target.type === 'checkbox') {
-        return;
+    console.log('selectOutput called:', folderName);
+
+    // Skip if clicking checkbox or button
+    if (event && event.target) {
+        const tagName = event.target.tagName.toLowerCase();
+        if (event.target.type === 'checkbox' || tagName === 'button') {
+            return;
+        }
     }
 
     // Highlight selected item
     document.querySelectorAll('.output-item').forEach(el => el.classList.remove('active'));
-    event.currentTarget.classList.add('active');
+
+    // Find the clicked item and highlight it
+    const clickedItem = event && event.currentTarget ? event.currentTarget :
+                        document.querySelector(`.output-item[data-folder="${folderName}"]`);
+    if (clickedItem) {
+        clickedItem.classList.add('active');
+    }
 
     // Show preview panel
     await showOutputPreview(folderName);
@@ -5657,10 +5668,15 @@ async function selectOutput(folderName, event) {
  * @param {string} folderName - Folder name
  */
 async function showOutputPreview(folderName) {
+    console.log('showOutputPreview called:', folderName);
+
     const previewPanel = document.getElementById('filePreviewPanel');
     const descDiv = document.getElementById('previewDescription');
 
-    if (!previewPanel || !descDiv) return;
+    if (!previewPanel || !descDiv) {
+        console.error('Preview panel elements not found');
+        return;
+    }
 
     previewPanel.style.display = 'block';
 
@@ -5683,6 +5699,7 @@ async function showOutputPreview(folderName) {
 
         // Render preview plots (similar to Run & Preview)
         const resultPath = `outputs/${AppState.userId}/${folderName}`;
+        console.log('Loading preview from:', resultPath);
 
         // Load analysis conditions for this result
         try {
@@ -5690,12 +5707,14 @@ async function showOutputPreview(folderName) {
             if (conditionsResponse.ok) {
                 const conditionsText = await conditionsResponse.text();
                 AppState.analysisConditions = JSON.parse(conditionsText);
+                console.log('Loaded analysis conditions:', AppState.analysisConditions);
             }
         } catch (error) {
             console.warn('Could not load analysis conditions:', error);
         }
 
         await renderFileManagerPreview(resultPath);
+        console.log('Preview rendered successfully');
 
     } catch (error) {
         console.error('Error loading preview:', error);
@@ -5708,56 +5727,31 @@ async function showOutputPreview(folderName) {
  * @param {string} resultPath - Result path
  */
 async function renderFileManagerPreview(resultPath) {
+    console.log('renderFileManagerPreview called:', resultPath);
+
     const plot1 = document.getElementById('filePreviewPlot1');
     const plot2 = document.getElementById('filePreviewPlot2');
 
-    if (!plot1 || !plot2) return;
+    if (!plot1 || !plot2) {
+        console.error('Preview plot elements not found');
+        return;
+    }
 
     // Load step 1 data for preview
     const step = 1;
 
-    // Plot 1: Input image
+    // Plot 1: Input image (use simple HTML img tag)
     try {
         const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        console.log('Loading input image from:', imgUrl);
 
-        plot1.innerHTML = '';
-        const size1 = getContainerSize(plot1);
-
-        // Load image to get dimensions
-        const img = new Image();
-        await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = () => reject(new Error('Failed to load image'));
-            img.src = imgUrl;
-        });
-
-        // Display image with Plotly
-        const trace = {
-            source: imgUrl,
-            type: 'image',
-            xref: 'x',
-            yref: 'y',
-            x: 0,
-            y: 0,
-            sizex: img.width,
-            sizey: img.height,
-            sizing: 'stretch',
-            layer: 'below'
-        };
-
-        const layout = {
-            width: size1.width,
-            height: size1.height,
-            title: 'Input Image',
-            xaxis: { title: 'X [pixels]', range: [0, img.width] },
-            yaxis: { title: 'Y [pixels]', range: [0, img.height], scaleanchor: 'x' },
-            margin: { t: 40, r: 20, b: 40, l: 60 },
-            dragmode: false
-        };
-
-        const tempId1 = 'temp_' + Math.random().toString(36).substring(2, 9);
-        plot1.id = tempId1;
-        await Plotly.newPlot(tempId1, [trace], layout, { responsive: true, displayModeBar: false });
+        plot1.innerHTML = `
+            <h4 style="text-align: center; margin-bottom: 10px;">Input Image (Step ${step})</h4>
+            <img src="${imgUrl}"
+                 style="max-width: 100%; max-height: calc(100% - 50px); object-fit: contain; display: block; margin: 0 auto;"
+                 onerror="this.parentElement.innerHTML='<div style=\\'padding: 20px; text-align: center; color: #999;\\'>Input image not available</div>'">
+        `;
+        console.log('Input image HTML set');
     } catch (error) {
         console.error('Error loading input image:', error);
         plot1.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">Input image not available</div>';
@@ -5767,18 +5761,22 @@ async function renderFileManagerPreview(resultPath) {
     try {
         const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
         const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
+        console.log('Using dx:', dx, 'dy:', dy);
 
         const azData = await loadCsvData('Az', step, resultPath);
         const muData = await loadCsvData('Mu', step, resultPath);
+        console.log('Loaded Az and Mu data');
 
         // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
         const azFlipped = flipVertical(azData);
         const muFlipped = flipVertical(muData);
 
         const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+        console.log('Calculated B magnitude');
 
         plot2.innerHTML = '';
         await plotHeatmapInDiv(plot2, B, '|B| [T]', true, false);
+        console.log('B magnitude plot rendered');
     } catch (error) {
         console.error('Error calculating B magnitude:', error);
         plot2.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">B magnitude not available</div>';
