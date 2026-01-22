@@ -606,6 +606,12 @@ private:
     void buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);
     void buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);
 
+    // Adaptive mesh coarsening solver methods
+    void buildMatrixCoarsened(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);
+    void buildAndSolveSystemCoarsened();
+    void interpolateToFullGrid(const Eigen::VectorXd& Az_coarse);
+    void exportCoarseningMask(const std::string& output_dir, int step_number);  // Export binary mask: active=255, coarsened=0
+
     // Maxwell stress calculation methods
     cv::Mat detectBoundaries();
     void calculateMagneticField();

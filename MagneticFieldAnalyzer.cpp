@@ -219,6 +219,10 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         theta_range = 2.0 * M_PI;
     }
 
+    // Set image dimensions (used for coarsening mask and other operations)
+    nx = image.cols;
+    ny = image.rows;
+
     // Determine nr and ntheta based on r_orientation
     if (r_orientation == "horizontal") {
         // r direction: horizontal (columns), theta direction: vertical (rows)
@@ -567,7 +571,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         double mu_r = evaluateMu(mu_value, 0.0);
 
         // Parse antialias flag and add to antialias_materials if enabled
-        bool antialias_enabled = props["antialias"].as<bool>(false);
+        bool antialias_enabled = props["anti_aliasing"].as<bool>(false);
         if (antialias_enabled) {
             AntialiasableMaterial aa_mat;
             aa_mat.name = name;
@@ -578,12 +582,20 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 
         // Parse coarsening settings for adaptive mesh
         CoarsenConfig coarsen_cfg;
-        coarsen_cfg.enabled = props["coarsen"].as<bool>(false);
-        coarsen_cfg.ratio = props["coarsen_ratio"].as<int>(2);  // Default ratio = 2
+        // std::cerr << "*** COARSEN DEBUG: " << name << " ***" << std::endl;
+        // std::cerr.flush();
+
+        if (props["coarsen"]) {
+            coarsen_cfg.enabled = props["coarsen"].as<bool>(false);
+            std::cout << "  DEBUG [" << name << "] coarsen parsed: " << (coarsen_cfg.enabled ? "true" : "false") << std::endl;
+        }
+        if (props["coarsen_ratio"]) {
+            coarsen_cfg.ratio = props["coarsen_ratio"].as<int>(2);
+        }
         material_coarsen[name] = coarsen_cfg;
         if (coarsen_cfg.enabled) {
             coarsening_enabled = true;
-            std::cout << "  Coarsening enabled: ratio = " << coarsen_cfg.ratio << std::endl;
+            std::cout << "  [" << name << "] Coarsening enabled: ratio = " << coarsen_cfg.ratio << std::endl;
         }
 
         // Parse Jz value (static, formula, or array)
@@ -1334,6 +1346,334 @@ double MagneticFieldAnalyzer::bilinearInterpolateFromCoarse(int i, int j, const 
     return 0.0;  // Should not reach here
 }
 
+// ============================================================================
+// Adaptive mesh coarsened solver (Phase B)
+// ============================================================================
+
+void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs) {
+    // Build FDM system matrix for coarsened mesh with non-uniform stencil
+    // Only active cells are included in the system
+
+    A.resize(n_active_cells, n_active_cells);
+    rhs.resize(n_active_cells);
+    rhs.setZero();
+
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(5 * n_active_cells);
+
+    // Check for periodic boundary conditions
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
+    // Build equation for each active cell
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+
+        bool is_left = (i == 0);
+        bool is_right = (i == nx - 1);
+        bool is_bottom = (j == 0);
+        bool is_top = (j == ny - 1);
+
+        // Dirichlet boundary conditions
+        if (is_left && bc_left.type == "dirichlet") {
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            rhs(idx) = bc_left.value;
+            continue;
+        } else if (is_right && bc_right.type == "dirichlet") {
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            rhs(idx) = bc_right.value;
+            continue;
+        } else if (is_bottom && bc_bottom.type == "dirichlet") {
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            rhs(idx) = bc_bottom.value;
+            continue;
+        } else if (is_top && bc_top.type == "dirichlet") {
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            rhs(idx) = bc_top.value;
+            continue;
+        }
+
+        // Robin boundary conditions
+        if (is_left && bc_left.type == "robin") {
+            double a = bc_left.alpha;
+            double b = bc_left.beta;
+            double g = bc_left.gamma;
+            // Find next active cell in +x direction for the derivative term
+            int i_east = findNextActiveX(i, j, +1);
+            double h_east = (i_east - i) * dx;
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_east));
+            auto it_east = fine_to_coarse.find({i_east, j});
+            if (it_east != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, -b/h_east));
+            }
+            rhs(idx) = g;
+            continue;
+        } else if (is_right && bc_right.type == "robin") {
+            double a = bc_right.alpha;
+            double b = bc_right.beta;
+            double g = bc_right.gamma;
+            int i_west = findNextActiveX(i, j, -1);
+            double h_west = (i - i_west) * dx;
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_west));
+            auto it_west = fine_to_coarse.find({i_west, j});
+            if (it_west != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, -b/h_west));
+            }
+            rhs(idx) = g;
+            continue;
+        } else if (is_bottom && bc_bottom.type == "robin") {
+            double a = bc_bottom.alpha;
+            double b = bc_bottom.beta;
+            double g = bc_bottom.gamma;
+            int j_north = findNextActiveY(i, j, +1);
+            double h_north = (j_north - j) * dy;
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_north));
+            auto it_north = fine_to_coarse.find({i, j_north});
+            if (it_north != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, -b/h_north));
+            }
+            rhs(idx) = g;
+            continue;
+        } else if (is_top && bc_top.type == "robin") {
+            double a = bc_top.alpha;
+            double b = bc_top.beta;
+            double g = bc_top.gamma;
+            int j_south = findNextActiveY(i, j, -1);
+            double h_south = (j - j_south) * dy;
+            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_south));
+            auto it_south = fine_to_coarse.find({i, j_south});
+            if (it_south != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, -b/h_south));
+            }
+            rhs(idx) = g;
+            continue;
+        }
+
+        // Interior points - non-uniform FDM stencil
+        // For non-uniform mesh: d²u/dx² ≈ 2/(h₋(h₋+h₊))·u_{i-1} - 2/(h₋h₊)·u_i + 2/(h₊(h₋+h₊))·u_{i+1}
+        double coeff_center = 0.0;
+
+        // Find neighboring active cells and compute distances
+        int i_west = findNextActiveX(i, j, -1);
+        int i_east = findNextActiveX(i, j, +1);
+        int j_south = findNextActiveY(i, j, -1);
+        int j_north = findNextActiveY(i, j, +1);
+
+        // Handle periodic wrapping
+        if (x_periodic) {
+            if (i == 0 && i_west == 0) i_west = nx - 1;
+            if (i == nx - 1 && i_east == nx - 1) i_east = 0;
+        }
+        if (y_periodic) {
+            if (j == 0 && j_south == 0) j_south = ny - 1;
+            if (j == ny - 1 && j_north == ny - 1) j_north = 0;
+        }
+
+        double h_west = std::abs(i - i_west) * dx;
+        double h_east = std::abs(i_east - i) * dx;
+        double h_south = std::abs(j - j_south) * dy;
+        double h_north = std::abs(j_north - j) * dy;
+
+        // Ensure minimum spacing to avoid division by zero
+        if (h_west < 1e-15) h_west = dx;
+        if (h_east < 1e-15) h_east = dx;
+        if (h_south < 1e-15) h_south = dy;
+        if (h_north < 1e-15) h_north = dy;
+
+        // X-direction terms with non-uniform stencil
+        // West neighbor
+        if (i > 0 || x_periodic) {
+            double mu_center = mu_map(j, i);
+            double mu_neighbor = mu_map(j, i_west);
+            double mu_west = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
+            // Non-uniform coefficient: 2 / (h₋ * (h₋ + h₊) * μ)
+            double coeff_west = 2.0 / (mu_west * h_west * (h_west + h_east));
+
+            auto it_west = fine_to_coarse.find({i_west, j});
+            bool west_is_dirichlet = (i_west == 0) && (bc_left.type == "dirichlet");
+
+            if (!west_is_dirichlet && it_west != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, coeff_west));
+            } else if (west_is_dirichlet) {
+                rhs(idx) -= coeff_west * bc_left.value;
+            }
+            coeff_center -= coeff_west;
+        }
+
+        // East neighbor
+        if (i < nx - 1 || x_periodic) {
+            double mu_center = mu_map(j, i);
+            double mu_neighbor = mu_map(j, i_east);
+            double mu_east = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
+            // Non-uniform coefficient: 2 / (h₊ * (h₋ + h₊) * μ)
+            double coeff_east = 2.0 / (mu_east * h_east * (h_west + h_east));
+
+            auto it_east = fine_to_coarse.find({i_east, j});
+            bool east_is_dirichlet = (i_east == nx - 1) && (bc_right.type == "dirichlet");
+
+            if (!east_is_dirichlet && it_east != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, coeff_east));
+            } else if (east_is_dirichlet) {
+                rhs(idx) -= coeff_east * bc_right.value;
+            }
+            coeff_center -= coeff_east;
+        }
+
+        // Y-direction terms with non-uniform stencil
+        // South neighbor
+        if (j > 0 || y_periodic) {
+            double mu_center = mu_map(j, i);
+            double mu_neighbor = mu_map(j_south, i);
+            double mu_south = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
+            double coeff_south = 2.0 / (mu_south * h_south * (h_south + h_north));
+
+            auto it_south = fine_to_coarse.find({i, j_south});
+            bool south_is_dirichlet = (j_south == 0) && (bc_bottom.type == "dirichlet");
+
+            if (!south_is_dirichlet && it_south != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, coeff_south));
+            } else if (south_is_dirichlet) {
+                rhs(idx) -= coeff_south * bc_bottom.value;
+            }
+            coeff_center -= coeff_south;
+        }
+
+        // North neighbor
+        if (j < ny - 1 || y_periodic) {
+            double mu_center = mu_map(j, i);
+            double mu_neighbor = mu_map(j_north, i);
+            double mu_north = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
+            double coeff_north = 2.0 / (mu_north * h_north * (h_south + h_north));
+
+            auto it_north = fine_to_coarse.find({i, j_north});
+            bool north_is_dirichlet = (j_north == ny - 1) && (bc_top.type == "dirichlet");
+
+            if (!north_is_dirichlet && it_north != fine_to_coarse.end()) {
+                triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, coeff_north));
+            } else if (north_is_dirichlet) {
+                rhs(idx) -= coeff_north * bc_top.value;
+            }
+            coeff_center -= coeff_north;
+        }
+
+        // Center coefficient
+        triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+
+        // Right-hand side (current density)
+        rhs(idx) = -jz_map(j, i);
+    }
+
+    A.setFromTriplets(triplets.begin(), triplets.end());
+    A.makeCompressed();
+}
+
+void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coarse) {
+    // Interpolate coarsened solution back to full grid
+
+    Az.resize(ny, nx);
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            if (active_cells(j, i)) {
+                // Active cell - copy directly from coarse solution
+                auto it = fine_to_coarse.find({i, j});
+                if (it != fine_to_coarse.end()) {
+                    Az(j, i) = Az_coarse(it->second);
+                }
+            } else {
+                // Inactive cell - interpolate from surrounding active cells
+                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
+    std::cout << "\n=== Building coarsened FDM system ===" << std::endl;
+    std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)
+              << " (reduction: " << std::fixed << std::setprecision(1)
+              << (100.0 * (1.0 - double(n_active_cells) / (nx * ny))) << "%)" << std::endl;
+
+    Eigen::SparseMatrix<double> A(n_active_cells, n_active_cells);
+    Eigen::VectorXd rhs(n_active_cells);
+
+    // Build coarsened matrix
+    buildMatrixCoarsened(A, rhs);
+
+    // Check matrix symmetry
+    Eigen::SparseMatrix<double> A_T = A.transpose();
+    double symmetry_error = (A - A_T).norm();
+    double A_norm = A.norm();
+    double relative_symmetry_error = (A_norm > 1e-12) ? (symmetry_error / A_norm) : symmetry_error;
+    std::cout << "Coarsened matrix symmetry check:" << std::endl;
+    std::cout << "  ||A - A^T|| = " << symmetry_error << std::endl;
+    std::cout << "  ||A|| = " << A_norm << std::endl;
+    std::cout << "  Relative error = " << relative_symmetry_error << std::endl;
+    if (relative_symmetry_error > 1e-8) {
+        std::cerr << "WARNING: Coarsened matrix is not symmetric! Relative error = "
+                  << relative_symmetry_error << std::endl;
+    } else {
+        std::cout << "  Matrix is symmetric (relative error < 1e-8)" << std::endl;
+    }
+
+    // Solve using SparseLU
+    std::cout << "\n=== Solving coarsened linear system ===" << std::endl;
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
+    solver.compute(A);
+
+    if (solver.info() != Eigen::Success) {
+        throw std::runtime_error("Coarsened matrix decomposition failed");
+    }
+
+    Eigen::VectorXd Az_coarse = solver.solve(rhs);
+
+    if (solver.info() != Eigen::Success) {
+        throw std::runtime_error("Coarsened linear system solving failed");
+    }
+
+    // Interpolate back to full grid
+    std::cout << "Interpolating to full grid..." << std::endl;
+    interpolateToFullGrid(Az_coarse);
+
+    std::cout << "Coarsened solution complete!" << std::endl;
+}
+
+void MagneticFieldAnalyzer::exportCoarseningMask(const std::string& output_dir, int step_number) {
+    if (!coarsening_enabled) {
+        return;  // No coarsening, nothing to export
+    }
+
+    // Create binary mask image: same size as input image, single channel
+    // Active cells = 255 (white), Inactive/coarsened cells = 0 (black)
+    cv::Mat mask_image(ny, nx, CV_8UC1);
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            mask_image.at<uchar>(j, i) = active_cells(j, i) ? 255 : 0;
+        }
+    }
+
+    // Flip vertically to match image coordinate system (y=0 at top)
+    // active_cells is in analysis coordinates (y=0 at bottom)
+    cv::Mat mask_flipped;
+    cv::flip(mask_image, mask_flipped, 0);
+
+    // Create CoarseningMask subfolder
+    std::string mask_folder = output_dir + "/CoarseningMask";
+    createDirectory(mask_folder);
+
+    // Save the mask image with step number
+    std::ostringstream oss;
+    oss << mask_folder << "/step_" << std::setw(4) << std::setfill('0') << (step_number + 1) << ".png";
+    std::string output_path = oss.str();
+
+    if (cv::imwrite(output_path, mask_flipped)) {
+        std::cout << "Coarsening mask exported to: " << output_path << std::endl;
+    } else {
+        std::cerr << "Warning: Failed to export coarsening mask to: " << output_path << std::endl;
+    }
+}
+
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {
     // Harmonic mean of permeability at cell interface
     if (direction == "x+") {
@@ -1462,7 +1802,12 @@ void MagneticFieldAnalyzer::solve() {
         if (coordinate_system == "polar") {
             buildAndSolveSystemPolar();
         } else {
-            buildAndSolveSystem();
+            // Use coarsened solver if coarsening is enabled and provides benefit
+            if (coarsening_enabled && n_active_cells < nx * ny) {
+                buildAndSolveSystemCoarsened();
+            } else {
+                buildAndSolveSystem();
+            }
         }
     }
 }
@@ -5479,6 +5824,11 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     // Create base folder (cross-platform)
     createDirectory(base_folder);
 
+    // Export coarsening mask (every step, as it may change with sliding)
+    if (coarsening_enabled) {
+        exportCoarseningMask(base_folder, step_number);
+    }
+
     // Create subfolders
     std::string az_folder = base_folder + "/Az";
     std::string mu_folder = base_folder + "/Mu";
@@ -6533,6 +6883,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         return;
     }
 
+    // IMPORTANT: Reset mu_map and jz_map to default values (air) before applying materials
+    // This ensures that pixels that changed material due to sliding get updated correctly
+    // Without this reset, old material values would persist even after the image slides
+    mu_map.setConstant(MU_0);  // Default: air (mu_r = 1.0)
+    jz_map.setZero();          // Default: no current
+
     for (const auto& material : config["materials"]) {
         std::string name = material.first.as<std::string>();
         YAML::Node props = material.second;
@@ -6610,6 +6966,11 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                 }
             }
         }
+    }
+
+    // Regenerate coarsening mask if sliding is enabled (material boundaries may have moved)
+    if (coarsening_enabled && transient_config.enable_sliding && step > 0) {
+        generateCoarseningMask();
     }
 }
 
