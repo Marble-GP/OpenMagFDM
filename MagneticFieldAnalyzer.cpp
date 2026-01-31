@@ -1808,6 +1808,123 @@ void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coar
     }
 }
 
+double MagneticFieldAnalyzer::calculateThetaInterpolationWeight(int j_theta, int j_prev, int j_next) const {
+    // Calculate interpolation weight for theta direction (periodic boundary aware)
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    if (j_prev == j_next) return 0.5;
+
+    int dist_to_prev, dist_to_next;
+    if (is_periodic) {
+        dist_to_prev = (j_theta - j_prev + ntheta) % ntheta;
+        dist_to_next = (j_next - j_theta + ntheta) % ntheta;
+    } else {
+        dist_to_prev = j_theta - j_prev;
+        dist_to_next = j_next - j_theta;
+    }
+
+    return double(dist_to_prev) / double(dist_to_prev + dist_to_next);
+}
+
+double MagneticFieldAnalyzer::interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const {
+    // Bilinear interpolation for inactive cells in polar coordinates
+    // Interpolate in both r and theta directions
+
+    // Find surrounding active cells in r direction
+    int i_prev = i_r, i_next = i_r;
+    while (i_prev > 0 && !active_cells(j_theta, i_prev)) i_prev--;
+    while (i_next < nr - 1 && !active_cells(j_theta, i_next)) i_next++;
+
+    // Find surrounding active cells in theta direction (periodic boundary aware)
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    int j_prev = j_theta, j_next = j_theta;
+
+    // Search for j_prev
+    int search = j_theta - 1;
+    for (int k = 0; k < ntheta; k++) {
+        int j_check = is_periodic ? (search + ntheta) % ntheta : std::max(0, search);
+        if (!is_periodic && search < 0) break;
+        if (active_cells(j_check, i_r)) {
+            j_prev = j_check;
+            break;
+        }
+        search--;
+    }
+
+    // Search for j_next
+    search = j_theta + 1;
+    for (int k = 0; k < ntheta; k++) {
+        int j_check = is_periodic ? search % ntheta : std::min(ntheta - 1, search);
+        if (!is_periodic && search >= ntheta) break;
+        if (active_cells(j_check, i_r)) {
+            j_next = j_check;
+            break;
+        }
+        search++;
+    }
+
+    // Get coarse indices for 4 surrounding points
+    auto it_sw = fine_to_coarse.find({i_prev, j_prev});  // (r_low, theta_low)
+    auto it_se = fine_to_coarse.find({i_next, j_prev});  // (r_high, theta_low)
+    auto it_nw = fine_to_coarse.find({i_prev, j_next});  // (r_low, theta_high)
+    auto it_ne = fine_to_coarse.find({i_next, j_next});  // (r_high, theta_high)
+
+    // Calculate interpolation weights
+    double wr = (i_next != i_prev) ? double(i_r - i_prev) / double(i_next - i_prev) : 0.5;
+    double wt = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
+
+    // Get values at 4 points
+    double v_sw = (it_sw != fine_to_coarse.end()) ? Az_coarse(it_sw->second) : 0.0;
+    double v_se = (it_se != fine_to_coarse.end()) ? Az_coarse(it_se->second) : 0.0;
+    double v_nw = (it_nw != fine_to_coarse.end()) ? Az_coarse(it_nw->second) : 0.0;
+    double v_ne = (it_ne != fine_to_coarse.end()) ? Az_coarse(it_ne->second) : 0.0;
+
+    // Fallback: if no points found, return 0
+    int found_count = (it_sw != fine_to_coarse.end()) + (it_se != fine_to_coarse.end()) +
+                      (it_nw != fine_to_coarse.end()) + (it_ne != fine_to_coarse.end());
+    if (found_count == 0) return 0.0;
+
+    // Bilinear interpolation
+    double v_low = (1.0 - wr) * v_sw + wr * v_se;
+    double v_high = (1.0 - wr) * v_nw + wr * v_ne;
+    return (1.0 - wt) * v_low + wt * v_high;
+}
+
+void MagneticFieldAnalyzer::interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse) {
+    // Interpolate coarsened solution back to full polar grid
+    // Note: Az is stored in image-compatible format based on r_orientation
+
+    if (r_orientation == "horizontal") {
+        Az.resize(ntheta, nr);  // Image is (theta, r)
+    } else {
+        Az.resize(nr, ntheta);  // Image is (r, theta)
+    }
+
+    for (int i_r = 0; i_r < nr; i_r++) {
+        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
+            if (active_cells(j_theta, i_r)) {  // Note: active_cells is always (theta, r)
+                // Active cell - copy directly from coarse solution
+                auto it = fine_to_coarse.find({i_r, j_theta});
+                if (it != fine_to_coarse.end()) {
+                    if (r_orientation == "horizontal") {
+                        Az(j_theta, i_r) = Az_coarse(it->second);
+                    } else {
+                        Az(i_r, j_theta) = Az_coarse(it->second);
+                    }
+                }
+            } else {
+                // Inactive cell - interpolate from surrounding active cells
+                double interpolated_value = interpolateFromCoarseGridPolar(i_r, j_theta, Az_coarse);
+                if (r_orientation == "horizontal") {
+                    Az(j_theta, i_r) = interpolated_value;
+                } else {
+                    Az(i_r, j_theta) = interpolated_value;
+                }
+            }
+        }
+    }
+}
+
 void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     std::cout << "\n=== Building coarsened FDM system ===" << std::endl;
     std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)
@@ -6814,25 +6931,8 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
                   << ", relative = " << (rhs_norm>0 ? res_norm / rhs_norm : res_norm) << std::endl;
     }
 
-    // Interpolate to full grid (Task 1.4 - to be implemented)
-    // For now, just resize Az to full size and copy active cells
-    // This is a placeholder - full interpolation will be added in Task 1.4
-    if (r_orientation == "horizontal") {
-        Az.resize(ntheta, nr);
-    } else {
-        Az.resize(nr, ntheta);
-    }
-    Az.setZero();
-
-    // Copy active cell values
-    for (int idx = 0; idx < n_active_cells; idx++) {
-        auto [i_r, j_theta] = coarse_to_fine[idx];
-        if (r_orientation == "horizontal") {
-            Az(j_theta, i_r) = Az_coarse(idx);
-        } else {
-            Az(i_r, j_theta) = Az_coarse(idx);
-        }
-    }
+    // Interpolate to full grid
+    interpolateToFullGridPolar(Az_coarse);
 
     std::cout << "Polar coarsened solve complete!" << std::endl;
 

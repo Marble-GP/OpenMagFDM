@@ -623,6 +623,7 @@ private:
     void buildAndSolveSystemCoarsened();
     void buildAndSolveSystemPolarCoarsened();
     void interpolateToFullGrid(const Eigen::VectorXd& Az_coarse);
+    void interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse);
     void exportCoarseningMask(const std::string& output_dir, int step_number);  // Export binary mask: active=255, coarsened=0
 
     // Maxwell stress calculation methods
