@@ -1129,9 +1129,17 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
     if (!has_nonlinear_materials) {
         // No nonlinear materials, use standard linear solver
         if (coordinate_system == "cartesian") {
-            buildAndSolveSystem();
-        } else {
-            buildAndSolveSystemPolar();
+            if (coarsening_enabled && n_active_cells < nx * ny) {
+                buildAndSolveSystemCoarsened();
+            } else {
+                buildAndSolveSystem();
+            }
+        } else {  // polar
+            if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                buildAndSolveSystemPolarCoarsened();
+            } else {
+                buildAndSolveSystemPolar();
+            }
         }
         return;
     }
@@ -1174,9 +1182,17 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         Eigen::VectorXd mu_old = flatten_mu();
 
         if (coordinate_system == "cartesian") {
-            buildAndSolveSystem();
-        } else {
-            buildAndSolveSystemPolar();
+            if (coarsening_enabled && n_active_cells < nx * ny) {
+                buildAndSolveSystemCoarsened();
+            } else {
+                buildAndSolveSystem();
+            }
+        } else {  // polar
+            if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                buildAndSolveSystemPolarCoarsened();
+            } else {
+                buildAndSolveSystemPolar();
+            }
         }
 
         if (coordinate_system == "cartesian") {
