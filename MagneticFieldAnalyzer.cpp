@@ -2137,7 +2137,12 @@ void MagneticFieldAnalyzer::solve() {
     } else {
         // Standard linear solver
         if (coordinate_system == "polar") {
-            buildAndSolveSystemPolar();
+            // Use coarsened solver if coarsening is enabled and provides benefit
+            if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                buildAndSolveSystemPolarCoarsened();
+            } else {
+                buildAndSolveSystemPolar();
+            }
         } else {
             // Use coarsened solver if coarsening is enabled and provides benefit
             if (coarsening_enabled && n_active_cells < nx * ny) {
