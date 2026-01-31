@@ -1036,9 +1036,17 @@ void MagneticFieldAnalyzer::solveNonlinear() {
     for (int iter = 0; iter < MAX_ITER; iter++) {
         // Step 1: Solve linear system with current μ distribution
         if (coordinate_system == "cartesian") {
-            buildAndSolveSystem();
-        } else {
-            buildAndSolveSystemPolar();
+            if (coarsening_enabled && n_active_cells < nx * ny) {
+                buildAndSolveSystemCoarsened();
+            } else {
+                buildAndSolveSystem();
+            }
+        } else {  // polar
+            if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                buildAndSolveSystemPolarCoarsened();
+            } else {
+                buildAndSolveSystemPolar();
+            }
         }
 
         // Step 2: Calculate magnetic field B
