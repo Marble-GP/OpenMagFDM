@@ -1373,21 +1373,43 @@ void MagneticFieldAnalyzer::calculateLocalMeshSpacing() {
     // Calculate local mesh spacing (h_minus, h_plus) for each active cell
     // This is needed for the non-uniform FDM stencil
 
-    local_dx.resize(ny, nx);
-    local_dy.resize(ny, nx);
-    local_dx.setZero();
-    local_dy.setZero();
+    if (coordinate_system == "polar") {
+        // Polar: local_dx = radial spacing, local_dy = angular spacing
+        // Both directions can be non-uniform due to coarsening
+        local_dx.resize(ntheta, nr);
+        local_dy.resize(ntheta, nr);
+        local_dx.setZero();
+        local_dy.setZero();
 
-    for (int idx = 0; idx < n_active_cells; idx++) {
-        auto [i, j] = coarse_to_fine[idx];
+        for (int idx = 0; idx < n_active_cells; idx++) {
+            auto [i_r, j_theta] = coarse_to_fine[idx];  // {r, theta} order
 
-        // Find distance to next active cell in +x direction
-        int i_next = findNextActiveX(i, j, +1);
-        local_dx(j, i) = (i_next - i) * dx;
+            // Find distance to next active cell in +r direction
+            int i_next = findNextActiveRadial(i_r, j_theta, +1);
+            local_dx(j_theta, i_r) = (i_next - i_r) * dr;
 
-        // Find distance to next active cell in +y direction
-        int j_next = findNextActiveY(i, j, +1);
-        local_dy(j, i) = (j_next - j) * dy;
+            // Find distance to next active cell in +theta direction
+            int j_next = findNextActiveTheta(i_r, j_theta, +1);
+            local_dy(j_theta, i_r) = (j_next - j_theta) * dtheta;
+        }
+    } else {
+        // Cartesian: local_dx = x spacing, local_dy = y spacing
+        local_dx.resize(ny, nx);
+        local_dy.resize(ny, nx);
+        local_dx.setZero();
+        local_dy.setZero();
+
+        for (int idx = 0; idx < n_active_cells; idx++) {
+            auto [i, j] = coarse_to_fine[idx];
+
+            // Find distance to next active cell in +x direction
+            int i_next = findNextActiveX(i, j, +1);
+            local_dx(j, i) = (i_next - i) * dx;
+
+            // Find distance to next active cell in +y direction
+            int j_next = findNextActiveY(i, j, +1);
+            local_dy(j, i) = (j_next - j) * dy;
+        }
     }
 }
 
@@ -1419,6 +1441,53 @@ int MagneticFieldAnalyzer::findNextActiveY(int i, int j, int direction) const {
     }
     // Reached boundary
     return (direction > 0) ? ny - 1 : 0;
+}
+
+int MagneticFieldAnalyzer::findNextActiveRadial(int i_r, int j_theta, int direction) const {
+    // Find the next active cell in radial direction (for polar coordinates)
+    // direction: +1 for outward, -1 for inward
+
+    int i_next = i_r + direction;
+    while (i_next >= 0 && i_next < nr) {
+        if (active_cells(j_theta, i_next)) {  // Note: (theta, r) order
+            return i_next;
+        }
+        i_next += direction;
+    }
+    // Reached boundary
+    return (direction > 0) ? nr - 1 : 0;
+}
+
+int MagneticFieldAnalyzer::findNextActiveTheta(int i_r, int j_theta, int direction) const {
+    // Find the next active cell in theta direction (for polar coordinates)
+    // direction: +1 for CCW, -1 for CW
+    // Handles periodic boundaries
+
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    int j_next = j_theta + direction;
+    int iterations = 0;
+
+    while (iterations < ntheta) {
+        // Handle periodic wrapping
+        if (is_periodic) {
+            j_next = (j_next + ntheta) % ntheta;
+        } else {
+            // Non-periodic: clamp at boundaries
+            if (j_next < 0) return 0;
+            if (j_next >= ntheta) return ntheta - 1;
+        }
+
+        if (active_cells(j_next, i_r)) {  // Note: (theta, r) order
+            return j_next;
+        }
+
+        j_next += direction;
+        iterations++;
+    }
+
+    // Fallback (shouldn't reach here unless all cells are inactive)
+    return j_theta;
 }
 
 std::pair<int, int> MagneticFieldAnalyzer::findActiveNeighbor(int i, int j, int di, int dj) const {
