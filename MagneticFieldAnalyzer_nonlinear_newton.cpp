@@ -27,9 +27,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     if (!has_nonlinear_materials) {
         // Fall back to linear solver
         if (coordinate_system == "cartesian") {
-            buildAndSolveSystem();
-        } else {
-            buildAndSolveSystemPolar();
+            if (coarsening_enabled && n_active_cells < nx * ny) {
+                buildAndSolveSystemCoarsened();
+            } else {
+                buildAndSolveSystem();
+            }
+        } else {  // polar
+            if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                buildAndSolveSystemPolarCoarsened();
+            } else {
+                buildAndSolveSystemPolar();
+            }
         }
         return;
     }
@@ -66,9 +74,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         std::cout << "Computing initial guess..." << std::endl;
     }
     if (is_polar) {
-        buildAndSolveSystemPolar();
+        if (coarsening_enabled && n_active_cells < nr * ntheta) {
+            buildAndSolveSystemPolarCoarsened();
+        } else {
+            buildAndSolveSystemPolar();
+        }
     } else {
-        buildAndSolveSystem();
+        if (coarsening_enabled && n_active_cells < nx * ny) {
+            buildAndSolveSystemCoarsened();
+        } else {
+            buildAndSolveSystem();
+        }
     }
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
@@ -87,16 +103,36 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         Eigen::SparseMatrix<double> A_matrix;
         Eigen::VectorXd b_vec;
         if (is_polar) {
-            buildMatrixPolar(A_matrix, b_vec);
+            if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                buildMatrixPolarCoarsened(A_matrix, b_vec);
+            } else {
+                buildMatrixPolar(A_matrix, b_vec);
+            }
         } else {
-            buildMatrix(A_matrix, b_vec);
+            if (coarsening_enabled && n_active_cells < nx * ny) {
+                buildMatrixCoarsened(A_matrix, b_vec);
+            } else {
+                buildMatrix(A_matrix, b_vec);
+            }
         }
 
         // CRITICAL: buildMatrixPolar uses row-major indexing (idx = r_idx * ntheta + theta_idx)
         // but Eigen Az.data() is column-major. Must convert to row-major order.
-        Eigen::VectorXd Az_vec(Az.size());
-        if (is_polar) {
-            // Convert Az to row-major order to match buildMatrixPolar indexing
+        // When coarsening is enabled, extract only active cell values.
+        Eigen::VectorXd Az_vec;
+        bool using_coarsening = (is_polar && coarsening_enabled && n_active_cells < nr * ntheta) ||
+                                (!is_polar && coarsening_enabled && n_active_cells < nx * ny);
+
+        if (using_coarsening) {
+            // Coarsened: extract only active cells
+            Az_vec.resize(n_active_cells);
+            for (int idx = 0; idx < n_active_cells; idx++) {
+                auto [i, j] = coarse_to_fine[idx];
+                Az_vec(idx) = Az(j, i);  // Az(row, col) for both Cartesian and Polar
+            }
+        } else if (is_polar) {
+            // Full polar grid: convert Az to row-major order to match buildMatrixPolar indexing
+            Az_vec.resize(Az.size());
             for (int i = 0; i < nr; i++) {
                 for (int j = 0; j < ntheta; j++) {
                     int idx = i * ntheta + j;  // Row-major index
@@ -108,7 +144,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
         } else {
-            // Cartesian: row-major is natural for (ny, nx) with idx = j * nx + i
+            // Full Cartesian grid: row-major is natural for (ny, nx) with idx = j * nx + i
+            Az_vec.resize(Az.size());
             for (int j = 0; j < ny; j++) {
                 for (int i = 0; i < nx; i++) {
                     int idx = j * nx + i;
@@ -208,9 +245,23 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             double dr = (r_end - r_start) / (nr - 1);
 
             for (int idx = 0; idx < Az_vec.size(); idx++) {
-                // Row-major: idx = r_idx * ntheta + theta_idx
-                int r_idx = idx / ntheta;
-                int theta_idx = idx % ntheta;
+                // Get grid indices (handle both full and coarsened grids)
+                int r_idx, theta_idx;
+                if (using_coarsening) {
+                    // Coarsened: use coarse_to_fine mapping
+                    auto [i, j] = coarse_to_fine[idx];
+                    if (r_orientation == "horizontal") {
+                        r_idx = i;
+                        theta_idx = j;
+                    } else {  // vertical
+                        r_idx = j;
+                        theta_idx = i;
+                    }
+                } else {
+                    // Full grid: row-major idx = r_idx * ntheta + theta_idx
+                    r_idx = idx / ntheta;
+                    theta_idx = idx % ntheta;
+                }
 
                 // Calculate r coordinate for this grid point
                 double r = r_start + r_idx * dr;
@@ -398,8 +449,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
             // Convert Az_trial (row-major vector) back to matrix form
             Eigen::MatrixXd Az_trial_mat;
-            if (is_polar) {
-                // CRITICAL: buildMatrixPolar uses row-major indexing (idx = r_idx * ntheta + theta_idx)
+            if (using_coarsening) {
+                // Coarsened: update only active cells, keep inactive from previous Az
+                Az_trial_mat = Az;  // Start with current Az (has full grid)
+                for (int idx = 0; idx < n_active_cells; idx++) {
+                    auto [i, j] = coarse_to_fine[idx];
+                    Az_trial_mat(j, i) = Az_trial(idx);  // Update active cell
+                }
+                // Note: Inactive cells retain values from previous iteration
+                // For better accuracy, could interpolate here, but keeping it simple for now
+            } else if (is_polar) {
+                // Full polar grid: CRITICAL - buildMatrixPolar uses row-major indexing
                 // Convert from row-major vector to matrix
                 if (r_orientation == "horizontal") {
                     Az_trial_mat.resize(ntheta, nr);
@@ -419,7 +479,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     }
                 }
             } else {
-                // Cartesian: Convert from row-major vector (idx = j * nx + i) to matrix
+                // Full Cartesian grid: Convert from row-major vector to matrix
                 Az_trial_mat.resize(ny, nx);
                 for (int j = 0; j < ny; j++) {
                     for (int i = 0; i < nx; i++) {
@@ -443,9 +503,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             Eigen::SparseMatrix<double> A_trial;
             Eigen::VectorXd b_trial;
             if (is_polar) {
-                buildMatrixPolar(A_trial, b_trial);
+                if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                    buildMatrixPolarCoarsened(A_trial, b_trial);
+                } else {
+                    buildMatrixPolar(A_trial, b_trial);
+                }
             } else {
-                buildMatrix(A_trial, b_trial);
+                if (coarsening_enabled && n_active_cells < nx * ny) {
+                    buildMatrixCoarsened(A_trial, b_trial);
+                } else {
+                    buildMatrix(A_trial, b_trial);
+                }
             }
             Eigen::VectorXd residual_trial = A_trial * Az_trial - b_trial;
             double residual_trial_norm = residual_trial.norm();
