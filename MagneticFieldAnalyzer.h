@@ -498,9 +498,11 @@ private:
     // Adaptive mesh coarsening configuration
     struct CoarsenConfig {
         bool enabled;       // Enable coarsening for this material
-        int ratio;          // Coarsening ratio (e.g., 4 means 4x4 -> 1 cell)
+        int ratio;          // Coarsening ratio (area reduction factor)
+        int skip_x;         // Actual skip ratio in x/r direction (auto-calculated)
+        int skip_y;         // Actual skip ratio in y/theta direction (auto-calculated)
 
-        CoarsenConfig() : enabled(false), ratio(1) {}
+        CoarsenConfig() : enabled(false), ratio(1), skip_x(1), skip_y(1) {}
     };
     std::map<std::string, CoarsenConfig> material_coarsen;  // Coarsening config per material
 
@@ -577,13 +579,22 @@ private:
 
     // Adaptive mesh coarsening methods
     cv::Mat detectMaterialBoundaries();  // Detect material boundaries using edge detection
+    void calculateOptimalSkipRatios();   // Calculate skip_x, skip_y from aspect ratio
     void generateCoarseningMask();       // Generate mask of active/inactive cells
+    void generateCoarseningMaskCartesian(const cv::Mat& boundaries);  // Cartesian mask generation
+    void generateCoarseningMaskPolar(const cv::Mat& boundaries);      // Polar mask generation
+    void polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const;  // Polar->Image coordinate transform
     void buildCoarseIndexMaps();         // Build coarse <-> fine index mappings
     void calculateLocalMeshSpacing();    // Calculate h_minus/h_plus for each active cell
     int findNextActiveX(int i, int j, int direction) const;  // Find next active cell in X
     int findNextActiveY(int i, int j, int direction) const;  // Find next active cell in Y
+    int findNextActiveRadial(int i_r, int j_theta, int direction) const;  // Find next active cell in r
+    int findNextActiveTheta(int i_r, int j_theta, int direction) const;   // Find next active cell in theta
     std::pair<int, int> findActiveNeighbor(int i, int j, int di, int dj) const;  // Find active neighbor
     double bilinearInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // Interpolate inactive cell
+    double interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const;  // Polar coarse grid interpolation
+    double calculateThetaDistance(int j_from, int j_to) const;  // Calculate theta distance (periodic-aware)
+    double calculateThetaInterpolationWeight(int j_theta, int j_prev, int j_next) const;  // Theta interpolation weight
 
     // Nonlinear solver methods
     void solveNonlinear();  // Main nonlinear Picard iteration solver

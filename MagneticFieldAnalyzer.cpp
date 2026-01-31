@@ -1117,26 +1117,92 @@ cv::Mat MagneticFieldAnalyzer::detectMaterialBoundaries() {
     return edges_flipped;
 }
 
+void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
+    // Calculate skip_x and skip_y from coarsen_ratio to maintain aspect ratio
+    // Goal: Make coarsened cells as square as possible
+
+    for (auto& [mat_name, cfg] : material_coarsen) {
+        if (!cfg.enabled || cfg.ratio <= 1) {
+            cfg.skip_x = cfg.skip_y = 1;
+            continue;
+        }
+
+        double aspect;  // Physical cell aspect ratio (x-direction / y-direction)
+
+        if (coordinate_system == "polar") {
+            // Polar coordinates: use representative radius for aspect calculation
+            double r_mid = (r_start + r_end) / 2.0;
+            double physical_dr = dr;
+            double physical_dtheta = r_mid * dtheta;
+            aspect = physical_dr / physical_dtheta;
+        } else {
+            // Cartesian coordinates: simple aspect ratio
+            aspect = dx / dy;
+        }
+
+        // Optimal skip ratios to make coarsened cells square:
+        // skip_x × skip_y ≈ ratio (area reduction)
+        // (skip_x × dx) / (skip_y × dy) ≈ 1 (square cells)
+        //
+        // Solution: skip_x = sqrt(ratio / aspect), skip_y = sqrt(ratio * aspect)
+        double skip_x_float = std::sqrt(cfg.ratio / aspect);
+        double skip_y_float = std::sqrt(cfg.ratio * aspect);
+
+        // Round to nearest integer
+        cfg.skip_x = std::max(1, (int)std::round(skip_x_float));
+        cfg.skip_y = std::max(1, (int)std::round(skip_y_float));
+
+        // Log actual reduction ratio
+        int actual_ratio = cfg.skip_x * cfg.skip_y;
+        std::cout << "Material '" << mat_name << "': coarsen_ratio=" << cfg.ratio
+                  << " -> skip_x=" << cfg.skip_x << ", skip_y=" << cfg.skip_y
+                  << " (actual ratio=" << actual_ratio << ")" << std::endl;
+    }
+}
+
 void MagneticFieldAnalyzer::generateCoarseningMask() {
     // Generate mask of active cells based on material coarsening settings
     // Cells on or near boundaries are always kept active
 
     if (!coarsening_enabled) {
         // No coarsening - all cells are active
-        active_cells.resize(ny, nx);
+        if (coordinate_system == "polar") {
+            active_cells.resize(ntheta, nr);
+            n_active_cells = nr * ntheta;
+        } else {
+            active_cells.resize(ny, nx);
+            n_active_cells = nx * ny;
+        }
         active_cells.setConstant(true);
-        n_active_cells = nx * ny;
         return;
     }
 
     std::cout << "Generating coarsening mask..." << std::endl;
 
+    // Calculate optimal skip ratios based on aspect ratio
+    calculateOptimalSkipRatios();
+
     // Detect material boundaries
     cv::Mat boundaries = detectMaterialBoundaries();
 
-    // Initialize all cells as active
-    active_cells.resize(ny, nx);
-    active_cells.setConstant(true);
+    // Generate mask based on coordinate system
+    if (coordinate_system == "polar") {
+        active_cells.resize(ntheta, nr);
+        active_cells.setConstant(true);
+        generateCoarseningMaskPolar(boundaries);
+    } else {
+        active_cells.resize(ny, nx);
+        active_cells.setConstant(true);
+        generateCoarseningMaskCartesian(boundaries);
+    }
+
+    // Build index mappings
+    buildCoarseIndexMaps();
+}
+
+void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(const cv::Mat& boundaries) {
+    // Generate coarsening mask for Cartesian coordinates
+    // Uses skip_x and skip_y calculated from aspect ratio
 
     // Flip image for coordinate matching
     cv::Mat image_flipped;
@@ -1163,12 +1229,10 @@ void MagneticFieldAnalyzer::generateCoarseningMask() {
             // Look up material coarsening settings
             for (const auto& mat_pair : material_coarsen) {
                 const auto& cfg = mat_pair.second;
-                if (!cfg.enabled || cfg.ratio <= 1) {
-                    continue;
-                }
+                if (!cfg.enabled) continue;
+                if (cfg.skip_x <= 1 && cfg.skip_y <= 1) continue;
 
                 // Check if this material matches by looking up its RGB
-                // We need to match the pixel to a material
                 for (const auto& material : config["materials"]) {
                     std::string mat_name = material.first.as<std::string>();
                     if (mat_name != mat_pair.first) continue;
@@ -1177,7 +1241,9 @@ void MagneticFieldAnalyzer::generateCoarseningMask() {
                     if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                         // This cell belongs to a coarsen-enabled material
                         // Keep only cells at coarsening grid positions
-                        if (i % cfg.ratio != 0 || j % cfg.ratio != 0) {
+                        bool coarsen_x = (cfg.skip_x > 1 && i % cfg.skip_x != 0);
+                        bool coarsen_y = (cfg.skip_y > 1 && j % cfg.skip_y != 0);
+                        if (coarsen_x || coarsen_y) {
                             active_cells(j, i) = false;
                             coarsened_count++;
                         }
@@ -1187,10 +1253,77 @@ void MagneticFieldAnalyzer::generateCoarseningMask() {
         }
     }
 
-    std::cout << "Coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+    std::cout << "Cartesian coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+}
 
-    // Build index mappings
-    buildCoarseIndexMaps();
+void MagneticFieldAnalyzer::generateCoarseningMaskPolar(const cv::Mat& boundaries) {
+    // Generate coarsening mask for Polar coordinates
+    // Uses skip_x (r-direction) and skip_y (theta-direction) calculated from aspect ratio
+
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    int coarsened_count = 0;
+
+    for (int i_r = 0; i_r < nr; i_r++) {
+        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
+            // Convert to image coordinates
+            int img_i, img_j;
+            polarToImageIndices(i_r, j_theta, img_i, img_j);
+
+            // Skip boundary cells - always keep them active
+            if (boundaries.at<uchar>(img_j, img_i) > 0) continue;
+
+            // Skip r-direction boundaries
+            if (i_r == 0 || i_r == nr - 1) continue;
+
+            // Skip theta-direction boundaries (if not periodic)
+            if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) continue;
+
+            // Find which material this cell belongs to
+            cv::Vec3b pixel = image.at<cv::Vec3b>(img_j, img_i);
+
+            // Look up material coarsening settings
+            for (const auto& mat_pair : material_coarsen) {
+                const auto& cfg = mat_pair.second;
+                if (!cfg.enabled) continue;
+                if (cfg.skip_x <= 1 && cfg.skip_y <= 1) continue;
+
+                // Check if this material matches by looking up its RGB
+                for (const auto& material : config["materials"]) {
+                    std::string mat_name = material.first.as<std::string>();
+                    if (mat_name != mat_pair.first) continue;
+
+                    auto rgb = material.second["rgb"].as<std::vector<int>>();
+                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                        // This cell belongs to a coarsen-enabled material
+                        // r-direction: skip_x, theta-direction: skip_y
+                        bool coarsen_r = (cfg.skip_x > 1 && i_r % cfg.skip_x != 0);
+                        bool coarsen_theta = (cfg.skip_y > 1 && j_theta % cfg.skip_y != 0);
+                        if (coarsen_r || coarsen_theta) {
+                            active_cells(j_theta, i_r) = false;  // Note: (theta, r) order
+                            coarsened_count++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    std::cout << "Polar coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+}
+
+void MagneticFieldAnalyzer::polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const {
+    // Convert polar grid indices (i_r, j_theta) to image pixel coordinates (img_i, img_j)
+    // Depends on r_orientation setting
+
+    if (r_orientation == "horizontal") {
+        // Image x-axis = r, Image y-axis = theta
+        img_i = i_r;
+        img_j = j_theta;
+    } else {  // "vertical"
+        // Image y-axis = r, Image x-axis = theta
+        img_i = j_theta;
+        img_j = i_r;
+    }
 }
 
 void MagneticFieldAnalyzer::buildCoarseIndexMaps() {
@@ -1200,19 +1333,37 @@ void MagneticFieldAnalyzer::buildCoarseIndexMaps() {
     fine_to_coarse.clear();
     n_active_cells = 0;
 
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (active_cells(j, i)) {
-                coarse_to_fine.push_back({i, j});
-                fine_to_coarse[{i, j}] = n_active_cells;
-                n_active_cells++;
+    if (coordinate_system == "polar") {
+        // Polar: iterate over (theta, r), store {i_r, j_theta}
+        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
+            for (int i_r = 0; i_r < nr; i_r++) {
+                if (active_cells(j_theta, i_r)) {
+                    coarse_to_fine.push_back({i_r, j_theta});  // {r, theta} order
+                    fine_to_coarse[{i_r, j_theta}] = n_active_cells;
+                    n_active_cells++;
+                }
             }
         }
-    }
 
-    std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)
-              << " (" << std::fixed << std::setprecision(1)
-              << (100.0 * n_active_cells / (nx * ny)) << "%)" << std::endl;
+        std::cout << "Active cells: " << n_active_cells << " / " << (nr * ntheta)
+                  << " (" << std::fixed << std::setprecision(1)
+                  << (100.0 * n_active_cells / (nr * ntheta)) << "%)" << std::endl;
+    } else {
+        // Cartesian: iterate over (y, x), store {i, j}
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                if (active_cells(j, i)) {
+                    coarse_to_fine.push_back({i, j});
+                    fine_to_coarse[{i, j}] = n_active_cells;
+                    n_active_cells++;
+                }
+            }
+        }
+
+        std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)
+                  << " (" << std::fixed << std::setprecision(1)
+                  << (100.0 * n_active_cells / (nx * ny)) << "%)" << std::endl;
+    }
 
     // Calculate local mesh spacing for active cells
     calculateLocalMeshSpacing();
