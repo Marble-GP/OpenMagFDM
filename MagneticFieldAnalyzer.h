@@ -619,7 +619,9 @@ private:
 
     // Adaptive mesh coarsening solver methods
     void buildMatrixCoarsened(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);
+    void buildMatrixPolarCoarsened(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);
     void buildAndSolveSystemCoarsened();
+    void buildAndSolveSystemPolarCoarsened();
     void interpolateToFullGrid(const Eigen::VectorXd& Az_coarse);
     void exportCoarseningMask(const std::string& output_dir, int step_number);  // Export binary mask: active=255, coarsened=0
 

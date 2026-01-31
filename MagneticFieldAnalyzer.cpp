@@ -6546,6 +6546,300 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
     calculateMagneticFieldPolar();
 }
 
+double MagneticFieldAnalyzer::calculateThetaDistance(int j_from, int j_to) const {
+    // Calculate theta-direction distance (periodic boundary aware)
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    int diff;
+    if (is_periodic) {
+        // Periodic: take shortest distance
+        diff = j_to - j_from;
+        if (diff < -ntheta / 2) diff += ntheta;
+        if (diff > ntheta / 2) diff -= ntheta;
+        diff = std::abs(diff);
+    } else {
+        diff = std::abs(j_to - j_from);
+    }
+
+    return diff * dtheta;
+}
+
+void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs) {
+    // Build FDM system matrix with coarsening (Polar coordinates, non-uniform stencil)
+    A.resize(n_active_cells, n_active_cells);
+    rhs.resize(n_active_cells);
+    rhs.setZero();
+
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(7 * n_active_cells);
+
+    // Determine boundary condition type
+    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+    double periodic_sign = is_antiperiodic ? -1.0 : 1.0;
+
+    // Build equation for each active cell
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i_r, j_theta] = coarse_to_fine[idx];  // {r, theta} order
+        double r = r_coords[i_r];
+
+        // Angular boundary conditions (non-periodic only)
+        if (!is_periodic) {
+            if (j_theta == 0 && bc_theta_min.type == "dirichlet") {
+                triplets.push_back({idx, idx, 1.0});
+                rhs(idx) = bc_theta_min.value;
+                continue;
+            }
+            if (j_theta == ntheta - 1 && bc_theta_max.type == "dirichlet") {
+                triplets.push_back({idx, idx, 1.0});
+                rhs(idx) = bc_theta_max.value;
+                continue;
+            }
+        }
+
+        // Radial boundary conditions (Dirichlet)
+        if (i_r == 0 && bc_inner.type == "dirichlet") {
+            triplets.push_back({idx, idx, 1.0});
+            rhs(idx) = bc_inner.value;
+            continue;
+        }
+        if (i_r == nr - 1 && bc_outer.type == "dirichlet") {
+            triplets.push_back({idx, idx, 1.0});
+            rhs(idx) = bc_outer.value;
+            continue;
+        }
+
+        // Robin boundary conditions for radial direction
+        if (i_r == 0 && bc_inner.type == "robin") {
+            double a = bc_inner.alpha;
+            double b = bc_inner.beta;
+            double g = bc_inner.gamma;
+
+            // Find next active cell outward
+            int i_next = findNextActiveRadial(i_r, j_theta, +1);
+            auto it_next = fine_to_coarse.find({i_next, j_theta});
+            if (it_next != fine_to_coarse.end()) {
+                double h_plus = (i_next - i_r) * dr;
+                triplets.push_back({idx, idx, a + b/h_plus});
+                triplets.push_back({idx, it_next->second, -b/h_plus});
+            }
+            rhs(idx) = g;
+            continue;
+        }
+        if (i_r == nr - 1 && bc_outer.type == "robin") {
+            double a = bc_outer.alpha;
+            double b = bc_outer.beta;
+            double g = bc_outer.gamma;
+
+            // Find next active cell inward
+            int i_prev = findNextActiveRadial(i_r, j_theta, -1);
+            auto it_prev = fine_to_coarse.find({i_prev, j_theta});
+            if (it_prev != fine_to_coarse.end()) {
+                double h_minus = (i_r - i_prev) * dr;
+                triplets.push_back({idx, idx, a + b/h_minus});
+                triplets.push_back({idx, it_prev->second, -b/h_minus});
+            }
+            rhs(idx) = g;
+            continue;
+        }
+
+        // Interior points and Neumann boundary points
+        // Polar equation: ∂/∂r(r·(1/μ)·∂Az/∂r) + (1/r)·∂/∂θ((1/μ)·∂Az/∂θ) = -r·Jz
+        double coeff_center = 0.0;
+
+        // --- Radial direction (non-uniform stencil) ---
+        int i_prev = findNextActiveRadial(i_r, j_theta, -1);
+        int i_next = findNextActiveRadial(i_r, j_theta, +1);
+
+        double h_minus = (i_r - i_prev) * dr;
+        double h_plus = (i_next - i_r) * dr;
+
+        // Prevent division by zero
+        if (h_minus < 1e-15) h_minus = dr;
+        if (h_plus < 1e-15) h_plus = dr;
+
+        // Interface positions (r-weighting)
+        double r_imh = r - h_minus / 2.0;  // r_{i-1/2}
+        double r_iph = r + h_plus / 2.0;   // r_{i+1/2}
+
+        // Interface permeabilities
+        double mu_inner = getMuAtInterfacePolar(i_r - 0.5, j_theta, "r");
+        double mu_outer = getMuAtInterfacePolar(i_r + 0.5, j_theta, "r");
+
+        // Non-uniform + r-weighted coefficients
+        double a_im = r_imh / (mu_inner * h_minus * (h_minus + h_plus));
+        double a_ip = r_iph / (mu_outer * h_plus * (h_minus + h_plus));
+
+        // Handle Neumann boundaries with ghost elimination
+        if (i_r == 0 && bc_inner.type == "neumann") {
+            if (r_imh <= 0.0) {
+                // Mirror approximation
+                std::cerr << "Warning: r_imh <= 0 at inner Neumann BC, using mirror" << std::endl;
+                double r_imh_eff = r_iph;
+                double a_im_eff = r_imh_eff / (mu_inner * h_plus * (h_minus + h_plus));
+                auto it_next = fine_to_coarse.find({i_next, j_theta});
+                if (it_next != fine_to_coarse.end()) {
+                    triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
+                }
+                coeff_center -= (a_im_eff + a_ip);
+            } else {
+                auto it_next = fine_to_coarse.find({i_next, j_theta});
+                if (it_next != fine_to_coarse.end()) {
+                    triplets.push_back({idx, it_next->second, a_im + a_ip});
+                }
+                coeff_center -= (a_im + a_ip);
+            }
+        } else if (i_r == nr - 1 && bc_outer.type == "neumann") {
+            auto it_prev = fine_to_coarse.find({i_prev, j_theta});
+            if (it_prev != fine_to_coarse.end()) {
+                triplets.push_back({idx, it_prev->second, a_im + a_ip});
+            }
+            coeff_center -= (a_im + a_ip);
+        } else {
+            // Standard interior stencil
+            bool inner_neighbor_is_dirichlet = (i_r == 1) && (bc_inner.type == "dirichlet");
+            bool outer_neighbor_is_dirichlet = (i_r == nr - 2) && (bc_outer.type == "dirichlet");
+
+            auto it_prev = fine_to_coarse.find({i_prev, j_theta});
+            auto it_next = fine_to_coarse.find({i_next, j_theta});
+
+            if (!inner_neighbor_is_dirichlet && it_prev != fine_to_coarse.end()) {
+                triplets.push_back({idx, it_prev->second, a_im});
+            } else if (inner_neighbor_is_dirichlet) {
+                rhs(idx) -= a_im * bc_inner.value;
+            }
+
+            if (!outer_neighbor_is_dirichlet && it_next != fine_to_coarse.end()) {
+                triplets.push_back({idx, it_next->second, a_ip});
+            } else if (outer_neighbor_is_dirichlet) {
+                rhs(idx) -= a_ip * bc_outer.value;
+            }
+
+            coeff_center -= (a_im + a_ip);
+        }
+
+        // --- Theta direction (non-uniform stencil) ---
+        int j_prev_theta = findNextActiveTheta(i_r, j_theta, -1);
+        int j_next_theta = findNextActiveTheta(i_r, j_theta, +1);
+
+        double h_theta_minus = calculateThetaDistance(j_theta, j_prev_theta);
+        double h_theta_plus = calculateThetaDistance(j_next_theta, j_theta);
+
+        // Prevent division by zero
+        if (h_theta_minus < 1e-15) h_theta_minus = dtheta;
+        if (h_theta_plus < 1e-15) h_theta_plus = dtheta;
+
+        double mu_theta = getMuPolar(mu_map, i_r, j_theta, r_orientation);
+
+        // Non-uniform theta stencil (1/r weight included)
+        double a_theta_m = 1.0 / (r * mu_theta * h_theta_minus * (h_theta_minus + h_theta_plus));
+        double a_theta_p = 1.0 / (r * mu_theta * h_theta_plus * (h_theta_minus + h_theta_plus));
+
+        auto it_theta_prev = fine_to_coarse.find({i_r, j_prev_theta});
+        auto it_theta_next = fine_to_coarse.find({i_r, j_next_theta});
+
+        if (it_theta_prev != fine_to_coarse.end()) {
+            // Check if crossing periodic boundary
+            bool crosses_boundary = is_periodic &&
+                ((j_theta == 0 && j_prev_theta > j_theta) ||
+                 (j_theta > 0 && j_prev_theta > j_theta));
+            double sign = crosses_boundary ? periodic_sign : 1.0;
+            triplets.push_back({idx, it_theta_prev->second, sign * a_theta_m});
+        }
+        if (it_theta_next != fine_to_coarse.end()) {
+            bool crosses_boundary = is_periodic &&
+                ((j_theta == ntheta-1 && j_next_theta < j_theta) ||
+                 (j_theta < ntheta-1 && j_next_theta < j_theta));
+            double sign = crosses_boundary ? periodic_sign : 1.0;
+            triplets.push_back({idx, it_theta_next->second, sign * a_theta_p});
+        }
+        coeff_center -= (a_theta_m + a_theta_p);
+
+        // Center coefficient
+        triplets.push_back({idx, idx, coeff_center});
+
+        // Source term (r-weighted)
+        double jz = getJzPolar(jz_map, i_r, j_theta, r_orientation);
+        rhs(idx) -= r * jz;
+    }
+
+    A.setFromTriplets(triplets.begin(), triplets.end());
+}
+
+void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
+    std::cout << "\n=== Building polar coarsened FDM system ===" << std::endl;
+    std::cout << "Active cells: " << n_active_cells << " / " << (nr * ntheta)
+              << " (reduction: " << std::fixed << std::setprecision(1)
+              << (100.0 * (1.0 - double(n_active_cells) / (nr * ntheta))) << "%)" << std::endl;
+
+    Eigen::SparseMatrix<double> A;
+    Eigen::VectorXd rhs;
+    buildMatrixPolarCoarsened(A, rhs);
+
+    std::cout << "Coarsened matrix size: " << A.rows() << "x" << A.cols() << std::endl;
+    std::cout << "Non-zero elements: " << A.nonZeros() << std::endl;
+
+    // Check matrix symmetry
+    Eigen::SparseMatrix<double> A_T = A.transpose();
+    double symmetry_error = (A - A_T).norm();
+    double A_norm = A.norm();
+    double relative_symmetry_error = (A_norm > 1e-12) ? (symmetry_error / A_norm) : symmetry_error;
+
+    std::cout << "Matrix symmetry: relative error = " << relative_symmetry_error << std::endl;
+    if (relative_symmetry_error > 1e-8) {
+        std::cerr << "Warning: Matrix not symmetric! Relative error = " << relative_symmetry_error << std::endl;
+    }
+
+    // Solve linear system
+    std::cout << "\n=== Solving coarsened linear system ===" << std::endl;
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
+    solver.compute(A);
+
+    if (solver.info() != Eigen::Success) {
+        throw std::runtime_error("Polar coarsened matrix decomposition failed!");
+    }
+
+    Eigen::VectorXd Az_coarse = solver.solve(rhs);
+
+    if (solver.info() != Eigen::Success) {
+        throw std::runtime_error("Polar coarsened solve failed!");
+    }
+
+    // Check residual
+    if (nonlinear_config.verbose) {
+        Eigen::VectorXd res = A * Az_coarse - rhs;
+        double res_norm = res.norm();
+        double rhs_norm = rhs.norm();
+        std::cout << "[DBG] Residual norm ||A x - b|| = " << res_norm
+                  << ", relative = " << (rhs_norm>0 ? res_norm / rhs_norm : res_norm) << std::endl;
+    }
+
+    // Interpolate to full grid (Task 1.4 - to be implemented)
+    // For now, just resize Az to full size and copy active cells
+    // This is a placeholder - full interpolation will be added in Task 1.4
+    if (r_orientation == "horizontal") {
+        Az.resize(ntheta, nr);
+    } else {
+        Az.resize(nr, ntheta);
+    }
+    Az.setZero();
+
+    // Copy active cell values
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i_r, j_theta] = coarse_to_fine[idx];
+        if (r_orientation == "horizontal") {
+            Az(j_theta, i_r) = Az_coarse(idx);
+        } else {
+            Az(i_r, j_theta) = Az_coarse(idx);
+        }
+    }
+
+    std::cout << "Polar coarsened solve complete!" << std::endl;
+
+    // Calculate magnetic field
+    calculateMagneticFieldPolar();
+}
+
 void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
     // Hybrid initialization for polar Newton-Krylov solver:
     // Interprets polar grid as Cartesian for faster initial guess.
