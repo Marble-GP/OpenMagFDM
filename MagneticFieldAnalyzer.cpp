@@ -1259,13 +1259,21 @@ void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(const cv::Mat& bound
 void MagneticFieldAnalyzer::generateCoarseningMaskPolar(const cv::Mat& boundaries) {
     // Generate coarsening mask for Polar coordinates
     // Uses skip_x (r-direction) and skip_y (theta-direction) calculated from aspect ratio
+    //
+    // IMPORTANT: boundaries is already flipped (from detectMaterialBoundaries) to match
+    // analysis coordinates (y-up). We must also flip image to ensure coordinate consistency.
+
+    // Flip image to match analysis coordinates (same as boundaries)
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
 
     bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
     int coarsened_count = 0;
 
     for (int i_r = 0; i_r < nr; i_r++) {
         for (int j_theta = 0; j_theta < ntheta; j_theta++) {
-            // Convert to image coordinates
+            // Convert polar indices to flipped image coordinates
+            // Both boundaries and image_flipped are now in analysis coordinates (y-up)
             int img_i, img_j;
             polarToImageIndices(i_r, j_theta, img_i, img_j);
 
@@ -1279,7 +1287,8 @@ void MagneticFieldAnalyzer::generateCoarseningMaskPolar(const cv::Mat& boundarie
             if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) continue;
 
             // Find which material this cell belongs to
-            cv::Vec3b pixel = image.at<cv::Vec3b>(img_j, img_i);
+            // Use flipped image to match boundaries coordinate system
+            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
 
             // Look up material coarsening settings
             for (const auto& mat_pair : material_coarsen) {
