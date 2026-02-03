@@ -1934,6 +1934,42 @@ void MagneticFieldAnalyzer::interpolateToFullGridPolar(const Eigen::VectorXd& Az
     }
 }
 
+void MagneticFieldAnalyzer::interpolateInactiveCells(const Eigen::VectorXd& Az_coarse) {
+    // Update ONLY inactive cells by interpolation from active cells
+    // Active cells in Az are assumed to already have correct values
+    // This is a lightweight function for nonlinear iteration (avoids full grid copy)
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            if (!active_cells(j, i)) {
+                // Inactive cell - interpolate from surrounding active cells
+                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
+            }
+            // Active cells: keep existing values (already updated from Az_coarse)
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::interpolateInactiveCellsPolar(const Eigen::VectorXd& Az_coarse) {
+    // Update ONLY inactive cells by interpolation from active cells (Polar version)
+    // Active cells in Az are assumed to already have correct values
+
+    for (int i_r = 0; i_r < nr; i_r++) {
+        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
+            if (!active_cells(j_theta, i_r)) {  // Note: active_cells is (theta, r)
+                // Inactive cell - interpolate from surrounding active cells
+                double interpolated_value = interpolateFromCoarseGridPolar(i_r, j_theta, Az_coarse);
+                if (r_orientation == "horizontal") {
+                    Az(j_theta, i_r) = interpolated_value;
+                } else {
+                    Az(i_r, j_theta) = interpolated_value;
+                }
+            }
+            // Active cells: keep existing values (already updated from Az_coarse)
+        }
+    }
+}
+
 void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     std::cout << "\n=== Building coarsened FDM system ===" << std::endl;
     std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)

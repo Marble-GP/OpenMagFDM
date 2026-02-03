@@ -450,14 +450,21 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Convert Az_trial (row-major vector) back to matrix form
             Eigen::MatrixXd Az_trial_mat;
             if (using_coarsening) {
-                // Coarsened: update only active cells, keep inactive from previous Az
+                // Coarsened: update active cells, then interpolate inactive cells
                 Az_trial_mat = Az;  // Start with current Az (has full grid)
                 for (int idx = 0; idx < n_active_cells; idx++) {
                     auto [i, j] = coarse_to_fine[idx];
                     Az_trial_mat(j, i) = Az_trial(idx);  // Update active cell
                 }
-                // Note: Inactive cells retain values from previous iteration
-                // For better accuracy, could interpolate here, but keeping it simple for now
+                // ★ CRITICAL FIX: Interpolate inactive cells to ensure consistent gradients
+                // This is required for accurate B/H/μ calculation in nonlinear iteration
+                Az = Az_trial_mat;  // Temporarily set Az for interpolation functions
+                if (is_polar) {
+                    interpolateInactiveCellsPolar(Az_trial);
+                } else {
+                    interpolateInactiveCells(Az_trial);
+                }
+                Az_trial_mat = Az;  // Copy back with interpolated inactive cells
             } else if (is_polar) {
                 // Full polar grid: CRITICAL - buildMatrixPolar uses row-major indexing
                 // Convert from row-major vector to matrix
@@ -537,7 +544,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 Az_vec = Az_vec_0 + alpha_min * delta_A;
 
                 // Convert Az_vec (row-major) back to matrix form
-                if (is_polar) {
+                if (using_coarsening) {
+                    // Coarsened: update active cells, then interpolate inactive cells
+                    for (int idx = 0; idx < n_active_cells; idx++) {
+                        auto [i, j] = coarse_to_fine[idx];
+                        Az(j, i) = Az_vec(idx);
+                    }
+                    // ★ CRITICAL FIX: Interpolate inactive cells
+                    if (is_polar) {
+                        interpolateInactiveCellsPolar(Az_vec);
+                    } else {
+                        interpolateInactiveCells(Az_vec);
+                    }
+                } else if (is_polar) {
                     if (r_orientation == "horizontal") {
                         Az.resize(ntheta, nr);
                         for (int i = 0; i < nr; i++) {
@@ -609,7 +628,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 Az_vec = beta_AA * Az_anderson + (1.0 - beta_AA) * Az_vec;
 
                 // Update Az matrix from Az_vec
-                if (is_polar) {
+                if (using_coarsening) {
+                    // Coarsened: update active cells, then interpolate inactive cells
+                    for (int idx = 0; idx < n_active_cells; idx++) {
+                        auto [i, j] = coarse_to_fine[idx];
+                        Az(j, i) = Az_vec(idx);
+                    }
+                    // ★ CRITICAL FIX: Interpolate inactive cells after Anderson update
+                    if (is_polar) {
+                        interpolateInactiveCellsPolar(Az_vec);
+                    } else {
+                        interpolateInactiveCells(Az_vec);
+                    }
+                } else if (is_polar) {
                     if (r_orientation == "horizontal") {
                         for (int i = 0; i < nr; i++) {
                             for (int j = 0; j < ntheta; j++) {

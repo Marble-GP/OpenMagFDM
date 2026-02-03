@@ -624,6 +624,8 @@ private:
     void buildAndSolveSystemPolarCoarsened();
     void interpolateToFullGrid(const Eigen::VectorXd& Az_coarse);
     void interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse);
+    void interpolateInactiveCells(const Eigen::VectorXd& Az_coarse);  // Update only inactive cells (for nonlinear iteration)
+    void interpolateInactiveCellsPolar(const Eigen::VectorXd& Az_coarse);  // Polar version
     void exportCoarseningMask(const std::string& output_dir, int step_number);  // Export binary mask: active=255, coarsened=0
 
     // Maxwell stress calculation methods
