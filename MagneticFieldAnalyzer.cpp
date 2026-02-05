@@ -79,6 +79,17 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>(0.65);
         nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>(50);
         nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
+
+        // Phase 4: Galerkin coarsening option (for coarsened Newton-Krylov)
+        nonlinear_config.use_galerkin_coarsening = nl_config["use_galerkin_coarsening"].as<bool>(true);
+
+        // Phase 5: Matrix-free Jv option (solves oscillation issue with coarsening + nonlinear)
+        nonlinear_config.use_matrix_free_jv = nl_config["use_matrix_free_jv"].as<bool>(true);
+
+        // Phase 6: Preconditioned JFNK (uses Galerkin coarse matrix as preconditioner)
+        nonlinear_config.use_phase6_precond_jfnk = nl_config["use_phase6_precond_jfnk"].as<bool>(false);
+        nonlinear_config.precond_update_frequency = nl_config["precond_update_frequency"].as<int>(1);
+        nonlinear_config.precond_verbose = nl_config["precond_verbose"].as<bool>(false);
     }
 
     // Determine coordinate system
@@ -2054,6 +2065,776 @@ void MagneticFieldAnalyzer::exportCoarseningMask(const std::string& output_dir, 
     } else {
         std::cerr << "Warning: Failed to export coarsening mask to: " << output_path << std::endl;
     }
+}
+
+// ============================================================================
+// Phase 4: Full-grid residual evaluation for coarsened Newton-Krylov convergence
+// ============================================================================
+
+void MagneticFieldAnalyzer::updateFullMatrixCache() {
+    // Rebuild full-grid matrix with current mu_map
+    // This is called during nonlinear iteration when mu changes
+    if (coordinate_system == "cartesian") {
+        buildMatrix(A_full_cached, rhs_full_cached);
+    } else {
+        buildMatrixPolar(A_full_cached, rhs_full_cached);
+    }
+    full_matrix_cache_valid = true;
+}
+
+double MagneticFieldAnalyzer::computeFullGridResidual(double& out_b_norm) {
+    // Ensure full matrix cache is valid
+    if (!full_matrix_cache_valid) {
+        updateFullMatrixCache();
+    }
+
+    // Convert current Az matrix to full vector
+    int n_full;
+    Eigen::VectorXd Az_full;
+
+    if (coordinate_system == "cartesian") {
+        n_full = nx * ny;
+        Az_full.resize(n_full);
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                Az_full(j * nx + i) = Az(j, i);
+            }
+        }
+    } else {
+        // Polar coordinate system
+        n_full = nr * ntheta;
+        Az_full.resize(n_full);
+        for (int i_r = 0; i_r < nr; i_r++) {
+            for (int j_theta = 0; j_theta < ntheta; j_theta++) {
+                int idx = i_r * ntheta + j_theta;
+                if (r_orientation == "horizontal") {
+                    // mu_map/Az shape: (ntheta, nr), indexing: (theta_idx, r_idx)
+                    Az_full(idx) = Az(j_theta, i_r);
+                } else {
+                    // mu_map/Az shape: (nr, ntheta), indexing: (r_idx, theta_idx)
+                    Az_full(idx) = Az(i_r, j_theta);
+                }
+            }
+        }
+    }
+
+    // Compute residual: r = A_f * Az_f - b_f
+    Eigen::VectorXd residual = A_full_cached * Az_full - rhs_full_cached;
+
+    out_b_norm = rhs_full_cached.norm();
+    return residual.norm();
+}
+
+// ============================================================================
+// Phase 4: Prolongation/Restriction operators for Galerkin projection
+// ============================================================================
+
+void MagneticFieldAnalyzer::buildInterpolationWeights(
+    int i, int j, int fine_idx,
+    std::vector<Eigen::Triplet<double>>& triplets)
+{
+    // Find active neighbors in x and y directions for bilinear interpolation
+    // This matches the logic in bilinearInterpolateFromCoarse()
+
+    // Search for active neighbors in x direction
+    int i_left = i, i_right = i;
+    while (i_left > 0 && !active_cells(j, i_left)) i_left--;
+    while (i_right < nx - 1 && !active_cells(j, i_right)) i_right++;
+
+    // Search for active neighbors in y direction
+    int j_bottom = j, j_top = j;
+    while (j_bottom > 0 && !active_cells(j_bottom, i)) j_bottom--;
+    while (j_top < ny - 1 && !active_cells(j_top, i)) j_top++;
+
+    // Check if we have valid active neighbors
+    auto it_left = fine_to_coarse.find({i_left, j});
+    auto it_right = fine_to_coarse.find({i_right, j});
+    auto it_bottom = fine_to_coarse.find({i, j_bottom});
+    auto it_top = fine_to_coarse.find({i, j_top});
+
+    bool have_x = (it_left != fine_to_coarse.end() && it_right != fine_to_coarse.end() &&
+                   active_cells(j, i_left) && active_cells(j, i_right) && i_left != i_right);
+    bool have_y = (it_bottom != fine_to_coarse.end() && it_top != fine_to_coarse.end() &&
+                   active_cells(j_bottom, i) && active_cells(j_top, i) && j_bottom != j_top);
+
+    if (have_x && have_y) {
+        // Full bilinear interpolation: average of x-interp and y-interp
+        double fx = double(i - i_left) / double(i_right - i_left);
+        double fy = double(j - j_bottom) / double(j_top - j_bottom);
+
+        // X-direction interpolation weights (scaled by 0.5)
+        triplets.push_back({fine_idx, it_left->second, 0.5 * (1.0 - fx)});
+        triplets.push_back({fine_idx, it_right->second, 0.5 * fx});
+        // Y-direction interpolation weights (scaled by 0.5)
+        triplets.push_back({fine_idx, it_bottom->second, 0.5 * (1.0 - fy)});
+        triplets.push_back({fine_idx, it_top->second, 0.5 * fy});
+    } else if (have_x) {
+        // X-direction only linear interpolation
+        double fx = double(i - i_left) / double(i_right - i_left);
+        triplets.push_back({fine_idx, it_left->second, 1.0 - fx});
+        triplets.push_back({fine_idx, it_right->second, fx});
+    } else if (have_y) {
+        // Y-direction only linear interpolation
+        double fy = double(j - j_bottom) / double(j_top - j_bottom);
+        triplets.push_back({fine_idx, it_bottom->second, 1.0 - fy});
+        triplets.push_back({fine_idx, it_top->second, fy});
+    } else {
+        // Fallback: find nearest active neighbor
+        double min_dist = std::numeric_limits<double>::max();
+        int nearest_coarse_idx = -1;
+
+        for (int dj = -2; dj <= 2; dj++) {
+            for (int di = -2; di <= 2; di++) {
+                int ni = i + di;
+                int nj = j + dj;
+                if (ni >= 0 && ni < nx && nj >= 0 && nj < ny && active_cells(nj, ni)) {
+                    double dist = std::sqrt(di * di + dj * dj);
+                    if (dist < min_dist) {
+                        auto it = fine_to_coarse.find({ni, nj});
+                        if (it != fine_to_coarse.end()) {
+                            min_dist = dist;
+                            nearest_coarse_idx = it->second;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (nearest_coarse_idx >= 0) {
+            triplets.push_back({fine_idx, nearest_coarse_idx, 1.0});
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
+    std::vector<Eigen::Triplet<double>>& triplets)
+{
+    // Polar version of prolongation matrix construction
+    // Index mapping: fine_idx = i_r * ntheta + j_theta
+
+    for (int i_r = 0; i_r < nr; i_r++) {
+        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
+            int fine_idx = i_r * ntheta + j_theta;
+
+            // Check active_cells with orientation-aware indexing
+            bool is_active;
+            if (r_orientation == "horizontal") {
+                is_active = active_cells(j_theta, i_r);
+            } else {
+                is_active = active_cells(i_r, j_theta);
+            }
+
+            if (is_active) {
+                // Active cell: injection (weight = 1.0)
+                auto it = fine_to_coarse.find({i_r, j_theta});
+                if (it != fine_to_coarse.end()) {
+                    triplets.push_back({fine_idx, it->second, 1.0});
+                }
+            } else {
+                // Inactive cell: interpolation from surrounding active cells
+                // Find neighbors in r and theta directions
+                int i_inner = findNextActiveRadial(i_r, j_theta, -1);
+                int i_outer = findNextActiveRadial(i_r, j_theta, +1);
+                int j_prev = findNextActiveTheta(i_r, j_theta, -1);
+                int j_next = findNextActiveTheta(i_r, j_theta, +1);
+
+                auto it_inner = fine_to_coarse.find({i_inner, j_theta});
+                auto it_outer = fine_to_coarse.find({i_outer, j_theta});
+                auto it_prev = fine_to_coarse.find({i_r, j_prev});
+                auto it_next = fine_to_coarse.find({i_r, j_next});
+
+                bool have_r = (it_inner != fine_to_coarse.end() && it_outer != fine_to_coarse.end() &&
+                               i_inner != i_outer);
+                bool have_theta = (it_prev != fine_to_coarse.end() && it_next != fine_to_coarse.end() &&
+                                   j_prev != j_next);
+
+                if (have_r && have_theta) {
+                    // Bilinear in r-theta
+                    double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
+                    double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
+
+                    triplets.push_back({fine_idx, it_inner->second, 0.5 * (1.0 - fr)});
+                    triplets.push_back({fine_idx, it_outer->second, 0.5 * fr});
+                    triplets.push_back({fine_idx, it_prev->second, 0.5 * (1.0 - ft)});
+                    triplets.push_back({fine_idx, it_next->second, 0.5 * ft});
+                } else if (have_r) {
+                    double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
+                    triplets.push_back({fine_idx, it_inner->second, 1.0 - fr});
+                    triplets.push_back({fine_idx, it_outer->second, fr});
+                } else if (have_theta) {
+                    double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
+                    triplets.push_back({fine_idx, it_prev->second, 1.0 - ft});
+                    triplets.push_back({fine_idx, it_next->second, ft});
+                } else {
+                    // Fallback: nearest active neighbor
+                    double min_dist = std::numeric_limits<double>::max();
+                    int nearest_coarse_idx = -1;
+
+                    for (int di = -2; di <= 2; di++) {
+                        for (int dj = -2; dj <= 2; dj++) {
+                            int ni = i_r + di;
+                            int nj = (j_theta + dj + ntheta) % ntheta;
+                            if (ni >= 0 && ni < nr) {
+                                bool neighbor_active = (r_orientation == "horizontal") ?
+                                    active_cells(nj, ni) : active_cells(ni, nj);
+                                if (neighbor_active) {
+                                    double dist = std::sqrt(di * di + dj * dj);
+                                    if (dist < min_dist) {
+                                        auto it = fine_to_coarse.find({ni, nj});
+                                        if (it != fine_to_coarse.end()) {
+                                            min_dist = dist;
+                                            nearest_coarse_idx = it->second;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (nearest_coarse_idx >= 0) {
+                        triplets.push_back({fine_idx, nearest_coarse_idx, 1.0});
+                    }
+                }
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::buildProlongationMatrix() {
+    if (multigrid_operators_built) return;
+
+    int n_full = (coordinate_system == "cartesian") ? (nx * ny) : (nr * ntheta);
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(n_full * 4);  // Max 4 weights per inactive cell
+
+    if (coordinate_system == "cartesian") {
+        // Cartesian: fine_idx = j * nx + i
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                int fine_idx = j * nx + i;
+
+                if (active_cells(j, i)) {
+                    // Active cell: injection (weight = 1.0)
+                    auto it = fine_to_coarse.find({i, j});
+                    if (it != fine_to_coarse.end()) {
+                        triplets.push_back({fine_idx, it->second, 1.0});
+                    }
+                } else {
+                    // Inactive cell: bilinear interpolation weights
+                    buildInterpolationWeights(i, j, fine_idx, triplets);
+                }
+            }
+        }
+    } else {
+        // Polar coordinate system
+        buildProlongationMatrixPolar(triplets);
+    }
+
+    P_prolongation.resize(n_full, n_active_cells);
+    P_prolongation.setFromTriplets(triplets.begin(), triplets.end());
+
+    // R = P^T (Galerkin restriction for symmetric A)
+    R_restriction = P_prolongation.transpose();
+
+    multigrid_operators_built = true;
+
+    std::cout << "Prolongation matrix built: " << n_full << " x " << n_active_cells
+              << " (nnz = " << P_prolongation.nonZeros() << ")" << std::endl;
+}
+
+// ============================================================================
+// Phase 4: Galerkin coarse matrix (A_c = R * A_f * P)
+// ============================================================================
+
+void MagneticFieldAnalyzer::buildMatrixGalerkin(
+    Eigen::SparseMatrix<double>& A_coarse,
+    Eigen::VectorXd& rhs_coarse)
+{
+    // Ensure operators are built
+    buildProlongationMatrix();
+
+    // Update full matrix cache (rebuilds with current mu_map)
+    updateFullMatrixCache();
+
+    // Galerkin projection: A_c = R * A_f * P = P^T * A_f * P
+    Eigen::SparseMatrix<double> AP = A_full_cached * P_prolongation;
+    A_coarse = R_restriction * AP;
+
+    // RHS: r_c = R * r_f = P^T * r_f
+    rhs_coarse = R_restriction * rhs_full_cached;
+
+    // Mark full matrix cache as valid (was just updated)
+    full_matrix_cache_valid = true;
+}
+
+// ============================================================================
+// Phase 5: Matrix-free Jacobian-vector product for coarsened Newton-Krylov
+// ============================================================================
+
+/**
+ * @brief Compute B, H, μ fields from an Az vector (without modifying member state)
+ *
+ * This function computes the magnetic field (B), field intensity (H), and
+ * permeability (μ) from a given Az vector. Unlike the member functions
+ * calculateMagneticField() and updateMuDistribution(), this function
+ * does not modify the class member variables, making it safe for use
+ * in matrix-free Jacobian computations.
+ *
+ * @param Az_full_vec  Input Az vector on full grid (size: nx*ny or nr*ntheta)
+ * @param mu_out       Output permeability matrix
+ * @param Bx_out       Output Bx (or Br for polar) matrix
+ * @param By_out       Output By (or Btheta for polar) matrix
+ * @param H_out        Output |H| matrix
+ */
+void MagneticFieldAnalyzer::computeBHmuFromAzVector(
+    const Eigen::VectorXd& Az_full_vec,
+    Eigen::MatrixXd& mu_out,
+    Eigen::MatrixXd& Bx_out,
+    Eigen::MatrixXd& By_out,
+    Eigen::MatrixXd& H_out)
+{
+    const bool is_polar = (coordinate_system != "cartesian");
+
+    // Initialize output matrices
+    if (is_polar) {
+        if (r_orientation == "horizontal") {
+            Bx_out.resize(ntheta, nr);  // Br
+            By_out.resize(ntheta, nr);  // Btheta
+            H_out.resize(ntheta, nr);
+            mu_out.resize(ntheta, nr);
+        } else {
+            Bx_out.resize(nr, ntheta);
+            By_out.resize(nr, ntheta);
+            H_out.resize(nr, ntheta);
+            mu_out.resize(nr, ntheta);
+        }
+        Bx_out.setZero();
+        By_out.setZero();
+
+        // Polar coordinates: B = curl(Az) in cylindrical
+        // Br = (1/r) * ∂Az/∂θ
+        // Bθ = -∂Az/∂r
+        YAML::Node polar_config = config["polar_domain"] ? config["polar_domain"] : config["polar"];
+        double r_start_val = polar_config["r_start"].as<double>();
+        double r_end_val = polar_config["r_end"].as<double>();
+        double dr_val = (r_end_val - r_start_val) / (nr - 1);
+
+        // Parse theta_range (can be string expression or double)
+        double theta_range_val;
+        try {
+            std::string theta_str = polar_config["theta_range"].as<std::string>();
+            te_parser parser;
+            theta_range_val = parser.evaluate(theta_str);
+        } catch (...) {
+            theta_range_val = polar_config["theta_range"].as<double>();
+        }
+        double dtheta_val = theta_range_val / (ntheta - 1);
+
+        for (int i = 0; i < nr; i++) {
+            double r = r_start_val + i * dr_val;
+            if (r < 1e-10) r = 1e-10;
+
+            for (int j = 0; j < ntheta; j++) {
+                int idx = i * ntheta + j;  // Row-major indexing
+
+                // Get Az values for finite differences
+                double Az_center = Az_full_vec(idx);
+
+                // ∂Az/∂r (central difference)
+                double dAz_dr = 0.0;
+                if (i > 0 && i < nr - 1) {
+                    int idx_prev = (i - 1) * ntheta + j;
+                    int idx_next = (i + 1) * ntheta + j;
+                    dAz_dr = (Az_full_vec(idx_next) - Az_full_vec(idx_prev)) / (2.0 * dr_val);
+                } else if (i == 0) {
+                    int idx_next = (i + 1) * ntheta + j;
+                    dAz_dr = (Az_full_vec(idx_next) - Az_center) / dr_val;
+                } else {
+                    int idx_prev = (i - 1) * ntheta + j;
+                    dAz_dr = (Az_center - Az_full_vec(idx_prev)) / dr_val;
+                }
+
+                // ∂Az/∂θ (central difference with periodic BC)
+                double dAz_dtheta = 0.0;
+                int j_prev = (j > 0) ? j - 1 : ntheta - 2;  // Periodic
+                int j_next = (j < ntheta - 1) ? j + 1 : 1;  // Periodic
+                int idx_theta_prev = i * ntheta + j_prev;
+                int idx_theta_next = i * ntheta + j_next;
+                dAz_dtheta = (Az_full_vec(idx_theta_next) - Az_full_vec(idx_theta_prev)) / (2.0 * dtheta_val);
+
+                // B components
+                double Br_val = dAz_dtheta / r;
+                double Btheta_val = -dAz_dr;
+
+                // Store in appropriate layout
+                if (r_orientation == "horizontal") {
+                    Bx_out(j, i) = Br_val;
+                    By_out(j, i) = Btheta_val;
+                } else {
+                    Bx_out(i, j) = Br_val;
+                    By_out(i, j) = Btheta_val;
+                }
+            }
+        }
+    } else {
+        // Cartesian coordinates
+        Bx_out.resize(ny, nx);
+        By_out.resize(ny, nx);
+        H_out.resize(ny, nx);
+        mu_out.resize(ny, nx);
+        Bx_out.setZero();
+        By_out.setZero();
+
+        // B = curl(Az)
+        // Bx = ∂Az/∂y
+        // By = -∂Az/∂x
+        for (int j = 0; j < ny; j++) {
+            for (int i = 0; i < nx; i++) {
+                int idx = j * nx + i;
+
+                // ∂Az/∂y
+                double dAz_dy = 0.0;
+                if (j > 0 && j < ny - 1) {
+                    int idx_prev = (j - 1) * nx + i;
+                    int idx_next = (j + 1) * nx + i;
+                    dAz_dy = (Az_full_vec(idx_next) - Az_full_vec(idx_prev)) / (2.0 * dy);
+                } else if (j == 0) {
+                    int idx_next = (j + 1) * nx + i;
+                    dAz_dy = (Az_full_vec(idx_next) - Az_full_vec(idx)) / dy;
+                } else {
+                    int idx_prev = (j - 1) * nx + i;
+                    dAz_dy = (Az_full_vec(idx) - Az_full_vec(idx_prev)) / dy;
+                }
+
+                // ∂Az/∂x
+                double dAz_dx = 0.0;
+                if (i > 0 && i < nx - 1) {
+                    int idx_prev = j * nx + (i - 1);
+                    int idx_next = j * nx + (i + 1);
+                    dAz_dx = (Az_full_vec(idx_next) - Az_full_vec(idx_prev)) / (2.0 * dx);
+                } else if (i == 0) {
+                    int idx_next = j * nx + (i + 1);
+                    dAz_dx = (Az_full_vec(idx_next) - Az_full_vec(idx)) / dx;
+                } else {
+                    int idx_prev = j * nx + (i - 1);
+                    dAz_dx = (Az_full_vec(idx) - Az_full_vec(idx_prev)) / dx;
+                }
+
+                Bx_out(j, i) = dAz_dy;
+                By_out(j, i) = -dAz_dx;
+            }
+        }
+    }
+
+    // Compute |H| and μ from |B|
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    int rows = is_polar ? (r_orientation == "horizontal" ? ntheta : nr) : ny;
+    int cols = is_polar ? (r_orientation == "horizontal" ? nr : ntheta) : nx;
+
+    // Copy initial mu_map as base (for linear materials)
+    mu_out = mu_map;
+
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < cols; col++) {
+            double B_mag = std::sqrt(Bx_out(row, col) * Bx_out(row, col) +
+                                     By_out(row, col) * By_out(row, col));
+
+            // Get pixel for material lookup
+            int img_row = row;
+            int img_col = col;
+            if (is_polar) {
+                int i_r, j_theta;
+                if (r_orientation == "horizontal") {
+                    i_r = col;
+                    j_theta = row;
+                } else {
+                    i_r = row;
+                    j_theta = col;
+                }
+                polarToImageIndices(i_r, j_theta, img_col, img_row);
+            }
+
+            if (img_row < 0 || img_row >= image_flipped.rows ||
+                img_col < 0 || img_col >= image_flipped.cols) {
+                H_out(row, col) = B_mag / (mu_out(row, col) + 1e-20);
+                continue;
+            }
+
+            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_row, img_col);
+            cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+
+            // Find material and evaluate μ(H)
+            bool found = false;
+            for (const auto& mat : config["materials"]) {
+                std::string name = mat.first.as<std::string>();
+                YAML::Node props = mat.second;
+                if (!props["rgb"]) continue;
+
+                cv::Scalar mat_rgb(
+                    props["rgb"][0].as<int>(),
+                    props["rgb"][1].as<int>(),
+                    props["rgb"][2].as<int>()
+                );
+
+                if (rgb[0] == mat_rgb[0] && rgb[1] == mat_rgb[1] && rgb[2] == mat_rgb[2]) {
+                    auto bh_it = material_bh_tables.find(name);
+                    if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                        // Nonlinear material: compute H from B using inverse B-H table
+                        double H_val = interpolateH_from_B(bh_it->second, B_mag);
+                        H_out(row, col) = H_val;
+
+                        // Update μ = B/H
+                        if (H_val > 1e-10) {
+                            mu_out(row, col) = B_mag / H_val;
+                        }
+                    } else {
+                        // Linear material: H = B/μ
+                        H_out(row, col) = B_mag / (mu_out(row, col) + 1e-20);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                H_out(row, col) = B_mag / (mu_out(row, col) + 1e-20);
+            }
+        }
+    }
+}
+
+/**
+ * @brief Assemble full-grid residual vector F(Az) = A(μ)*Az - b
+ *
+ * This function computes the nonlinear residual on the full grid.
+ * The key point is that μ is evaluated from the input Az vector,
+ * so the residual properly captures the nonlinear dependency.
+ *
+ * @param Az_full_vec  Input Az vector on full grid
+ * @param mu_full      Permeability matrix corresponding to Az_full_vec
+ * @return Residual vector F(Az) on full grid
+ */
+Eigen::VectorXd MagneticFieldAnalyzer::assembleFullGridResidualVector(
+    const Eigen::VectorXd& Az_full_vec,
+    const Eigen::MatrixXd& mu_full)
+{
+    // Temporarily swap mu_map to build matrix with given mu
+    Eigen::MatrixXd mu_map_backup = mu_map;
+    mu_map = mu_full;
+
+    // Build full matrix with the given mu distribution
+    Eigen::SparseMatrix<double> A_full;
+    Eigen::VectorXd rhs_full;
+    if (coordinate_system == "cartesian") {
+        buildMatrix(A_full, rhs_full);
+    } else {
+        buildMatrixPolar(A_full, rhs_full);
+    }
+
+    // Restore original mu_map
+    mu_map = mu_map_backup;
+
+    // Compute residual: F(Az) = A(μ)*Az - b
+    return A_full * Az_full_vec - rhs_full;
+}
+
+/**
+ * @brief Matrix-free Jacobian-vector product for coarsened system
+ *
+ * Computes J_c * v using finite differences:
+ *   J_c * v ≈ R * (F_full(P*(x + ε*v)) - F_full(P*x)) / ε
+ *
+ * This approach correctly captures the μ(Az) dependency that is lost
+ * when using explicit Jacobian matrices with interpolated Az values.
+ *
+ * @param x_c  Current solution on coarse grid (size: n_active_cells)
+ * @param v_c  Direction vector on coarse grid (size: n_active_cells)
+ * @return J_c * v on coarse grid (size: n_active_cells)
+ */
+Eigen::VectorXd MagneticFieldAnalyzer::matrixFreeJv(
+    const Eigen::VectorXd& x_c,
+    const Eigen::VectorXd& v_c)
+{
+    // Ensure prolongation operator is built
+    buildProlongationMatrix();
+
+    // Compute optimal epsilon for finite difference
+    double x_norm = x_c.norm();
+    double v_norm = v_c.norm();
+    double eps = std::sqrt(std::numeric_limits<double>::epsilon()) *
+                 (1.0 + x_norm) / (v_norm + 1e-12);
+
+    // Prolongate x_c and (x_c + eps*v_c) to full grid
+    Eigen::VectorXd x_c_plus = x_c + eps * v_c;
+    Eigen::VectorXd Az_full = P_prolongation * x_c;
+    Eigen::VectorXd Az_full_eps = P_prolongation * x_c_plus;
+
+    // Compute B/H/μ for both states
+    Eigen::MatrixXd mu_full, Bx_full, By_full, H_full;
+    Eigen::MatrixXd mu_full_eps, Bx_full_eps, By_full_eps, H_full_eps;
+
+    computeBHmuFromAzVector(Az_full, mu_full, Bx_full, By_full, H_full);
+    computeBHmuFromAzVector(Az_full_eps, mu_full_eps, Bx_full_eps, By_full_eps, H_full_eps);
+
+    // Compute full-grid residuals
+    Eigen::VectorXd F_full = assembleFullGridResidualVector(Az_full, mu_full);
+    Eigen::VectorXd F_full_eps = assembleFullGridResidualVector(Az_full_eps, mu_full_eps);
+
+    // Finite difference approximation of Jacobian action
+    Eigen::VectorXd Jv_full = (F_full_eps - F_full) / eps;
+
+    // Restrict to coarse grid: J_c * v = R * (J_full * P * v) ≈ R * Jv_full
+    return R_restriction * Jv_full;
+}
+
+/**
+ * @brief GMRES solver using matrix-free Jacobian-vector product
+ *
+ * Solves J*delta = rhs where J is defined implicitly through matrixFreeJv().
+ * Uses restarted GMRES algorithm for robustness.
+ *
+ * @param x_c      Current solution on coarse grid (for Jv computation context)
+ * @param rhs      Right-hand side vector (-residual)
+ * @param max_iter Maximum number of GMRES iterations
+ * @param tol      Convergence tolerance
+ * @return Solution vector delta
+ */
+Eigen::VectorXd MagneticFieldAnalyzer::solveWithMatrixFreeGMRES(
+    const Eigen::VectorXd& x_c,
+    const Eigen::VectorXd& rhs,
+    int max_iter,
+    double tol)
+{
+    const int n = rhs.size();
+    const int restart = std::min(nonlinear_config.gmres_restart, max_iter);
+
+    Eigen::VectorXd x = Eigen::VectorXd::Zero(n);  // Initial guess
+    double rhs_norm = rhs.norm();
+    if (rhs_norm < 1e-14) return x;
+
+    // GMRES with restart
+    for (int outer = 0; outer < max_iter / restart + 1; outer++) {
+        // Compute initial residual: r = rhs - J*x
+        Eigen::VectorXd r = rhs;
+        if (x.norm() > 1e-14) {
+            r = rhs - matrixFreeJv(x_c, x);
+        }
+
+        double beta = r.norm();
+        if (beta / rhs_norm < tol) return x;
+
+        // Arnoldi process storage
+        Eigen::MatrixXd V(n, restart + 1);  // Orthonormal basis
+        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(restart + 1, restart);  // Hessenberg matrix
+        Eigen::VectorXd g = Eigen::VectorXd::Zero(restart + 1);  // Residual in reduced space
+        g(0) = beta;
+
+        V.col(0) = r / beta;
+
+        // Persistent Givens rotation coefficients
+        Eigen::VectorXd cs(restart);  // cosines
+        Eigen::VectorXd sn(restart);  // sines
+
+        int j_final = restart;
+        for (int j = 0; j < restart; j++) {
+            // Matrix-free Jv: w = J * V(:,j)
+            Eigen::VectorXd w = matrixFreeJv(x_c, V.col(j));
+
+            // Check for NaN/Inf in matrix-free Jv result
+            if (!w.allFinite()) {
+                std::cerr << "WARNING: GMRES matrixFreeJv returned non-finite values at j=" << j << std::endl;
+                j_final = (j > 0) ? j : 1;
+                break;
+            }
+
+            // Modified Gram-Schmidt orthogonalization
+            for (int i = 0; i <= j; i++) {
+                H(i, j) = w.dot(V.col(i));
+                w -= H(i, j) * V.col(i);
+            }
+            H(j + 1, j) = w.norm();
+
+            if (H(j + 1, j) < 1e-14) {
+                j_final = j + 1;
+                break;
+            }
+            V.col(j + 1) = w / H(j + 1, j);
+
+            // Apply previous Givens rotations to new column of H
+            for (int i = 0; i < j; i++) {
+                double temp = cs(i) * H(i, j) + sn(i) * H(i + 1, j);
+                H(i + 1, j) = -sn(i) * H(i, j) + cs(i) * H(i + 1, j);
+                H(i, j) = temp;
+            }
+
+            // Compute new Givens rotation
+            double h_jj = H(j, j);
+            double h_jp1j = H(j + 1, j);
+            double denom = std::sqrt(h_jj * h_jj + h_jp1j * h_jp1j);
+            if (denom < 1e-14) {
+                j_final = j + 1;
+                break;
+            }
+            cs(j) = h_jj / denom;
+            sn(j) = h_jp1j / denom;
+
+            H(j, j) = denom;
+            H(j + 1, j) = 0.0;
+
+            // Apply rotation to g
+            double g_j = g(j);
+            g(j) = cs(j) * g_j;
+            g(j + 1) = -sn(j) * g_j;
+
+            // Check convergence
+            double res_norm = std::abs(g(j + 1));
+            if (res_norm / rhs_norm < tol) {
+                j_final = j + 1;
+                break;
+            }
+        }
+
+        // Solve upper triangular system: H(0:j_final, 0:j_final) * y = g(0:j_final)
+        Eigen::VectorXd y = Eigen::VectorXd::Zero(j_final);
+        bool solve_ok = true;
+        for (int i = j_final - 1; i >= 0; i--) {
+            y(i) = g(i);
+            for (int k = i + 1; k < j_final; k++) {
+                y(i) -= H(i, k) * y(k);
+            }
+            if (std::abs(H(i, i)) < 1e-14) {
+                std::cerr << "WARNING: GMRES singular H matrix at diagonal " << i << std::endl;
+                solve_ok = false;
+                break;
+            }
+            y(i) /= H(i, i);
+        }
+
+        if (!solve_ok || !y.allFinite()) {
+            std::cerr << "WARNING: GMRES solve failed, returning current estimate" << std::endl;
+            return x;
+        }
+
+        // Update solution: x = x + V(:,0:j_final) * y
+        x += V.leftCols(j_final) * y;
+
+        // Check for NaN/Inf in solution
+        if (!x.allFinite()) {
+            std::cerr << "WARNING: GMRES solution became non-finite" << std::endl;
+            return Eigen::VectorXd::Zero(n);
+        }
+
+        // Check convergence
+        Eigen::VectorXd r_new = rhs - matrixFreeJv(x_c, x);
+        if (r_new.allFinite() && r_new.norm() / rhs_norm < tol) {
+            return x;
+        }
+    }
+
+    return x;
 }
 
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {

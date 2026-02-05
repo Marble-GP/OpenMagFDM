@@ -368,13 +368,22 @@ private:
         bool line_search_adaptive;        // Use adaptive initial step length (default: true) - for Newton-Krylov
         bool verbose;               // Print iteration details (default: false)
         bool export_convergence;    // Export convergence history (default: false)
+        bool use_galerkin_coarsening;  // Phase 4: Use Galerkin A_c=R*A_f*P instead of geometric coarsening (default: true)
+        bool use_matrix_free_jv;       // Phase 5: Use matrix-free Jv for Newton step (solves oscillation issue)
+
+        // Phase 6: Preconditioned JFNK - use Galerkin coarse matrix as preconditioner for matrix-free GMRES
+        bool use_phase6_precond_jfnk;     // Enable preconditioned JFNK (default: false)
+        int precond_update_frequency;     // How often to update preconditioner: 1=every Newton iter (default: 1)
+        bool precond_verbose;             // Print preconditioner statistics (default: false)
 
         NonlinearSolverConfig() :
             enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
             relaxation(0.7), anderson(), gmres_restart(30), line_search_c(1e-4),
             line_search_alpha_init(1.0), line_search_alpha_min(1e-3), line_search_rho(0.65),
             line_search_max_trials(50), line_search_adaptive(true),
-            verbose(false), export_convergence(false) {}
+            verbose(false), export_convergence(false), use_galerkin_coarsening(true),
+            use_matrix_free_jv(true),
+            use_phase6_precond_jfnk(false), precond_update_frequency(1), precond_verbose(false) {}
     };
 
     // Maxwell stress and force calculation
@@ -514,6 +523,22 @@ private:
     int n_active_cells;  // Number of active cells in coarsened mesh
     bool coarsening_enabled;  // Global flag: true if any material has coarsening enabled
 
+    // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
+    Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix
+    Eigen::VectorXd rhs_full_cached;              // Cached full-grid RHS
+    bool full_matrix_cache_valid = false;         // Cache validity flag
+
+    // Phase 4: Multigrid-style operators for Galerkin projection (A_c = R * A_f * P)
+    Eigen::SparseMatrix<double> P_prolongation;   // n_full x n_active (coarse -> fine)
+    Eigen::SparseMatrix<double> R_restriction;    // n_active x n_full (fine -> coarse, = P^T)
+    bool multigrid_operators_built = false;       // Operators built flag
+
+    // Phase 6: Preconditioner cache for Preconditioned JFNK
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> precond_solver;  // LU factorization of A_c
+    Eigen::SparseMatrix<double> A_coarse_precond;  // Cached coarse matrix for preconditioner
+    int precond_newton_iter = -1;                   // Newton iteration at which preconditioner was built
+    bool precond_factorization_valid = false;       // Whether preconditioner is ready to use
+
     // User-defined variables (from YAML "variables" section)
     std::map<std::string, double> user_variables;  // Variable name -> evaluated value
 
@@ -627,6 +652,41 @@ private:
     void interpolateInactiveCells(const Eigen::VectorXd& Az_coarse);  // Update only inactive cells (for nonlinear iteration)
     void interpolateInactiveCellsPolar(const Eigen::VectorXd& Az_coarse);  // Polar version
     void exportCoarseningMask(const std::string& output_dir, int step_number);  // Export binary mask: active=255, coarsened=0
+
+    // Phase 4: Full-grid residual evaluation for coarsened Newton-Krylov convergence
+    void updateFullMatrixCache();  // Rebuild A_full_cached and rhs_full_cached
+    double computeFullGridResidual(double& out_b_norm);  // Compute ||A_f * Az - b_f|| on full grid
+
+    // Phase 4: Prolongation/Restriction operators for Galerkin projection
+    void buildProlongationMatrix();  // Build P_prolongation (n_full x n_active) and R_restriction (P^T)
+    void buildInterpolationWeights(int i, int j, int fine_idx,
+        std::vector<Eigen::Triplet<double>>& triplets);  // Helper: Cartesian interpolation weights
+    void buildProlongationMatrixPolar(std::vector<Eigen::Triplet<double>>& triplets);  // Polar version
+
+    // Phase 4: Galerkin coarse matrix (A_c = R * A_f * P)
+    void buildMatrixGalerkin(Eigen::SparseMatrix<double>& A_coarse, Eigen::VectorXd& rhs_coarse);
+
+    // Phase 5: Matrix-free Jacobian-vector product for coarsened Newton-Krylov
+    // Root solution for oscillating convergence: J*v computed via finite differences
+    // J_c*v ≈ R * (F_full(P*(x + ε*v)) - F_full(P*x)) / ε
+    Eigen::VectorXd assembleFullGridResidualVector(const Eigen::VectorXd& Az_full_vec,
+        const Eigen::MatrixXd& mu_full);  // Compute F(Az) = A(μ)*Az - b on full grid
+    void computeBHmuFromAzVector(const Eigen::VectorXd& Az_full_vec,
+        Eigen::MatrixXd& mu_out, Eigen::MatrixXd& Bx_out, Eigen::MatrixXd& By_out,
+        Eigen::MatrixXd& H_out);  // Compute B, H, μ from Az vector
+    Eigen::VectorXd matrixFreeJv(const Eigen::VectorXd& x_c, const Eigen::VectorXd& v_c);
+        // Matrix-free J*v for coarsened system
+    Eigen::VectorXd solveWithMatrixFreeGMRES(const Eigen::VectorXd& x_c,
+        const Eigen::VectorXd& rhs, int max_iter, double tol);
+        // GMRES solver using matrix-free Jv
+
+    // Phase 6: Preconditioned JFNK (uses Galerkin coarse matrix as preconditioner)
+    // Combines matrix-free Jv correctness with efficient preconditioner
+    void updatePreconditioner(int newton_iter);  // Build/update A_c preconditioner
+    Eigen::VectorXd applyPreconditioner(const Eigen::VectorXd& v_c);  // Compute A_c^{-1} * v
+    Eigen::VectorXd solveWithPreconditionedGMRES(const Eigen::VectorXd& x_c,
+        const Eigen::VectorXd& rhs, int max_iter, double tol);
+        // Right-preconditioned GMRES: J * M^{-1} * y = rhs, delta = M^{-1} * y
 
     // Maxwell stress calculation methods
     cv::Mat detectBoundaries();
