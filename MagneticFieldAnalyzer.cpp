@@ -2837,6 +2837,289 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveWithMatrixFreeGMRES(
     return x;
 }
 
+// ============================================================================
+// Phase 6: Preconditioned JFNK
+// Uses Galerkin coarse matrix A_c as preconditioner for matrix-free GMRES
+// ============================================================================
+
+/**
+ * @brief Update the Galerkin preconditioner for JFNK
+ *
+ * Builds A_c = R * A_f * P (Galerkin projection) and computes its LU factorization.
+ * The preconditioner is updated based on precond_update_frequency setting.
+ *
+ * @param newton_iter Current Newton iteration (0-indexed)
+ */
+void MagneticFieldAnalyzer::updatePreconditioner(int newton_iter) {
+    // Check if we need to update
+    bool should_update = false;
+
+    if (!precond_factorization_valid) {
+        // First call or invalidated
+        should_update = true;
+    } else if (nonlinear_config.precond_update_frequency <= 0) {
+        // Never update after first (lagged preconditioner)
+        should_update = false;
+    } else if ((newton_iter - precond_newton_iter) >= nonlinear_config.precond_update_frequency) {
+        // Time to update
+        should_update = true;
+    }
+
+    if (!should_update) {
+        return;
+    }
+
+    // Ensure prolongation/restriction operators are built
+    buildProlongationMatrix();
+
+    // Update full matrix cache with current mu
+    updateFullMatrixCache();
+
+    // Compute Galerkin coarse matrix: A_c = R * A_f * P = P^T * A_f * P
+    Eigen::SparseMatrix<double> AP = A_full_cached * P_prolongation;
+    A_coarse_precond = R_restriction * AP;
+
+    // LU factorization
+    precond_solver.compute(A_coarse_precond);
+
+    if (precond_solver.info() != Eigen::Success) {
+        std::cerr << "WARNING: Preconditioner LU factorization failed" << std::endl;
+        precond_factorization_valid = false;
+        return;
+    }
+
+    precond_factorization_valid = true;
+    precond_newton_iter = newton_iter;
+
+    if (nonlinear_config.precond_verbose) {
+        std::cout << "Preconditioner updated at Newton iter " << newton_iter
+                  << " (A_c: " << A_coarse_precond.rows() << "x" << A_coarse_precond.cols()
+                  << ", nnz=" << A_coarse_precond.nonZeros() << ")" << std::endl;
+    }
+}
+
+/**
+ * @brief Apply preconditioner: compute M^{-1} * v = A_c^{-1} * v
+ *
+ * Uses the cached LU factorization of A_c.
+ *
+ * @param v_c Input vector (coarse space, size n_active_cells)
+ * @return Preconditioned vector A_c^{-1} * v_c
+ */
+Eigen::VectorXd MagneticFieldAnalyzer::applyPreconditioner(const Eigen::VectorXd& v_c) {
+    if (!precond_factorization_valid) {
+        // No preconditioner available, return identity
+        return v_c;
+    }
+
+    Eigen::VectorXd result = precond_solver.solve(v_c);
+
+    if (!result.allFinite()) {
+        std::cerr << "WARNING: Preconditioner solve returned non-finite values" << std::endl;
+        return v_c;  // Fall back to identity
+    }
+
+    return result;
+}
+
+/**
+ * @brief Right-preconditioned GMRES for Newton step with matrix-free Jacobian
+ *
+ * Solves J * delta = rhs using right preconditioning:
+ *   J * M^{-1} * y = rhs
+ *   delta = M^{-1} * y
+ *
+ * where M = A_c (Galerkin coarse matrix) is used as preconditioner.
+ *
+ * This combines:
+ * - Matrix-free Jv for correctness (captures μ(Az) dependency)
+ * - Galerkin preconditioner for efficiency (reduces GMRES iterations)
+ *
+ * @param x_c Current solution in coarse space
+ * @param rhs Right-hand side (typically -residual)
+ * @param max_iter Maximum GMRES iterations
+ * @param tol Relative tolerance for convergence
+ * @return Newton step delta in coarse space
+ */
+Eigen::VectorXd MagneticFieldAnalyzer::solveWithPreconditionedGMRES(
+    const Eigen::VectorXd& x_c, const Eigen::VectorXd& rhs,
+    int max_iter, double tol)
+{
+    const int n = rhs.size();
+    const int restart = std::min(max_iter, nonlinear_config.gmres_restart);
+
+    if (n == 0) return Eigen::VectorXd::Zero(0);
+
+    // Track Jv call count for statistics
+    int jv_count = 0;
+
+    // Initial guess x = 0
+    Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
+
+    // Right preconditioning: J * M^{-1} * y = rhs, then delta = M^{-1} * y
+    // We store Z columns as preconditioned basis vectors: Z(:,j) = M^{-1} * V(:,j)
+
+    double rhs_norm = rhs.norm();
+    if (rhs_norm < 1e-15) {
+        if (nonlinear_config.precond_verbose) {
+            std::cout << "Preconditioned GMRES: rhs norm near zero, returning zero" << std::endl;
+        }
+        return x;
+    }
+
+    // Outer iterations (restarts)
+    for (int outer = 0; outer < max_iter / restart + 1; outer++) {
+        // Compute r = rhs - J * M^{-1} * x
+        // For initial x=0: r = rhs
+        Eigen::VectorXd r;
+        if (x.norm() < 1e-15) {
+            r = rhs;
+        } else {
+            // Apply M^{-1} to current x first, then J
+            Eigen::VectorXd Mx = applyPreconditioner(x);
+            r = rhs - matrixFreeJv(x_c, Mx);
+            jv_count++;
+        }
+
+        if (!r.allFinite()) {
+            std::cerr << "WARNING: Preconditioned GMRES residual is non-finite" << std::endl;
+            return x;
+        }
+
+        double beta = r.norm();
+        if (beta < tol * rhs_norm) {
+            if (nonlinear_config.precond_verbose) {
+                std::cout << "Preconditioned GMRES converged: " << jv_count << " Jv calls" << std::endl;
+            }
+            // Return M^{-1} * x for right preconditioning
+            return applyPreconditioner(x);
+        }
+
+        // Arnoldi iteration with right preconditioning
+        Eigen::MatrixXd V(n, restart + 1);  // Orthonormal basis
+        Eigen::MatrixXd Z(n, restart);      // Z(:,j) = M^{-1} * V(:,j)
+        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(restart + 1, restart);  // Upper Hessenberg
+
+        V.col(0) = r / beta;
+
+        // Givens rotation storage
+        Eigen::VectorXd cs(restart);  // Cosines
+        Eigen::VectorXd sn(restart);  // Sines
+        Eigen::VectorXd g(restart + 1);  // RHS in least squares
+        g.setZero();
+        g(0) = beta;
+
+        int j_last = 0;
+        for (int j = 0; j < restart; j++) {
+            j_last = j;
+
+            // Right preconditioning: z_j = M^{-1} * v_j
+            Z.col(j) = applyPreconditioner(V.col(j));
+
+            // w = J * z_j = J * M^{-1} * v_j
+            Eigen::VectorXd w = matrixFreeJv(x_c, Z.col(j));
+            jv_count++;
+
+            if (!w.allFinite()) {
+                std::cerr << "WARNING: Preconditioned GMRES Jv returned non-finite at j=" << j << std::endl;
+                break;
+            }
+
+            // Modified Gram-Schmidt orthogonalization
+            for (int i = 0; i <= j; i++) {
+                H(i, j) = w.dot(V.col(i));
+                w -= H(i, j) * V.col(i);
+            }
+
+            H(j + 1, j) = w.norm();
+
+            // Check for breakdown
+            if (std::abs(H(j + 1, j)) < 1e-14) {
+                if (nonlinear_config.precond_verbose) {
+                    std::cout << "Preconditioned GMRES breakdown at j=" << j
+                              << " (happy breakdown?)" << std::endl;
+                }
+                // Solve least squares and return
+                break;
+            }
+
+            V.col(j + 1) = w / H(j + 1, j);
+
+            // Apply previous Givens rotations to new column
+            for (int i = 0; i < j; i++) {
+                double temp = cs(i) * H(i, j) + sn(i) * H(i + 1, j);
+                H(i + 1, j) = -sn(i) * H(i, j) + cs(i) * H(i + 1, j);
+                H(i, j) = temp;
+            }
+
+            // Compute new Givens rotation
+            double h_jj = H(j, j);
+            double h_j1j = H(j + 1, j);
+            double denom = std::sqrt(h_jj * h_jj + h_j1j * h_j1j);
+            if (denom < 1e-15) denom = 1e-15;
+
+            cs(j) = h_jj / denom;
+            sn(j) = h_j1j / denom;
+
+            // Apply to H and g
+            H(j, j) = cs(j) * h_jj + sn(j) * h_j1j;
+            H(j + 1, j) = 0.0;
+
+            double g_old = g(j);
+            g(j) = cs(j) * g_old;
+            g(j + 1) = -sn(j) * g_old;
+
+            // Check convergence
+            double residual_est = std::abs(g(j + 1));
+            if (residual_est < tol * rhs_norm) {
+                j_last = j;
+                break;
+            }
+        }
+
+        // Solve upper triangular system H*y = g
+        Eigen::VectorXd y(j_last + 1);
+        for (int i = j_last; i >= 0; i--) {
+            y(i) = g(i);
+            for (int k = i + 1; k <= j_last; k++) {
+                y(i) -= H(i, k) * y(k);
+            }
+            if (std::abs(H(i, i)) > 1e-15) {
+                y(i) /= H(i, i);
+            }
+        }
+
+        // Update solution: x = x + Z * y (using preconditioned basis)
+        for (int i = 0; i <= j_last; i++) {
+            x += y(i) * Z.col(i);
+        }
+
+        if (!x.allFinite()) {
+            std::cerr << "WARNING: Preconditioned GMRES solution became non-finite" << std::endl;
+            return Eigen::VectorXd::Zero(n);
+        }
+
+        // Check convergence with true residual
+        Eigen::VectorXd Mx = applyPreconditioner(x);
+        Eigen::VectorXd r_true = rhs - matrixFreeJv(x_c, Mx);
+        jv_count++;
+
+        if (r_true.allFinite() && r_true.norm() < tol * rhs_norm) {
+            if (nonlinear_config.precond_verbose) {
+                std::cout << "Preconditioned GMRES converged: " << jv_count << " Jv calls"
+                          << ", ||r||/||b|| = " << r_true.norm() / rhs_norm << std::endl;
+            }
+            return Mx;  // Return M^{-1} * x for right preconditioning
+        }
+    }
+
+    // Did not converge - return best approximation
+    if (nonlinear_config.precond_verbose) {
+        std::cout << "Preconditioned GMRES did not converge after " << jv_count << " Jv calls" << std::endl;
+    }
+    return applyPreconditioner(x);
+}
+
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {
     // Harmonic mean of permeability at cell interface
     if (direction == "x+") {
