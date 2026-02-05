@@ -960,21 +960,27 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
 
                 if (rgb == mat_rgb) {
                     // Found matching material
+                    auto it = material_mu.find(name);
+
+                    // Phase 6 optimization: Skip linear (STATIC) materials
+                    // Their μ is constant and doesn't depend on H, so no update needed.
+                    // This saves computation during nonlinear iteration.
+                    if (it != material_mu.end() && it->second.type == MuType::STATIC) {
+                        // Linear material: mu already set in setupMaterialProperties()
+                        break;
+                    }
+
                     double H_mag = H_map(j, i);
                     double mu_r = 1.0;  // Default to 1 (air)
 
-                    auto it = material_mu.find(name);
                     if (it != material_mu.end()) {
                         // Nonlinear material: interpolate μ_eff(H) from YAML table
                         // IMPORTANT: mu_r in YAML is effective permeability μ_eff = B/H
                         mu_r = evaluateMu(it->second, H_mag);
                     } else if (props["mu_r"]) {
-                        // Linear material: use constant mu_r from YAML
-                        try {
-                            mu_r = props["mu_r"].as<double>();
-                        } catch (...) {
-                            mu_r = 1.0;
-                        }
+                        // Material not in material_mu but has mu_r - treat as linear
+                        // Already set in setupMaterialProperties(), skip update
+                        break;
                     }
 
                     mu_map(j, i) = mu_r * MU_0;

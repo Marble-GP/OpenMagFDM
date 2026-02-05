@@ -56,7 +56,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         std::cout << "\n=== Newton-Krylov Solver (Jacobian-free + AMGCL) ===" << std::endl;
         std::cout << "Coordinate system: " << coordinate_system << std::endl;
         std::cout << "Max outer iterations: " << MAX_ITER << std::endl;
-        std::cout << "Tolerance: " << TOL << std::endl;
+        std::cout << "Tolerance: " << std::scientific << std::setprecision(1) << TOL << std::endl;
         if (USE_ANDERSON) {
             std::cout << "Anderson acceleration: enabled (depth=" << m_AA << ", beta=" << beta_AA << ")" << std::endl;
         }
@@ -102,7 +102,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // ===== Step 3: Build residual and system matrix with current μ =====
         Eigen::SparseMatrix<double> A_matrix;
         Eigen::VectorXd b_vec;
-        if (is_polar) {
+
+        // Determine if coarsening is active
+        bool using_coarsening = (is_polar && coarsening_enabled && n_active_cells < nr * ntheta) ||
+                                (!is_polar && coarsening_enabled && n_active_cells < nx * ny);
+
+        if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
+            // Phase 4: Galerkin projection A_c = R * A_f * P
+            buildMatrixGalerkin(A_matrix, b_vec);
+        } else if (is_polar) {
             if (coarsening_enabled && n_active_cells < nr * ntheta) {
                 buildMatrixPolarCoarsened(A_matrix, b_vec);
             } else {
@@ -120,8 +128,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // but Eigen Az.data() is column-major. Must convert to row-major order.
         // When coarsening is enabled, extract only active cell values.
         Eigen::VectorXd Az_vec;
-        bool using_coarsening = (is_polar && coarsening_enabled && n_active_cells < nr * ntheta) ||
-                                (!is_polar && coarsening_enabled && n_active_cells < nx * ny);
+        // Note: using_coarsening is already defined above in Step 3
 
         if (using_coarsening) {
             // Coarsened: extract only active cells
@@ -154,9 +161,23 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             }
         }
 
-        Eigen::VectorXd residual = A_matrix * Az_vec - b_vec;
-        double residual_norm = residual.norm();
-        double b_vec_norm = b_vec.norm();
+        // Coarse residual (used for Newton step direction)
+        Eigen::VectorXd residual_coarse = A_matrix * Az_vec - b_vec;
+        double residual_coarse_norm = residual_coarse.norm();
+        double b_vec_coarse_norm = b_vec.norm();
+
+        // Phase 4: For convergence check, use full-grid residual when coarsening is enabled
+        // This ensures convergence is measured on the physical problem, not the reduced one
+        double residual_norm, b_vec_norm;
+        if (using_coarsening) {
+            // Full-grid residual for accurate convergence checking
+            residual_norm = computeFullGridResidual(b_vec_norm);
+            // Invalidate cache since mu may change next iteration
+            full_matrix_cache_valid = false;
+        } else {
+            residual_norm = residual_coarse_norm;
+            b_vec_norm = b_vec_coarse_norm;
+        }
         double residual_rel = residual_norm / (b_vec_norm + 1e-12);
 
         residual_history.push_back(residual_rel);
@@ -166,13 +187,22 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             double A_norm = A_matrix.norm();
             std::cout << "DEBUG: ||A|| = " << A_norm
                       << ", ||Az|| = " << Az_vec.norm()
-                      << ", ||b|| = " << b_vec_norm
-                      << ", ||R||_abs = " << residual_norm << std::endl;
+                      << ", ||b_coarse|| = " << b_vec_coarse_norm
+                      << ", ||R_coarse||_abs = " << residual_coarse_norm;
+            if (using_coarsening) {
+                std::cout << ", ||R_full||_abs = " << residual_norm;
+            }
+            std::cout << std::endl;
         }
 
         if (VERBOSE) {
             std::cout << "NK iter " << std::setw(3) << iter + 1
-                      << ": ||R|| = " << std::scientific << std::setprecision(4) << residual_rel << std::flush;
+                      << ": ||R|| = " << std::scientific << std::setprecision(4) << residual_rel;
+            if (using_coarsening) {
+                double residual_coarse_rel = residual_coarse_norm / (b_vec_coarse_norm + 1e-12);
+                std::cout << " (coarse: " << residual_coarse_rel << ")";
+            }
+            std::cout << std::flush;
         }
 
         // ===== Step 4: Check convergence =====
@@ -386,16 +416,46 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
 
         // Solve improved system: J·δA = -R
-        Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-        solver.compute(J_matrix);
-        if (solver.info() != Eigen::Success) {
-            std::cerr << "ERROR: Matrix factorization failed!" << std::endl;
-            return;
-        }
-        delta_A = solver.solve(-residual);
-        if (solver.info() != Eigen::Success) {
-            std::cerr << "ERROR: Linear solve failed!" << std::endl;
-            return;
+        // Phase 6: Preconditioned JFNK - combines matrix-free Jv with Galerkin preconditioner
+        // Phase 5: Use matrix-free GMRES when coarsening is enabled with nonlinear materials
+        // This correctly captures μ(Az) dependency that is lost with explicit Jacobian
+        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
+            // Phase 6: Preconditioned JFNK
+            // - Matrix-free Jv for correctness (captures μ(Az) dependency)
+            // - Galerkin coarse matrix A_c as preconditioner for efficiency
+            // Expected to reduce GMRES iterations from ~30 to ~5
+            if (VERBOSE && iter == 0) {
+                std::cout << "Using Preconditioned JFNK (Phase 6) for Newton step" << std::endl;
+            }
+
+            // Update preconditioner based on configured frequency
+            updatePreconditioner(iter);
+
+            // Solve with right-preconditioned GMRES: J * M^{-1} * y = -R, delta = M^{-1} * y
+            delta_A = solveWithPreconditionedGMRES(Az_vec, -residual_coarse,
+                nonlinear_config.gmres_restart * 3, 1e-6);
+
+        } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
+            // Phase 5: Matrix-free GMRES (no preconditioner)
+            // Correct but may require many GMRES iterations
+            if (VERBOSE && iter == 0) {
+                std::cout << "Using matrix-free GMRES (Phase 5) for Newton step" << std::endl;
+            }
+            delta_A = solveWithMatrixFreeGMRES(Az_vec, -residual_coarse,
+                nonlinear_config.gmres_restart * 3, 1e-6);
+        } else {
+            // Standard direct solve with explicit Jacobian
+            Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
+            solver.compute(J_matrix);
+            if (solver.info() != Eigen::Success) {
+                std::cerr << "ERROR: Matrix factorization failed!" << std::endl;
+                return;
+            }
+            delta_A = solver.solve(-residual_coarse);
+            if (solver.info() != Eigen::Success) {
+                std::cerr << "ERROR: Linear solve failed!" << std::endl;
+                return;
+            }
         }
 
         // ===== Step 6: Backtracking line search =====
