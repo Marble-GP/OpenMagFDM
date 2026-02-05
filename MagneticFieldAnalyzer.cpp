@@ -2991,8 +2991,8 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveWithPreconditionedGMRES(
             if (nonlinear_config.precond_verbose) {
                 std::cout << "Preconditioned GMRES converged: " << jv_count << " Jv calls" << std::endl;
             }
-            // Return M^{-1} * x for right preconditioning
-            return applyPreconditioner(x);
+            // x = Z * y is already δ = M^{-1} * y for right preconditioning
+            return x;
         }
 
         // Arnoldi iteration with right preconditioning
@@ -3100,8 +3100,8 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveWithPreconditionedGMRES(
         }
 
         // Check convergence with true residual
-        Eigen::VectorXd Mx = applyPreconditioner(x);
-        Eigen::VectorXd r_true = rhs - matrixFreeJv(x_c, Mx);
+        // x = Z * y is already δ = M^{-1} * y, so compute J * x directly
+        Eigen::VectorXd r_true = rhs - matrixFreeJv(x_c, x);
         jv_count++;
 
         if (r_true.allFinite() && r_true.norm() < tol * rhs_norm) {
@@ -3109,7 +3109,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveWithPreconditionedGMRES(
                 std::cout << "Preconditioned GMRES converged: " << jv_count << " Jv calls"
                           << ", ||r||/||b|| = " << r_true.norm() / rhs_norm << std::endl;
             }
-            return Mx;  // Return M^{-1} * x for right preconditioning
+            return x;  // x is already the Newton step δ
         }
     }
 
@@ -3117,7 +3117,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveWithPreconditionedGMRES(
     if (nonlinear_config.precond_verbose) {
         std::cout << "Preconditioned GMRES did not converge after " << jv_count << " Jv calls" << std::endl;
     }
-    return applyPreconditioner(x);
+    return x;  // x is already the Newton step δ
 }
 
 double MagneticFieldAnalyzer::getMuAtInterface(int i, int j, const std::string& direction) const {
