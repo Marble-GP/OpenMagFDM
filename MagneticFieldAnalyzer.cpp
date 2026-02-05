@@ -2969,15 +2969,16 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveWithPreconditionedGMRES(
 
     // Outer iterations (restarts)
     for (int outer = 0; outer < max_iter / restart + 1; outer++) {
-        // Compute r = rhs - J * M^{-1} * x
+        // Compute r = rhs - J * x
         // For initial x=0: r = rhs
+        // Note: x is already δ = M^{-1} * y (built from Z * y where Z = M^{-1} * V)
+        // So we compute J * x directly, NOT J * M^{-1} * x
         Eigen::VectorXd r;
         if (x.norm() < 1e-15) {
             r = rhs;
         } else {
-            // Apply M^{-1} to current x first, then J
-            Eigen::VectorXd Mx = applyPreconditioner(x);
-            r = rhs - matrixFreeJv(x_c, Mx);
+            // x is already δ = M^{-1} * y, so compute J * x directly
+            r = rhs - matrixFreeJv(x_c, x);
             jv_count++;
         }
 
