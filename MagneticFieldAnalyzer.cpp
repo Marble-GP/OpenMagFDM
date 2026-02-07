@@ -2141,16 +2141,14 @@ void MagneticFieldAnalyzer::interpolateToFullGridPolar(const Eigen::VectorXd& Az
 }
 
 void MagneticFieldAnalyzer::interpolateInactiveCells(const Eigen::VectorXd& Az_coarse) {
-    // Update ONLY inactive cells using cubic Hermite interpolation (C^1)
-    // Active cells in Az are assumed to already have correct values
-
-    // Compute gradients at active cells (required for Hermite)
-    computeAzGradientsAtActiveCells(Az_coarse);
+    // Update ONLY inactive cells by bilinear interpolation from active cells.
+    // Uses bilinear (not Hermite) to preserve solver convergence behavior.
+    // Hermite is only used in interpolateToFullGrid() for final output quality.
 
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
             if (!active_cells(j, i)) {
-                Az(j, i) = hermiteInterpolateFromCoarse(i, j, Az_coarse);
+                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
             }
         }
     }
