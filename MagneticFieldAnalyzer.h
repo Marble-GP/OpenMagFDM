@@ -533,6 +533,10 @@ private:
     Eigen::SparseMatrix<double> R_restriction;    // n_active x n_full (fine -> coarse, = P^T)
     bool multigrid_operators_built = false;       // Operators built flag
 
+    // Phase 7: Hermite interpolation gradients at active cells
+    Eigen::MatrixXd dAz_dx_active;  // ∂Az/∂x at active cells (full grid size, zeros at inactive)
+    Eigen::MatrixXd dAz_dy_active;  // ∂Az/∂y at active cells
+
     // Phase 6: Preconditioner cache for Preconditioned JFNK
     Eigen::SparseLU<Eigen::SparseMatrix<double>> precond_solver;  // LU factorization of A_c
     Eigen::SparseMatrix<double> A_coarse_precond;  // Cached coarse matrix for preconditioner
@@ -617,6 +621,8 @@ private:
     int findNextActiveTheta(int i_r, int j_theta, int direction) const;   // Find next active cell in theta
     std::pair<int, int> findActiveNeighbor(int i, int j, int di, int dj) const;  // Find active neighbor
     double bilinearInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // Interpolate inactive cell
+    double hermiteInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // C^1 Hermite interpolation
+    void computeAzGradientsAtActiveCells(const Eigen::VectorXd& Az_coarse);  // Compute ∂Az/∂x, ∂Az/∂y at active cells
     double interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const;  // Polar coarse grid interpolation
     double calculateThetaDistance(int j_from, int j_to) const;  // Calculate theta distance (periodic-aware)
     double calculateThetaInterpolationWeight(int j_theta, int j_prev, int j_next) const;  // Theta interpolation weight

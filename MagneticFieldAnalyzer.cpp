@@ -1587,6 +1587,186 @@ double MagneticFieldAnalyzer::bilinearInterpolateFromCoarse(int i, int j, const 
 }
 
 // ============================================================================
+// Phase 7: Cubic Hermite interpolation for smooth Az
+// ============================================================================
+
+void MagneticFieldAnalyzer::computeAzGradientsAtActiveCells(const Eigen::VectorXd& Az_coarse) {
+    // Compute ∂Az/∂x and ∂Az/∂y at all active cells using central differences
+    // with neighboring active cells. These gradients are used by hermiteInterpolateFromCoarse()
+    // to produce C^1 continuous Az interpolation (vs C^0 for bilinear).
+
+    dAz_dx_active.resize(ny, nx);
+    dAz_dy_active.resize(ny, nx);
+    dAz_dx_active.setZero();
+    dAz_dy_active.setZero();
+
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+        double Az_here = Az_coarse(idx);
+
+        // --- ∂Az/∂x ---
+        int i_left = i - 1, i_right = i + 1;
+        while (i_left > 0 && !active_cells(j, i_left)) i_left--;
+        while (i_right < nx - 1 && !active_cells(j, i_right)) i_right++;
+
+        bool have_left = (i_left >= 0 && active_cells(j, i_left));
+        bool have_right = (i_right < nx && active_cells(j, i_right));
+
+        // Periodic boundary wrap
+        if (x_periodic && !have_left) {
+            i_left = nx - 1;
+            while (i_left > i && !active_cells(j, i_left)) i_left--;
+            have_left = active_cells(j, i_left);
+        }
+        if (x_periodic && !have_right) {
+            i_right = 0;
+            while (i_right < i && !active_cells(j, i_right)) i_right++;
+            have_right = active_cells(j, i_right);
+        }
+
+        if (have_left && have_right && i_left != i_right) {
+            auto it_l = fine_to_coarse.find({i_left, j});
+            auto it_r = fine_to_coarse.find({i_right, j});
+            if (it_l != fine_to_coarse.end() && it_r != fine_to_coarse.end()) {
+                double Az_l = Az_coarse(it_l->second);
+                double Az_r = Az_coarse(it_r->second);
+                int dist = i_right - i_left;
+                if (x_periodic && dist < 0) dist += nx;  // Wrap distance
+                dAz_dx_active(j, i) = (Az_r - Az_l) / (dist * dx);
+            }
+        } else if (have_right) {
+            auto it_r = fine_to_coarse.find({i_right, j});
+            if (it_r != fine_to_coarse.end()) {
+                double Az_r = Az_coarse(it_r->second);
+                int dist = i_right - i;
+                if (x_periodic && dist < 0) dist += nx;
+                dAz_dx_active(j, i) = (Az_r - Az_here) / (dist * dx);
+            }
+        } else if (have_left) {
+            auto it_l = fine_to_coarse.find({i_left, j});
+            if (it_l != fine_to_coarse.end()) {
+                double Az_l = Az_coarse(it_l->second);
+                int dist = i - i_left;
+                if (x_periodic && dist < 0) dist += nx;
+                dAz_dx_active(j, i) = (Az_here - Az_l) / (dist * dx);
+            }
+        }
+
+        // --- ∂Az/∂y ---
+        int j_bottom = j - 1, j_top = j + 1;
+        while (j_bottom > 0 && !active_cells(j_bottom, i)) j_bottom--;
+        while (j_top < ny - 1 && !active_cells(j_top, i)) j_top++;
+
+        bool have_bottom = (j_bottom >= 0 && active_cells(j_bottom, i));
+        bool have_top = (j_top < ny && active_cells(j_top, i));
+
+        // Periodic boundary wrap
+        if (y_periodic && !have_bottom) {
+            j_bottom = ny - 1;
+            while (j_bottom > j && !active_cells(j_bottom, i)) j_bottom--;
+            have_bottom = active_cells(j_bottom, i);
+        }
+        if (y_periodic && !have_top) {
+            j_top = 0;
+            while (j_top < j && !active_cells(j_top, i)) j_top++;
+            have_top = active_cells(j_top, i);
+        }
+
+        if (have_bottom && have_top && j_bottom != j_top) {
+            auto it_b = fine_to_coarse.find({i, j_bottom});
+            auto it_t = fine_to_coarse.find({i, j_top});
+            if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+                double Az_b = Az_coarse(it_b->second);
+                double Az_t = Az_coarse(it_t->second);
+                int dist = j_top - j_bottom;
+                if (y_periodic && dist < 0) dist += ny;
+                dAz_dy_active(j, i) = (Az_t - Az_b) / (dist * dy);
+            }
+        } else if (have_top) {
+            auto it_t = fine_to_coarse.find({i, j_top});
+            if (it_t != fine_to_coarse.end()) {
+                double Az_t = Az_coarse(it_t->second);
+                int dist = j_top - j;
+                if (y_periodic && dist < 0) dist += ny;
+                dAz_dy_active(j, i) = (Az_t - Az_here) / (dist * dy);
+            }
+        } else if (have_bottom) {
+            auto it_b = fine_to_coarse.find({i, j_bottom});
+            if (it_b != fine_to_coarse.end()) {
+                double Az_b = Az_coarse(it_b->second);
+                int dist = j - j_bottom;
+                if (y_periodic && dist < 0) dist += ny;
+                dAz_dy_active(j, i) = (Az_here - Az_b) / (dist * dy);
+            }
+        }
+    }
+}
+
+double MagneticFieldAnalyzer::hermiteInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const {
+    // Cubic Hermite interpolation for inactive cells from surrounding active cells.
+    // Uses pre-computed gradients (dAz_dx_active, dAz_dy_active) to produce C^1 continuity.
+    // When differentiated, the result is C^0 (continuous) → no stripe artifacts in B field.
+
+    // Hermite basis functions (1D, t ∈ [0,1])
+    auto H00 = [](double t) { return 2*t*t*t - 3*t*t + 1; };
+    auto H10 = [](double t) { return t*t*t - 2*t*t + t; };
+    auto H01 = [](double t) { return -2*t*t*t + 3*t*t; };
+    auto H11 = [](double t) { return t*t*t - t*t; };
+
+    // Find surrounding active cells (same logic as bilinear)
+    int i_left = i, i_right = i, j_bottom = j, j_top = j;
+    while (i_left > 0 && !active_cells(j, i_left)) i_left--;
+    while (i_right < nx - 1 && !active_cells(j, i_right)) i_right++;
+    while (j_bottom > 0 && !active_cells(j_bottom, i)) j_bottom--;
+    while (j_top < ny - 1 && !active_cells(j_top, i)) j_top++;
+
+    double result = 0.0;
+    int n_dirs = 0;
+
+    // --- X-direction Hermite ---
+    if (active_cells(j, i_left) && active_cells(j, i_right) && i_left != i_right) {
+        auto it_l = fine_to_coarse.find({i_left, j});
+        auto it_r = fine_to_coarse.find({i_right, j});
+        if (it_l != fine_to_coarse.end() && it_r != fine_to_coarse.end()) {
+            double p0 = Az_coarse(it_l->second);
+            double p1 = Az_coarse(it_r->second);
+            double m0 = dAz_dx_active(j, i_left);
+            double m1 = dAz_dx_active(j, i_right);
+            double h = (i_right - i_left) * dx;
+            double t = double(i - i_left) / (i_right - i_left);
+
+            result += H00(t) * p0 + H10(t) * h * m0 + H01(t) * p1 + H11(t) * h * m1;
+            n_dirs++;
+        }
+    }
+
+    // --- Y-direction Hermite ---
+    if (active_cells(j_bottom, i) && active_cells(j_top, i) && j_bottom != j_top) {
+        auto it_b = fine_to_coarse.find({i, j_bottom});
+        auto it_t = fine_to_coarse.find({i, j_top});
+        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+            double p0 = Az_coarse(it_b->second);
+            double p1 = Az_coarse(it_t->second);
+            double m0 = dAz_dy_active(j_bottom, i);
+            double m1 = dAz_dy_active(j_top, i);
+            double h = (j_top - j_bottom) * dy;
+            double s = double(j - j_bottom) / (j_top - j_bottom);
+
+            result += H00(s) * p0 + H10(s) * h * m0 + H01(s) * p1 + H11(s) * h * m1;
+            n_dirs++;
+        }
+    }
+
+    if (n_dirs > 0) return result / n_dirs;
+
+    // Fallback to bilinear if Hermite data unavailable
+    return bilinearInterpolateFromCoarse(i, j, Az_coarse);
+}
+
+// ============================================================================
 // Adaptive mesh coarsened solver (Phase B)
 // ============================================================================
 
@@ -1814,21 +1994,30 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
 }
 
 void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coarse) {
-    // Interpolate coarsened solution back to full grid
+    // Interpolate coarsened solution back to full grid using cubic Hermite (C^1)
 
     Az.resize(ny, nx);
 
+    // Step 1: Set Az at active cells
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
             if (active_cells(j, i)) {
-                // Active cell - copy directly from coarse solution
                 auto it = fine_to_coarse.find({i, j});
                 if (it != fine_to_coarse.end()) {
                     Az(j, i) = Az_coarse(it->second);
                 }
-            } else {
-                // Inactive cell - interpolate from surrounding active cells
-                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
+            }
+        }
+    }
+
+    // Step 2: Compute gradients at active cells (for Hermite interpolation)
+    computeAzGradientsAtActiveCells(Az_coarse);
+
+    // Step 3: Interpolate inactive cells with cubic Hermite (C^1)
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            if (!active_cells(j, i)) {
+                Az(j, i) = hermiteInterpolateFromCoarse(i, j, Az_coarse);
             }
         }
     }
@@ -1952,17 +2141,17 @@ void MagneticFieldAnalyzer::interpolateToFullGridPolar(const Eigen::VectorXd& Az
 }
 
 void MagneticFieldAnalyzer::interpolateInactiveCells(const Eigen::VectorXd& Az_coarse) {
-    // Update ONLY inactive cells by interpolation from active cells
+    // Update ONLY inactive cells using cubic Hermite interpolation (C^1)
     // Active cells in Az are assumed to already have correct values
-    // This is a lightweight function for nonlinear iteration (avoids full grid copy)
+
+    // Compute gradients at active cells (required for Hermite)
+    computeAzGradientsAtActiveCells(Az_coarse);
 
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
             if (!active_cells(j, i)) {
-                // Inactive cell - interpolate from surrounding active cells
-                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
+                Az(j, i) = hermiteInterpolateFromCoarse(i, j, Az_coarse);
             }
-            // Active cells: keep existing values (already updated from Az_coarse)
         }
     }
 }
