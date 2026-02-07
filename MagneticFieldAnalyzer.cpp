@@ -1994,11 +1994,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
 }
 
 void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coarse) {
-    // Interpolate coarsened solution back to full grid using cubic Hermite (C^1)
+    // Interpolate coarsened solution back to full grid using bilinear interpolation
 
     Az.resize(ny, nx);
 
-    // Step 1: Set Az at active cells
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
             if (active_cells(j, i)) {
@@ -2006,18 +2005,8 @@ void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coar
                 if (it != fine_to_coarse.end()) {
                     Az(j, i) = Az_coarse(it->second);
                 }
-            }
-        }
-    }
-
-    // Step 2: Compute gradients at active cells (for Hermite interpolation)
-    computeAzGradientsAtActiveCells(Az_coarse);
-
-    // Step 3: Interpolate inactive cells with cubic Hermite (C^1)
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (!active_cells(j, i)) {
-                Az(j, i) = hermiteInterpolateFromCoarse(i, j, Az_coarse);
+            } else {
+                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
             }
         }
     }
