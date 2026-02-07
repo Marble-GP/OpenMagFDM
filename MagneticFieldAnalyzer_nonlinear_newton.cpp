@@ -166,13 +166,18 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_coarse_norm = residual_coarse.norm();
         double b_vec_coarse_norm = b_vec.norm();
 
-        // Phase 4: For convergence check, use full-grid residual when coarsening is enabled
-        // This ensures convergence is measured on the physical problem, not the reduced one
+        // Convergence residual selection
         double residual_norm, b_vec_norm;
-        if (using_coarsening) {
-            // Full-grid residual for accurate convergence checking
+        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
+            // Defect correction: use Galerkin (coarse) residual for convergence
+            // R_c = P^T * R_fine = P^T * (A_f * Az - b_f)
+            // The full-grid residual includes inactive cell interpolation error
+            // that cannot be reduced by coarse-space corrections
+            residual_norm = residual_coarse_norm;
+            b_vec_norm = b_vec_coarse_norm;
+        } else if (using_coarsening) {
+            // Other coarsening modes: full-grid residual for accurate convergence
             residual_norm = computeFullGridResidual(b_vec_norm);
-            // Invalidate cache since mu may change next iteration
             full_matrix_cache_valid = false;
         } else {
             residual_norm = residual_coarse_norm;
