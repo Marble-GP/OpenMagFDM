@@ -416,24 +416,61 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
 
         // Solve improved system: J·δA = -R
-        // Phase 6: Preconditioned JFNK - combines matrix-free Jv with Galerkin preconditioner
+        // Phase 6: Nonlinear Defect Correction
+        //   1. R_fine = F(x_fine) on FULL grid
+        //   2. R_coarse = P^T * R_fine (restriction)
+        //   3. A_c * δx_c = -R_coarse (direct coarse solve)
+        //   No inner GMRES loop, no matrixFreeJv needed.
+        //
         // Phase 5: Use matrix-free GMRES when coarsening is enabled with nonlinear materials
-        // This correctly captures μ(Az) dependency that is lost with explicit Jacobian
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // Phase 6: Preconditioned JFNK
-            // - Matrix-free Jv for correctness (captures μ(Az) dependency)
-            // - Galerkin coarse matrix A_c as preconditioner for efficiency
-            // Expected to reduce GMRES iterations from ~30 to ~5
+            // Phase 6: Nonlinear Defect Correction
             if (VERBOSE && iter == 0) {
-                std::cout << "Using Preconditioned JFNK (Phase 6) for Newton step" << std::endl;
+                std::cout << "Using Defect Correction (Phase 6) for Newton step" << std::endl;
             }
 
-            // Update preconditioner based on configured frequency
+            // Update coarse operator A_c = P^T * A_f(μ) * P and LU factorize
             updatePreconditioner(iter);
 
-            // Solve with right-preconditioned GMRES: J * M^{-1} * y = -R, delta = M^{-1} * y
-            delta_A = solveWithPreconditionedGMRES(Az_vec, -residual_coarse,
-                nonlinear_config.gmres_restart * 3, 1e-6);
+            // Step 1: Compute fine-grid residual vector R_fine = A_f * Az_full - b_f
+            // A_full_cached is already built by updatePreconditioner → updateFullMatrixCache
+            Eigen::VectorXd Az_full_vec;
+            if (is_polar) {
+                int n_full = nr * ntheta;
+                Az_full_vec.resize(n_full);
+                for (int i_r = 0; i_r < nr; i_r++) {
+                    for (int j_theta = 0; j_theta < ntheta; j_theta++) {
+                        int idx = i_r * ntheta + j_theta;
+                        if (r_orientation == "horizontal") {
+                            Az_full_vec(idx) = Az(j_theta, i_r);
+                        } else {
+                            Az_full_vec(idx) = Az(i_r, j_theta);
+                        }
+                    }
+                }
+            } else {
+                int n_full = nx * ny;
+                Az_full_vec.resize(n_full);
+                for (int j = 0; j < ny; j++) {
+                    for (int i = 0; i < nx; i++) {
+                        Az_full_vec(j * nx + i) = Az(j, i);
+                    }
+                }
+            }
+
+            Eigen::VectorXd R_fine = A_full_cached * Az_full_vec - rhs_full_cached;
+
+            // Step 2: Restrict to coarse space: R_c = P^T * R_fine
+            buildProlongationMatrix();  // Ensure P and R are built
+            Eigen::VectorXd R_coarse_defect = R_restriction * R_fine;
+
+            // Step 3: Direct coarse solve: A_c * δx_c = -R_c
+            delta_A = applyPreconditioner(-R_coarse_defect);
+
+            if (nonlinear_config.precond_verbose) {
+                std::cout << "Defect correction: ||R_fine||=" << R_fine.norm()
+                          << ", ||R_c||=" << R_coarse_defect.norm() << std::endl;
+            }
 
         } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
             // Phase 5: Matrix-free GMRES (no preconditioner)
@@ -567,23 +604,32 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             updateMuDistribution();
 
             // Build matrix and compute residual at trial point
-            Eigen::SparseMatrix<double> A_trial;
-            Eigen::VectorXd b_trial;
-            if (is_polar) {
-                if (coarsening_enabled && n_active_cells < nr * ntheta) {
-                    buildMatrixPolarCoarsened(A_trial, b_trial);
-                } else {
-                    buildMatrixPolar(A_trial, b_trial);
-                }
+            double residual_trial_norm;
+            if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
+                // Defect correction / Galerkin: use full-grid residual
+                // Az and mu_map are already updated for trial point (lines above)
+                full_matrix_cache_valid = false;  // Force rebuild with trial μ
+                double b_trial_norm;
+                residual_trial_norm = computeFullGridResidual(b_trial_norm);
             } else {
-                if (coarsening_enabled && n_active_cells < nx * ny) {
-                    buildMatrixCoarsened(A_trial, b_trial);
+                Eigen::SparseMatrix<double> A_trial;
+                Eigen::VectorXd b_trial;
+                if (is_polar) {
+                    if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                        buildMatrixPolarCoarsened(A_trial, b_trial);
+                    } else {
+                        buildMatrixPolar(A_trial, b_trial);
+                    }
                 } else {
-                    buildMatrix(A_trial, b_trial);
+                    if (coarsening_enabled && n_active_cells < nx * ny) {
+                        buildMatrixCoarsened(A_trial, b_trial);
+                    } else {
+                        buildMatrix(A_trial, b_trial);
+                    }
                 }
+                Eigen::VectorXd residual_trial = A_trial * Az_trial - b_trial;
+                residual_trial_norm = residual_trial.norm();
             }
-            Eigen::VectorXd residual_trial = A_trial * Az_trial - b_trial;
-            double residual_trial_norm = residual_trial.norm();
 
             // Check Armijo condition: ||R(A + α·δA)|| <= ||R(A)||·(1 - c·α)
             if (residual_trial_norm <= residual_0 * (1.0 - c * alpha) || alpha < alpha_min) {
