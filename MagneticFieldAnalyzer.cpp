@@ -1720,14 +1720,18 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
         if (h_south < 1e-15) h_south = dy;
         if (h_north < 1e-15) h_north = dy;
 
-        // X-direction terms with non-uniform stencil
+        // X-direction terms with SYMMETRIC FVM-based stencil
+        // For symmetry: coeff depends ONLY on the edge (i,j), not on other neighbors
+        // Flux = μ_interface * (u_neighbor - u_center) / distance
+        // This ensures A[i,j] = A[j,i]
+
         // West neighbor
         if (i > 0 || x_periodic) {
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j, i_west);
             double mu_west = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            // Non-uniform coefficient: 2 / (h₋ * (h₋ + h₊) * μ)
-            double coeff_west = 2.0 / (mu_west * h_west * (h_west + h_east));
+            // Symmetric coefficient: 1 / (μ * distance)
+            double coeff_west = 1.0 / (mu_west * h_west);
 
             auto it_west = fine_to_coarse.find({i_west, j});
             bool west_is_dirichlet = (i_west == 0) && (bc_left.type == "dirichlet");
@@ -1745,8 +1749,8 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j, i_east);
             double mu_east = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            // Non-uniform coefficient: 2 / (h₊ * (h₋ + h₊) * μ)
-            double coeff_east = 2.0 / (mu_east * h_east * (h_west + h_east));
+            // Symmetric coefficient: 1 / (μ * distance)
+            double coeff_east = 1.0 / (mu_east * h_east);
 
             auto it_east = fine_to_coarse.find({i_east, j});
             bool east_is_dirichlet = (i_east == nx - 1) && (bc_right.type == "dirichlet");
@@ -1759,13 +1763,14 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             coeff_center -= coeff_east;
         }
 
-        // Y-direction terms with non-uniform stencil
+        // Y-direction terms with SYMMETRIC FVM-based stencil
         // South neighbor
         if (j > 0 || y_periodic) {
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j_south, i);
             double mu_south = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            double coeff_south = 2.0 / (mu_south * h_south * (h_south + h_north));
+            // Symmetric coefficient: 1 / (μ * distance)
+            double coeff_south = 1.0 / (mu_south * h_south);
 
             auto it_south = fine_to_coarse.find({i, j_south});
             bool south_is_dirichlet = (j_south == 0) && (bc_bottom.type == "dirichlet");
@@ -1783,7 +1788,8 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j_north, i);
             double mu_north = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            double coeff_north = 2.0 / (mu_north * h_north * (h_south + h_north));
+            // Symmetric coefficient: 1 / (μ * distance)
+            double coeff_north = 1.0 / (mu_north * h_north);
 
             auto it_north = fine_to_coarse.find({i, j_north});
             bool north_is_dirichlet = (j_north == ny - 1) && (bc_top.type == "dirichlet");
