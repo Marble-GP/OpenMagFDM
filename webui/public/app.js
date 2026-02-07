@@ -1269,45 +1269,46 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
         }
 
         // Step 2: Bilinear interpolate B at inactive cells from 4 enclosing active cells
+        // Key: ALL 4 corners of the enclosing rectangle must be active cells (with computed B).
+        // Previous bug: boundary-only rows (e.g., j=2 where only i=0,cols-1 are active)
+        // were found by the search, leading to corners at inactive cells with B=0.
         for (let j = 0; j < rows; j++) {
             for (let i = 0; i < cols; i++) {
                 if (activeMask[j][i]) continue;
 
-                // Find nearest active row above (j_top, smaller j) and below (j_bot, larger j)
-                let j_top = -1, j_bot = -1;
+                // Search upward for a row that has active cells bracketing i,
+                // then verify a matching row below where the SAME columns are active.
+                let j_top = -1, j_bot = -1, i_left = -1, i_right = -1;
+
                 for (let jj = j - 1; jj >= 0; jj--) {
-                    // Check if this row has active cells that can bracket column i
-                    let hasLeft = false, hasRight = false;
-                    for (let ii = i; ii >= 0; ii--) { if (activeMask[jj][ii]) { hasLeft = true; break; } }
-                    for (let ii = i; ii < cols; ii++) { if (activeMask[jj][ii]) { hasRight = true; break; } }
-                    if (hasLeft && hasRight) { j_top = jj; break; }
+                    // Find bracketing active cells in this row
+                    let il = -1, ir = -1;
+                    for (let ii = i; ii >= 0; ii--) {
+                        if (activeMask[jj][ii]) { il = ii; break; }
+                    }
+                    for (let ii = i; ii < cols; ii++) {
+                        if (activeMask[jj][ii]) { ir = ii; break; }
+                    }
+                    if (il < 0 || ir < 0 || il >= ir) continue;
+
+                    // Search downward for a row where both il and ir are active
+                    for (let jjj = j + 1; jjj < rows; jjj++) {
+                        if (activeMask[jjj][il] && activeMask[jjj][ir]) {
+                            j_top = jj;
+                            j_bot = jjj;
+                            i_left = il;
+                            i_right = ir;
+                            break;
+                        }
+                    }
+                    if (j_top >= 0) break;
                 }
-                for (let jj = j + 1; jj < rows; jj++) {
-                    let hasLeft = false, hasRight = false;
-                    for (let ii = i; ii >= 0; ii--) { if (activeMask[jj][ii]) { hasLeft = true; break; } }
-                    for (let ii = i; ii < cols; ii++) { if (activeMask[jj][ii]) { hasRight = true; break; } }
-                    if (hasLeft && hasRight) { j_bot = jj; break; }
-                }
 
-                if (j_top < 0 || j_bot < 0) continue; // Edge case: no enclosing rectangle
-
-                // Find active cells bracketing i in both rows
-                let i_left_top = -1, i_right_top = -1, i_left_bot = -1, i_right_bot = -1;
-                for (let ii = i; ii >= 0; ii--) { if (activeMask[j_top][ii]) { i_left_top = ii; break; } }
-                for (let ii = i; ii < cols; ii++) { if (activeMask[j_top][ii]) { i_right_top = ii; break; } }
-                for (let ii = i; ii >= 0; ii--) { if (activeMask[j_bot][ii]) { i_left_bot = ii; break; } }
-                for (let ii = i; ii < cols; ii++) { if (activeMask[j_bot][ii]) { i_right_bot = ii; break; } }
-
-                // Use consistent bounding rectangle
-                const i_left = Math.max(i_left_top, i_left_bot);
-                const i_right = Math.min(i_right_top, i_right_bot);
-
-                if (i_left < 0 || i_right < 0 || i_left >= i_right) continue;
+                if (j_top < 0 || j_bot < 0) continue;
 
                 const fx = (i - i_left) / (i_right - i_left);
                 const fy = (j - j_top) / (j_bot - j_top);
 
-                // Bilinear interpolation of Bx and By from 4 corners
                 Bx[j][i] = (1-fx)*(1-fy)*Bx[j_top][i_left] + fx*(1-fy)*Bx[j_top][i_right]
                           + (1-fx)*fy*Bx[j_bot][i_left] + fx*fy*Bx[j_bot][i_right];
                 By[j][i] = (1-fx)*(1-fy)*By[j_top][i_left] + fx*(1-fy)*By[j_top][i_right]
