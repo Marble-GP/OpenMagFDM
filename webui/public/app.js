@@ -1035,7 +1035,8 @@ async function loadResultLog(resultPath) {
 }
 
 // Helper: Calculate magnetic fields from Az and Mu (supports both polar and Cartesian coordinates)
-function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
+// activeMask: optional 2D boolean array (same size as Az) indicating active cells for coarsening-aware differentiation
+function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = null) {
     const rows = Az.length;
     const cols = Az[0].length;
 
@@ -1187,9 +1188,134 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
                 }
             }
         }
+    } else if (activeMask) {
+        // Cartesian with coarsening-aware differentiation
+        // Step 1: Compute B at active cells using nearest active neighbors
+        // Step 2: Bilinear interpolate B at inactive cells from enclosing active cells
+        const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
+        const x_periodic = bc && bc.left && bc.right &&
+                          bc.left.type === 'periodic' && bc.right.type === 'periodic';
+        const y_periodic = bc && bc.bottom && bc.top &&
+                          bc.bottom.type === 'periodic' && bc.top.type === 'periodic';
+
+        // Step 1: B at active cells only (non-uniform central difference)
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                if (!activeMask[j][i]) continue;
+
+                // Bx = ∂Az/∂y: find nearest active neighbors in j direction (same column)
+                let j_prev = -1, j_next = -1;
+                for (let jj = j - 1; jj >= 0; jj--) {
+                    if (activeMask[jj][i]) { j_prev = jj; break; }
+                }
+                for (let jj = j + 1; jj < rows; jj++) {
+                    if (activeMask[jj][i]) { j_next = jj; break; }
+                }
+                // Periodic wrap
+                if (j_prev < 0 && y_periodic) {
+                    for (let jj = rows - 1; jj > j; jj--) {
+                        if (activeMask[jj][i]) { j_prev = jj; break; }
+                    }
+                }
+                if (j_next < 0 && y_periodic) {
+                    for (let jj = 0; jj < j; jj++) {
+                        if (activeMask[jj][i]) { j_next = jj; break; }
+                    }
+                }
+
+                if (j_prev >= 0 && j_next >= 0) {
+                    const h_back = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
+                    const h_fwd = j_next < j ? (j_next + rows - j) : (j_next - j);
+                    Bx[j][i] = (Az[j_next][i] - Az[j_prev][i]) / ((h_back + h_fwd) * dy);
+                } else if (j_next >= 0) {
+                    const h = j_next < j ? (j_next + rows - j) : (j_next - j);
+                    Bx[j][i] = (Az[j_next][i] - Az[j][i]) / (h * dy);
+                } else if (j_prev >= 0) {
+                    const h = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
+                    Bx[j][i] = (Az[j][i] - Az[j_prev][i]) / (h * dy);
+                }
+
+                // By = -∂Az/∂x: find nearest active neighbors in i direction (same row)
+                let i_prev = -1, i_next = -1;
+                for (let ii = i - 1; ii >= 0; ii--) {
+                    if (activeMask[j][ii]) { i_prev = ii; break; }
+                }
+                for (let ii = i + 1; ii < cols; ii++) {
+                    if (activeMask[j][ii]) { i_next = ii; break; }
+                }
+                if (i_prev < 0 && x_periodic) {
+                    for (let ii = cols - 1; ii > i; ii--) {
+                        if (activeMask[j][ii]) { i_prev = ii; break; }
+                    }
+                }
+                if (i_next < 0 && x_periodic) {
+                    for (let ii = 0; ii < i; ii++) {
+                        if (activeMask[j][ii]) { i_next = ii; break; }
+                    }
+                }
+
+                if (i_prev >= 0 && i_next >= 0) {
+                    const h_back = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
+                    const h_fwd = i_next < i ? (i_next + cols - i) : (i_next - i);
+                    By[j][i] = -(Az[j][i_next] - Az[j][i_prev]) / ((h_back + h_fwd) * dx);
+                } else if (i_next >= 0) {
+                    const h = i_next < i ? (i_next + cols - i) : (i_next - i);
+                    By[j][i] = -(Az[j][i_next] - Az[j][i]) / (h * dx);
+                } else if (i_prev >= 0) {
+                    const h = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
+                    By[j][i] = -(Az[j][i] - Az[j][i_prev]) / (h * dx);
+                }
+            }
+        }
+
+        // Step 2: Bilinear interpolate B at inactive cells from 4 enclosing active cells
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                if (activeMask[j][i]) continue;
+
+                // Find nearest active row above (j_top, smaller j) and below (j_bot, larger j)
+                let j_top = -1, j_bot = -1;
+                for (let jj = j - 1; jj >= 0; jj--) {
+                    // Check if this row has active cells that can bracket column i
+                    let hasLeft = false, hasRight = false;
+                    for (let ii = i; ii >= 0; ii--) { if (activeMask[jj][ii]) { hasLeft = true; break; } }
+                    for (let ii = i; ii < cols; ii++) { if (activeMask[jj][ii]) { hasRight = true; break; } }
+                    if (hasLeft && hasRight) { j_top = jj; break; }
+                }
+                for (let jj = j + 1; jj < rows; jj++) {
+                    let hasLeft = false, hasRight = false;
+                    for (let ii = i; ii >= 0; ii--) { if (activeMask[jj][ii]) { hasLeft = true; break; } }
+                    for (let ii = i; ii < cols; ii++) { if (activeMask[jj][ii]) { hasRight = true; break; } }
+                    if (hasLeft && hasRight) { j_bot = jj; break; }
+                }
+
+                if (j_top < 0 || j_bot < 0) continue; // Edge case: no enclosing rectangle
+
+                // Find active cells bracketing i in both rows
+                let i_left_top = -1, i_right_top = -1, i_left_bot = -1, i_right_bot = -1;
+                for (let ii = i; ii >= 0; ii--) { if (activeMask[j_top][ii]) { i_left_top = ii; break; } }
+                for (let ii = i; ii < cols; ii++) { if (activeMask[j_top][ii]) { i_right_top = ii; break; } }
+                for (let ii = i; ii >= 0; ii--) { if (activeMask[j_bot][ii]) { i_left_bot = ii; break; } }
+                for (let ii = i; ii < cols; ii++) { if (activeMask[j_bot][ii]) { i_right_bot = ii; break; } }
+
+                // Use consistent bounding rectangle
+                const i_left = Math.max(i_left_top, i_left_bot);
+                const i_right = Math.min(i_right_top, i_right_bot);
+
+                if (i_left < 0 || i_right < 0 || i_left >= i_right) continue;
+
+                const fx = (i - i_left) / (i_right - i_left);
+                const fy = (j - j_top) / (j_bot - j_top);
+
+                // Bilinear interpolation of Bx and By from 4 corners
+                Bx[j][i] = (1-fx)*(1-fy)*Bx[j_top][i_left] + fx*(1-fy)*Bx[j_top][i_right]
+                          + (1-fx)*fy*Bx[j_bot][i_left] + fx*fy*Bx[j_bot][i_right];
+                By[j][i] = (1-fx)*(1-fy)*By[j_top][i_left] + fx*(1-fy)*By[j_top][i_right]
+                          + (1-fx)*fy*By[j_bot][i_left] + fx*fy*By[j_bot][i_right];
+            }
+        }
     } else {
-        // Cartesian coordinate magnetic field calculation
-        // Determine periodic boundary conditions
+        // Cartesian coordinate magnetic field calculation (standard uniform grid)
         const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
         const x_periodic = bc && bc.left && bc.right &&
                           bc.left.type === 'periodic' && bc.right.type === 'periodic';
@@ -1201,44 +1327,34 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001) {
                 // Bx = ∂Az/∂y
                 if (j === 0) {
                     if (y_periodic) {
-                        // Periodic boundary: use central difference with wrap
                         Bx[j][i] = (Az[1][i] - Az[rows-1][i]) / (2 * dy);
                     } else {
-                        // Forward difference
                         Bx[j][i] = (Az[1][i] - Az[0][i]) / dy;
                     }
                 } else if (j === rows - 1) {
                     if (y_periodic) {
-                        // Periodic boundary: use central difference with wrap
                         Bx[j][i] = (Az[0][i] - Az[rows-2][i]) / (2 * dy);
                     } else {
-                        // Backward difference
                         Bx[j][i] = (Az[rows-1][i] - Az[rows-2][i]) / dy;
                     }
                 } else {
-                    // Central difference
                     Bx[j][i] = (Az[j+1][i] - Az[j-1][i]) / (2 * dy);
                 }
 
                 // By = -∂Az/∂x
                 if (i === 0) {
                     if (x_periodic) {
-                        // Periodic boundary: use central difference with wrap
                         By[j][i] = -(Az[j][1] - Az[j][cols-1]) / (2 * dx);
                     } else {
-                        // Forward difference
                         By[j][i] = -(Az[j][1] - Az[j][0]) / dx;
                     }
                 } else if (i === cols - 1) {
                     if (x_periodic) {
-                        // Periodic boundary: use central difference with wrap
                         By[j][i] = -(Az[j][0] - Az[j][cols-2]) / (2 * dx);
                     } else {
-                        // Backward difference
                         By[j][i] = -(Az[j][cols-1] - Az[j][cols-2]) / dx;
                     }
                 } else {
-                    // Central difference
                     By[j][i] = -(Az[j][i+1] - Az[j][i-1]) / (2 * dx);
                 }
             }
@@ -1308,8 +1424,12 @@ async function loadQuickPreviewFromResult(resultPath) {
                 console.log('Mu data dimensions:', muFlipped.length, 'x', muFlipped[0]?.length);
                 console.log('Grid spacing: dx =', dx, ', dy =', dy);
 
+                // Load coarsening mask for coarsening-aware B differentiation
+                const maskResult1 = await getCoarseningMaskArray(resultPath, step).catch(() => null);
+                const activeMask1 = maskResult1 ? maskResult1.mask : null;
+
                 // Calculate B and H fields
-                const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+                const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask1);
                 console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
                 console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
                 console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
@@ -2301,7 +2421,9 @@ async function renderBMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+    // Load coarsening mask for coarsening-aware B differentiation
+    const maskResultB = await getCoarseningMaskArray(getCurrentResultPath(), step).catch(() => null);
+    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultB ? maskResultB.mask : null);
 
     plotHeatmap(containerId, B, '|B| [T]', true);
 }
@@ -2336,7 +2458,9 @@ async function renderHMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+    // Load coarsening mask for coarsening-aware B differentiation
+    const maskResultH = await getCoarseningMaskArray(getCurrentResultPath(), step).catch(() => null);
+    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultH ? maskResultH.mask : null);
 
     plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true);
 }
@@ -3634,6 +3758,40 @@ async function renderStepInputImage(containerId, step) {
     }
 }
 
+// Shared utility: Fetch coarsening mask PNG and convert to 2D boolean array (image coordinates)
+// Returns { mask: bool[][], img: HTMLImageElement } or null if not available
+// Used by renderCoarseningMask (visualization) and calculateMagneticField (B computation)
+async function getCoarseningMaskArray(resultPath, step) {
+    const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+    const img = await loadImage(maskUrl);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const pixelData = ctx.getImageData(0, 0, img.width, img.height);
+
+    const rows = img.height;
+    const cols = img.width;
+    const mask = Array(rows).fill(null).map(() => Array(cols).fill(false));
+    let activeCount = 0;
+
+    for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+            const isActive = pixelData.data[(j * cols + i) * 4] > 128;
+            mask[j][i] = isActive;
+            if (isActive) activeCount++;
+        }
+    }
+
+    // All cells active means no coarsening
+    if (activeCount === rows * cols) return null;
+
+    console.log(`Coarsening mask: ${activeCount}/${rows * cols} active cells`);
+    return { mask, img, pixelData };
+}
+
 async function renderCoarseningMask(containerId, step) {
     const resultPath = getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
@@ -3642,67 +3800,53 @@ async function renderCoarseningMask(containerId, step) {
     if (!container) return;
 
     try {
-        // Get step-specific coarsening mask (binary: 0=coarsened, 255=active)
-        const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-        // Get step-specific input image
-        const inputUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        // Load coarsening mask via shared utility
+        const maskResult = await getCoarseningMaskArray(resultPath, step).catch(() => null);
+        if (!maskResult) throw new Error('Coarsening mask not available');
+
+        const maskImg = maskResult.img;
+        const rows = maskImg.height;
+        const cols = maskImg.width;
 
         container.innerHTML = '';
         const size = getContainerSize(container);
 
-        // Load both images
-        const [maskImg, inputImg] = await Promise.all([
-            loadImage(maskUrl).catch(() => null),
-            loadImage(inputUrl).catch(() => null)
-        ]);
-
-        if (!maskImg) {
-            throw new Error('Coarsening mask not available');
-        }
-
-        const rows = maskImg.height;
-        const cols = maskImg.width;
+        // Load input image for overlay
+        const inputUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const inputImg = await loadImage(inputUrl).catch(() => null);
 
         // Compute product of input image and mask
         let resultImgUrl;
         if (inputImg && inputImg.width === cols && inputImg.height === rows) {
-            // Create canvas for pixel manipulation
             const canvas = document.createElement('canvas');
             canvas.width = cols;
             canvas.height = rows;
             const ctx = canvas.getContext('2d');
 
-            // Draw input image first
             ctx.drawImage(inputImg, 0, 0);
             const inputData = ctx.getImageData(0, 0, cols, rows);
 
-            // Draw mask image to get mask data
-            ctx.drawImage(maskImg, 0, 0);
-            const maskData = ctx.getImageData(0, 0, cols, rows);
-
-            // Compute product: output = input * (mask / 255)
-            // mask is grayscale, so all channels have same value
             const outputData = ctx.createImageData(cols, rows);
-            for (let i = 0; i < inputData.data.length; i += 4) {
-                const maskValue = maskData.data[i]; // R channel (all channels same for grayscale)
-                if (maskValue > 128) {
-                    // Active cell: show input image pixel
-                    outputData.data[i] = inputData.data[i];       // R
-                    outputData.data[i + 1] = inputData.data[i + 1]; // G
-                    outputData.data[i + 2] = inputData.data[i + 2]; // B
-                    outputData.data[i + 3] = 255;                   // A
+            for (let pi = 0; pi < inputData.data.length; pi += 4) {
+                const pixIdx = pi / 4;
+                const j = Math.floor(pixIdx / cols);
+                const i = pixIdx % cols;
+                if (maskResult.mask[j][i]) {
+                    outputData.data[pi] = inputData.data[pi];         // R
+                    outputData.data[pi + 1] = inputData.data[pi + 1]; // G
+                    outputData.data[pi + 2] = inputData.data[pi + 2]; // B
+                    outputData.data[pi + 3] = 255;                     // A
                 } else {
-                    // Coarsened cell: show black
-                    outputData.data[i] = 0;
-                    outputData.data[i + 1] = 0;
-                    outputData.data[i + 2] = 0;
-                    outputData.data[i + 3] = 255;
+                    outputData.data[pi] = 0;
+                    outputData.data[pi + 1] = 0;
+                    outputData.data[pi + 2] = 0;
+                    outputData.data[pi + 3] = 255;
                 }
             }
             ctx.putImageData(outputData, 0, 0);
             resultImgUrl = canvas.toDataURL('image/png');
         } else {
-            // Fallback: just show mask if input image unavailable or size mismatch
+            const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
             resultImgUrl = maskUrl;
         }
 
@@ -3842,8 +3986,11 @@ async function renderLineProfile(containerId, step) {
         const azFlipped = flipVertical(azData);
         const muFlipped = flipVertical(muData);
 
+        // Load coarsening mask for coarsening-aware B differentiation
+        const maskResultLP = await getCoarseningMaskArray(getCurrentResultPath(), step).catch(() => null);
+
         // Calculate B and H with components
-        const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+        const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultLP ? maskResultLP.mask : null);
 
         const rows = azFlipped.length;
         const cols = azFlipped[0].length;
@@ -5991,7 +6138,9 @@ async function renderFileManagerPreview(resultPath) {
         const azFlipped = flipVertical(azData);
         const muFlipped = flipVertical(muData);
 
-        const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy);
+        // Load coarsening mask for coarsening-aware B differentiation
+        const maskResultCmp = await getCoarseningMaskArray(resultPath, step).catch(() => null);
+        const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultCmp ? maskResultCmp.mask : null);
         console.log('Calculated B magnitude');
 
         plot2.innerHTML = '';
