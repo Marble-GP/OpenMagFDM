@@ -8706,6 +8706,10 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
     // Regenerate coarsening mask if sliding is enabled (material boundaries may have moved)
     if (coarsening_enabled && transient_config.enable_sliding && step > 0) {
         generateCoarseningMask();
+        // Invalidate cached operators that depend on the coarsening mask
+        multigrid_operators_built = false;
+        precond_factorization_valid = false;
+        full_matrix_cache_valid = false;
     }
 }
 

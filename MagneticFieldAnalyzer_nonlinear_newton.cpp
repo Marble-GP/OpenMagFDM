@@ -610,9 +610,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
             // Build matrix and compute residual at trial point
             double residual_trial_norm;
-            if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
-                // Defect correction / Galerkin: use full-grid residual
-                // Az and mu_map are already updated for trial point (lines above)
+            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
+                // Defect correction: use Galerkin (coarse) residual
+                // Must match convergence check metric (residual_0 is coarse residual)
+                full_matrix_cache_valid = false;  // Force rebuild with trial μ
+                Eigen::SparseMatrix<double> A_trial_gal;
+                Eigen::VectorXd b_trial_gal;
+                buildMatrixGalerkin(A_trial_gal, b_trial_gal);
+                Eigen::VectorXd residual_trial = A_trial_gal * Az_trial - b_trial_gal;
+                residual_trial_norm = residual_trial.norm();
+            } else if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
+                // Galerkin without defect correction: use full-grid residual
                 full_matrix_cache_valid = false;  // Force rebuild with trial μ
                 double b_trial_norm;
                 residual_trial_norm = computeFullGridResidual(b_trial_norm);
