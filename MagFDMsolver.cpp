@@ -404,6 +404,7 @@ int main(int argc, char* argv[]) {
             // Export all results to folder structure
             std::cout << "\n=== Exporting Results ===" << std::endl;
             analyzer.exportResults(base_folder, 0);
+            analyzer.exportActiveOnlyResults(base_folder, 0);
         }
 
         std::cout << "\n========================================" << std::endl;

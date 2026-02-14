@@ -87,25 +87,39 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
     }
 
+    // Determine if coarsening is active (constant across iterations)
+    bool using_coarsening = (is_polar && coarsening_enabled && n_active_cells < nr * ntheta) ||
+                            (!is_polar && coarsening_enabled && n_active_cells < nx * ny);
+
     for (int iter = 0; iter < MAX_ITER; iter++) {
-        // ===== Step 1: Calculate B and H fields =====
-        if (is_polar) {
-            calculateMagneticFieldPolar();
+        // ===== Step 1: Calculate B and H fields, update μ =====
+        if (using_coarsening) {
+            // Phase 8: Wide-stencil B/H/μ at active cells only.
+            // Avoids stripe artifacts from bilinear-interpolated inactive cell Az.
+            Eigen::VectorXd Az_coarse_for_B(n_active_cells);
+            for (int cidx = 0; cidx < n_active_cells; cidx++) {
+                auto [ci, cj] = coarse_to_fine[cidx];
+                Az_coarse_for_B(cidx) = Az(cj, ci);
+            }
+            Eigen::VectorXd Bx_active, By_active, H_active;
+            calculateBFieldAtActiveCells(Az_coarse_for_B, Bx_active, By_active);
+            calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+            updateMuAtActiveCells(H_active);
+            interpolateMuToFullGrid();  // Fill inactive cells (needed for Galerkin A_f)
         } else {
-            calculateMagneticField();
+            // Full-grid path (unchanged)
+            if (is_polar) {
+                calculateMagneticFieldPolar();
+            } else {
+                calculateMagneticField();
+            }
+            calculateHField();
+            updateMuDistribution();
         }
-        calculateHField();
 
-        // ===== Step 2: Update μ based on current B and H =====
-        updateMuDistribution();
-
-        // ===== Step 3: Build residual and system matrix with current μ =====
+        // ===== Step 2: Build residual and system matrix with current μ =====
         Eigen::SparseMatrix<double> A_matrix;
         Eigen::VectorXd b_vec;
-
-        // Determine if coarsening is active
-        bool using_coarsening = (is_polar && coarsening_enabled && n_active_cells < nr * ntheta) ||
-                                (!is_polar && coarsening_enabled && n_active_cells < nx * ny);
 
         if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
             // Phase 4: Galerkin projection A_c = R * A_f * P
@@ -241,6 +255,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Always print convergence message (important for user feedback)
             std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
                       << std::scientific << std::setprecision(2) << residual_rel << ")" << std::endl;
+
+            // Final output: cubic spline interpolation for smooth Az (C^2)
+            // During iteration, bilinear was used for P-matrix consistency.
+            // Now apply cubic spline for final output quality.
+            if (using_coarsening) {
+                if (is_polar) {
+                    interpolateToFullGridPolar(Az_vec);
+                } else {
+                    interpolateToFullGrid(Az_vec);
+                }
+                // Harmonically interpolate μ at inactive cells (IDW, series circuit model)
+                interpolateMuToFullGrid();
+            }
 
             if (nonlinear_config.export_convergence) {
                 std::ofstream conv_file("newton_krylov_convergence.csv");
@@ -600,13 +627,22 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
             // Calculate B and H for trial point
             Az = Az_trial_mat;
-            if (is_polar) {
-                calculateMagneticFieldPolar();
+            if (using_coarsening) {
+                // Phase 8: Wide-stencil B/H/μ at active cells only
+                Eigen::VectorXd Bx_active, By_active, H_active;
+                calculateBFieldAtActiveCells(Az_trial, Bx_active, By_active);
+                calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+                updateMuAtActiveCells(H_active);
+                interpolateMuToFullGrid();
             } else {
-                calculateMagneticField();
+                if (is_polar) {
+                    calculateMagneticFieldPolar();
+                } else {
+                    calculateMagneticField();
+                }
+                calculateHField();
+                updateMuDistribution();
             }
-            calculateHField();
-            updateMuDistribution();
 
             // Build matrix and compute residual at trial point
             double residual_trial_norm;
@@ -807,6 +843,27 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     }
 
     std::cerr << "WARNING: Newton-Krylov solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
+
+    // Apply Hermite interpolation for output even if not converged
+    {
+        bool coarsen_active = is_polar
+            ? (coarsening_enabled && n_active_cells < nr * ntheta)
+            : (coarsening_enabled && n_active_cells < nx * ny);
+        if (coarsen_active) {
+            Eigen::VectorXd Az_c(n_active_cells);
+            for (int idx = 0; idx < n_active_cells; idx++) {
+                auto [ci, cj] = coarse_to_fine[idx];
+                Az_c(idx) = Az(cj, ci);
+            }
+            if (is_polar) {
+                interpolateToFullGridPolar(Az_c);
+            } else {
+                interpolateToFullGrid(Az_c);
+            }
+            // Harmonically interpolate μ at inactive cells (IDW, series circuit model)
+            interpolateMuToFullGrid();
+        }
+    }
 
     if (nonlinear_config.export_convergence) {
         std::ofstream conv_file("newton_krylov_convergence.csv");

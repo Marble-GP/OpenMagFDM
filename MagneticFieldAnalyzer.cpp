@@ -87,7 +87,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.use_matrix_free_jv = nl_config["use_matrix_free_jv"].as<bool>(true);
 
         // Phase 6: Preconditioned JFNK (uses Galerkin coarse matrix as preconditioner)
-        nonlinear_config.use_phase6_precond_jfnk = nl_config["use_phase6_precond_jfnk"].as<bool>(false);
+        nonlinear_config.use_phase6_precond_jfnk = nl_config["use_phase6_precond_jfnk"].as<bool>(true);
         nonlinear_config.precond_update_frequency = nl_config["precond_update_frequency"].as<int>(1);
         nonlinear_config.precond_verbose = nl_config["precond_verbose"].as<bool>(false);
     }
@@ -1387,6 +1387,31 @@ void MagneticFieldAnalyzer::buildCoarseIndexMaps() {
 
     // Calculate local mesh spacing for active cells
     calculateLocalMeshSpacing();
+
+    // Precompute active row flags for bilinear interpolation
+    // A row is "active" if it has active cells in the interior (not just domain boundaries)
+    int n_rows = (coordinate_system == "polar") ? ntheta : ny;
+    int n_cols = (coordinate_system == "polar") ? nr : nx;
+    active_row_flags.assign(n_rows, false);
+    // Domain boundary rows are always considered active
+    active_row_flags[0] = true;
+    active_row_flags[n_rows - 1] = true;
+    for (int j = 1; j < n_rows - 1; j++) {
+        for (int i = 1; i < n_cols - 1; i++) {
+            if (active_cells(j, i)) {
+                active_row_flags[j] = true;
+                break;
+            }
+        }
+    }
+
+    // Compute max coarsening skip across all materials (for locality check in interpolation)
+    max_coarsen_skip = 1;
+    for (const auto& [name, cfg] : material_coarsen) {
+        if (cfg.enabled) {
+            max_coarsen_skip = std::max(max_coarsen_skip, std::max(cfg.skip_x, cfg.skip_y));
+        }
+    }
 }
 
 void MagneticFieldAnalyzer::calculateLocalMeshSpacing() {
@@ -1532,48 +1557,147 @@ std::pair<int, int> MagneticFieldAnalyzer::findActiveNeighbor(int i, int j, int 
 }
 
 double MagneticFieldAnalyzer::bilinearInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const {
-    // Bilinear interpolation for inactive cells from surrounding active cells
+    // Bilinear interpolation from the 4 enclosing active rectangle corners.
+    //
+    // Supports periodic boundary conditions: wraps search across domain edges
+    // when y-periodic (bottom/top) or x-periodic (left/right) BCs are set.
 
-    // Find surrounding active cells
-    int i_left = i, i_right = i, j_bottom = j, j_top = j;
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    // Search left
-    while (i_left > 0 && !active_cells(j, i_left)) i_left--;
-    // Search right
-    while (i_right < nx - 1 && !active_cells(j, i_right)) i_right++;
-    // Search down
-    while (j_bottom > 0 && !active_cells(j_bottom, i)) j_bottom--;
-    // Search up
-    while (j_top < ny - 1 && !active_cells(j_top, i)) j_top++;
-
-    // If we found active cells on all sides, use bilinear interpolation
-    if (active_cells(j, i_left) && active_cells(j, i_right) &&
-        active_cells(j_bottom, i) && active_cells(j_top, i)) {
-
-        // Get coarse indices
-        auto it_left = fine_to_coarse.find({i_left, j});
-        auto it_right = fine_to_coarse.find({i_right, j});
-        auto it_bottom = fine_to_coarse.find({i, j_bottom});
-        auto it_top = fine_to_coarse.find({i, j_top});
-
-        if (it_left != fine_to_coarse.end() && it_right != fine_to_coarse.end()) {
-            // Interpolate in x direction first
-            double fx = (i_right > i_left) ? double(i - i_left) / (i_right - i_left) : 0.5;
-            double Az_x = (1.0 - fx) * Az_coarse(it_left->second) + fx * Az_coarse(it_right->second);
-
-            if (it_bottom != fine_to_coarse.end() && it_top != fine_to_coarse.end()) {
-                double fy = (j_top > j_bottom) ? double(j - j_bottom) / (j_top - j_bottom) : 0.5;
-                double Az_y = (1.0 - fy) * Az_coarse(it_bottom->second) + fy * Az_coarse(it_top->second);
-                return 0.5 * (Az_x + Az_y);  // Average of x and y interpolations
-            }
-            return Az_x;
+    // Step 1: Find nearest active row at or below j, and strictly above j
+    //         with periodic wrapping if applicable.
+    //         Locality check: only accept a row if it has active cells within
+    //         max_coarsen_skip+1 of column i (prevents domain-spanning interpolation
+    //         when distant non-coarsened material makes active_row_flags true).
+    int j_bot = -1, j_top = -1;
+    int locality_radius = max_coarsen_skip + 1;
+    auto hasLocalActive = [&](int row, int col) -> bool {
+        int lo = std::max(0, col - locality_radius);
+        int hi = std::min(nx - 1, col + locality_radius);
+        for (int ii = lo; ii <= hi; ii++) {
+            if (active_cells(row, ii)) return true;
+        }
+        return false;
+    };
+    for (int jj = j; jj >= 0; jj--) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_bot = jj; break; }
+    }
+    if (j_bot < 0 && y_periodic) {
+        for (int jj = ny - 1; jj > j; jj--) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_bot = jj; break; }
+        }
+    }
+    for (int jj = j + 1; jj < ny; jj++) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_top = jj; break; }
+    }
+    if (j_top < 0 && y_periodic) {
+        for (int jj = 0; jj < j; jj++) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_top = jj; break; }
         }
     }
 
-    // Fallback: use nearest active neighbor
+    // If no top row found, try j itself (cell on last active row)
+    if (j_top < 0 && j_bot >= 0) j_top = j_bot;
+    if (j_bot < 0) return 0.0;
+
+    // Compute fy (periodic-aware: j_bot might be > j if it wrapped)
+    double fy = 0.0;
+    if (j_top != j_bot) {
+        if (j_bot <= j && j_top > j) {
+            // Normal case: j_bot <= j < j_top
+            fy = double(j - j_bot) / double(j_top - j_bot);
+        } else if (y_periodic && j_bot > j) {
+            // Wrapped bottom: j_bot is above j (wrapped from top)
+            int dist_total = (ny - j_bot) + j_top;  // j_bot→ny + 0→j_top
+            int dist_from_bot = (ny - j_bot) + j;    // j_bot→ny + 0→j
+            fy = double(dist_from_bot) / double(dist_total);
+        } else if (y_periodic && j_top < j) {
+            // Wrapped top: j_top is below j (wrapped from bottom)
+            int dist_total = (ny - j_bot) + j_top;
+            int dist_from_bot = j - j_bot;
+            fy = double(dist_from_bot) / double(dist_total);
+        }
+    }
+
+    // Step 2: Find columns active on BOTH j_bot and j_top rows
+    //         with periodic wrapping if applicable
+    int il = -1, ir = -1;
+    for (int ii = i; ii >= 0; ii--) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            il = ii; break;
+        }
+    }
+    if (il < 0 && x_periodic) {
+        for (int ii = nx - 1; ii > i; ii--) {
+            if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+                il = ii; break;
+            }
+        }
+    }
+    for (int ii = i + 1; ii < nx; ii++) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            ir = ii; break;
+        }
+    }
+    if (ir < 0 && x_periodic) {
+        for (int ii = 0; ii < i; ii++) {
+            if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+                ir = ii; break;
+            }
+        }
+    }
+
+    // Compute fx (periodic-aware)
+    double fx = 0.0;
+    if (il >= 0 && ir >= 0 && il != ir) {
+        if (il <= i && ir > i) {
+            fx = double(i - il) / double(ir - il);
+        } else if (x_periodic && il > i) {
+            int dist_total = (nx - il) + ir;
+            int dist_from_left = (nx - il) + i;
+            fx = double(dist_from_left) / double(dist_total);
+        } else if (x_periodic && ir < i) {
+            int dist_total = (nx - il) + ir;
+            int dist_from_left = i - il;
+            fx = double(dist_from_left) / double(dist_total);
+        }
+    }
+
+    // Step 3: Bilinear interpolation from 4 corners
+    if (il >= 0 && ir >= 0 && j_bot >= 0 && j_top >= 0) {
+        auto it_bl = fine_to_coarse.find({il, j_bot});
+        auto it_br = fine_to_coarse.find({ir, j_bot});
+        auto it_tl = fine_to_coarse.find({il, j_top});
+        auto it_tr = fine_to_coarse.find({ir, j_top});
+
+        if (it_bl != fine_to_coarse.end() && it_br != fine_to_coarse.end() &&
+            it_tl != fine_to_coarse.end() && it_tr != fine_to_coarse.end()) {
+
+            double v_bl = Az_coarse(it_bl->second);
+            double v_br = Az_coarse(it_br->second);
+            double v_tl = Az_coarse(it_tl->second);
+            double v_tr = Az_coarse(it_tr->second);
+
+            return (1-fx)*(1-fy)*v_bl + fx*(1-fy)*v_br + (1-fx)*fy*v_tl + fx*fy*v_tr;
+        }
+    }
+
+    // Fallback: 1D interpolation if only one column found
+    if (il >= 0 && j_bot >= 0 && j_top >= 0 && j_top != j_bot) {
+        auto it_b = fine_to_coarse.find({il, j_bot});
+        auto it_t = fine_to_coarse.find({il, j_top});
+        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+            return (1-fy) * Az_coarse(it_b->second) + fy * Az_coarse(it_t->second);
+        }
+    }
+
+    // Last fallback: nearest active neighbor (periodic-aware)
     for (int dj = -1; dj <= 1; dj++) {
         for (int di = -1; di <= 1; di++) {
             int ni = i + di, nj = j + dj;
+            if (y_periodic) { nj = ((nj % ny) + ny) % ny; }
+            if (x_periodic) { ni = ((ni % nx) + nx) % nx; }
             if (ni >= 0 && ni < nx && nj >= 0 && nj < ny && active_cells(nj, ni)) {
                 auto it = fine_to_coarse.find({ni, nj});
                 if (it != fine_to_coarse.end()) {
@@ -1583,7 +1707,7 @@ double MagneticFieldAnalyzer::bilinearInterpolateFromCoarse(int i, int j, const 
         }
     }
 
-    return 0.0;  // Should not reach here
+    return 0.0;
 }
 
 // ============================================================================
@@ -1708,7 +1832,8 @@ void MagneticFieldAnalyzer::computeAzGradientsAtActiveCells(const Eigen::VectorX
 double MagneticFieldAnalyzer::hermiteInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const {
     // Cubic Hermite interpolation for inactive cells from surrounding active cells.
     // Uses pre-computed gradients (dAz_dx_active, dAz_dy_active) to produce C^1 continuity.
-    // When differentiated, the result is C^0 (continuous) → no stripe artifacts in B field.
+    // Two-pass approach: Hermite in x at j_bot/j_top rows, then Hermite in y.
+    // Fritsch-Carlson monotone gradient clamping prevents overshoot.
 
     // Hermite basis functions (1D, t ∈ [0,1])
     auto H00 = [](double t) { return 2*t*t*t - 3*t*t + 1; };
@@ -1716,53 +1841,113 @@ double MagneticFieldAnalyzer::hermiteInterpolateFromCoarse(int i, int j, const E
     auto H01 = [](double t) { return -2*t*t*t + 3*t*t; };
     auto H11 = [](double t) { return t*t*t - t*t; };
 
-    // Find surrounding active cells (same logic as bilinear)
-    int i_left = i, i_right = i, j_bottom = j, j_top = j;
-    while (i_left > 0 && !active_cells(j, i_left)) i_left--;
-    while (i_right < nx - 1 && !active_cells(j, i_right)) i_right++;
-    while (j_bottom > 0 && !active_cells(j_bottom, i)) j_bottom--;
-    while (j_top < ny - 1 && !active_cells(j_top, i)) j_top++;
+    // Fritsch-Carlson monotone gradient clamping
+    auto clampGradients = [](double p0, double p1, double h, double& m0, double& m1) {
+        double delta = (p1 - p0) / h;
+        if (std::abs(delta) < 1e-30) {
+            m0 = 0.0; m1 = 0.0;
+            return;
+        }
+        double alpha = m0 / delta;
+        double beta  = m1 / delta;
+        // If gradient opposes slope, zero it out
+        if (alpha < 0.0) m0 = 0.0;
+        if (beta  < 0.0) m1 = 0.0;
+        // Recalculate after zeroing
+        alpha = m0 / delta;
+        beta  = m1 / delta;
+        double r2 = alpha * alpha + beta * beta;
+        if (r2 > 9.0) {
+            double tau = 3.0 / std::sqrt(r2);
+            m0 = tau * alpha * delta;
+            m1 = tau * beta  * delta;
+        }
+    };
 
-    double result = 0.0;
-    int n_dirs = 0;
+    // Step 1: Find enclosing active rows (matching bilinearInterpolateFromCoarse)
+    int j_bot = -1, j_top = -1;
+    for (int jj = j; jj >= 0; jj--) {
+        if (active_row_flags[jj]) { j_bot = jj; break; }
+    }
+    for (int jj = j + 1; jj < ny; jj++) {
+        if (active_row_flags[jj]) { j_top = jj; break; }
+    }
+    if (j_top < 0 && j_bot >= 0) j_top = j_bot;
+    if (j_bot < 0) return 0.0;
 
-    // --- X-direction Hermite ---
-    if (active_cells(j, i_left) && active_cells(j, i_right) && i_left != i_right) {
-        auto it_l = fine_to_coarse.find({i_left, j});
-        auto it_r = fine_to_coarse.find({i_right, j});
+    // Step 2: Find common active columns on both rows
+    int il = -1, ir = -1;
+    for (int ii = i; ii >= 0; ii--) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            il = ii; break;
+        }
+    }
+    for (int ii = i + 1; ii < nx; ii++) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            ir = ii; break;
+        }
+    }
+
+    // Step 3: Two-pass Hermite from 4 corners
+    if (il >= 0 && ir >= 0 && il != ir && j_bot != j_top) {
+        auto it_bl = fine_to_coarse.find({il, j_bot});
+        auto it_br = fine_to_coarse.find({ir, j_bot});
+        auto it_tl = fine_to_coarse.find({il, j_top});
+        auto it_tr = fine_to_coarse.find({ir, j_top});
+
+        if (it_bl != fine_to_coarse.end() && it_br != fine_to_coarse.end() &&
+            it_tl != fine_to_coarse.end() && it_tr != fine_to_coarse.end()) {
+
+            double fx = double(i - il) / (ir - il);
+            double fy = double(j - j_bot) / (j_top - j_bot);
+            double hx = (ir - il) * dx;
+            double hy = (j_top - j_bot) * dy;
+
+            // Values at 4 corners
+            double v_bl = Az_coarse(it_bl->second);
+            double v_br = Az_coarse(it_br->second);
+            double v_tl = Az_coarse(it_tl->second);
+            double v_tr = Az_coarse(it_tr->second);
+
+            // Pass 1: Hermite in x at j_bot row (with monotone clamping)
+            double mx_bl = dAz_dx_active(j_bot, il);
+            double mx_br = dAz_dx_active(j_bot, ir);
+            clampGradients(v_bl, v_br, hx, mx_bl, mx_br);
+            double v_bot = H00(fx)*v_bl + H10(fx)*hx*mx_bl + H01(fx)*v_br + H11(fx)*hx*mx_br;
+
+            // Pass 1: Hermite in x at j_top row (with monotone clamping)
+            double mx_tl = dAz_dx_active(j_top, il);
+            double mx_tr = dAz_dx_active(j_top, ir);
+            clampGradients(v_tl, v_tr, hx, mx_tl, mx_tr);
+            double v_top = H00(fx)*v_tl + H10(fx)*hx*mx_tl + H01(fx)*v_tr + H11(fx)*hx*mx_tr;
+
+            // Interpolate y-gradients to intermediate x position
+            double my_bot = (1.0-fx) * dAz_dy_active(j_bot, il) + fx * dAz_dy_active(j_bot, ir);
+            double my_top = (1.0-fx) * dAz_dy_active(j_top, il) + fx * dAz_dy_active(j_top, ir);
+
+            // Pass 2: Hermite in y (with monotone clamping)
+            clampGradients(v_bot, v_top, hy, my_bot, my_top);
+            return H00(fy)*v_bot + H10(fy)*hy*my_bot + H01(fy)*v_top + H11(fy)*hy*my_top;
+        }
+    }
+
+    // Degenerate case: same row (j_bot == j_top) → 1D Hermite in x only
+    if (il >= 0 && ir >= 0 && il != ir && j_bot >= 0) {
+        auto it_l = fine_to_coarse.find({il, j_bot});
+        auto it_r = fine_to_coarse.find({ir, j_bot});
         if (it_l != fine_to_coarse.end() && it_r != fine_to_coarse.end()) {
+            double fx = double(i - il) / (ir - il);
+            double hx = (ir - il) * dx;
             double p0 = Az_coarse(it_l->second);
             double p1 = Az_coarse(it_r->second);
-            double m0 = dAz_dx_active(j, i_left);
-            double m1 = dAz_dx_active(j, i_right);
-            double h = (i_right - i_left) * dx;
-            double t = double(i - i_left) / (i_right - i_left);
-
-            result += H00(t) * p0 + H10(t) * h * m0 + H01(t) * p1 + H11(t) * h * m1;
-            n_dirs++;
+            double m0 = dAz_dx_active(j_bot, il);
+            double m1 = dAz_dx_active(j_bot, ir);
+            clampGradients(p0, p1, hx, m0, m1);
+            return H00(fx)*p0 + H10(fx)*hx*m0 + H01(fx)*p1 + H11(fx)*hx*m1;
         }
     }
 
-    // --- Y-direction Hermite ---
-    if (active_cells(j_bottom, i) && active_cells(j_top, i) && j_bottom != j_top) {
-        auto it_b = fine_to_coarse.find({i, j_bottom});
-        auto it_t = fine_to_coarse.find({i, j_top});
-        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
-            double p0 = Az_coarse(it_b->second);
-            double p1 = Az_coarse(it_t->second);
-            double m0 = dAz_dy_active(j_bottom, i);
-            double m1 = dAz_dy_active(j_top, i);
-            double h = (j_top - j_bottom) * dy;
-            double s = double(j - j_bottom) / (j_top - j_bottom);
-
-            result += H00(s) * p0 + H10(s) * h * m0 + H01(s) * p1 + H11(s) * h * m1;
-            n_dirs++;
-        }
-    }
-
-    if (n_dirs > 0) return result / n_dirs;
-
-    // Fallback to bilinear if Hermite data unavailable
+    // Fallback to bilinear
     return bilinearInterpolateFromCoarse(i, j, Az_coarse);
 }
 
@@ -1869,8 +2054,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             continue;
         }
 
-        // Interior points - non-uniform FDM stencil
-        // For non-uniform mesh: d²u/dx² ≈ 2/(h₋(h₋+h₊))·u_{i-1} - 2/(h₋h₊)·u_i + 2/(h₊(h₋+h₊))·u_{i+1}
+        // Interior points - Non-uniform FDM stencil on coarsened grid
+        // Standard 2nd-order finite difference on non-uniform mesh:
+        //   coeff = 2 / (μ_face · h · (h_w + h_e))
+        // For uniform grid: 2/(μ·dx·2dx) = 1/(μ·dx²) → matches buildMatrix()
         double coeff_center = 0.0;
 
         // Find neighboring active cells and compute distances
@@ -1889,10 +2076,28 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             if (j == ny - 1 && j_north == ny - 1) j_north = 0;
         }
 
-        double h_west = std::abs(i - i_west) * dx;
-        double h_east = std::abs(i_east - i) * dx;
-        double h_south = std::abs(j - j_south) * dy;
-        double h_north = std::abs(j_north - j) * dy;
+        // Distances to neighbors (periodic-aware)
+        double h_west, h_east, h_south, h_north;
+        if (x_periodic && i_west > i) {
+            h_west = (i + (nx - i_west)) * dx;
+        } else {
+            h_west = std::abs(i - i_west) * dx;
+        }
+        if (x_periodic && i_east < i) {
+            h_east = ((nx - i) + i_east) * dx;
+        } else {
+            h_east = std::abs(i_east - i) * dx;
+        }
+        if (y_periodic && j_south > j) {
+            h_south = (j + (ny - j_south)) * dy;
+        } else {
+            h_south = std::abs(j - j_south) * dy;
+        }
+        if (y_periodic && j_north < j) {
+            h_north = ((ny - j) + j_north) * dy;
+        } else {
+            h_north = std::abs(j_north - j) * dy;
+        }
 
         // Ensure minimum spacing to avoid division by zero
         if (h_west < 1e-15) h_west = dx;
@@ -1900,18 +2105,14 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
         if (h_south < 1e-15) h_south = dy;
         if (h_north < 1e-15) h_north = dy;
 
-        // X-direction terms with SYMMETRIC FVM-based stencil
-        // For symmetry: coeff depends ONLY on the edge (i,j), not on other neighbors
-        // Flux = μ_interface * (u_neighbor - u_center) / distance
-        // This ensures A[i,j] = A[j,i]
+        // X-direction coefficients: 2 / (μ_face · h · (h_w + h_e))
 
         // West neighbor
         if (i > 0 || x_periodic) {
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j, i_west);
             double mu_west = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            // Symmetric coefficient: 1 / (μ * distance)
-            double coeff_west = 1.0 / (mu_west * h_west);
+            double coeff_west = 2.0 / (mu_west * h_west * (h_west + h_east));
 
             auto it_west = fine_to_coarse.find({i_west, j});
             bool west_is_dirichlet = (i_west == 0) && (bc_left.type == "dirichlet");
@@ -1929,8 +2130,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j, i_east);
             double mu_east = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            // Symmetric coefficient: 1 / (μ * distance)
-            double coeff_east = 1.0 / (mu_east * h_east);
+            double coeff_east = 2.0 / (mu_east * h_east * (h_west + h_east));
 
             auto it_east = fine_to_coarse.find({i_east, j});
             bool east_is_dirichlet = (i_east == nx - 1) && (bc_right.type == "dirichlet");
@@ -1943,14 +2143,14 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             coeff_center -= coeff_east;
         }
 
-        // Y-direction terms with SYMMETRIC FVM-based stencil
+        // Y-direction coefficients: 2 / (μ_face · h · (h_s + h_n))
+
         // South neighbor
         if (j > 0 || y_periodic) {
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j_south, i);
             double mu_south = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            // Symmetric coefficient: 1 / (μ * distance)
-            double coeff_south = 1.0 / (mu_south * h_south);
+            double coeff_south = 2.0 / (mu_south * h_south * (h_south + h_north));
 
             auto it_south = fine_to_coarse.find({i, j_south});
             bool south_is_dirichlet = (j_south == 0) && (bc_bottom.type == "dirichlet");
@@ -1968,8 +2168,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double mu_center = mu_map(j, i);
             double mu_neighbor = mu_map(j_north, i);
             double mu_north = 2.0 / (1.0 / mu_center + 1.0 / mu_neighbor);
-            // Symmetric coefficient: 1 / (μ * distance)
-            double coeff_north = 1.0 / (mu_north * h_north);
+            double coeff_north = 2.0 / (mu_north * h_north * (h_south + h_north));
 
             auto it_north = fine_to_coarse.find({i, j_north});
             bool north_is_dirichlet = (j_north == ny - 1) && (bc_top.type == "dirichlet");
@@ -1985,8 +2184,9 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
         // Center coefficient
         triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
-        // Right-hand side (current density)
-        rhs(idx) = -jz_map(j, i);
+        // Right-hand side: source term (no area scaling for FDM)
+        // Use += to preserve any accumulated Dirichlet boundary contributions
+        rhs(idx) += -jz_map(j, i);
     }
 
     A.setFromTriplets(triplets.begin(), triplets.end());
@@ -1994,10 +2194,19 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
 }
 
 void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coarse) {
-    // Interpolate coarsened solution back to full grid using bilinear interpolation
+    // Bilinear interpolation from coarse (active) cells to full grid.
+    // Active cells get exact values from the solver; inactive cells are
+    // interpolated using bilinearInterpolateFromCoarse() with active_row_flags
+    // for proper enclosing-rectangle detection.
+    //
+    // NOTE: Cubic spline / Hermite interpolation was tried (Phase 7) but
+    // failed due to overshoot near material boundaries. Bilinear is the
+    // best practical solution for coarsened grids.
 
     Az.resize(ny, nx);
+    Az.setZero();
 
+    // Step 1: Set active cells directly from solver output
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
             if (active_cells(j, i)) {
@@ -2005,8 +2214,459 @@ void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coar
                 if (it != fine_to_coarse.end()) {
                     Az(j, i) = Az_coarse(it->second);
                 }
-            } else {
+            }
+        }
+    }
+
+    // Step 2: Interpolate inactive cells with bilinear
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            if (!active_cells(j, i)) {
                 Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
+    // Rebuild mu_map for inactive cells directly from the input image.
+    // Active cells keep their B-H curve computed μ (from updateMuAtActiveCells).
+    // Inactive cells get the material-based μ from image pixel lookup (ground truth).
+    // This avoids cross-material contamination from harmonic mean interpolation.
+
+    if (!coarsening_enabled || n_active_cells == 0) return;
+
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    int n_rows, n_cols;
+    if (coordinate_system == "polar") {
+        n_rows = (r_orientation == "horizontal") ? ntheta : nr;
+        n_cols = (r_orientation == "horizontal") ? nr : ntheta;
+    } else {
+        n_rows = ny;
+        n_cols = nx;
+    }
+
+    for (int j = 0; j < n_rows; j++) {
+        for (int i = 0; i < n_cols; i++) {
+            if (active_cells(j, i)) continue;  // Keep B-H computed μ
+
+            // Get pixel from flipped image (same coordinate system as setupMaterialProperties)
+            int img_i = i, img_j = j;
+            if (coordinate_system == "polar") {
+                polarToImageIndices(i, j, img_i, img_j);
+            }
+            if (img_j < 0 || img_j >= image_flipped.rows ||
+                img_i < 0 || img_i >= image_flipped.cols) continue;
+
+            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+
+            // Find matching material and set μ
+            for (const auto& mat : config["materials"]) {
+                std::string name = mat.first.as<std::string>();
+                YAML::Node props = mat.second;
+                if (!props["rgb"]) continue;
+
+                auto rgb = props["rgb"].as<std::vector<int>>();
+                if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
+                    auto it = material_mu.find(name);
+                    if (it != material_mu.end()) {
+                        // Use current H=0 for inactive cells (initial/base μ)
+                        double mu_r = evaluateMu(it->second, 0.0);
+                        mu_map(j, i) = mu_r * MU_0;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Phase 8: Wide-stencil B/H/μ at active cells only
+// ============================================================================
+
+void MagneticFieldAnalyzer::calculateBFieldAtActiveCells(
+    const Eigen::VectorXd& Az_coarse,
+    Eigen::VectorXd& Bx_active,
+    Eigen::VectorXd& By_active)
+{
+    // Compute B = curl(Az) at active cells only using wide stencil.
+    // References only active cell Az values — no dependence on inactive cells.
+    // This eliminates the stencil-width mismatch that causes stripe artifacts
+    // in nonlinear iteration (see docs/coarsening_nonlinear_stripe_analysis.md).
+
+    Bx_active.resize(n_active_cells);
+    By_active.resize(n_active_cells);
+
+    bool is_polar = (coordinate_system == "polar");
+    bool x_periodic = (!is_polar) && (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (!is_polar) && (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+
+        if (is_polar) {
+            // Polar coordinates: i = i_r, j = j_theta
+            // Br = (1/r) * ∂Az/∂θ,  Bθ = -∂Az/∂r
+            double r = r_start + i * dr;
+            if (r < 1e-10) r = 1e-10;
+
+            // θ-direction: find neighboring active cells
+            int j_prev = findNextActiveTheta(i, j, -1);
+            int j_next = findNextActiveTheta(i, j, +1);
+
+            double Az_here = Az_coarse(idx);
+            double Az_theta_prev, Az_theta_next;
+
+            auto it_prev = fine_to_coarse.find({i, j_prev});
+            auto it_next = fine_to_coarse.find({i, j_next});
+
+            if (j_prev == j && j_next == j) {
+                // Isolated cell — zero gradient
+                Bx_active(idx) = 0.0;
+            } else if (j_prev == j) {
+                // Forward difference
+                Az_theta_next = (it_next != fine_to_coarse.end()) ? Az_coarse(it_next->second) : Az_here;
+                double h_theta = calculateThetaDistance(j, j_next) * dtheta;
+                if (h_theta < 1e-15) h_theta = dtheta;
+                Bx_active(idx) = (Az_theta_next - Az_here) / (r * h_theta);
+            } else if (j_next == j) {
+                // Backward difference
+                Az_theta_prev = (it_prev != fine_to_coarse.end()) ? Az_coarse(it_prev->second) : Az_here;
+                double h_theta = calculateThetaDistance(j_prev, j) * dtheta;
+                if (h_theta < 1e-15) h_theta = dtheta;
+                Bx_active(idx) = (Az_here - Az_theta_prev) / (r * h_theta);
+            } else {
+                // Central difference
+                Az_theta_prev = (it_prev != fine_to_coarse.end()) ? Az_coarse(it_prev->second) : Az_here;
+                Az_theta_next = (it_next != fine_to_coarse.end()) ? Az_coarse(it_next->second) : Az_here;
+                double h_theta = calculateThetaDistance(j_prev, j_next) * dtheta;
+                if (h_theta < 1e-15) h_theta = dtheta;
+                Bx_active(idx) = (Az_theta_next - Az_theta_prev) / (r * h_theta);
+            }
+
+            // r-direction: find neighboring active cells
+            int i_prev = findNextActiveRadial(i, j, -1);
+            int i_next = findNextActiveRadial(i, j, +1);
+
+            auto it_r_prev = fine_to_coarse.find({i_prev, j});
+            auto it_r_next = fine_to_coarse.find({i_next, j});
+
+            if (i_prev == i && i_next == i) {
+                By_active(idx) = 0.0;
+            } else if (i_prev == i) {
+                double Az_r_next = (it_r_next != fine_to_coarse.end()) ? Az_coarse(it_r_next->second) : Az_here;
+                double h_r = (i_next - i) * dr;
+                By_active(idx) = -(Az_r_next - Az_here) / h_r;
+            } else if (i_next == i) {
+                double Az_r_prev = (it_r_prev != fine_to_coarse.end()) ? Az_coarse(it_r_prev->second) : Az_here;
+                double h_r = (i - i_prev) * dr;
+                By_active(idx) = -(Az_here - Az_r_prev) / h_r;
+            } else {
+                double Az_r_prev = (it_r_prev != fine_to_coarse.end()) ? Az_coarse(it_r_prev->second) : Az_here;
+                double Az_r_next = (it_r_next != fine_to_coarse.end()) ? Az_coarse(it_r_next->second) : Az_here;
+                double h_r = (i_next - i_prev) * dr;
+                if (h_r < 1e-15) { By_active(idx) = 0.0; }
+                else { By_active(idx) = -(Az_r_next - Az_r_prev) / h_r; }
+            }
+
+        } else {
+            // Cartesian: i = i_x, j = j_y
+            // Bx = ∂Az/∂y,  By = -∂Az/∂x
+            double Az_here = Az_coarse(idx);
+
+            // --- Bx = ∂Az/∂y ---
+            int j_south = findNextActiveY(i, j, -1);
+            int j_north = findNextActiveY(i, j, +1);
+
+            // Handle periodic wrapping: when findNextActiveY returns j itself
+            // (couldn't find any neighbor in that direction), search across
+            // the periodic boundary for the actual nearest active neighbor.
+            // Note: j_south == j only happens when j == 0 (search starts OOB).
+            //       j_north == j only happens when j == ny-1.
+            if (y_periodic) {
+                if (j_south == j) {
+                    // Wrap: search backward from top of domain
+                    for (int jj = ny - 1; jj > j; jj--) {
+                        if (active_cells(jj, i)) {
+                            auto it_wrap = fine_to_coarse.find({i, jj});
+                            if (it_wrap != fine_to_coarse.end()) {
+                                j_south = jj;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (j_north == j) {
+                    // Wrap: search forward from bottom of domain
+                    for (int jj = 0; jj < j; jj++) {
+                        if (active_cells(jj, i)) {
+                            auto it_wrap = fine_to_coarse.find({i, jj});
+                            if (it_wrap != fine_to_coarse.end()) {
+                                j_north = jj;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            auto it_s = fine_to_coarse.find({i, j_south});
+            auto it_n = fine_to_coarse.find({i, j_north});
+
+            if (j_south == j && j_north == j) {
+                // No neighbors at all — zero gradient
+                Bx_active(idx) = 0.0;
+            } else if (j_south == j_north) {
+                // Degenerate: both directions found the same cell
+                // Use single-neighbor difference
+                double Az_nb = (it_n != fine_to_coarse.end()) ? Az_coarse(it_n->second) : Az_here;
+                int dist = y_periodic
+                    ? std::min({std::abs(j_north - j), ny - std::abs(j_north - j)})
+                    : std::abs(j_north - j);
+                double h_y = dist * dy;
+                if (h_y < 1e-15) { Bx_active(idx) = 0.0; }
+                else { Bx_active(idx) = (Az_nb - Az_here) / h_y; }
+            } else if (j_south == j) {
+                // Bottom boundary: forward difference
+                double Az_n = (it_n != fine_to_coarse.end()) ? Az_coarse(it_n->second) : Az_here;
+                int dist = y_periodic
+                    ? std::min(std::abs(j_north - j), ny - std::abs(j_north - j))
+                    : (j_north - j);
+                double h_y = dist * dy;
+                Bx_active(idx) = (Az_n - Az_here) / h_y;
+            } else if (j_north == j) {
+                // Top boundary: backward difference
+                double Az_s = (it_s != fine_to_coarse.end()) ? Az_coarse(it_s->second) : Az_here;
+                int dist = y_periodic
+                    ? std::min(std::abs(j - j_south), ny - std::abs(j - j_south))
+                    : (j - j_south);
+                double h_y = dist * dy;
+                Bx_active(idx) = (Az_here - Az_s) / h_y;
+            } else {
+                // Central difference (wide stencil)
+                double Az_s = (it_s != fine_to_coarse.end()) ? Az_coarse(it_s->second) : Az_here;
+                double Az_n = (it_n != fine_to_coarse.end()) ? Az_coarse(it_n->second) : Az_here;
+                // Compute periodic-aware distance
+                int raw_dist = std::abs(j_north - j_south);
+                int h_cells = y_periodic ? std::min(raw_dist, ny - raw_dist) : raw_dist;
+                double h_y = h_cells * dy;
+                if (h_y < 1e-15) { Bx_active(idx) = 0.0; }
+                else { Bx_active(idx) = (Az_n - Az_s) / h_y; }
+            }
+
+            // --- By = -∂Az/∂x ---
+            int i_west = findNextActiveX(i, j, -1);
+            int i_east = findNextActiveX(i, j, +1);
+
+            // Handle periodic wrapping for x-direction
+            if (x_periodic) {
+                if (i_west == i) {
+                    for (int ii = nx - 1; ii > i; ii--) {
+                        if (active_cells(j, ii)) {
+                            auto it_wrap = fine_to_coarse.find({ii, j});
+                            if (it_wrap != fine_to_coarse.end()) {
+                                i_west = ii;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (i_east == i) {
+                    for (int ii = 0; ii < i; ii++) {
+                        if (active_cells(j, ii)) {
+                            auto it_wrap = fine_to_coarse.find({ii, j});
+                            if (it_wrap != fine_to_coarse.end()) {
+                                i_east = ii;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            auto it_w = fine_to_coarse.find({i_west, j});
+            auto it_e = fine_to_coarse.find({i_east, j});
+
+            if (i_west == i && i_east == i) {
+                By_active(idx) = 0.0;
+            } else if (i_west == i_east) {
+                // Degenerate case
+                double Az_nb = (it_e != fine_to_coarse.end()) ? Az_coarse(it_e->second) : Az_here;
+                int dist = x_periodic
+                    ? std::min({std::abs(i_east - i), nx - std::abs(i_east - i)})
+                    : std::abs(i_east - i);
+                double h_x = dist * dx;
+                if (h_x < 1e-15) { By_active(idx) = 0.0; }
+                else { By_active(idx) = -(Az_nb - Az_here) / h_x; }
+            } else if (i_west == i) {
+                double Az_e = (it_e != fine_to_coarse.end()) ? Az_coarse(it_e->second) : Az_here;
+                int dist = x_periodic
+                    ? std::min(std::abs(i_east - i), nx - std::abs(i_east - i))
+                    : (i_east - i);
+                double h_x = dist * dx;
+                By_active(idx) = -(Az_e - Az_here) / h_x;
+            } else if (i_east == i) {
+                double Az_w = (it_w != fine_to_coarse.end()) ? Az_coarse(it_w->second) : Az_here;
+                int dist = x_periodic
+                    ? std::min(std::abs(i - i_west), nx - std::abs(i - i_west))
+                    : (i - i_west);
+                double h_x = dist * dx;
+                By_active(idx) = -(Az_here - Az_w) / h_x;
+            } else {
+                double Az_w = (it_w != fine_to_coarse.end()) ? Az_coarse(it_w->second) : Az_here;
+                double Az_e = (it_e != fine_to_coarse.end()) ? Az_coarse(it_e->second) : Az_here;
+                int raw_dist = std::abs(i_east - i_west);
+                int h_cells = x_periodic ? std::min(raw_dist, nx - raw_dist) : raw_dist;
+                double h_x = h_cells * dx;
+                if (h_x < 1e-15) { By_active(idx) = 0.0; }
+                else { By_active(idx) = -(Az_e - Az_w) / h_x; }
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::calculateHFieldAtActiveCells(
+    const Eigen::VectorXd& Bx_active,
+    const Eigen::VectorXd& By_active,
+    Eigen::VectorXd& H_active)
+{
+    // Compute H field magnitude at active cells only.
+    // Same material lookup logic as calculateHField() but limited to active cells.
+
+    H_active.resize(n_active_cells);
+
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    bool is_polar = (coordinate_system == "polar");
+
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+
+        double B_mag = std::sqrt(Bx_active(idx) * Bx_active(idx) +
+                                  By_active(idx) * By_active(idx));
+
+        // Get image pixel coordinates for material lookup
+        int img_i, img_j;
+        if (is_polar) {
+            polarToImageIndices(i, j, img_i, img_j);
+        } else {
+            img_i = i;
+            img_j = j;
+        }
+
+        // Bounds check
+        if (img_j < 0 || img_j >= image_flipped.rows ||
+            img_i < 0 || img_i >= image_flipped.cols) {
+            double mu = mu_map(j, i);
+            H_active(idx) = (mu > 1e-20) ? B_mag / mu : 0.0;
+            continue;
+        }
+
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+
+        // Find material by RGB and compute H
+        bool found = false;
+        for (const auto& mat : config["materials"]) {
+            std::string name = mat.first.as<std::string>();
+            YAML::Node props = mat.second;
+            if (!props["rgb"]) continue;
+
+            cv::Scalar mat_rgb(
+                props["rgb"][0].as<int>(),
+                props["rgb"][1].as<int>(),
+                props["rgb"][2].as<int>()
+            );
+
+            if (rgb == mat_rgb) {
+                auto bh_it = material_bh_tables.find(name);
+                if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                    // Nonlinear: inverse B-H interpolation
+                    H_active(idx) = interpolateH_from_B(bh_it->second, B_mag);
+                } else {
+                    // Linear: H = B/μ
+                    double mu = mu_map(j, i);
+                    H_active(idx) = (mu > 1e-20) ? B_mag / mu : 0.0;
+                }
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            double mu = mu_map(j, i);
+            H_active(idx) = (mu > 1e-20) ? B_mag / mu : 0.0;
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::updateMuAtActiveCells(
+    const Eigen::VectorXd& H_active)
+{
+    // Update mu_map at active cells only based on H field.
+    // Inactive cells retain their initial μ values (from setupMaterialProperties).
+    // This breaks the stripe feedback loop where full-grid B/H/μ computation
+    // at inactive cells with bilinear-interpolated Az creates piecewise-constant
+    // gradients that feed back into the solver matrix.
+
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    bool is_polar = (coordinate_system == "polar");
+
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+        double H_mag = H_active(idx);
+
+        // Get image pixel for material lookup
+        int img_i, img_j;
+        if (is_polar) {
+            polarToImageIndices(i, j, img_i, img_j);
+        } else {
+            img_i = i;
+            img_j = j;
+        }
+
+        if (img_j < 0 || img_j >= image_flipped.rows ||
+            img_i < 0 || img_i >= image_flipped.cols) {
+            continue;
+        }
+
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+
+        for (const auto& mat : config["materials"]) {
+            std::string name = mat.first.as<std::string>();
+            YAML::Node props = mat.second;
+            if (!props["rgb"]) continue;
+
+            cv::Scalar mat_rgb(
+                props["rgb"][0].as<int>(),
+                props["rgb"][1].as<int>(),
+                props["rgb"][2].as<int>()
+            );
+
+            if (rgb == mat_rgb) {
+                auto it = material_mu.find(name);
+                if (it != material_mu.end()) {
+                    // Skip STATIC (linear) materials — μ doesn't depend on H
+                    if (it->second.type == MuType::STATIC) break;
+
+                    // Guard: skip update if H is NaN (edge case from B computation)
+                    if (std::isnan(H_mag) || std::isinf(H_mag)) break;
+                    double mu_r = evaluateMu(it->second, H_mag);
+                    if (!std::isnan(mu_r) && !std::isinf(mu_r) && mu_r >= 1.0) {
+                        mu_map(j, i) = mu_r * MU_0;
+                    }
+                }
+                break;
             }
         }
     }
@@ -2209,6 +2869,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     // Interpolate back to full grid
     std::cout << "Interpolating to full grid..." << std::endl;
     interpolateToFullGrid(Az_coarse);
+    interpolateMuToFullGrid();
 
     std::cout << "Coarsened solution complete!" << std::endl;
 }
@@ -2315,75 +2976,151 @@ void MagneticFieldAnalyzer::buildInterpolationWeights(
     int i, int j, int fine_idx,
     std::vector<Eigen::Triplet<double>>& triplets)
 {
-    // Find active neighbors in x and y directions for bilinear interpolation
-    // This matches the logic in bilinearInterpolateFromCoarse()
+    // Build prolongation weights matching bilinearInterpolateFromCoarse() logic.
+    // Uses active_row_flags to find enclosing active rows, then common active columns.
+    // Supports periodic boundary conditions (wraps search across domain edges).
 
-    // Search for active neighbors in x direction
-    int i_left = i, i_right = i;
-    while (i_left > 0 && !active_cells(j, i_left)) i_left--;
-    while (i_right < nx - 1 && !active_cells(j, i_right)) i_right++;
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    // Search for active neighbors in y direction
-    int j_bottom = j, j_top = j;
-    while (j_bottom > 0 && !active_cells(j_bottom, i)) j_bottom--;
-    while (j_top < ny - 1 && !active_cells(j_top, i)) j_top++;
+    // Step 1: Find nearest active rows (with periodic wrapping + locality check)
+    //         Locality check prevents domain-spanning interpolation when distant
+    //         non-coarsened material makes active_row_flags true on the cell's row.
+    int j_bot = -1, j_top = -1;
+    int locality_radius = max_coarsen_skip + 1;
+    auto hasLocalActive = [&](int row, int col) -> bool {
+        int lo = std::max(0, col - locality_radius);
+        int hi = std::min(nx - 1, col + locality_radius);
+        for (int ii = lo; ii <= hi; ii++) {
+            if (active_cells(row, ii)) return true;
+        }
+        return false;
+    };
+    for (int jj = j; jj >= 0; jj--) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_bot = jj; break; }
+    }
+    if (j_bot < 0 && y_periodic) {
+        for (int jj = ny - 1; jj > j; jj--) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_bot = jj; break; }
+        }
+    }
+    for (int jj = j + 1; jj < ny; jj++) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_top = jj; break; }
+    }
+    if (j_top < 0 && y_periodic) {
+        for (int jj = 0; jj < j; jj++) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i)) { j_top = jj; break; }
+        }
+    }
+    if (j_top < 0 && j_bot >= 0) j_top = j_bot;
+    if (j_bot < 0) return;
 
-    // Check if we have valid active neighbors
-    auto it_left = fine_to_coarse.find({i_left, j});
-    auto it_right = fine_to_coarse.find({i_right, j});
-    auto it_bottom = fine_to_coarse.find({i, j_bottom});
-    auto it_top = fine_to_coarse.find({i, j_top});
+    // Compute fy (periodic-aware)
+    double fy = 0.0;
+    if (j_top != j_bot) {
+        if (j_bot <= j && j_top > j) {
+            fy = double(j - j_bot) / double(j_top - j_bot);
+        } else if (y_periodic && j_bot > j) {
+            int dist_total = (ny - j_bot) + j_top;
+            int dist_from_bot = (ny - j_bot) + j;
+            fy = double(dist_from_bot) / double(dist_total);
+        } else if (y_periodic && j_top < j) {
+            int dist_total = (ny - j_bot) + j_top;
+            int dist_from_bot = j - j_bot;
+            fy = double(dist_from_bot) / double(dist_total);
+        }
+    }
 
-    bool have_x = (it_left != fine_to_coarse.end() && it_right != fine_to_coarse.end() &&
-                   active_cells(j, i_left) && active_cells(j, i_right) && i_left != i_right);
-    bool have_y = (it_bottom != fine_to_coarse.end() && it_top != fine_to_coarse.end() &&
-                   active_cells(j_bottom, i) && active_cells(j_top, i) && j_bottom != j_top);
-
-    if (have_x && have_y) {
-        // Full bilinear interpolation: average of x-interp and y-interp
-        double fx = double(i - i_left) / double(i_right - i_left);
-        double fy = double(j - j_bottom) / double(j_top - j_bottom);
-
-        // X-direction interpolation weights (scaled by 0.5)
-        triplets.push_back({fine_idx, it_left->second, 0.5 * (1.0 - fx)});
-        triplets.push_back({fine_idx, it_right->second, 0.5 * fx});
-        // Y-direction interpolation weights (scaled by 0.5)
-        triplets.push_back({fine_idx, it_bottom->second, 0.5 * (1.0 - fy)});
-        triplets.push_back({fine_idx, it_top->second, 0.5 * fy});
-    } else if (have_x) {
-        // X-direction only linear interpolation
-        double fx = double(i - i_left) / double(i_right - i_left);
-        triplets.push_back({fine_idx, it_left->second, 1.0 - fx});
-        triplets.push_back({fine_idx, it_right->second, fx});
-    } else if (have_y) {
-        // Y-direction only linear interpolation
-        double fy = double(j - j_bottom) / double(j_top - j_bottom);
-        triplets.push_back({fine_idx, it_bottom->second, 1.0 - fy});
-        triplets.push_back({fine_idx, it_top->second, fy});
-    } else {
-        // Fallback: find nearest active neighbor
-        double min_dist = std::numeric_limits<double>::max();
-        int nearest_coarse_idx = -1;
-
-        for (int dj = -2; dj <= 2; dj++) {
-            for (int di = -2; di <= 2; di++) {
-                int ni = i + di;
-                int nj = j + dj;
-                if (ni >= 0 && ni < nx && nj >= 0 && nj < ny && active_cells(nj, ni)) {
-                    double dist = std::sqrt(di * di + dj * dj);
-                    if (dist < min_dist) {
-                        auto it = fine_to_coarse.find({ni, nj});
-                        if (it != fine_to_coarse.end()) {
-                            min_dist = dist;
-                            nearest_coarse_idx = it->second;
-                        }
-                    }
-                }
+    // Step 2: Find columns active on BOTH j_bot and j_top rows (with periodic wrapping)
+    int il = -1, ir = -1;
+    for (int ii = i; ii >= 0; ii--) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            il = ii; break;
+        }
+    }
+    if (il < 0 && x_periodic) {
+        for (int ii = nx - 1; ii > i; ii--) {
+            if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+                il = ii; break;
             }
         }
+    }
+    for (int ii = i + 1; ii < nx; ii++) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            ir = ii; break;
+        }
+    }
+    if (ir < 0 && x_periodic) {
+        for (int ii = 0; ii < i; ii++) {
+            if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+                ir = ii; break;
+            }
+        }
+    }
 
-        if (nearest_coarse_idx >= 0) {
-            triplets.push_back({fine_idx, nearest_coarse_idx, 1.0});
+    // Compute fx (periodic-aware)
+    double fx = 0.0;
+    if (il >= 0 && ir >= 0 && il != ir) {
+        if (il <= i && ir > i) {
+            fx = double(i - il) / double(ir - il);
+        } else if (x_periodic && il > i) {
+            int dist_total = (nx - il) + ir;
+            int dist_from_left = (nx - il) + i;
+            fx = double(dist_from_left) / double(dist_total);
+        } else if (x_periodic && ir < i) {
+            int dist_total = (nx - il) + ir;
+            int dist_from_left = i - il;
+            fx = double(dist_from_left) / double(dist_total);
+        }
+    }
+
+    // Step 3: 4-corner bilinear interpolation weights
+    if (il >= 0 && ir >= 0) {
+        auto it_bl = fine_to_coarse.find({il, j_bot});
+        auto it_br = fine_to_coarse.find({ir, j_bot});
+        auto it_tl = fine_to_coarse.find({il, j_top});
+        auto it_tr = fine_to_coarse.find({ir, j_top});
+
+        if (it_bl != fine_to_coarse.end() && it_br != fine_to_coarse.end() &&
+            it_tl != fine_to_coarse.end() && it_tr != fine_to_coarse.end()) {
+
+            double w_bl = (1.0 - fx) * (1.0 - fy);
+            double w_br = fx * (1.0 - fy);
+            double w_tl = (1.0 - fx) * fy;
+            double w_tr = fx * fy;
+
+            if (w_bl > 1e-15) triplets.push_back({fine_idx, it_bl->second, w_bl});
+            if (w_br > 1e-15) triplets.push_back({fine_idx, it_br->second, w_br});
+            if (w_tl > 1e-15) triplets.push_back({fine_idx, it_tl->second, w_tl});
+            if (w_tr > 1e-15) triplets.push_back({fine_idx, it_tr->second, w_tr});
+            return;
+        }
+    }
+
+    // Fallback: 1D interpolation if only one column found
+    if (il >= 0 && j_bot >= 0 && j_top >= 0 && j_top != j_bot) {
+        auto it_b = fine_to_coarse.find({il, j_bot});
+        auto it_t = fine_to_coarse.find({il, j_top});
+        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+            triplets.push_back({fine_idx, it_b->second, 1.0 - fy});
+            triplets.push_back({fine_idx, it_t->second, fy});
+            return;
+        }
+    }
+
+    // Last fallback: nearest active neighbor (periodic-aware)
+    for (int dj = -1; dj <= 1; dj++) {
+        for (int di = -1; di <= 1; di++) {
+            int ni = i + di, nj = j + dj;
+            if (y_periodic) { nj = ((nj % ny) + ny) % ny; }
+            if (x_periodic) { ni = ((ni % nx) + nx) % nx; }
+            if (ni >= 0 && ni < nx && nj >= 0 && nj < ny && active_cells(nj, ni)) {
+                auto it = fine_to_coarse.find({ni, nj});
+                if (it != fine_to_coarse.end()) {
+                    triplets.push_back({fine_idx, it->second, 1.0});
+                    return;
+                }
+            }
         }
     }
 }
@@ -3668,7 +4405,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
             triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
             // Right-hand side (current density)
-            rhs(idx) = -jz_map(j, i);
+            // Use += to preserve any accumulated Dirichlet boundary contributions
+            rhs(idx) += -jz_map(j, i);
         }
     }
 
@@ -7583,6 +8321,83 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
     std::cout << "Step number: " << step_number << std::endl;
 }
 
+void MagneticFieldAnalyzer::exportActiveOnlyResults(const std::string& base_folder, int step_number) {
+    // Export Az, Mu, |B|, |H| CSVs with NaN for inactive cells.
+    // This enables Plotly contourf to interpolate directly from active cell data,
+    // avoiding C++ interpolation artifacts on inactive cells.
+
+    if (!coarsening_enabled || n_active_cells == 0) return;
+
+    bool is_polar = (coordinate_system == "polar");
+    int n_rows = is_polar ? ntheta : ny;
+    int n_cols = is_polar ? nr : nx;
+
+    // Create subdirectories
+    std::string az_dir = base_folder + "/Az_active";
+    std::string mu_dir = base_folder + "/Mu_active";
+    std::string bmag_dir = base_folder + "/Bmag_active";
+    std::string hmag_dir = base_folder + "/Hmag_active";
+    createDirectory(az_dir);
+    createDirectory(mu_dir);
+    createDirectory(bmag_dir);
+    createDirectory(hmag_dir);
+
+    std::ostringstream step_str;
+    step_str << "step_" << std::setfill('0') << std::setw(4) << step_number + 1;
+    std::string step_name = step_str.str() + ".csv";
+
+    // Compute B and H at active cells
+    Eigen::VectorXd Az_coarse(n_active_cells);
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [ci, cj] = coarse_to_fine[idx];
+        Az_coarse(idx) = Az(cj, ci);
+    }
+    Eigen::VectorXd Bx_active, By_active, H_active;
+    calculateBFieldAtActiveCells(Az_coarse, Bx_active, By_active);
+    calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+
+    // Build full-grid matrices with NaN for inactive cells
+    const double NAN_VAL = std::numeric_limits<double>::quiet_NaN();
+    Eigen::MatrixXd az_out = Eigen::MatrixXd::Constant(n_rows, n_cols, NAN_VAL);
+    Eigen::MatrixXd mu_out = Eigen::MatrixXd::Constant(n_rows, n_cols, NAN_VAL);
+    Eigen::MatrixXd bmag_out = Eigen::MatrixXd::Constant(n_rows, n_cols, NAN_VAL);
+    Eigen::MatrixXd hmag_out = Eigen::MatrixXd::Constant(n_rows, n_cols, NAN_VAL);
+
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [ci, cj] = coarse_to_fine[idx];
+        az_out(cj, ci) = Az(cj, ci);
+        mu_out(cj, ci) = mu_map(cj, ci);
+        double b = std::sqrt(Bx_active(idx) * Bx_active(idx) + By_active(idx) * By_active(idx));
+        bmag_out(cj, ci) = std::isnan(b) ? NAN_VAL : b;
+        hmag_out(cj, ci) = std::isnan(H_active(idx)) ? NAN_VAL : H_active(idx);
+    }
+
+    // Helper lambda to write a matrix to CSV (NaN renders as empty field)
+    auto writeCSV = [&](const std::string& path, const Eigen::MatrixXd& mat) {
+        std::ofstream f(path);
+        if (!f.is_open()) return;
+        f << std::scientific << std::setprecision(16);
+        for (int j = 0; j < mat.rows(); j++) {
+            for (int i = 0; i < mat.cols(); i++) {
+                if (!std::isnan(mat(j, i))) {
+                    f << mat(j, i);
+                }
+                // NaN → empty field (just comma separator)
+                if (i < mat.cols() - 1) f << ",";
+            }
+            f << "\n";
+        }
+        f.close();
+    };
+
+    writeCSV(az_dir + "/" + step_name, az_out);
+    writeCSV(mu_dir + "/" + step_name, mu_out);
+    writeCSV(bmag_dir + "/" + step_name, bmag_out);
+    writeCSV(hmag_dir + "/" + step_name, hmag_out);
+
+    std::cout << "Active-only results exported (Az_active, Mu_active, Bmag_active, Hmag_active)" << std::endl;
+}
+
 // ============================================================================
 // Polar Coordinate Methods
 // ============================================================================
@@ -7848,7 +8663,8 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             // Right-hand side (current density)
             // After r-weighting: RHS becomes -r·Jz
-            rhs(idx) = -getJzPolar(jz_map, i, j, r_orientation) * r;
+            // Use += to preserve any accumulated Dirichlet boundary contributions
+            rhs(idx) += -getJzPolar(jz_map, i, j, r_orientation) * r;
         }
     }
 
@@ -8058,7 +8874,11 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         }
 
         // Interior points and Neumann boundary points
-        // Polar equation: ∂/∂r(r·(1/μ)·∂Az/∂r) + (1/r)·∂/∂θ((1/μ)·∂Az/∂θ) = -r·Jz
+        // Non-uniform FDM on polar grid (r-weighted for symmetry):
+        //   Radial: 2 * r_face / (μ · h_r · (h_minus + h_plus))
+        //   Theta:  2 / (r · μ · h_θ · (h_θ_minus + h_θ_plus))
+        //   Source: -Jz * r
+        // For uniform: 2*r_face/(μ·dr·2dr) = r_face/(μ·dr²) → matches buildMatrixPolar()
         double coeff_center = 0.0;
 
         // --- Radial direction (non-uniform stencil) ---
@@ -8072,25 +8892,34 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         if (h_minus < 1e-15) h_minus = dr;
         if (h_plus < 1e-15) h_plus = dr;
 
+        // --- Theta direction distances (needed for control volume) ---
+        int j_prev_theta = findNextActiveTheta(i_r, j_theta, -1);
+        int j_next_theta = findNextActiveTheta(i_r, j_theta, +1);
+
+        double h_theta_minus = calculateThetaDistance(j_theta, j_prev_theta);
+        double h_theta_plus = calculateThetaDistance(j_next_theta, j_theta);
+
+        if (h_theta_minus < 1e-15) h_theta_minus = dtheta;
+        if (h_theta_plus < 1e-15) h_theta_plus = dtheta;
+
         // Interface positions (r-weighting)
         double r_imh = r - h_minus / 2.0;  // r_{i-1/2}
         double r_iph = r + h_plus / 2.0;   // r_{i+1/2}
 
         // Interface permeabilities
-        double mu_inner = getMuAtInterfacePolar(i_r - 0.5, j_theta, "r");
-        double mu_outer = getMuAtInterfacePolar(i_r + 0.5, j_theta, "r");
+        double mu_inner_r = getMuAtInterfacePolar(i_r - 0.5, j_theta, "r");
+        double mu_outer_r = getMuAtInterfacePolar(i_r + 0.5, j_theta, "r");
 
-        // Non-uniform + r-weighted coefficients
-        double a_im = r_imh / (mu_inner * h_minus * (h_minus + h_plus));
-        double a_ip = r_iph / (mu_outer * h_plus * (h_minus + h_plus));
+        // Non-uniform FDM radial coefficients: 2 * r_face / (μ · h_r · (h_minus + h_plus))
+        double a_im = 2.0 * r_imh / (mu_inner_r * h_minus * (h_minus + h_plus));
+        double a_ip = 2.0 * r_iph / (mu_outer_r * h_plus * (h_minus + h_plus));
 
         // Handle Neumann boundaries with ghost elimination
         if (i_r == 0 && bc_inner.type == "neumann") {
             if (r_imh <= 0.0) {
-                // Mirror approximation
                 std::cerr << "Warning: r_imh <= 0 at inner Neumann BC, using mirror" << std::endl;
                 double r_imh_eff = r_iph;
-                double a_im_eff = r_imh_eff / (mu_inner * h_plus * (h_minus + h_plus));
+                double a_im_eff = 2.0 * r_imh_eff / (mu_inner_r * h_plus * (h_minus + h_plus));
                 auto it_next = fine_to_coarse.find({i_next, j_theta});
                 if (it_next != fine_to_coarse.end()) {
                     triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
@@ -8132,28 +8961,22 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             coeff_center -= (a_im + a_ip);
         }
 
-        // --- Theta direction (non-uniform stencil) ---
-        int j_prev_theta = findNextActiveTheta(i_r, j_theta, -1);
-        int j_next_theta = findNextActiveTheta(i_r, j_theta, +1);
+        // --- Theta direction non-uniform FDM coefficients ---
+        // Interface permeabilities (harmonic mean, matching buildMatrixPolar)
+        double mu_ij = getMuPolar(mu_map, i_r, j_theta, r_orientation);
+        double mu_prev_theta = getMuPolar(mu_map, i_r, j_prev_theta, r_orientation);
+        double mu_next_theta = getMuPolar(mu_map, i_r, j_next_theta, r_orientation);
+        double mu_theta_prev = 2.0 / (1.0 / mu_ij + 1.0 / mu_prev_theta);
+        double mu_theta_next = 2.0 / (1.0 / mu_ij + 1.0 / mu_next_theta);
 
-        double h_theta_minus = calculateThetaDistance(j_theta, j_prev_theta);
-        double h_theta_plus = calculateThetaDistance(j_next_theta, j_theta);
-
-        // Prevent division by zero
-        if (h_theta_minus < 1e-15) h_theta_minus = dtheta;
-        if (h_theta_plus < 1e-15) h_theta_plus = dtheta;
-
-        double mu_theta = getMuPolar(mu_map, i_r, j_theta, r_orientation);
-
-        // Non-uniform theta stencil (1/r weight included)
-        double a_theta_m = 1.0 / (r * mu_theta * h_theta_minus * (h_theta_minus + h_theta_plus));
-        double a_theta_p = 1.0 / (r * mu_theta * h_theta_plus * (h_theta_minus + h_theta_plus));
+        // Non-uniform FDM theta coefficients: 2 / (r · μ · h_θ · (h_θ_minus + h_θ_plus))
+        double a_theta_m = 2.0 / (r * mu_theta_prev * h_theta_minus * (h_theta_minus + h_theta_plus));
+        double a_theta_p = 2.0 / (r * mu_theta_next * h_theta_plus * (h_theta_minus + h_theta_plus));
 
         auto it_theta_prev = fine_to_coarse.find({i_r, j_prev_theta});
         auto it_theta_next = fine_to_coarse.find({i_r, j_next_theta});
 
         if (it_theta_prev != fine_to_coarse.end()) {
-            // Check if crossing periodic boundary
             bool crosses_boundary = is_periodic &&
                 ((j_theta == 0 && j_prev_theta > j_theta) ||
                  (j_theta > 0 && j_prev_theta > j_theta));
@@ -8172,9 +8995,9 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         // Center coefficient
         triplets.push_back({idx, idx, coeff_center});
 
-        // Source term (r-weighted)
+        // Source term: -Jz * r (r-weighted, no area scaling for FDM)
         double jz = getJzPolar(jz_map, i_r, j_theta, r_orientation);
-        rhs(idx) -= r * jz;
+        rhs(idx) -= jz * r;
     }
 
     A.setFromTriplets(triplets.begin(), triplets.end());
@@ -8230,6 +9053,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
 
     // Interpolate to full grid
     interpolateToFullGridPolar(Az_coarse);
+    interpolateMuToFullGrid();
 
     std::cout << "Polar coarsened solve complete!" << std::endl;
 
@@ -8418,7 +9242,8 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
 
             // RHS: pure Cartesian formulation (no r-weighting)
             // This gives a physically consistent pseudo-Cartesian approximation
-            rhs(idx) = -getJzPolar(jz_map, i, j, r_orientation);
+            // Use += to preserve any accumulated Dirichlet boundary contributions
+            rhs(idx) += -getJzPolar(jz_map, i, j, r_orientation);
         }
     }
 
@@ -9588,6 +10413,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
         // 4. Export results for this step
         exportResults(output_dir, step);
+        exportActiveOnlyResults(output_dir, step);
 
         // Calculate and display step elapsed time
         auto step_end_time = std::chrono::high_resolution_clock::now();

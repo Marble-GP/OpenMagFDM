@@ -57,6 +57,7 @@ public:
      * @param step_number Step number for transient analysis (default: 0)
      */
     void exportResults(const std::string& base_folder, int step_number = 0);
+    void exportActiveOnlyResults(const std::string& base_folder, int step_number = 0);
 
     /**
      * @brief Perform transient analysis with image sliding
@@ -372,7 +373,7 @@ private:
         bool use_matrix_free_jv;       // Phase 5: Use matrix-free Jv for Newton step (solves oscillation issue)
 
         // Phase 6: Preconditioned JFNK - use Galerkin coarse matrix as preconditioner for matrix-free GMRES
-        bool use_phase6_precond_jfnk;     // Enable preconditioned JFNK (default: false)
+        bool use_phase6_precond_jfnk;     // Enable preconditioned JFNK (default: true)
         int precond_update_frequency;     // How often to update preconditioner: 1=every Newton iter (default: 1)
         bool precond_verbose;             // Print preconditioner statistics (default: false)
 
@@ -383,7 +384,7 @@ private:
             line_search_max_trials(50), line_search_adaptive(true),
             verbose(false), export_convergence(false), use_galerkin_coarsening(true),
             use_matrix_free_jv(true),
-            use_phase6_precond_jfnk(false), precond_update_frequency(1), precond_verbose(false) {}
+            use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false) {}
     };
 
     // Maxwell stress and force calculation
@@ -522,6 +523,8 @@ private:
     std::map<std::pair<int, int>, int> fine_to_coarse;  // (i, j) -> coarse_idx
     int n_active_cells;  // Number of active cells in coarsened mesh
     bool coarsening_enabled;  // Global flag: true if any material has coarsening enabled
+    std::vector<bool> active_row_flags;  // True if row has interior active cells (for interpolation)
+    int max_coarsen_skip = 1;  // Maximum skip across all coarsened materials (for locality check)
 
     // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
     Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix
@@ -655,9 +658,22 @@ private:
     void buildAndSolveSystemPolarCoarsened();
     void interpolateToFullGrid(const Eigen::VectorXd& Az_coarse);
     void interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse);
+    void interpolateMuToFullGrid();  // IDW harmonic mean μ interpolation at inactive cells
     void interpolateInactiveCells(const Eigen::VectorXd& Az_coarse);  // Update only inactive cells (for nonlinear iteration)
     void interpolateInactiveCellsPolar(const Eigen::VectorXd& Az_coarse);  // Polar version
     void exportCoarseningMask(const std::string& output_dir, int step_number);  // Export binary mask: active=255, coarsened=0
+
+    // Phase 8: Wide-stencil B/H/μ at active cells only (stripe-free nonlinear coarsening)
+    // Computes B using only active cell Az values (wide stencil, no inactive cell dependency)
+    void calculateBFieldAtActiveCells(const Eigen::VectorXd& Az_coarse,
+                                       Eigen::VectorXd& Bx_active,
+                                       Eigen::VectorXd& By_active);
+    // Computes H from B at active cells via material B-H tables
+    void calculateHFieldAtActiveCells(const Eigen::VectorXd& Bx_active,
+                                       const Eigen::VectorXd& By_active,
+                                       Eigen::VectorXd& H_active);
+    // Updates mu_map at active cells only from H (inactive cells unchanged)
+    void updateMuAtActiveCells(const Eigen::VectorXd& H_active);
 
     // Phase 4: Full-grid residual evaluation for coarsened Newton-Krylov convergence
     void updateFullMatrixCache();  // Rebuild A_full_cached and rhs_full_cached

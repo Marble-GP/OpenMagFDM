@@ -1055,22 +1055,41 @@ void MagneticFieldAnalyzer::solveNonlinear() {
             }
         }
 
-        // Step 2: Calculate magnetic field B
-        if (coordinate_system == "cartesian") {
-            calculateMagneticField();
-        } else {
-            calculateMagneticFieldPolar();
-        }
+        // Step 2-4: Calculate B, H, update μ with relaxation
+        bool using_coarsening = coarsening_enabled &&
+            ((coordinate_system == "polar" && n_active_cells < nr * ntheta) ||
+             (coordinate_system != "polar" && n_active_cells < nx * ny));
 
-        // Step 3: Calculate |H| from B and current μ
-        calculateHField();
-
-        // Step 4: Update μ distribution with relaxation
         Eigen::MatrixXd mu_old = mu_map;
-        updateMuDistribution();
 
-        // Apply relaxation: μ_new = ω * μ_new + (1-ω) * μ_old
-        mu_map = OMEGA * mu_map + (1.0 - OMEGA) * mu_old;
+        if (using_coarsening) {
+            // Phase 8: Wide-stencil B/H/μ at active cells only
+            Eigen::VectorXd Az_coarse_for_B(n_active_cells);
+            for (int cidx = 0; cidx < n_active_cells; cidx++) {
+                auto [ci, cj] = coarse_to_fine[cidx];
+                Az_coarse_for_B(cidx) = Az(cj, ci);
+            }
+            Eigen::VectorXd Bx_active, By_active, H_active;
+            calculateBFieldAtActiveCells(Az_coarse_for_B, Bx_active, By_active);
+            calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+            updateMuAtActiveCells(H_active);
+            // Relaxation at active cells only
+            for (int cidx = 0; cidx < n_active_cells; cidx++) {
+                auto [ci, cj] = coarse_to_fine[cidx];
+                mu_map(cj, ci) = OMEGA * mu_map(cj, ci) + (1.0 - OMEGA) * mu_old(cj, ci);
+            }
+            interpolateMuToFullGrid();
+        } else {
+            // Full-grid path (unchanged)
+            if (coordinate_system == "cartesian") {
+                calculateMagneticField();
+            } else {
+                calculateMagneticFieldPolar();
+            }
+            calculateHField();
+            updateMuDistribution();
+            mu_map = OMEGA * mu_map + (1.0 - OMEGA) * mu_old;
+        }
 
         // Step 5: Check convergence
         Eigen::VectorXd Az_new = Eigen::Map<Eigen::VectorXd>(Az.data(), Az.size());
@@ -1201,19 +1220,40 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
             }
         }
 
-        if (coordinate_system == "cartesian") {
-            calculateMagneticField();
-        } else {
-            calculateMagneticFieldPolar();
-        }
-
-        calculateHField();
+        bool using_coarsening = coarsening_enabled &&
+            ((coordinate_system == "polar" && n_active_cells < nr * ntheta) ||
+             (coordinate_system != "polar" && n_active_cells < nx * ny));
 
         Eigen::MatrixXd mu_map_before_relax = mu_map;
-        updateMuDistribution();
 
-        // Relaxation before Anderson
-        mu_map = OMEGA * mu_map + (1.0 - OMEGA) * mu_map_before_relax;
+        if (using_coarsening) {
+            // Phase 8: Wide-stencil B/H/μ at active cells only
+            Eigen::VectorXd Az_coarse_for_B(n_active_cells);
+            for (int cidx = 0; cidx < n_active_cells; cidx++) {
+                auto [ci, cj] = coarse_to_fine[cidx];
+                Az_coarse_for_B(cidx) = Az(cj, ci);
+            }
+            Eigen::VectorXd Bx_active, By_active, H_active;
+            calculateBFieldAtActiveCells(Az_coarse_for_B, Bx_active, By_active);
+            calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+            updateMuAtActiveCells(H_active);
+            // Relaxation at active cells only
+            for (int cidx = 0; cidx < n_active_cells; cidx++) {
+                auto [ci, cj] = coarse_to_fine[cidx];
+                mu_map(cj, ci) = OMEGA * mu_map(cj, ci) + (1.0 - OMEGA) * mu_map_before_relax(cj, ci);
+            }
+            interpolateMuToFullGrid();
+        } else {
+            // Full-grid path (unchanged)
+            if (coordinate_system == "cartesian") {
+                calculateMagneticField();
+            } else {
+                calculateMagneticFieldPolar();
+            }
+            calculateHField();
+            updateMuDistribution();
+            mu_map = OMEGA * mu_map + (1.0 - OMEGA) * mu_map_before_relax;
+        }
 
         Eigen::VectorXd mu_new = flatten_mu();
         Eigen::VectorXd residual = mu_new - mu_old;

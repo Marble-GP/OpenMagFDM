@@ -1034,6 +1034,99 @@ async function loadResultLog(resultPath) {
     }
 }
 
+// Helper: Harmonic mean interpolation of μ at inactive cells
+// Two-pass approach:
+//   Pass 1: 1D harmonic interpolation along x for inactive cells on active rows
+//   Pass 2: Column-wise Hermite (C^1) interpolation in y for inactive rows
+// Returns a new 2D array with interpolated values (does not modify input)
+function interpolateMuHarmonic(Mu, activeMask) {
+    const rows = Mu.length;
+    const cols = Mu[0].length;
+    const result = Mu.map(row => [...row]);
+
+    // Precompute which rows have interior active cells
+    const activeRowFlag = Array(rows).fill(false);
+    activeRowFlag[0] = true;
+    activeRowFlag[rows - 1] = true;
+    for (let j = 1; j < rows - 1; j++) {
+        for (let i = 1; i < cols - 1; i++) {
+            if (activeMask[j][i]) { activeRowFlag[j] = true; break; }
+        }
+    }
+
+    // Pass 1: 1D harmonic interpolation along x for inactive cells on active rows
+    for (let j = 0; j < rows; j++) {
+        if (!activeRowFlag[j]) continue;
+        for (let i = 0; i < cols; i++) {
+            if (activeMask[j][i]) continue;
+            let il = -1, ir = -1;
+            for (let ii = i - 1; ii >= 0; ii--) {
+                if (activeMask[j][ii]) { il = ii; break; }
+            }
+            for (let ii = i + 1; ii < cols; ii++) {
+                if (activeMask[j][ii]) { ir = ii; break; }
+            }
+            if (il >= 0 && ir >= 0 && Mu[j][il] > 0 && Mu[j][ir] > 0) {
+                const t = (i - il) / (ir - il);
+                result[j][i] = 1.0 / ((1 - t) / Mu[j][il] + t / Mu[j][ir]);
+            } else if (il >= 0) {
+                result[j][i] = Mu[j][il];
+            } else if (ir >= 0) {
+                result[j][i] = Mu[j][ir];
+            }
+        }
+    }
+
+    // Collect active row list
+    const activeRowList = [];
+    for (let j = 0; j < rows; j++) {
+        if (activeRowFlag[j]) activeRowList.push(j);
+    }
+
+    // Pass 2: Column-wise Hermite (C^1) interpolation in y for inactive rows
+    // Uses result[] values from Pass 1 (active rows now fully populated)
+    if (activeRowList.length >= 2) {
+        const nAR = activeRowList.length;
+        for (let i = 0; i < cols; i++) {
+            // Compute dμ/dy tangents at active rows (Catmull-Rom)
+            const dMu_dy = new Float64Array(nAR);
+            for (let k = 0; k < nAR; k++) {
+                const jc = activeRowList[k];
+                const jp = k > 0 ? activeRowList[k - 1] : -1;
+                const jn = k < nAR - 1 ? activeRowList[k + 1] : -1;
+                if (jp >= 0 && jn >= 0) {
+                    dMu_dy[k] = (result[jn][i] - result[jp][i]) / (jn - jp);
+                } else if (jn >= 0) {
+                    dMu_dy[k] = (result[jn][i] - result[jc][i]) / (jn - jc);
+                } else if (jp >= 0) {
+                    dMu_dy[k] = (result[jc][i] - result[jp][i]) / (jc - jp);
+                }
+            }
+
+            // Hermite fill between consecutive active rows
+            for (let k = 0; k < nAR - 1; k++) {
+                const j1 = activeRowList[k];
+                const j2 = activeRowList[k + 1];
+                if (j2 - j1 <= 1) continue;
+                const span = j2 - j1;
+                const mu0 = result[j1][i], mu1 = result[j2][i];
+                const m0 = dMu_dy[k] * span, m1 = dMu_dy[k + 1] * span;
+                for (let j = j1 + 1; j < j2; j++) {
+                    const t = (j - j1) / span;
+                    const t2 = t * t, t3 = t2 * t;
+                    const H00 = 2 * t3 - 3 * t2 + 1;
+                    const H10 = t3 - 2 * t2 + t;
+                    const H01 = -2 * t3 + 3 * t2;
+                    const H11 = t3 - t2;
+                    result[j][i] = H00 * mu0 + H10 * m0 + H01 * mu1 + H11 * m1;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
 // Helper: Calculate magnetic fields from Az and Mu (supports both polar and Cartesian coordinates)
 // activeMask: optional 2D boolean array (same size as Az) indicating active cells for coarsening-aware differentiation
 function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = null) {
@@ -1268,51 +1361,102 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             }
         }
 
-        // Step 2: Bilinear interpolate B at inactive cells from 4 enclosing active cells
-        // Key: ALL 4 corners of the enclosing rectangle must be active cells (with computed B).
-        // Previous bug: boundary-only rows (e.g., j=2 where only i=0,cols-1 are active)
-        // were found by the search, leading to corners at inactive cells with B=0.
+        // Step 2: Smooth interpolation of B at inactive cells
+        // Two-pass approach:
+        //   2a: 1D x-interpolation for inactive cells on active rows
+        //   2b: Column-wise Hermite (C^1) interpolation in y for inactive rows
+        // This eliminates horizontal stripes caused by linear y-interpolation (C^0 slope jumps)
+
+        // Precompute which rows have interior active cells
+        const activeRowFlag = Array(rows).fill(false);
+        activeRowFlag[0] = true;
+        activeRowFlag[rows - 1] = true;
+        for (let j = 1; j < rows - 1; j++) {
+            for (let i = 1; i < cols - 1; i++) {
+                if (activeMask[j][i]) {
+                    activeRowFlag[j] = true;
+                    break;
+                }
+            }
+        }
+
+        // Step 2a: Fill inactive cells on active rows via 1D x-interpolation
         for (let j = 0; j < rows; j++) {
+            if (!activeRowFlag[j]) continue;
             for (let i = 0; i < cols; i++) {
                 if (activeMask[j][i]) continue;
+                let il = -1, ir = -1;
+                for (let ii = i - 1; ii >= 0; ii--) {
+                    if (activeMask[j][ii]) { il = ii; break; }
+                }
+                for (let ii = i + 1; ii < cols; ii++) {
+                    if (activeMask[j][ii]) { ir = ii; break; }
+                }
+                if (il >= 0 && ir >= 0) {
+                    const t = (i - il) / (ir - il);
+                    Bx[j][i] = (1 - t) * Bx[j][il] + t * Bx[j][ir];
+                    By[j][i] = (1 - t) * By[j][il] + t * By[j][ir];
+                } else if (il >= 0) {
+                    Bx[j][i] = Bx[j][il]; By[j][i] = By[j][il];
+                } else if (ir >= 0) {
+                    Bx[j][i] = Bx[j][ir]; By[j][i] = By[j][ir];
+                }
+            }
+        }
 
-                // Search upward for a row that has active cells bracketing i,
-                // then verify a matching row below where the SAME columns are active.
-                let j_top = -1, j_bot = -1, i_left = -1, i_right = -1;
+        // After Step 2a, all cells on active rows have valid B values.
+        // Collect active row list for Hermite interpolation.
+        const activeRowList = [];
+        for (let j = 0; j < rows; j++) {
+            if (activeRowFlag[j]) activeRowList.push(j);
+        }
 
-                for (let jj = j - 1; jj >= 0; jj--) {
-                    // Find bracketing active cells in this row
-                    let il = -1, ir = -1;
-                    for (let ii = i; ii >= 0; ii--) {
-                        if (activeMask[jj][ii]) { il = ii; break; }
+        // Step 2b: Column-wise Hermite interpolation in y for inactive rows
+        // Hermite basis: H00(t)=2t³-3t²+1, H10(t)=t³-2t²+t, H01(t)=-2t³+3t², H11(t)=t³-t²
+        // This gives C^1 continuity at active row boundaries → no slope jumps → no stripes
+        if (activeRowList.length >= 2) {
+            const nAR = activeRowList.length;
+            for (let i = 0; i < cols; i++) {
+                // Compute dBx/dy and dBy/dy tangents at each active row (Catmull-Rom style)
+                const dBx_dy = new Float64Array(nAR);
+                const dBy_dy = new Float64Array(nAR);
+                for (let k = 0; k < nAR; k++) {
+                    const jc = activeRowList[k];
+                    const jp = k > 0 ? activeRowList[k - 1] : -1;
+                    const jn = k < nAR - 1 ? activeRowList[k + 1] : -1;
+                    if (jp >= 0 && jn >= 0) {
+                        dBx_dy[k] = (Bx[jn][i] - Bx[jp][i]) / ((jn - jp) * dy);
+                        dBy_dy[k] = (By[jn][i] - By[jp][i]) / ((jn - jp) * dy);
+                    } else if (jn >= 0) {
+                        dBx_dy[k] = (Bx[jn][i] - Bx[jc][i]) / ((jn - jc) * dy);
+                        dBy_dy[k] = (By[jn][i] - By[jc][i]) / ((jn - jc) * dy);
+                    } else if (jp >= 0) {
+                        dBx_dy[k] = (Bx[jc][i] - Bx[jp][i]) / ((jc - jp) * dy);
+                        dBy_dy[k] = (By[jc][i] - By[jp][i]) / ((jc - jp) * dy);
                     }
-                    for (let ii = i; ii < cols; ii++) {
-                        if (activeMask[jj][ii]) { ir = ii; break; }
-                    }
-                    if (il < 0 || ir < 0 || il >= ir) continue;
-
-                    // Search downward for a row where both il and ir are active
-                    for (let jjj = j + 1; jjj < rows; jjj++) {
-                        if (activeMask[jjj][il] && activeMask[jjj][ir]) {
-                            j_top = jj;
-                            j_bot = jjj;
-                            i_left = il;
-                            i_right = ir;
-                            break;
-                        }
-                    }
-                    if (j_top >= 0) break;
                 }
 
-                if (j_top < 0 || j_bot < 0) continue;
-
-                const fx = (i - i_left) / (i_right - i_left);
-                const fy = (j - j_top) / (j_bot - j_top);
-
-                Bx[j][i] = (1-fx)*(1-fy)*Bx[j_top][i_left] + fx*(1-fy)*Bx[j_top][i_right]
-                          + (1-fx)*fy*Bx[j_bot][i_left] + fx*fy*Bx[j_bot][i_right];
-                By[j][i] = (1-fx)*(1-fy)*By[j_top][i_left] + fx*(1-fy)*By[j_top][i_right]
-                          + (1-fx)*fy*By[j_bot][i_left] + fx*fy*By[j_bot][i_right];
+                // Hermite fill between consecutive active rows
+                for (let k = 0; k < nAR - 1; k++) {
+                    const j1 = activeRowList[k];
+                    const j2 = activeRowList[k + 1];
+                    if (j2 - j1 <= 1) continue; // No gap to fill
+                    const h = (j2 - j1) * dy;
+                    const bx0 = Bx[j1][i], bx1 = Bx[j2][i];
+                    const by0 = By[j1][i], by1 = By[j2][i];
+                    const mbx0 = dBx_dy[k], mbx1 = dBx_dy[k + 1];
+                    const mby0 = dBy_dy[k], mby1 = dBy_dy[k + 1];
+                    for (let j = j1 + 1; j < j2; j++) {
+                        const t = (j - j1) / (j2 - j1);
+                        const t2 = t * t, t3 = t2 * t;
+                        const H00 = 2 * t3 - 3 * t2 + 1;
+                        const H10 = t3 - 2 * t2 + t;
+                        const H01 = -2 * t3 + 3 * t2;
+                        const H11 = t3 - t2;
+                        Bx[j][i] = H00 * bx0 + H10 * h * mbx0 + H01 * bx1 + H11 * h * mbx1;
+                        By[j][i] = H00 * by0 + H10 * h * mby0 + H01 * by1 + H11 * h * mby1;
+                    }
+                }
             }
         }
     } else {
@@ -1362,9 +1506,10 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
         }
     }
 
-    // H = B / μ
-    const Hx = Bx.map((row, j) => row.map((val, i) => val / Mu[j][i]));
-    const Hy = By.map((row, j) => row.map((val, i) => val / Mu[j][i]));
+    // H = B / μ (use harmonic-mean-interpolated μ for coarsened grids)
+    const MuFinal = activeMask ? interpolateMuHarmonic(Mu, activeMask) : Mu;
+    const Hx = Bx.map((row, j) => row.map((val, i) => val / MuFinal[j][i]));
+    const Hy = By.map((row, j) => row.map((val, i) => val / MuFinal[j][i]));
 
     // Magnitude
     const B = Bx.map((row, j) => row.map((val, i) => Math.sqrt(val**2 + By[j][i]**2)));
@@ -1425,12 +1570,8 @@ async function loadQuickPreviewFromResult(resultPath) {
                 console.log('Mu data dimensions:', muFlipped.length, 'x', muFlipped[0]?.length);
                 console.log('Grid spacing: dx =', dx, ', dy =', dy);
 
-                // Load coarsening mask for coarsening-aware B differentiation
-                const maskResult1 = await getCoarseningMaskArray(resultPath, step).catch(() => null);
-                const activeMask1 = maskResult1 ? maskResult1.mask : null;
-
-                // Calculate B and H fields
-                const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask1);
+                // Calculate B and H fields (C++ solver outputs fully-interpolated grids)
+                const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, null);
                 console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
                 console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
                 console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
@@ -2422,9 +2563,8 @@ async function renderBMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    // Load coarsening mask for coarsening-aware B differentiation
-    const maskResultB = await getCoarseningMaskArray(getCurrentResultPath(), step).catch(() => null);
-    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultB ? maskResultB.mask : null);
+    // C++ solver outputs fully-interpolated Az/Mu grids — use standard uniform-grid diff
+    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, null);
 
     plotHeatmap(containerId, B, '|B| [T]', true);
 }
@@ -2459,9 +2599,8 @@ async function renderHMagnitude(containerId, step) {
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
-    // Load coarsening mask for coarsening-aware B differentiation
-    const maskResultH = await getCoarseningMaskArray(getCurrentResultPath(), step).catch(() => null);
-    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultH ? maskResultH.mask : null);
+    // C++ solver outputs fully-interpolated Az/Mu grids — use standard uniform-grid diff
+    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, null);
 
     plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true);
 }
@@ -2469,8 +2608,10 @@ async function renderHMagnitude(containerId, step) {
 async function renderMuDistribution(containerId, step) {
     const data = await loadCsvData('Mu', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
-    const flipped = flipVertical(data);
-    // Use harmonic mean for permeability interpolation (series magnetic circuit)
+    let flipped = flipVertical(data);
+
+    // C++ solver outputs fully-interpolated Mu grid — no frontend interpolation needed
+
     plotHeatmap(containerId, flipped, 'μ [H/m]', true, true);
 }
 
@@ -3987,11 +4128,8 @@ async function renderLineProfile(containerId, step) {
         const azFlipped = flipVertical(azData);
         const muFlipped = flipVertical(muData);
 
-        // Load coarsening mask for coarsening-aware B differentiation
-        const maskResultLP = await getCoarseningMaskArray(getCurrentResultPath(), step).catch(() => null);
-
-        // Calculate B and H with components
-        const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultLP ? maskResultLP.mask : null);
+        // Calculate B and H with components (C++ solver outputs fully-interpolated grids)
+        const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, null);
 
         const rows = azFlipped.length;
         const cols = azFlipped[0].length;
@@ -6139,9 +6277,8 @@ async function renderFileManagerPreview(resultPath) {
         const azFlipped = flipVertical(azData);
         const muFlipped = flipVertical(muData);
 
-        // Load coarsening mask for coarsening-aware B differentiation
-        const maskResultCmp = await getCoarseningMaskArray(resultPath, step).catch(() => null);
-        const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, maskResultCmp ? maskResultCmp.mask : null);
+        // C++ solver outputs fully-interpolated grids — use standard uniform-grid diff
+        const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, null);
         console.log('Calculated B magnitude');
 
         plot2.innerHTML = '';
