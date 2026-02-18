@@ -1361,9 +1361,9 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             }
         }
 
-        // Inactive cells: leave as null for Plotly connectgaps interpolation
-        // (Previous Steps 2a/2b manual interpolation removed — POC confirmed
-        //  connectgaps produces cleaner results without patch boundary artifacts)
+        // Inactive cells: Bx/By left as 0 (initialized value).
+        // |B|/|H| magnitudes are computed at active cells, then _fillInactiveScalar()
+        // interpolates the scalar values directly — avoids vector-component artifacts.
     } else {
         // Cartesian coordinate magnetic field calculation (standard uniform grid)
         const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
@@ -1416,17 +1416,76 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
     const Hx = Bx.map((row, j) => row.map((val, i) => val / MuFinal[j][i]));
     const Hy = By.map((row, j) => row.map((val, i) => val / MuFinal[j][i]));
 
-    // Magnitude (null at inactive cells for connectgaps interpolation)
-    const B = Bx.map((row, j) => row.map((val, i) => {
-        if (activeMask && !activeMask[j][i]) return null;
-        return Math.sqrt(val**2 + By[j][i]**2);
-    }));
-    const H = Hx.map((row, j) => row.map((val, i) => {
-        if (activeMask && !activeMask[j][i]) return null;
-        return Math.sqrt(val**2 + Hy[j][i]**2);
-    }));
+    // Magnitude at active cells only
+    const B = Bx.map((row, j) => row.map((val, i) => Math.sqrt(val**2 + By[j][i]**2)));
+    const H = Hx.map((row, j) => row.map((val, i) => Math.sqrt(val**2 + Hy[j][i]**2)));
+
+    // Fill inactive cells by interpolating scalar |B|/|H| directly
+    // (Interpolating scalar magnitudes avoids vector-component artifacts at material boundaries)
+    if (activeMask) {
+        _fillInactiveScalar(B, activeMask);
+        _fillInactiveScalar(H, activeMask);
+    }
 
     return { Bx, By, B, Hx, Hy, H };
+}
+
+// Fast 2-pass scalar interpolation for inactive cells in coarsened grids.
+// Pass 1: x-interpolation on rows that contain active cells.
+// Pass 2: y-interpolation column-wise to fill remaining inactive rows.
+// Operates on scalar magnitudes (|B|, |H|) to avoid vector-component artifacts.
+function _fillInactiveScalar(data, mask) {
+    const rows = data.length;
+    const cols = data[0].length;
+
+    // Identify rows containing at least one interior active cell
+    const activeRowFlag = new Uint8Array(rows);
+    activeRowFlag[0] = 1;
+    activeRowFlag[rows - 1] = 1;
+    for (let j = 1; j < rows - 1; j++) {
+        for (let i = 1; i < cols - 1; i++) {
+            if (mask[j][i]) { activeRowFlag[j] = 1; break; }
+        }
+    }
+
+    // Pass 1: x-interpolation on active rows
+    for (let j = 0; j < rows; j++) {
+        if (!activeRowFlag[j]) continue;
+        for (let i = 0; i < cols; i++) {
+            if (mask[j][i]) continue;
+            // Find enclosing active cells on this row
+            let il = -1, ir = -1;
+            for (let ii = i - 1; ii >= 0; ii--) { if (mask[j][ii]) { il = ii; break; } }
+            for (let ii = i + 1; ii < cols; ii++) { if (mask[j][ii]) { ir = ii; break; } }
+            if (il >= 0 && ir >= 0) {
+                const t = (i - il) / (ir - il);
+                data[j][i] = (1 - t) * data[j][il] + t * data[j][ir];
+            } else if (il >= 0) {
+                data[j][i] = data[j][il];
+            } else if (ir >= 0) {
+                data[j][i] = data[j][ir];
+            }
+        }
+    }
+
+    // Pass 2: y-interpolation for inactive rows
+    const activeRowList = [];
+    for (let j = 0; j < rows; j++) { if (activeRowFlag[j]) activeRowList.push(j); }
+
+    if (activeRowList.length >= 2) {
+        const nAR = activeRowList.length;
+        for (let k = 0; k < nAR - 1; k++) {
+            const j1 = activeRowList[k];
+            const j2 = activeRowList[k + 1];
+            if (j2 - j1 <= 1) continue;
+            for (let j = j1 + 1; j < j2; j++) {
+                const t = (j - j1) / (j2 - j1);
+                for (let i = 0; i < cols; i++) {
+                    data[j][i] = (1 - t) * data[j1][i] + t * data[j2][i];
+                }
+            }
+        }
+    }
 }
 
 // Helper: Calculate magnitude from vector components
@@ -1491,9 +1550,9 @@ async function loadQuickPreviewFromResult(resultPath) {
                 console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
                 console.log('B magnitude sample values:', B[0]?.slice(0, 3));
 
-                // Plot |B| and |H| (use connectgaps when coarsening mask is active)
-                plotHeatmap('previewPlot2', B, '|B| [T]', true, false, !!activeMask);
-                plotHeatmap('previewPlot3', H, '|H| [A/m]', true, false, !!activeMask);
+                // Plot |B| and |H|
+                plotHeatmap('previewPlot2', B, '|B| [T]', true);
+                plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
             } else {
                 console.error('Az/Mu data loading failed:', { azSuccess: azData.success, muSuccess: muData.success });
                 document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
@@ -2455,20 +2514,14 @@ async function renderAzHeatmap(containerId, step) {
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
 
-    // Check for coarsening mask — if present, null-out inactive cells and use connectgaps
+    // For coarsened grids: replace C++ bilinear with JS scalar interpolation
+    // (avoids patch boundary artifacts from C++ interpolation of inactive cells)
     const resultPath = getCurrentResultPath();
     const maskResult = await getCoarseningMaskArray(resultPath, step).catch(() => null);
     if (maskResult) {
-        const mask = maskResult.mask;
-        for (let j = 0; j < flipped.length; j++) {
-            for (let i = 0; i < flipped[0].length; i++) {
-                if (j < mask.length && i < mask[0].length && !mask[j][i]) {
-                    flipped[j][i] = null;
-                }
-            }
-        }
+        _fillInactiveScalar(flipped, maskResult.mask);
     }
-    plotHeatmap(containerId, flipped, 'Az [Wb/m]', true, false, !!maskResult);
+    plotHeatmap(containerId, flipped, 'Az [Wb/m]', true);
 }
 
 async function renderJzDistribution(containerId, step) {
@@ -2498,7 +2551,7 @@ async function renderBMagnitude(containerId, step) {
 
     const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
 
-    plotHeatmap(containerId, B, '|B| [T]', true, false, !!activeMask);
+    plotHeatmap(containerId, B, '|B| [T]', true);
 }
 
 async function renderHMagnitude(containerId, step) {
@@ -2538,7 +2591,7 @@ async function renderHMagnitude(containerId, step) {
 
     const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
 
-    plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true, false, !!activeMask);
+    plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true);
 }
 
 async function renderMuDistribution(containerId, step) {
@@ -5724,7 +5777,7 @@ function setupZoomTracking(containerId) {
 }
 
 // ===== Plotting Functions =====
-function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmonicMean = false, connectgaps = false) {
+function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmonicMean = false) {
     const container = document.getElementById(elementId);
     if (!container) {
         console.error(`plotHeatmap: Container not found: ${elementId}`);
@@ -5766,8 +5819,6 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
         z: data,
         type: 'heatmap',
         colorscale: plotConfig.colorscale || 'Viridis',
-        connectgaps: connectgaps,
-        zsmooth: connectgaps ? false : undefined,
         colorbar: {
             title: colorbarTitle,
             thickness: colorbarThickness,
@@ -6258,7 +6309,7 @@ async function renderFileManagerPreview(resultPath) {
         console.log('Calculated B magnitude');
 
         plot2.innerHTML = '';
-        await plotHeatmapInDiv(plot2, B, '|B| [T]', true, false, !!activeMask);
+        await plotHeatmapInDiv(plot2, B, '|B| [T]', true);
         console.log('B magnitude plot rendered');
     } catch (error) {
         console.error('Error calculating B magnitude:', error);
@@ -6274,7 +6325,7 @@ async function renderFileManagerPreview(resultPath) {
  * @param {boolean} usePhysicalAxes - Use physical axes
  * @param {boolean} useHarmonicMean - Use harmonic mean for interpolation
  */
-async function plotHeatmapInDiv(container, data, title, usePhysicalAxes, useHarmonicMean, connectgaps = false) {
+async function plotHeatmapInDiv(container, data, title, usePhysicalAxes, useHarmonicMean) {
     // Save original ID
     const originalId = container.id;
 
@@ -6283,7 +6334,7 @@ async function plotHeatmapInDiv(container, data, title, usePhysicalAxes, useHarm
     container.id = tempId;
 
     try {
-        await plotHeatmap(tempId, data, title, usePhysicalAxes, useHarmonicMean, connectgaps);
+        await plotHeatmap(tempId, data, title, usePhysicalAxes, useHarmonicMean);
     } finally {
         // Restore original ID
         container.id = originalId;
