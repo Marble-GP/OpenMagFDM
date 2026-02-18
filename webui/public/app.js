@@ -3879,9 +3879,10 @@ async function renderStepInputImage(containerId, step) {
     }
 }
 
-// Shared utility: Fetch coarsening mask PNG and convert to 2D boolean array (image coordinates)
-// Returns { mask: bool[][], img: HTMLImageElement } or null if not available
-// Used by renderCoarseningMask (visualization) and calculateMagneticField (B computation)
+// Shared utility: Fetch coarsening mask PNG and convert to 2D boolean array.
+// Returns { mask: bool[][] (analysis coords, y=0 at bottom), img, pixelData (image coords) }
+// mask is flipped from image coords to match flipVertical()'d Az/Mu data.
+// pixelData remains in image coords for overlay rendering (renderCoarseningMask).
 // Cached per resultPath:step — same mask is reused across Az/B/H renders in a single step
 const _maskCache = { key: '', result: null, promise: null };
 
@@ -3940,6 +3941,9 @@ async function _fetchCoarseningMask(resultPath, step) {
     // All cells active means no coarsening
     if (activeCount === rows * cols) return null;
 
+    // Flip mask to analysis coordinates (y=0 at bottom) to match flipVertical()'d data
+    mask.reverse();
+
     console.log(`Coarsening mask: ${activeCount}/${rows * cols} active cells`);
     return { mask, img, pixelData };
 }
@@ -3979,11 +3983,9 @@ async function renderCoarseningMask(containerId, step) {
             const inputData = ctx.getImageData(0, 0, cols, rows);
 
             const outputData = ctx.createImageData(cols, rows);
+            const maskPixels = maskResult.pixelData.data; // image coords (not flipped)
             for (let pi = 0; pi < inputData.data.length; pi += 4) {
-                const pixIdx = pi / 4;
-                const j = Math.floor(pixIdx / cols);
-                const i = pixIdx % cols;
-                if (maskResult.mask[j][i]) {
+                if (maskPixels[pi] > 128) { // R channel > 128 = active
                     outputData.data[pi] = inputData.data[pi];         // R
                     outputData.data[pi + 1] = inputData.data[pi + 1]; // G
                     outputData.data[pi + 2] = inputData.data[pi + 2]; // B
