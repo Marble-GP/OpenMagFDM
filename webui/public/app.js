@@ -1430,59 +1430,49 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
     return { Bx, By, B, Hx, Hy, H };
 }
 
-// Fast 2-pass scalar interpolation for inactive cells in coarsened grids.
-// Pass 1: x-interpolation on rows that contain active cells.
-// Pass 2: y-interpolation column-wise to fill remaining inactive rows.
-// Operates on scalar magnitudes (|B|, |H|) to avoid vector-component artifacts.
+// Interpolate inactive cells using iterative Gauss-Seidel diffusion.
+// Same algorithm as Plotly's interp2d (connectgaps) but without Plotly overhead.
+// Phase 1: Flood-fill nulls from active cell boundaries (neighbor averaging).
+// Phase 2: Relaxation sweeps to smooth (active cells pinned).
+// Operates on scalar values (|B|, |H|, Az) to avoid vector-component artifacts.
 function _fillInactiveScalar(data, mask) {
     const rows = data.length;
     const cols = data[0].length;
 
-    // Identify rows containing at least one interior active cell
-    const activeRowFlag = new Uint8Array(rows);
-    activeRowFlag[0] = 1;
-    activeRowFlag[rows - 1] = 1;
-    for (let j = 1; j < rows - 1; j++) {
-        for (let i = 1; i < cols - 1; i++) {
-            if (mask[j][i]) { activeRowFlag[j] = 1; break; }
+    // Mark inactive cells as null (distinguishes "unfilled" from "value = 0")
+    for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+            if (!mask[j][i]) data[j][i] = null;
         }
     }
 
-    // Pass 1: x-interpolation on active rows
-    for (let j = 0; j < rows; j++) {
-        if (!activeRowFlag[j]) continue;
-        for (let i = 0; i < cols; i++) {
-            if (mask[j][i]) continue;
-            // Find enclosing active cells on this row
-            let il = -1, ir = -1;
-            for (let ii = i - 1; ii >= 0; ii--) { if (mask[j][ii]) { il = ii; break; } }
-            for (let ii = i + 1; ii < cols; ii++) { if (mask[j][ii]) { ir = ii; break; } }
-            if (il >= 0 && ir >= 0) {
-                const t = (i - il) / (ir - il);
-                data[j][i] = (1 - t) * data[j][il] + t * data[j][ir];
-            } else if (il >= 0) {
-                data[j][i] = data[j][il];
-            } else if (ir >= 0) {
-                data[j][i] = data[j][ir];
+    // Phase 1: Iterative flood-fill from active cells outward
+    // Each iteration fills cells adjacent to already-filled cells.
+    // For coarsening ratio R, needs ~R iterations to reach all cells.
+    for (let iter = 0; iter < 100; iter++) {
+        let filled = 0;
+        for (let j = 0; j < rows; j++) {
+            for (let i = 0; i < cols; i++) {
+                if (data[j][i] !== null) continue;
+                let sum = 0, n = 0;
+                if (j > 0 && data[j - 1][i] !== null) { sum += data[j - 1][i]; n++; }
+                if (j < rows - 1 && data[j + 1][i] !== null) { sum += data[j + 1][i]; n++; }
+                if (i > 0 && data[j][i - 1] !== null) { sum += data[j][i - 1]; n++; }
+                if (i < cols - 1 && data[j][i + 1] !== null) { sum += data[j][i + 1]; n++; }
+                if (n > 0) { data[j][i] = sum / n; filled++; }
             }
         }
+        if (filled === 0) break;
     }
 
-    // Pass 2: y-interpolation for inactive rows
-    const activeRowList = [];
-    for (let j = 0; j < rows; j++) { if (activeRowFlag[j]) activeRowList.push(j); }
-
-    if (activeRowList.length >= 2) {
-        const nAR = activeRowList.length;
-        for (let k = 0; k < nAR - 1; k++) {
-            const j1 = activeRowList[k];
-            const j2 = activeRowList[k + 1];
-            if (j2 - j1 <= 1) continue;
-            for (let j = j1 + 1; j < j2; j++) {
-                const t = (j - j1) / (j2 - j1);
-                for (let i = 0; i < cols; i++) {
-                    data[j][i] = (1 - t) * data[j1][i] + t * data[j2][i];
-                }
+    // Phase 2: Gauss-Seidel relaxation to smooth (active cells pinned)
+    // Converges quickly for small gaps between active cells.
+    for (let iter = 0; iter < 10; iter++) {
+        for (let j = 1; j < rows - 1; j++) {
+            for (let i = 1; i < cols - 1; i++) {
+                if (mask[j][i]) continue;
+                data[j][i] = (data[j - 1][i] + data[j + 1][i] +
+                              data[j][i - 1] + data[j][i + 1]) * 0.25;
             }
         }
     }
