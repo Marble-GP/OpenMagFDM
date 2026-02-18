@@ -1416,16 +1416,19 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
     const Hx = Bx.map((row, j) => row.map((val, i) => val / MuFinal[j][i]));
     const Hy = By.map((row, j) => row.map((val, i) => val / MuFinal[j][i]));
 
-    // Magnitude at active cells only
+    // Fill inactive cells for all field arrays using Gauss-Seidel diffusion.
+    // Components (Bx, By, Hx, Hy) are filled for Line Profile vector decomposition.
+    // Magnitudes (B, H) are filled separately from scalar values to avoid
+    // vector-component artifacts (interpolating |B| ≠ |interpolated B|).
+    if (activeMask) {
+        _fillInactiveScalar(Bx, activeMask);
+        _fillInactiveScalar(By, activeMask);
+        _fillInactiveScalar(Hx, activeMask);
+        _fillInactiveScalar(Hy, activeMask);
+    }
+
     const B = Bx.map((row, j) => row.map((val, i) => Math.sqrt(val**2 + By[j][i]**2)));
     const H = Hx.map((row, j) => row.map((val, i) => Math.sqrt(val**2 + Hy[j][i]**2)));
-
-    // Fill inactive cells by interpolating scalar |B|/|H| directly
-    // (Interpolating scalar magnitudes avoids vector-component artifacts at material boundaries)
-    if (activeMask) {
-        _fillInactiveScalar(B, activeMask);
-        _fillInactiveScalar(H, activeMask);
-    }
 
     return { Bx, By, B, Hx, Hy, H };
 }
@@ -3932,7 +3935,9 @@ async function _fetchCoarseningMask(resultPath, step) {
 
     for (let j = 0; j < rows; j++) {
         for (let i = 0; i < cols; i++) {
-            const isActive = pixelData.data[(j * cols + i) * 4] > 128;
+            // Active=255, inactive=max 127 (255/skip). Threshold at 200 to avoid
+            // grayscale PNG color-space conversion artifacts near 128.
+            const isActive = pixelData.data[(j * cols + i) * 4] > 200;
             mask[j][i] = isActive;
             if (isActive) activeCount++;
         }
@@ -3985,7 +3990,7 @@ async function renderCoarseningMask(containerId, step) {
             const outputData = ctx.createImageData(cols, rows);
             const maskPixels = maskResult.pixelData.data; // image coords (not flipped)
             for (let pi = 0; pi < inputData.data.length; pi += 4) {
-                if (maskPixels[pi] > 128) { // R channel > 128 = active
+                if (maskPixels[pi] > 200) { // R channel > 200 = active (255 vs max 127)
                     outputData.data[pi] = inputData.data[pi];         // R
                     outputData.data[pi + 1] = inputData.data[pi + 1]; // G
                     outputData.data[pi + 2] = inputData.data[pi + 2]; // B
