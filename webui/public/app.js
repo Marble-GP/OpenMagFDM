@@ -3839,8 +3839,39 @@ async function renderStepInputImage(containerId, step) {
 // Shared utility: Fetch coarsening mask PNG and convert to 2D boolean array (image coordinates)
 // Returns { mask: bool[][], img: HTMLImageElement } or null if not available
 // Used by renderCoarseningMask (visualization) and calculateMagneticField (B computation)
+// Cached per resultPath:step — same mask is reused across Az/B/H renders in a single step
+const _maskCache = { key: '', result: null, promise: null };
+
 async function getCoarseningMaskArray(resultPath, step) {
-    const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+    const cacheKey = `${resultPath}:${step}`;
+
+    // Return cached result (including null = no coarsening)
+    if (_maskCache.key === cacheKey && _maskCache.promise === null) {
+        return _maskCache.result;
+    }
+
+    // Deduplicate concurrent requests for the same mask
+    if (_maskCache.key === cacheKey && _maskCache.promise) {
+        return _maskCache.promise;
+    }
+
+    _maskCache.key = cacheKey;
+    _maskCache.promise = _fetchCoarseningMask(resultPath, step);
+
+    try {
+        const result = await _maskCache.promise;
+        _maskCache.result = result;
+        _maskCache.promise = null;
+        return result;
+    } catch (e) {
+        _maskCache.key = '';
+        _maskCache.promise = null;
+        throw e;
+    }
+}
+
+async function _fetchCoarseningMask(resultPath, step) {
+    const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}`;
     const img = await loadImage(maskUrl);
 
     const canvas = document.createElement('canvas');
