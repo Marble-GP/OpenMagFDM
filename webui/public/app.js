@@ -2506,14 +2506,8 @@ async function renderAzHeatmap(containerId, step) {
     const data = await loadCsvData('Az', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-
-    // For coarsened grids: replace C++ bilinear with JS scalar interpolation
-    // (avoids patch boundary artifacts from C++ interpolation of inactive cells)
-    const resultPath = getCurrentResultPath();
-    const maskResult = await getCoarseningMaskArray(resultPath, step).catch(() => null);
-    if (maskResult) {
-        _fillInactiveScalar(flipped, maskResult.mask);
-    }
+    // C++ solver already outputs fully-interpolated Az grid (bilinear at inactive cells).
+    // No JS re-interpolation needed — Gauss-Seidel would create visible dots at active cells.
     plotHeatmap(containerId, flipped, 'Az [Wb/m]', true);
 }
 
