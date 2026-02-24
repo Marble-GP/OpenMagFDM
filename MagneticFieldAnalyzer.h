@@ -509,15 +509,17 @@ private:
     struct CoarsenConfig {
         bool enabled;       // Enable coarsening for this material
         int ratio;          // Coarsening ratio (area reduction factor)
-        int skip_x;         // Actual skip ratio in x/r direction (auto-calculated)
-        int skip_y;         // Actual skip ratio in y/theta direction (auto-calculated)
+        int skip_x;         // Max skip ratio in x/r direction (auto-calculated, power of 2)
+        int skip_y;         // Max skip ratio in y/theta direction (auto-calculated, power of 2)
+        int max_skip_iso;   // min(skip_x, skip_y) for gradient coarsening levels
 
-        CoarsenConfig() : enabled(false), ratio(1), skip_x(1), skip_y(1) {}
+        CoarsenConfig() : enabled(false), ratio(1), skip_x(1), skip_y(1), max_skip_iso(1) {}
     };
     std::map<std::string, CoarsenConfig> material_coarsen;  // Coarsening config per material
 
     // Adaptive mesh coarsening data
     Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> active_cells;  // True if cell is active (not coarsened)
+    Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic> cell_skip_level;  // Per-cell skip level (1,2,4,8...)
     Eigen::MatrixXd local_dx, local_dy;  // Local mesh spacing at each active cell
     std::vector<std::pair<int, int>> coarse_to_fine;  // coarse_idx -> (i, j) in full grid
     std::map<std::pair<int, int>, int> fine_to_coarse;  // (i, j) -> coarse_idx
@@ -525,6 +527,8 @@ private:
     bool coarsening_enabled;  // Global flag: true if any material has coarsening enabled
     std::vector<bool> active_row_flags;  // True if row has interior active cells (for interpolation)
     int max_coarsen_skip = 1;  // Maximum skip across all coarsened materials (for locality check)
+    int coarsen_boundary_shell = 1;      // Edge dilation radius [pixels] for boundary protection (YAML: coarsening.boundary_shell)
+    int coarsen_smooth_iterations = 0;   // Post-interpolation Laplacian smoothing iterations (YAML: coarsening.smooth_iterations)
 
     // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
     Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix
@@ -613,8 +617,8 @@ private:
     cv::Mat detectMaterialBoundaries();  // Detect material boundaries using edge detection
     void calculateOptimalSkipRatios();   // Calculate skip_x, skip_y from aspect ratio
     void generateCoarseningMask();       // Generate mask of active/inactive cells
-    void generateCoarseningMaskCartesian(const cv::Mat& boundaries);  // Cartesian mask generation
-    void generateCoarseningMaskPolar(const cv::Mat& boundaries);      // Polar mask generation
+    void generateCoarseningMaskCartesian(const cv::Mat& boundaries, const cv::Mat& dist_map);  // Cartesian mask generation
+    void generateCoarseningMaskPolar(const cv::Mat& boundaries, const cv::Mat& dist_map);      // Polar mask generation
     void polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const;  // Polar->Image coordinate transform
     void buildCoarseIndexMaps();         // Build coarse <-> fine index mappings
     void calculateLocalMeshSpacing();    // Calculate h_minus/h_plus for each active cell
@@ -658,6 +662,7 @@ private:
     void buildAndSolveSystemPolarCoarsened();
     void interpolateToFullGrid(const Eigen::VectorXd& Az_coarse);
     void interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse);
+    void smoothInactiveCells(int iterations);  // Post-interpolation Laplacian smoothing at inactive cells
     void interpolateMuToFullGrid();  // IDW harmonic mean μ interpolation at inactive cells
     void interpolateInactiveCells(const Eigen::VectorXd& Az_coarse);  // Update only inactive cells (for nonlinear iteration)
     void interpolateInactiveCellsPolar(const Eigen::VectorXd& Az_coarse);  // Polar version

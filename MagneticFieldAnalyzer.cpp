@@ -92,6 +92,13 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.precond_verbose = nl_config["precond_verbose"].as<bool>(false);
     }
 
+    // Parse global coarsening settings
+    if (config["coarsening"]) {
+        auto cs_cfg = config["coarsening"];
+        coarsen_boundary_shell = cs_cfg["boundary_shell"].as<int>(1);
+        coarsen_smooth_iterations = cs_cfg["smooth_iterations"].as<int>(0);
+    }
+
     // Determine coordinate system
     coordinate_system = config["coordinate_system"].as<std::string>("cartesian");
     std::cout << "Coordinate system: " << coordinate_system << std::endl;
@@ -1105,21 +1112,45 @@ void MagneticFieldAnalyzer::exportFluxLinkageCSV(const std::string& output_dir) 
 // ============================================================================
 
 cv::Mat MagneticFieldAnalyzer::detectMaterialBoundaries() {
-    // Detect material boundaries using Canny edge detection
-    // Returns a binary mask where boundaries are marked as white (255)
+    // Detect material boundaries using per-channel Sobel gradient.
+    // Previous approach (grayscale Canny) failed when different materials
+    // had similar brightness but different colors (e.g., green vs gray:
+    // grayscale 150 vs 128, difference=22 < Canny threshold 50).
+    //
+    // Per-channel approach: compute Sobel gradient on each BGR channel
+    // independently, take the maximum across channels, then threshold.
+    // This detects ANY color boundary regardless of grayscale similarity.
 
-    cv::Mat gray, edges;
+    cv::Mat channels[3];
+    cv::split(image, channels);
 
-    // Convert to grayscale for edge detection
-    cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
+    cv::Mat max_grad = cv::Mat::zeros(image.rows, image.cols, CV_32F);
 
-    // Apply Canny edge detection
-    cv::Canny(gray, edges, 50, 150);
+    for (int c = 0; c < 3; c++) {
+        cv::Mat grad_x, grad_y, grad_mag;
+        cv::Sobel(channels[c], grad_x, CV_32F, 1, 0);
+        cv::Sobel(channels[c], grad_y, CV_32F, 0, 1);
+        cv::magnitude(grad_x, grad_y, grad_mag);
+        max_grad = cv::max(max_grad, grad_mag);
+    }
 
-    // Dilate edges to create a protection zone around boundaries
-    // This ensures cells near boundaries are not coarsened
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
-    cv::dilate(edges, edges, kernel);
+    // Threshold to binary edge mask.
+    // Sobel-3 kernel on a sharp step of height h gives ~4*h response.
+    // Minimum detectable single-channel step: threshold/4 ≈ 8 gray levels.
+    cv::Mat edges;
+    cv::threshold(max_grad, edges, 30, 255, cv::THRESH_BINARY);
+    edges.convertTo(edges, CV_8U);
+
+    // Dilate edges to create a protection zone around boundaries.
+    // Radius is configurable via YAML coarsening.boundary_shell (default: 1).
+    // The gradient coarsening levels already provide a gradual transition,
+    // so a thin shell (1-2px) is typically sufficient.
+    int shell = coarsen_boundary_shell;
+    if (shell > 0) {
+        int ksize = 2 * shell + 1;  // radius -> diameter
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(ksize, ksize));
+        cv::dilate(edges, edges, kernel);
+    }
 
     // Flip to match analysis coordinate system (y up)
     cv::Mat edges_flipped;
@@ -1134,7 +1165,7 @@ void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
 
     for (auto& [mat_name, cfg] : material_coarsen) {
         if (!cfg.enabled || cfg.ratio <= 1) {
-            cfg.skip_x = cfg.skip_y = 1;
+            cfg.skip_x = cfg.skip_y = cfg.max_skip_iso = 1;
             continue;
         }
 
@@ -1162,12 +1193,14 @@ void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
         // Round to nearest integer
         cfg.skip_x = std::max(1, (int)std::round(skip_x_float));
         cfg.skip_y = std::max(1, (int)std::round(skip_y_float));
+        cfg.max_skip_iso = std::min(cfg.skip_x, cfg.skip_y);
 
         // Log actual reduction ratio
         int actual_ratio = cfg.skip_x * cfg.skip_y;
         std::cout << "Material '" << mat_name << "': coarsen_ratio=" << cfg.ratio
                   << " -> skip_x=" << cfg.skip_x << ", skip_y=" << cfg.skip_y
-                  << " (actual ratio=" << actual_ratio << ")" << std::endl;
+                  << " (actual ratio=" << actual_ratio
+                  << ", gradient max_skip=" << cfg.max_skip_iso << ")" << std::endl;
     }
 }
 
@@ -1188,32 +1221,102 @@ void MagneticFieldAnalyzer::generateCoarseningMask() {
         return;
     }
 
-    std::cout << "Generating coarsening mask..." << std::endl;
+    std::cout << "Generating gradient coarsening mask..." << std::endl;
 
-    // Calculate optimal skip ratios based on aspect ratio
+    // Calculate optimal skip ratios based on aspect ratio (power-of-2)
     calculateOptimalSkipRatios();
 
     // Detect material boundaries
     cv::Mat boundaries = detectMaterialBoundaries();
 
+    // Compute distance transform from boundaries for gradient coarsening
+    cv::Mat boundary_inv;
+    cv::bitwise_not(boundaries, boundary_inv);
+    cv::Mat dist_map;
+    cv::distanceTransform(boundary_inv, dist_map, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+
     // Generate mask based on coordinate system
     if (coordinate_system == "polar") {
         active_cells.resize(ntheta, nr);
         active_cells.setConstant(true);
-        generateCoarseningMaskPolar(boundaries);
+        cell_skip_level.resize(ntheta, nr);
+        cell_skip_level.setConstant(1);
+        generateCoarseningMaskPolar(boundaries, dist_map);
     } else {
         active_cells.resize(ny, nx);
         active_cells.setConstant(true);
-        generateCoarseningMaskCartesian(boundaries);
+        cell_skip_level.resize(ny, nx);
+        cell_skip_level.setConstant(1);
+        generateCoarseningMaskCartesian(boundaries, dist_map);
     }
 
     // Build index mappings
     buildCoarseIndexMaps();
 }
 
-void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(const cv::Mat& boundaries) {
-    // Generate coarsening mask for Cartesian coordinates
-    // Uses skip_x and skip_y calculated from aspect ratio
+void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(
+    const cv::Mat& boundaries, const cv::Mat& dist_map)
+{
+    // Generate gradient coarsening mask for Cartesian coordinates
+    // Uses distance from boundaries to assign progressive skip levels
+    // Divisor chain: each level divides the next (nesting property)
+    // This guarantees i%s_large==0 → i%s_small==0 for all levels
+
+    // Pre-compute gradient levels for each unique max_skip value
+    // Built by repeatedly dividing max_skip by its smallest prime factor
+    // e.g. max_skip=10 → [1, 5, 10]     (10/2=5, 5/5=1)
+    // e.g. max_skip=8  → [1, 2, 4, 8]   (8/2=4, 4/2=2, 2/2=1)
+    // e.g. max_skip=12 → [1, 3, 6, 12]  (12/2=6, 6/2=3, 3/3=1)
+    std::map<int, std::vector<int>> gradient_levels_cache;
+    auto getGradientLevels = [&](int max_skip) -> const std::vector<int>& {
+        auto it = gradient_levels_cache.find(max_skip);
+        if (it != gradient_levels_cache.end()) return it->second;
+
+        std::vector<int> levels;
+        if (max_skip <= 1) {
+            levels = {1};
+        } else {
+            // Build chain from max_skip down to 1 by dividing by smallest prime factor
+            std::vector<int> descending;
+            int n = max_skip;
+            descending.push_back(n);
+            while (n > 1) {
+                // Find smallest prime factor of n
+                int p = 2;
+                while (p * p <= n && n % p != 0) p++;
+                if (p * p > n) p = n;  // n itself is prime
+                n /= p;
+                descending.push_back(n);
+            }
+            // Reverse to ascending order: {1, ..., max_skip}
+            levels.assign(descending.rbegin(), descending.rend());
+        }
+
+        // Log the divisor chain
+        std::cout << "  Gradient divisor chain for max_skip=" << max_skip << ": [";
+        for (size_t k = 0; k < levels.size(); k++) {
+            if (k > 0) std::cout << ", ";
+            std::cout << levels[k];
+        }
+        std::cout << "]" << std::endl;
+
+        gradient_levels_cache[max_skip] = levels;
+        return gradient_levels_cache[max_skip];
+    };
+
+    // Look up skip level from distance: band width for level k = levels[k+1]
+    // (minimum pixels needed for proper transition to next coarser level).
+    // This is much tighter than the old formula (each band = max_skip pixels).
+    // Example: levels={1,5,10} → skip=1 zone is 5px wide (was 10), skip=5 is 10px.
+    auto computeGradientSkipLevel = [&](float dist, int max_skip) -> int {
+        const auto& levels = getGradientLevels(max_skip);
+        float cumulative = 0;
+        for (size_t k = 0; k < levels.size() - 1; k++) {
+            cumulative += levels[k + 1];  // band width = next level's skip value
+            if (dist < cumulative) return levels[k];
+        }
+        return levels.back();
+    };
 
     // Flip image for coordinate matching
     cv::Mat image_flipped;
@@ -1221,58 +1324,124 @@ void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(const cv::Mat& bound
 
     int coarsened_count = 0;
 
-    // Mark cells for coarsening based on material settings
+    // Mark cells for coarsening based on distance and material settings
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
-            // Skip boundary cells - always keep them active
+            // Canny boundary cells - always full resolution
             if (boundaries.at<uchar>(j, i) > 0) {
+                cell_skip_level(j, i) = 1;
                 continue;
             }
 
-            // Skip cells on domain boundary
+            // Domain boundary cells - always full resolution
             if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1) {
+                cell_skip_level(j, i) = 1;
                 continue;
             }
 
             // Find which material this cell belongs to
             cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
 
-            // Look up material coarsening settings
+            // Look up material coarsening settings to find max_skip
+            int max_skip = 1;
             for (const auto& mat_pair : material_coarsen) {
                 const auto& cfg = mat_pair.second;
                 if (!cfg.enabled) continue;
-                if (cfg.skip_x <= 1 && cfg.skip_y <= 1) continue;
+                if (cfg.max_skip_iso <= 1) continue;
 
-                // Check if this material matches by looking up its RGB
                 for (const auto& material : config["materials"]) {
                     std::string mat_name = material.first.as<std::string>();
                     if (mat_name != mat_pair.first) continue;
 
                     auto rgb = material.second["rgb"].as<std::vector<int>>();
                     if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                        // This cell belongs to a coarsen-enabled material
-                        // Keep only cells at coarsening grid positions
-                        bool coarsen_x = (cfg.skip_x > 1 && i % cfg.skip_x != 0);
-                        bool coarsen_y = (cfg.skip_y > 1 && j % cfg.skip_y != 0);
-                        if (coarsen_x || coarsen_y) {
-                            active_cells(j, i) = false;
-                            coarsened_count++;
-                        }
+                        max_skip = cfg.max_skip_iso;
                     }
                 }
+            }
+
+            if (max_skip <= 1) {
+                cell_skip_level(j, i) = 1;
+                continue;
+            }
+
+            // Compute gradient skip level from distance to boundary
+            float dist = dist_map.at<float>(j, i);
+            int local_skip = computeGradientSkipLevel(dist, max_skip);
+            cell_skip_level(j, i) = local_skip;
+
+            // Apply modulo test: mark inactive if not aligned to local skip grid
+            if (local_skip > 1 && (i % local_skip != 0 || j % local_skip != 0)) {
+                active_cells(j, i) = false;
+                coarsened_count++;
             }
         }
     }
 
-    std::cout << "Cartesian coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+    // Log gradient level statistics
+    std::map<int, int> level_counts;
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            level_counts[cell_skip_level(j, i)]++;
+        }
+    }
+    std::cout << "Cartesian gradient coarsening levels:" << std::endl;
+    for (const auto& [level, count] : level_counts) {
+        std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
+    }
+    std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
 }
 
-void MagneticFieldAnalyzer::generateCoarseningMaskPolar(const cv::Mat& boundaries) {
-    // Generate coarsening mask for Polar coordinates
-    // Uses skip_x (r-direction) and skip_y (theta-direction) calculated from aspect ratio
-    //
-    // IMPORTANT: boundaries is already flipped (from detectMaterialBoundaries) to match
-    // analysis coordinates (y-up). We must also flip image to ensure coordinate consistency.
+void MagneticFieldAnalyzer::generateCoarseningMaskPolar(
+    const cv::Mat& boundaries, const cv::Mat& dist_map)
+{
+    // Generate gradient coarsening mask for Polar coordinates
+    // Uses distance from boundaries to assign progressive skip levels
+    // Divisor chain: each level divides the next (nesting property)
+
+    // Pre-compute gradient levels (same divisor chain logic as Cartesian)
+    std::map<int, std::vector<int>> gradient_levels_cache;
+    auto getGradientLevels = [&](int max_skip) -> const std::vector<int>& {
+        auto it = gradient_levels_cache.find(max_skip);
+        if (it != gradient_levels_cache.end()) return it->second;
+
+        std::vector<int> levels;
+        if (max_skip <= 1) {
+            levels = {1};
+        } else {
+            std::vector<int> descending;
+            int n = max_skip;
+            descending.push_back(n);
+            while (n > 1) {
+                int p = 2;
+                while (p * p <= n && n % p != 0) p++;
+                if (p * p > n) p = n;
+                n /= p;
+                descending.push_back(n);
+            }
+            levels.assign(descending.rbegin(), descending.rend());
+        }
+
+        std::cout << "  Gradient divisor chain for max_skip=" << max_skip << ": [";
+        for (size_t k = 0; k < levels.size(); k++) {
+            if (k > 0) std::cout << ", ";
+            std::cout << levels[k];
+        }
+        std::cout << "]" << std::endl;
+
+        gradient_levels_cache[max_skip] = levels;
+        return gradient_levels_cache[max_skip];
+    };
+
+    auto computeGradientSkipLevel = [&](float dist, int max_skip) -> int {
+        const auto& levels = getGradientLevels(max_skip);
+        float cumulative = 0;
+        for (size_t k = 0; k < levels.size() - 1; k++) {
+            cumulative += levels[k + 1];
+            if (dist < cumulative) return levels[k];
+        }
+        return levels.back();
+    };
 
     // Flip image to match analysis coordinates (same as boundaries)
     cv::Mat image_flipped;
@@ -1284,51 +1453,78 @@ void MagneticFieldAnalyzer::generateCoarseningMaskPolar(const cv::Mat& boundarie
     for (int i_r = 0; i_r < nr; i_r++) {
         for (int j_theta = 0; j_theta < ntheta; j_theta++) {
             // Convert polar indices to flipped image coordinates
-            // Both boundaries and image_flipped are now in analysis coordinates (y-up)
             int img_i, img_j;
             polarToImageIndices(i_r, j_theta, img_i, img_j);
 
-            // Skip boundary cells - always keep them active
-            if (boundaries.at<uchar>(img_j, img_i) > 0) continue;
+            // Canny boundary cells - always full resolution
+            if (boundaries.at<uchar>(img_j, img_i) > 0) {
+                cell_skip_level(j_theta, i_r) = 1;
+                continue;
+            }
 
-            // Skip r-direction boundaries
-            if (i_r == 0 || i_r == nr - 1) continue;
+            // R-direction boundaries - always full resolution
+            if (i_r == 0 || i_r == nr - 1) {
+                cell_skip_level(j_theta, i_r) = 1;
+                continue;
+            }
 
-            // Skip theta-direction boundaries (if not periodic)
-            if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) continue;
+            // Theta-direction boundaries (if not periodic) - always full resolution
+            if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) {
+                cell_skip_level(j_theta, i_r) = 1;
+                continue;
+            }
 
             // Find which material this cell belongs to
-            // Use flipped image to match boundaries coordinate system
             cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
 
-            // Look up material coarsening settings
+            // Look up material coarsening settings to find max_skip
+            int max_skip = 1;
             for (const auto& mat_pair : material_coarsen) {
                 const auto& cfg = mat_pair.second;
                 if (!cfg.enabled) continue;
-                if (cfg.skip_x <= 1 && cfg.skip_y <= 1) continue;
+                if (cfg.max_skip_iso <= 1) continue;
 
-                // Check if this material matches by looking up its RGB
                 for (const auto& material : config["materials"]) {
                     std::string mat_name = material.first.as<std::string>();
                     if (mat_name != mat_pair.first) continue;
 
                     auto rgb = material.second["rgb"].as<std::vector<int>>();
                     if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                        // This cell belongs to a coarsen-enabled material
-                        // r-direction: skip_x, theta-direction: skip_y
-                        bool coarsen_r = (cfg.skip_x > 1 && i_r % cfg.skip_x != 0);
-                        bool coarsen_theta = (cfg.skip_y > 1 && j_theta % cfg.skip_y != 0);
-                        if (coarsen_r || coarsen_theta) {
-                            active_cells(j_theta, i_r) = false;  // Note: (theta, r) order
-                            coarsened_count++;
-                        }
+                        max_skip = cfg.max_skip_iso;
                     }
                 }
+            }
+
+            if (max_skip <= 1) {
+                cell_skip_level(j_theta, i_r) = 1;
+                continue;
+            }
+
+            // Compute gradient skip level from distance to boundary
+            float dist = dist_map.at<float>(img_j, img_i);
+            int local_skip = computeGradientSkipLevel(dist, max_skip);
+            cell_skip_level(j_theta, i_r) = local_skip;
+
+            // Apply modulo test: mark inactive if not aligned to local skip grid
+            if (local_skip > 1 && (i_r % local_skip != 0 || j_theta % local_skip != 0)) {
+                active_cells(j_theta, i_r) = false;
+                coarsened_count++;
             }
         }
     }
 
-    std::cout << "Polar coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+    // Log gradient level statistics
+    std::map<int, int> level_counts;
+    for (int j = 0; j < ntheta; j++) {
+        for (int i = 0; i < nr; i++) {
+            level_counts[cell_skip_level(j, i)]++;
+        }
+    }
+    std::cout << "Polar gradient coarsening levels:" << std::endl;
+    for (const auto& [level, count] : level_counts) {
+        std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
+    }
+    std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
 }
 
 void MagneticFieldAnalyzer::polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const {
@@ -2228,6 +2424,115 @@ void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coar
     }
 }
 
+void MagneticFieldAnalyzer::smoothInactiveCells(int iterations) {
+    // ν-weighted Gauss-Seidel smoothing at inactive cells.
+    //
+    // Solves the discrete form of ∇·(ν∇Az) = 0  (ν = 1/μ) at inactive cells,
+    // using active cells as fixed Dirichlet constraints. This is the physically
+    // correct interpolation that respects the magnetic reluctance distribution.
+    //
+    // At each inactive cell:
+    //   Az_c = Σ(ν_face · Az_neighbor / h²) / Σ(ν_face / h²)
+    //
+    // where ν_face = 2·ν_i·ν_j/(ν_i+ν_j) is the harmonic mean face reluctivity
+    // (series magnetic circuit model at material interfaces).
+    //
+    // Properties:
+    // - Uniform μ region: reduces to simple Laplacian averaging (mean value property)
+    // - μ interface: correctly models reluctance discontinuity
+    // - Active cells (material boundaries) act as Dirichlet constraints
+    //   → no cross-material contamination
+    // - Gauss-Seidel (in-place) for ~2-3x faster convergence vs Jacobi
+
+    if (iterations <= 0 || !coarsening_enabled) return;
+
+    int n_rows, n_cols;
+    double h_x, h_y;
+    if (coordinate_system == "polar") {
+        n_rows = (r_orientation == "horizontal") ? ntheta : nr;
+        n_cols = (r_orientation == "horizontal") ? nr : ntheta;
+        // For polar: h_x is along columns (i), h_y is along rows (j)
+        // horizontal: i→r, j→θ  →  h_x=dr, h_y=dtheta
+        // vertical:   i→θ, j→r  →  h_x=dtheta, h_y=dr
+        h_x = (r_orientation == "horizontal") ? dr : dtheta;
+        h_y = (r_orientation == "horizontal") ? dtheta : dr;
+    } else {
+        n_rows = ny;
+        n_cols = nx;
+        h_x = dx;
+        h_y = dy;
+    }
+
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    if (coordinate_system == "polar") {
+        x_periodic = false;
+        y_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    }
+
+    double inv_hx2 = 1.0 / (h_x * h_x);
+    double inv_hy2 = 1.0 / (h_y * h_y);
+
+    // Harmonic mean face reluctivity: ν_face = 2·ν_a·ν_b / (ν_a + ν_b)
+    auto face_nu = [](double mu_a, double mu_b) -> double {
+        // ν = 1/μ, harmonic mean of ν = 2/(μ_a + μ_b) * (μ_a·μ_b)/(μ_a·μ_b) ... simplify:
+        // = 2 * (1/μ_a) * (1/μ_b) / (1/μ_a + 1/μ_b) = 2 / (μ_a + μ_b)
+        return 2.0 / (mu_a + mu_b);
+    };
+
+    double max_change = 0.0;
+    for (int iter = 0; iter < iterations; iter++) {
+        max_change = 0.0;
+        for (int j = 0; j < n_rows; j++) {
+            for (int i = 0; i < n_cols; i++) {
+                if (active_cells(j, i)) continue;  // Keep solver values
+
+                double mu_c = mu_map(j, i);
+                double sum = 0.0, wsum = 0.0;
+
+                // West neighbor
+                int jn, in_;
+                jn = j; in_ = (i > 0) ? i - 1 : (x_periodic ? n_cols - 1 : -1);
+                if (in_ >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hx2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+                // East neighbor
+                jn = j; in_ = (i < n_cols - 1) ? i + 1 : (x_periodic ? 0 : -1);
+                if (in_ >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hx2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+                // South neighbor
+                in_ = i; jn = (j > 0) ? j - 1 : (y_periodic ? n_rows - 1 : -1);
+                if (jn >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hy2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+                // North neighbor
+                in_ = i; jn = (j < n_rows - 1) ? j + 1 : (y_periodic ? 0 : -1);
+                if (jn >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hy2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+
+                if (wsum > 0) {
+                    double new_val = sum / wsum;
+                    double change = std::abs(new_val - Az(j, i));
+                    if (change > max_change) max_change = change;
+                    Az(j, i) = new_val;  // Gauss-Seidel: in-place update
+                }
+            }
+        }
+    }
+    std::cout << "nu-weighted smoothing: " << iterations << " iters, max_change="
+              << std::scientific << std::setprecision(2) << max_change << std::endl;
+}
+
 void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
     // Rebuild mu_map for inactive cells directly from the input image.
     // Active cells keep their B-H curve computed μ (from updateMuAtActiveCells).
@@ -2824,7 +3129,7 @@ void MagneticFieldAnalyzer::interpolateInactiveCellsPolar(const Eigen::VectorXd&
 }
 
 void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
-    std::cout << "\n=== Building coarsened FDM system ===" << std::endl;
+    std::cout << "\n=== Building coarsened system (Galerkin: A_c = P^T * A_f * P) ===" << std::endl;
     std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)
               << " (reduction: " << std::fixed << std::setprecision(1)
               << (100.0 * (1.0 - double(n_active_cells) / (nx * ny))) << "%)" << std::endl;
@@ -2832,20 +3137,23 @@ void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     Eigen::SparseMatrix<double> A(n_active_cells, n_active_cells);
     Eigen::VectorXd rhs(n_active_cells);
 
-    // Build coarsened matrix
-    buildMatrixCoarsened(A, rhs);
+    // Use Galerkin projection instead of geometric coarsened matrix.
+    // The geometric stencil 2/(mu*h*(h_w+h_e)) is asymmetric at skip transitions
+    // because (h_w+h_e) differs per cell. Galerkin A_c = P^T * A_f * P is
+    // automatically symmetric since A_f (uniform fine grid) is symmetric.
+    buildMatrixGalerkin(A, rhs);
 
-    // Check matrix symmetry
+    // Verify matrix symmetry (should always pass with Galerkin)
     Eigen::SparseMatrix<double> A_T = A.transpose();
     double symmetry_error = (A - A_T).norm();
     double A_norm = A.norm();
     double relative_symmetry_error = (A_norm > 1e-12) ? (symmetry_error / A_norm) : symmetry_error;
-    std::cout << "Coarsened matrix symmetry check:" << std::endl;
+    std::cout << "Galerkin matrix symmetry check:" << std::endl;
     std::cout << "  ||A - A^T|| = " << symmetry_error << std::endl;
     std::cout << "  ||A|| = " << A_norm << std::endl;
     std::cout << "  Relative error = " << relative_symmetry_error << std::endl;
     if (relative_symmetry_error > 1e-8) {
-        std::cerr << "WARNING: Coarsened matrix is not symmetric! Relative error = "
+        std::cerr << "WARNING: Galerkin matrix is not symmetric! Relative error = "
                   << relative_symmetry_error << std::endl;
     } else {
         std::cout << "  Matrix is symmetric (relative error < 1e-8)" << std::endl;
@@ -2857,18 +3165,19 @@ void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     solver.compute(A);
 
     if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Coarsened matrix decomposition failed");
+        throw std::runtime_error("Galerkin matrix decomposition failed");
     }
 
     Eigen::VectorXd Az_coarse = solver.solve(rhs);
 
     if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Coarsened linear system solving failed");
+        throw std::runtime_error("Galerkin linear system solving failed");
     }
 
     // Interpolate back to full grid
     std::cout << "Interpolating to full grid..." << std::endl;
     interpolateToFullGrid(Az_coarse);
+    smoothInactiveCells(coarsen_smooth_iterations);
     interpolateMuToFullGrid();
 
     std::cout << "Coarsened solution complete!" << std::endl;
@@ -2879,13 +3188,20 @@ void MagneticFieldAnalyzer::exportCoarseningMask(const std::string& output_dir, 
         return;  // No coarsening, nothing to export
     }
 
-    // Create binary mask image: same size as input image, single channel
-    // Active cells = 255 (white), Inactive/coarsened cells = 0 (black)
+    // Create gradient mask image: same size as input image, single channel
+    // Active cells = 255 (white)
+    // Inactive cells = 255/skip_level (encodes gradient coarsening level)
+    //   skip=2 → 127, skip=4 → 63, skip=8 → 31 (all < 128 for frontend compatibility)
     cv::Mat mask_image(ny, nx, CV_8UC1);
 
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
-            mask_image.at<uchar>(j, i) = active_cells(j, i) ? 255 : 0;
+            if (active_cells(j, i)) {
+                mask_image.at<uchar>(j, i) = 255;
+            } else {
+                int skip = cell_skip_level(j, i);
+                mask_image.at<uchar>(j, i) = (uchar)std::max(1, 255 / skip);
+            }
         }
     }
 
@@ -3135,13 +3451,8 @@ void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
         for (int j_theta = 0; j_theta < ntheta; j_theta++) {
             int fine_idx = i_r * ntheta + j_theta;
 
-            // Check active_cells with orientation-aware indexing
-            bool is_active;
-            if (r_orientation == "horizontal") {
-                is_active = active_cells(j_theta, i_r);
-            } else {
-                is_active = active_cells(i_r, j_theta);
-            }
+            // active_cells is ALWAYS (ntheta, nr) = (j_theta, i_r) regardless of r_orientation
+            bool is_active = active_cells(j_theta, i_r);
 
             if (is_active) {
                 // Active cell: injection (weight = 1.0)
@@ -3194,8 +3505,8 @@ void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
                             int ni = i_r + di;
                             int nj = (j_theta + dj + ntheta) % ntheta;
                             if (ni >= 0 && ni < nr) {
-                                bool neighbor_active = (r_orientation == "horizontal") ?
-                                    active_cells(nj, ni) : active_cells(ni, nj);
+                                // active_cells is ALWAYS (ntheta, nr) = (nj, ni)
+                                bool neighbor_active = active_cells(nj, ni);
                                 if (neighbor_active) {
                                     double dist = std::sqrt(di * di + dj * dj);
                                     if (dist < min_dist) {
@@ -9004,27 +9315,31 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
 }
 
 void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
-    std::cout << "\n=== Building polar coarsened FDM system ===" << std::endl;
+    std::cout << "\n=== Building polar coarsened system (Galerkin: A_c = P^T * A_f * P) ===" << std::endl;
     std::cout << "Active cells: " << n_active_cells << " / " << (nr * ntheta)
               << " (reduction: " << std::fixed << std::setprecision(1)
               << (100.0 * (1.0 - double(n_active_cells) / (nr * ntheta))) << "%)" << std::endl;
 
     Eigen::SparseMatrix<double> A;
     Eigen::VectorXd rhs;
-    buildMatrixPolarCoarsened(A, rhs);
 
-    std::cout << "Coarsened matrix size: " << A.rows() << "x" << A.cols() << std::endl;
+    // Use Galerkin projection instead of geometric coarsened matrix.
+    // buildMatrixGalerkin() auto-dispatches to Polar via updateFullMatrixCache()
+    // → buildMatrixPolar() and buildProlongationMatrix() → buildProlongationMatrixPolar().
+    buildMatrixGalerkin(A, rhs);
+
+    std::cout << "Galerkin matrix size: " << A.rows() << "x" << A.cols() << std::endl;
     std::cout << "Non-zero elements: " << A.nonZeros() << std::endl;
 
-    // Check matrix symmetry
+    // Verify matrix symmetry (should always pass with Galerkin)
     Eigen::SparseMatrix<double> A_T = A.transpose();
     double symmetry_error = (A - A_T).norm();
     double A_norm = A.norm();
     double relative_symmetry_error = (A_norm > 1e-12) ? (symmetry_error / A_norm) : symmetry_error;
 
-    std::cout << "Matrix symmetry: relative error = " << relative_symmetry_error << std::endl;
+    std::cout << "Galerkin matrix symmetry: relative error = " << relative_symmetry_error << std::endl;
     if (relative_symmetry_error > 1e-8) {
-        std::cerr << "Warning: Matrix not symmetric! Relative error = " << relative_symmetry_error << std::endl;
+        std::cerr << "Warning: Galerkin matrix not symmetric! Relative error = " << relative_symmetry_error << std::endl;
     }
 
     // Solve linear system
@@ -9033,13 +9348,13 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
     solver.compute(A);
 
     if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Polar coarsened matrix decomposition failed!");
+        throw std::runtime_error("Polar Galerkin matrix decomposition failed!");
     }
 
     Eigen::VectorXd Az_coarse = solver.solve(rhs);
 
     if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Polar coarsened solve failed!");
+        throw std::runtime_error("Polar Galerkin solve failed!");
     }
 
     // Check residual
@@ -9053,6 +9368,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
 
     // Interpolate to full grid
     interpolateToFullGridPolar(Az_coarse);
+    smoothInactiveCells(coarsen_smooth_iterations);
     interpolateMuToFullGrid();
 
     std::cout << "Polar coarsened solve complete!" << std::endl;

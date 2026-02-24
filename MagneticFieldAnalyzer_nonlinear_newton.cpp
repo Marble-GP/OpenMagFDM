@@ -256,15 +256,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
                       << std::scientific << std::setprecision(2) << residual_rel << ")" << std::endl;
 
-            // Final output: cubic spline interpolation for smooth Az (C^2)
+            // Final output: interpolate coarse solution to full grid.
             // During iteration, bilinear was used for P-matrix consistency.
-            // Now apply cubic spline for final output quality.
+            // After convergence, apply optional Laplacian smoothing for
+            // smooth B field visualization (C¹ Az at skip transitions).
             if (using_coarsening) {
                 if (is_polar) {
                     interpolateToFullGridPolar(Az_vec);
                 } else {
                     interpolateToFullGrid(Az_vec);
                 }
+                smoothInactiveCells(coarsen_smooth_iterations);
                 // Harmonically interpolate μ at inactive cells (IDW, series circuit model)
                 interpolateMuToFullGrid();
             }
@@ -293,170 +295,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         Eigen::VectorXd delta_A;
 
-        // Build r-weighted diagonal Jacobian correction for polar + nonlinear
-        Eigen::SparseMatrix<double> J_matrix = A_matrix;  // Start with linear matrix
-
-        if (is_polar && config["materials"]) {
-            cv::Mat image_to_use;
-            cv::flip(image, image_to_use, 0);  // Match setupMaterialProperties()
-
-            const double MU_0 = 4.0 * M_PI * 1e-7;
-            YAML::Node polar_config = config["polar_domain"] ? config["polar_domain"] : config["polar"];
-            double r_start = polar_config["r_start"].as<double>();
-            double r_end = polar_config["r_end"].as<double>();
-            double dr = (r_end - r_start) / (nr - 1);
-
-            for (int idx = 0; idx < Az_vec.size(); idx++) {
-                // Get grid indices (handle both full and coarsened grids)
-                int r_idx, theta_idx;
-                if (using_coarsening) {
-                    // Coarsened: use coarse_to_fine mapping
-                    auto [i, j] = coarse_to_fine[idx];
-                    if (r_orientation == "horizontal") {
-                        r_idx = i;
-                        theta_idx = j;
-                    } else {  // vertical
-                        r_idx = j;
-                        theta_idx = i;
-                    }
-                } else {
-                    // Full grid: row-major idx = r_idx * ntheta + theta_idx
-                    r_idx = idx / ntheta;
-                    theta_idx = idx % ntheta;
-                }
-
-                // Calculate r coordinate for this grid point
-                double r = r_start + r_idx * dr;
-                if (r < 1e-10) continue;  // Avoid singularity at r=0
-
-                // Get pixel indices (match mu_map layout)
-                int img_row, img_col;
-                if (r_orientation == "horizontal") {
-                    img_row = theta_idx;  // theta
-                    img_col = r_idx;      // r
-                } else {  // vertical
-                    img_row = r_idx;      // r
-                    img_col = theta_idx;  // theta
-                }
-
-                if (img_row < 0 || img_row >= image_to_use.rows ||
-                    img_col < 0 || img_col >= image_to_use.cols) {
-                    continue;
-                }
-
-                cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(img_row, img_col);
-                cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
-
-                // Find material and check if nonlinear
-                for (const auto& mat : config["materials"]) {
-                    std::string name = mat.first.as<std::string>();
-                    YAML::Node props = mat.second;
-                    if (!props["rgb"]) continue;
-
-                    cv::Scalar mat_rgb(
-                        props["rgb"][0].as<int>(),
-                        props["rgb"][1].as<int>(),
-                        props["rgb"][2].as<int>()
-                    );
-
-                    if (rgb[0] == mat_rgb[0] && rgb[1] == mat_rgb[1] && rgb[2] == mat_rgb[2]) {
-                        // Check if this is a nonlinear material (B-H table or formula)
-                        bool is_nonlinear = false;
-                        if (props["mu_r"]) {
-                            if (props["mu_r"].IsSequence()) {
-                                is_nonlinear = true;  // B-H table
-                            } else {
-                                std::string mu_str = props["mu_r"].as<std::string>();
-                                if (mu_str.find('$') != std::string::npos) {
-                                    is_nonlinear = true;  // Formula with $H
-                                }
-                            }
-                        }
-
-                        if (is_nonlinear) {
-                            // === ANALYTICAL JACOBIAN CORRECTION ===
-                            // This approach avoids numerical differentiation errors by computing
-                            // dμ/dH analytically from the effective permeability μ_eff = B/H.
-                            //
-                            // Mathematical Derivation:
-                            // ------------------------
-                            // Given: B = μ_eff · μ₀ · H  (effective permeability definition)
-                            //        μ = B/H = μ_eff · μ₀  (actual permeability)
-                            //
-                            // We need: dμ/dH = d(B/H)/dH for Jacobian correction
-                            //
-                            // Using the quotient rule:
-                            //   dμ/dH = d(B/H)/dH = (dB/dH · H - B) / H²
-                            //
-                            // Simplify by dividing numerator and denominator by H:
-                            //   dμ/dH = (dB/dH - B/H) / H = (dB/dH - μ) / H
-                            //
-                            // Where dB/dH is computed analytically using the product rule:
-                            //   dB/dH = μ₀ · (μ_eff + H · dμ_eff/dH)
-                            //
-                            // For TABLE type materials, dμ_eff/dH comes from the exact slope
-                            // of linear interpolation segments - no numerical differentiation!
-
-                            double H_val = H_map(img_row, img_col);
-                            double mu_current = mu_map(img_row, img_col);
-
-                            // Find material's MuValue to access the B-H table
-                            auto mu_it = material_mu.find(name);
-                            if (mu_it != material_mu.end()) {
-                                // Step 1: Get effective permeability and its derivative
-                                double mu_eff = evaluateMu(mu_it->second, H_val);
-                                double dmu_eff_dH = evaluateMuDerivative(mu_it->second, H_val);
-
-                                // Step 2: Compute differential permeability dB/dH analytically
-                                // dB/dH = μ₀ · (μ_eff + H · dμ_eff/dH)
-                                double dB_dH = MU_0 * (mu_eff + H_val * dmu_eff_dH);
-
-                                // Step 3: Compute dμ/dH = (dB/dH - μ) / H
-                                double dmu_dH = 0.0;
-                                if (H_val > 1.0) {  // H > 1 A/m ensures numerical stability
-                                    double mu_actual = mu_eff * MU_0;  // μ = μ_eff · μ₀
-                                    dmu_dH = (dB_dH - mu_actual) / H_val;
-                                } else {
-                                    // Low-field region (H < 1 A/m): Use linear approximation
-                                    // In this region, μ ≈ constant, so dμ/dH ≈ 0
-                                    // Alternative: dμ/dH ≈ μ₀ · dμ_eff/dH (from initial slope)
-                                    dmu_dH = MU_0 * dmu_eff_dH;
-                                }
-
-                                // Step 4: Jacobian diagonal correction with r-weighting
-                                //
-                                // For polar FDM equation: ∂/∂r(r·(1/μ)·∂Az/∂r) + ... = -r·Jz
-                                //
-                                // The Jacobian term for nonlinear μ(H(Az)) includes:
-                                //   ∂/∂Az[(1/μ)·∇Az] = (1/μ)·∇ + ∇Az·∂(1/μ)/∂Az
-                                //
-                                // Since ν = 1/μ, we have:
-                                //   dν/dH = -dμ/dH / μ²
-                                //
-                                // With r-weighting and FDM discretization:
-                                double correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
-                                correction_factor *= (dr * dr);  // FDM mesh spacing scale
-
-                                // Add to diagonal element of Jacobian matrix
-                                J_matrix.coeffRef(idx, idx) += correction_factor;
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Solve improved system: J·δA = -R
-        // Phase 6: Nonlinear Defect Correction
-        //   1. R_fine = F(x_fine) on FULL grid
-        //   2. R_coarse = P^T * R_fine (restriction)
-        //   3. A_c * δx_c = -R_coarse (direct coarse solve)
-        //   No inner GMRES loop, no matrixFreeJv needed.
-        //
-        // Phase 5: Use matrix-free GMRES when coarsening is enabled with nonlinear materials
+        // ===== Step 5: Compute Newton step δA =====
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
             // Phase 6: Nonlinear Defect Correction
+            // J_matrix (diagonal Jacobian correction) is NOT needed here — the defect
+            // correction uses coarse LU solve via applyPreconditioner instead.
             if (VERBOSE && iter == 0) {
                 std::cout << "Using Defect Correction (Phase 6) for Newton step" << std::endl;
             }
@@ -506,14 +349,111 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
             // Phase 5: Matrix-free GMRES (no preconditioner)
-            // Correct but may require many GMRES iterations
             if (VERBOSE && iter == 0) {
                 std::cout << "Using matrix-free GMRES (Phase 5) for Newton step" << std::endl;
             }
             delta_A = solveWithMatrixFreeGMRES(Az_vec, -residual_coarse,
                 nonlinear_config.gmres_restart * 3, 1e-6);
         } else {
-            // Standard direct solve with explicit Jacobian
+            // Standard direct solve with explicit Jacobian (J = A + diagonal correction)
+            Eigen::SparseMatrix<double> J_matrix = A_matrix;
+
+            // Build r-weighted diagonal Jacobian correction for polar + nonlinear
+            if (is_polar && config["materials"]) {
+                cv::Mat image_to_use;
+                cv::flip(image, image_to_use, 0);  // Match setupMaterialProperties()
+
+                const double MU_0 = 4.0 * M_PI * 1e-7;
+                YAML::Node polar_config = config["polar_domain"] ? config["polar_domain"] : config["polar"];
+                double r_start_local = polar_config["r_start"].as<double>();
+                double r_end_local = polar_config["r_end"].as<double>();
+                double dr_local = (r_end_local - r_start_local) / (nr - 1);
+
+                for (int idx = 0; idx < Az_vec.size(); idx++) {
+                    // Get grid indices
+                    int r_idx, theta_idx;
+                    if (using_coarsening) {
+                        auto [i, j] = coarse_to_fine[idx];
+                        r_idx = i;      // i_r
+                        theta_idx = j;  // j_theta
+                    } else {
+                        r_idx = idx / ntheta;
+                        theta_idx = idx % ntheta;
+                    }
+
+                    double r = r_start_local + r_idx * dr_local;
+                    if (r < 1e-10) continue;
+
+                    int img_row, img_col;
+                    if (r_orientation == "horizontal") {
+                        img_row = theta_idx;
+                        img_col = r_idx;
+                    } else {
+                        img_row = r_idx;
+                        img_col = theta_idx;
+                    }
+
+                    if (img_row < 0 || img_row >= image_to_use.rows ||
+                        img_col < 0 || img_col >= image_to_use.cols) {
+                        continue;
+                    }
+
+                    cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(img_row, img_col);
+                    cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+
+                    for (const auto& mat : config["materials"]) {
+                        std::string name = mat.first.as<std::string>();
+                        YAML::Node props = mat.second;
+                        if (!props["rgb"]) continue;
+
+                        cv::Scalar mat_rgb(
+                            props["rgb"][0].as<int>(),
+                            props["rgb"][1].as<int>(),
+                            props["rgb"][2].as<int>()
+                        );
+
+                        if (rgb[0] == mat_rgb[0] && rgb[1] == mat_rgb[1] && rgb[2] == mat_rgb[2]) {
+                            bool is_nonlinear = false;
+                            if (props["mu_r"]) {
+                                if (props["mu_r"].IsSequence()) {
+                                    is_nonlinear = true;
+                                } else {
+                                    std::string mu_str = props["mu_r"].as<std::string>();
+                                    if (mu_str.find('$') != std::string::npos) {
+                                        is_nonlinear = true;
+                                    }
+                                }
+                            }
+
+                            if (is_nonlinear) {
+                                double H_val = H_map(img_row, img_col);
+                                double mu_current = mu_map(img_row, img_col);
+
+                                auto mu_it = material_mu.find(name);
+                                if (mu_it != material_mu.end()) {
+                                    double mu_eff = evaluateMu(mu_it->second, H_val);
+                                    double dmu_eff_dH = evaluateMuDerivative(mu_it->second, H_val);
+                                    double dB_dH = MU_0 * (mu_eff + H_val * dmu_eff_dH);
+
+                                    double dmu_dH = 0.0;
+                                    if (H_val > 1.0) {
+                                        double mu_actual = mu_eff * MU_0;
+                                        dmu_dH = (dB_dH - mu_actual) / H_val;
+                                    } else {
+                                        dmu_dH = MU_0 * dmu_eff_dH;
+                                    }
+
+                                    double correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
+                                    correction_factor *= (dr_local * dr_local);
+                                    J_matrix.coeffRef(idx, idx) += correction_factor;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
             Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
             solver.compute(J_matrix);
             if (solver.info() != Eigen::Success) {
@@ -625,59 +565,71 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
 
-            // Calculate B and H for trial point
-            Az = Az_trial_mat;
-            if (using_coarsening) {
-                // Phase 8: Wide-stencil B/H/μ at active cells only
-                Eigen::VectorXd Bx_active, By_active, H_active;
-                calculateBFieldAtActiveCells(Az_trial, Bx_active, By_active);
-                calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
-                updateMuAtActiveCells(H_active);
-                interpolateMuToFullGrid();
-            } else {
-                if (is_polar) {
-                    calculateMagneticFieldPolar();
-                } else {
-                    calculateMagneticField();
-                }
-                calculateHField();
-                updateMuDistribution();
-            }
-
             // Build matrix and compute residual at trial point
             double residual_trial_norm;
             if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-                // Defect correction: use Galerkin (coarse) residual
-                // Must match convergence check metric (residual_0 is coarse residual)
-                full_matrix_cache_valid = false;  // Force rebuild with trial μ
-                Eigen::SparseMatrix<double> A_trial_gal;
-                Eigen::VectorXd b_trial_gal;
-                buildMatrixGalerkin(A_trial_gal, b_trial_gal);
-                Eigen::VectorXd residual_trial = A_trial_gal * Az_trial - b_trial_gal;
-                residual_trial_norm = residual_trial.norm();
-            } else if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
-                // Galerkin without defect correction: use full-grid residual
-                full_matrix_cache_valid = false;  // Force rebuild with trial μ
-                double b_trial_norm;
-                residual_trial_norm = computeFullGridResidual(b_trial_norm);
-            } else {
-                Eigen::SparseMatrix<double> A_trial;
-                Eigen::VectorXd b_trial;
-                if (is_polar) {
-                    if (coarsening_enabled && n_active_cells < nr * ntheta) {
-                        buildMatrixPolarCoarsened(A_trial, b_trial);
-                    } else {
-                        buildMatrixPolar(A_trial, b_trial);
-                    }
-                } else {
-                    if (coarsening_enabled && n_active_cells < nx * ny) {
-                        buildMatrixCoarsened(A_trial, b_trial);
-                    } else {
-                        buildMatrix(A_trial, b_trial);
-                    }
+                // Defect correction: frozen-Jacobian line search.
+                // Use the FIXED A_matrix/b_vec from iteration start (standard Newton method).
+                // μ update happens at the top of next iteration (Step 1).
+                // This avoids expensive full-grid matrix rebuild + Galerkin projection per trial.
+
+                // Update Az matrix for inactive cell interpolation (needed for loop exit)
+                for (int idx = 0; idx < n_active_cells; idx++) {
+                    auto [ci, cj] = coarse_to_fine[idx];
+                    Az(cj, ci) = Az_trial(idx);
                 }
-                Eigen::VectorXd residual_trial = A_trial * Az_trial - b_trial;
+                if (is_polar) {
+                    interpolateInactiveCellsPolar(Az_trial);
+                } else {
+                    interpolateInactiveCells(Az_trial);
+                }
+                Az_trial_mat = Az;
+
+                // Evaluate coarse residual with frozen matrix — O(nnz_coarse) only
+                Eigen::VectorXd residual_trial = A_matrix * Az_trial - b_vec;
                 residual_trial_norm = residual_trial.norm();
+            } else {
+                // Non-defect-correction paths: update B/H/μ and rebuild matrix per trial
+                Az = Az_trial_mat;
+                if (using_coarsening) {
+                    Eigen::VectorXd Bx_active, By_active, H_active;
+                    calculateBFieldAtActiveCells(Az_trial, Bx_active, By_active);
+                    calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+                    updateMuAtActiveCells(H_active);
+                    interpolateMuToFullGrid();
+                } else {
+                    if (is_polar) {
+                        calculateMagneticFieldPolar();
+                    } else {
+                        calculateMagneticField();
+                    }
+                    calculateHField();
+                    updateMuDistribution();
+                }
+
+                if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
+                    full_matrix_cache_valid = false;
+                    double b_trial_norm;
+                    residual_trial_norm = computeFullGridResidual(b_trial_norm);
+                } else {
+                    Eigen::SparseMatrix<double> A_trial;
+                    Eigen::VectorXd b_trial;
+                    if (is_polar) {
+                        if (coarsening_enabled && n_active_cells < nr * ntheta) {
+                            buildMatrixPolarCoarsened(A_trial, b_trial);
+                        } else {
+                            buildMatrixPolar(A_trial, b_trial);
+                        }
+                    } else {
+                        if (coarsening_enabled && n_active_cells < nx * ny) {
+                            buildMatrixCoarsened(A_trial, b_trial);
+                        } else {
+                            buildMatrix(A_trial, b_trial);
+                        }
+                    }
+                    Eigen::VectorXd residual_trial = A_trial * Az_trial - b_trial;
+                    residual_trial_norm = residual_trial.norm();
+                }
             }
 
             // Check Armijo condition: ||R(A + α·δA)|| <= ||R(A)||·(1 - c·α)
@@ -692,6 +644,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             }
 
             // Reject step and backtrack
+            if (VERBOSE) {
+                std::cout << "." << std::flush;  // Progress dot for each rejected trial
+            }
             alpha *= rho;
 
             if (ls == max_line_search - 1) {
