@@ -1200,61 +1200,129 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             }
         };
 
-        for (let jt = 0; jt < ntheta; jt++) {
-            for (let ir = 0; ir < nr; ir++) {
-                const r = r_coords[ir];
-                const safe_r = Math.max(r, 1e-15);
+        // Helper: check if cell (ir, jt) is active (true when no coarsening mask)
+        const getActivePolar = (ir, jt) => {
+            if (!activeMask) return true;
+            return r_orientation === 'horizontal' ? activeMask[jt][ir] : activeMask[ir][jt];
+        };
 
-                // Br = (1/r) * ∂Az/∂θ
-                let jt_next, jt_prev;
-                let Az_next, Az_prev;
+        if (activeMask) {
+            // Coarsening-aware: nearest-active-neighbor stencil at active cells.
+            // Same approach as Cartesian coarsening path — avoids surface-concentration
+            // artifact caused by differentiating across interpolated inactive cells.
+            // Inactive cells remain 0; _fillInactiveScalar() fills them after Bx/By conversion.
+            for (let jt = 0; jt < ntheta; jt++) {
+                for (let ir = 0; ir < nr; ir++) {
+                    if (!getActivePolar(ir, jt)) continue;
 
-                if (thetaPeriodic) {
-                    // Periodic or anti-periodic boundary
-                    jt_next = (jt + 1) % ntheta;
-                    jt_prev = (jt - 1 + ntheta) % ntheta;
-                    Az_next = getAz(ir, jt_next);
-                    Az_prev = getAz(ir, jt_prev);
+                    const r = r_coords[ir];
+                    const safe_r = Math.max(r, 1e-15);
 
-                    // Apply sign flip for anti-periodic BC
-                    if (thetaAntiperiodic) {
-                        if (jt === ntheta - 1) Az_next = -Az_next;  // next crosses boundary
-                        if (jt === 0) Az_prev = -Az_prev;          // prev crosses boundary
+                    // Br = (1/r) * ∂Az/∂θ — find nearest active theta neighbors at same ir
+                    let jt_prev = -1, jt_next = -1;
+                    for (let jj = jt - 1; jj >= 0; jj--) {
+                        if (getActivePolar(ir, jj)) { jt_prev = jj; break; }
                     }
-                } else {
-                    // Non-periodic (Dirichlet/Neumann) - use one-sided difference at boundaries
-                    if (jt === 0) {
-                        jt_next = 1;
-                        jt_prev = 0;
+                    for (let jj = jt + 1; jj < ntheta; jj++) {
+                        if (getActivePolar(ir, jj)) { jt_next = jj; break; }
+                    }
+                    if (jt_prev < 0 && thetaPeriodic) {
+                        for (let jj = ntheta - 1; jj > jt; jj--) {
+                            if (getActivePolar(ir, jj)) { jt_prev = jj; break; }
+                        }
+                    }
+                    if (jt_next < 0 && thetaPeriodic) {
+                        for (let jj = 0; jj < jt; jj++) {
+                            if (getActivePolar(ir, jj)) { jt_next = jj; break; }
+                        }
+                    }
+
+                    let Br_val = 0;
+                    if (jt_prev >= 0 && jt_next >= 0) {
+                        const h_back = jt_prev > jt ? (jt + ntheta - jt_prev) : (jt - jt_prev);
+                        const h_fwd  = jt_next < jt ? (jt_next + ntheta - jt)  : (jt_next - jt);
+                        let Az_next = getAz(ir, jt_next), Az_prev = getAz(ir, jt_prev);
+                        if (thetaAntiperiodic) {
+                            if (jt_next < jt) Az_next = -Az_next;
+                            if (jt_prev > jt) Az_prev = -Az_prev;
+                        }
+                        Br_val = (Az_next - Az_prev) / ((h_back + h_fwd) * dtheta) / safe_r;
+                    } else if (jt_next >= 0) {
+                        const h = jt_next < jt ? (jt_next + ntheta - jt) : (jt_next - jt);
+                        Br_val = (getAz(ir, jt_next) - getAz(ir, jt)) / (h * dtheta) / safe_r;
+                    } else if (jt_prev >= 0) {
+                        const h = jt_prev > jt ? (jt + ntheta - jt_prev) : (jt - jt_prev);
+                        Br_val = (getAz(ir, jt) - getAz(ir, jt_prev)) / (h * dtheta) / safe_r;
+                    }
+                    setField(Br, ir, jt, Br_val);
+
+                    // Bθ = -∂Az/∂r — find nearest active radial neighbors at same jt
+                    let ir_prev = -1, ir_next = -1;
+                    for (let ii = ir - 1; ii >= 0; ii--) {
+                        if (getActivePolar(ii, jt)) { ir_prev = ii; break; }
+                    }
+                    for (let ii = ir + 1; ii < nr; ii++) {
+                        if (getActivePolar(ii, jt)) { ir_next = ii; break; }
+                    }
+
+                    let Btheta_val = 0;
+                    if (ir_prev >= 0 && ir_next >= 0) {
+                        const h_back = ir - ir_prev, h_fwd = ir_next - ir;
+                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir_prev, jt)) / ((h_back + h_fwd) * dr);
+                    } else if (ir_next >= 0) {
+                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir, jt)) / ((ir_next - ir) * dr);
+                    } else if (ir_prev >= 0) {
+                        Btheta_val = -(getAz(ir, jt) - getAz(ir_prev, jt)) / ((ir - ir_prev) * dr);
+                    }
+                    setField(Btheta, ir, jt, Btheta_val);
+                }
+            }
+        } else {
+            // Uniform grid (no coarsening)
+            for (let jt = 0; jt < ntheta; jt++) {
+                for (let ir = 0; ir < nr; ir++) {
+                    const r = r_coords[ir];
+                    const safe_r = Math.max(r, 1e-15);
+
+                    // Br = (1/r) * ∂Az/∂θ
+                    let jt_next, jt_prev;
+                    let Az_next, Az_prev;
+
+                    if (thetaPeriodic) {
+                        jt_next = (jt + 1) % ntheta;
+                        jt_prev = (jt - 1 + ntheta) % ntheta;
                         Az_next = getAz(ir, jt_next);
                         Az_prev = getAz(ir, jt_prev);
-                    } else if (jt === ntheta - 1) {
-                        jt_next = ntheta - 1;
-                        jt_prev = ntheta - 2;
-                        Az_next = getAz(ir, jt_next);
-                        Az_prev = getAz(ir, jt_prev);
+                        if (thetaAntiperiodic) {
+                            if (jt === ntheta - 1) Az_next = -Az_next;
+                            if (jt === 0) Az_prev = -Az_prev;
+                        }
                     } else {
-                        jt_next = jt + 1;
-                        jt_prev = jt - 1;
+                        if (jt === 0) {
+                            jt_next = 1; jt_prev = 0;
+                        } else if (jt === ntheta - 1) {
+                            jt_next = ntheta - 1; jt_prev = ntheta - 2;
+                        } else {
+                            jt_next = jt + 1; jt_prev = jt - 1;
+                        }
                         Az_next = getAz(ir, jt_next);
                         Az_prev = getAz(ir, jt_prev);
                     }
-                }
 
-                const denom = (jt === 0 || jt === ntheta - 1) && !thetaPeriodic ? dtheta : (2 * dtheta);
-                const dAz_dtheta = (Az_next - Az_prev) / denom;
-                setField(Br, ir, jt, dAz_dtheta / safe_r);
+                    const denom = (jt === 0 || jt === ntheta - 1) && !thetaPeriodic ? dtheta : (2 * dtheta);
+                    setField(Br, ir, jt, (Az_next - Az_prev) / denom / safe_r);
 
-                // Bθ = -∂Az/∂r
-                let dAz_dr = 0;
-                if (ir === 0) {
-                    dAz_dr = (getAz(1, jt) - getAz(0, jt)) / dr;
-                } else if (ir === nr - 1) {
-                    dAz_dr = (getAz(nr-1, jt) - getAz(nr-2, jt)) / dr;
-                } else {
-                    dAz_dr = (getAz(ir+1, jt) - getAz(ir-1, jt)) / (2 * dr);
+                    // Bθ = -∂Az/∂r
+                    let dAz_dr = 0;
+                    if (ir === 0) {
+                        dAz_dr = (getAz(1, jt) - getAz(0, jt)) / dr;
+                    } else if (ir === nr - 1) {
+                        dAz_dr = (getAz(nr-1, jt) - getAz(nr-2, jt)) / dr;
+                    } else {
+                        dAz_dr = (getAz(ir+1, jt) - getAz(ir-1, jt)) / (2 * dr);
+                    }
+                    setField(Btheta, ir, jt, -dAz_dr);
                 }
-                setField(Btheta, ir, jt, -dAz_dr);
             }
         }
 
