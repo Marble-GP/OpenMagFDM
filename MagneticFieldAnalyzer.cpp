@@ -2996,67 +2996,63 @@ double MagneticFieldAnalyzer::calculateThetaInterpolationWeight(int j_theta, int
 }
 
 double MagneticFieldAnalyzer::interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const {
-    // Bilinear interpolation for inactive cells in polar coordinates
-    // Interpolate in both r and theta directions
+    // Interpolation that exactly matches buildProlongationMatrixPolar.
+    // Uses axis-aligned neighbors (same row/column), not 4-corner bilinear.
+    // This ensures interpolateInactiveCellsPolar(Az_c) == P_prolongation * Az_c,
+    // which is required for Galerkin consistency in defect correction.
+    //
+    // Formula (matching buildProlongationMatrixPolar):
+    //   have_r && have_theta: 0.5*(r-interp) + 0.5*(theta-interp)
+    //   have_r only:          r-interp
+    //   have_theta only:      theta-interp
+    //   fallback:             nearest active neighbor
 
-    // Find surrounding active cells in r direction
-    int i_prev = i_r, i_next = i_r;
-    while (i_prev > 0 && !active_cells(j_theta, i_prev)) i_prev--;
-    while (i_next < nr - 1 && !active_cells(j_theta, i_next)) i_next++;
+    int i_inner = findNextActiveRadial(i_r, j_theta, -1);
+    int i_outer = findNextActiveRadial(i_r, j_theta, +1);
+    int j_prev  = findNextActiveTheta(i_r, j_theta, -1);
+    int j_next  = findNextActiveTheta(i_r, j_theta, +1);
 
-    // Find surrounding active cells in theta direction (periodic boundary aware)
-    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
-    int j_prev = j_theta, j_next = j_theta;
+    auto it_inner = fine_to_coarse.find({i_inner, j_theta});
+    auto it_outer = fine_to_coarse.find({i_outer, j_theta});
+    auto it_prev  = fine_to_coarse.find({i_r, j_prev});
+    auto it_next  = fine_to_coarse.find({i_r, j_next});
 
-    // Search for j_prev
-    int search = j_theta - 1;
-    for (int k = 0; k < ntheta; k++) {
-        int j_check = is_periodic ? (search + ntheta) % ntheta : std::max(0, search);
-        if (!is_periodic && search < 0) break;
-        if (active_cells(j_check, i_r)) {
-            j_prev = j_check;
-            break;
+    bool have_r     = (it_inner != fine_to_coarse.end() && it_outer != fine_to_coarse.end() &&
+                       i_inner != i_outer);
+    bool have_theta = (it_prev  != fine_to_coarse.end() && it_next  != fine_to_coarse.end() &&
+                       j_prev != j_next);
+
+    if (have_r && have_theta) {
+        double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
+        double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
+        double v_r = (1.0 - fr) * Az_coarse(it_inner->second) + fr * Az_coarse(it_outer->second);
+        double v_t = (1.0 - ft) * Az_coarse(it_prev->second)  + ft * Az_coarse(it_next->second);
+        return 0.5 * (v_r + v_t);
+    } else if (have_r) {
+        double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
+        return (1.0 - fr) * Az_coarse(it_inner->second) + fr * Az_coarse(it_outer->second);
+    } else if (have_theta) {
+        double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
+        return (1.0 - ft) * Az_coarse(it_prev->second) + ft * Az_coarse(it_next->second);
+    } else {
+        // Fallback: nearest active neighbor (same as buildProlongationMatrixPolar)
+        double min_dist = std::numeric_limits<double>::max();
+        int nearest_idx = -1;
+        for (int di = -2; di <= 2; di++) {
+            for (int dj = -2; dj <= 2; dj++) {
+                int ni = i_r + di;
+                int nj = (j_theta + dj + ntheta) % ntheta;
+                if (ni >= 0 && ni < nr && active_cells(nj, ni)) {
+                    auto it = fine_to_coarse.find({ni, nj});
+                    if (it != fine_to_coarse.end()) {
+                        double dist = std::sqrt(double(di * di + dj * dj));
+                        if (dist < min_dist) { min_dist = dist; nearest_idx = it->second; }
+                    }
+                }
+            }
         }
-        search--;
+        return (nearest_idx >= 0) ? Az_coarse(nearest_idx) : 0.0;
     }
-
-    // Search for j_next
-    search = j_theta + 1;
-    for (int k = 0; k < ntheta; k++) {
-        int j_check = is_periodic ? search % ntheta : std::min(ntheta - 1, search);
-        if (!is_periodic && search >= ntheta) break;
-        if (active_cells(j_check, i_r)) {
-            j_next = j_check;
-            break;
-        }
-        search++;
-    }
-
-    // Get coarse indices for 4 surrounding points
-    auto it_sw = fine_to_coarse.find({i_prev, j_prev});  // (r_low, theta_low)
-    auto it_se = fine_to_coarse.find({i_next, j_prev});  // (r_high, theta_low)
-    auto it_nw = fine_to_coarse.find({i_prev, j_next});  // (r_low, theta_high)
-    auto it_ne = fine_to_coarse.find({i_next, j_next});  // (r_high, theta_high)
-
-    // Calculate interpolation weights
-    double wr = (i_next != i_prev) ? double(i_r - i_prev) / double(i_next - i_prev) : 0.5;
-    double wt = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-
-    // Get values at 4 points
-    double v_sw = (it_sw != fine_to_coarse.end()) ? Az_coarse(it_sw->second) : 0.0;
-    double v_se = (it_se != fine_to_coarse.end()) ? Az_coarse(it_se->second) : 0.0;
-    double v_nw = (it_nw != fine_to_coarse.end()) ? Az_coarse(it_nw->second) : 0.0;
-    double v_ne = (it_ne != fine_to_coarse.end()) ? Az_coarse(it_ne->second) : 0.0;
-
-    // Fallback: if no points found, return 0
-    int found_count = (it_sw != fine_to_coarse.end()) + (it_se != fine_to_coarse.end()) +
-                      (it_nw != fine_to_coarse.end()) + (it_ne != fine_to_coarse.end());
-    if (found_count == 0) return 0.0;
-
-    // Bilinear interpolation
-    double v_low = (1.0 - wr) * v_sw + wr * v_se;
-    double v_high = (1.0 - wr) * v_nw + wr * v_ne;
-    return (1.0 - wt) * v_low + wt * v_high;
 }
 
 void MagneticFieldAnalyzer::interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse) {

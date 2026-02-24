@@ -309,34 +309,18 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
             // Step 1: Compute fine-grid residual vector R_fine = A_f * Az_full - b_f
             // A_full_cached is already built by updatePreconditioner → updateFullMatrixCache
-            Eigen::VectorXd Az_full_vec;
-            if (is_polar) {
-                int n_full = nr * ntheta;
-                Az_full_vec.resize(n_full);
-                for (int i_r = 0; i_r < nr; i_r++) {
-                    for (int j_theta = 0; j_theta < ntheta; j_theta++) {
-                        int idx = i_r * ntheta + j_theta;
-                        if (r_orientation == "horizontal") {
-                            Az_full_vec(idx) = Az(j_theta, i_r);
-                        } else {
-                            Az_full_vec(idx) = Az(i_r, j_theta);
-                        }
-                    }
-                }
-            } else {
-                int n_full = nx * ny;
-                Az_full_vec.resize(n_full);
-                for (int j = 0; j < ny; j++) {
-                    for (int i = 0; i < nx; i++) {
-                        Az_full_vec(j * nx + i) = Az(j, i);
-                    }
-                }
-            }
+            //
+            // CRITICAL: Use P_prolongation * Az_vec (Galerkin-consistent interpolation)
+            // instead of reading from the Az matrix directly.
+            // This ensures P^T * R_fine = P^T * A_f * P * Az_c - P^T * b_f = A_c * Az_c - b_c
+            // i.e., R_c_defect == residual_coarse, so the Newton direction is consistent
+            // with the Armijo condition in the frozen-Jacobian line search.
+            buildProlongationMatrix();  // Ensure P and R are built
+            Eigen::VectorXd Az_full_vec = P_prolongation * Az_vec;
 
             Eigen::VectorXd R_fine = A_full_cached * Az_full_vec - rhs_full_cached;
 
-            // Step 2: Restrict to coarse space: R_c = P^T * R_fine
-            buildProlongationMatrix();  // Ensure P and R are built
+            // Step 2: Restrict to coarse space: R_c = P^T * R_fine = A_c * Az_c - b_c
             Eigen::VectorXd R_coarse_defect = R_restriction * R_fine;
 
             // Step 3: Direct coarse solve: A_c * δx_c = -R_c
@@ -644,9 +628,6 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             }
 
             // Reject step and backtrack
-            if (VERBOSE) {
-                std::cout << "." << std::flush;  // Progress dot for each rejected trial
-            }
             alpha *= rho;
 
             if (ls == max_line_search - 1) {
