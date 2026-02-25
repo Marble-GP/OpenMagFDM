@@ -628,6 +628,7 @@ private:
     int findNextActiveTheta(int i_r, int j_theta, int direction) const;   // Find next active cell in theta
     std::pair<int, int> findActiveNeighbor(int i, int j, int di, int dj) const;  // Find active neighbor
     double bilinearInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // Interpolate inactive cell
+    double bilinearInterpolateFromCoarsePolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const;  // Polar 4-corner bilinear
     double hermiteInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // C^1 Hermite interpolation
     void computeAzGradientsAtActiveCells(const Eigen::VectorXd& Az_coarse);  // Compute ∂Az/∂x, ∂Az/∂y at active cells
     double interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const;  // Polar coarse grid interpolation
@@ -688,6 +689,8 @@ private:
     void buildProlongationMatrix();  // Build P_prolongation (n_full x n_active) and R_restriction (P^T)
     void buildInterpolationWeights(int i, int j, int fine_idx,
         std::vector<Eigen::Triplet<double>>& triplets);  // Helper: Cartesian interpolation weights
+    void buildInterpolationWeightsPolar(int i_r, int j_theta, int fine_idx,
+        std::vector<Eigen::Triplet<double>>& triplets);  // Helper: Polar interpolation weights
     void buildProlongationMatrixPolar(std::vector<Eigen::Triplet<double>>& triplets);  // Polar version
 
     // Phase 4: Galerkin coarse matrix (A_c = R * A_f * P)

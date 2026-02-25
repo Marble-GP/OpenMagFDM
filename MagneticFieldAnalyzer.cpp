@@ -1906,6 +1906,121 @@ double MagneticFieldAnalyzer::bilinearInterpolateFromCoarse(int i, int j, const 
     return 0.0;
 }
 
+double MagneticFieldAnalyzer::bilinearInterpolateFromCoarsePolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const {
+    // 4-corner bilinear interpolation for polar grid inactive cells.
+    // Row direction = theta (j_theta, 0..ntheta-1), column direction = r (i_r, 0..nr-1).
+    // active_row_flags[j_theta] = true if theta-row j_theta has local active cells.
+    // fine_to_coarse key = {i_r, j_theta} matching coarse_to_fine ordering.
+    // This must match buildInterpolationWeightsPolar exactly for Galerkin consistency.
+
+    bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    int locality_radius = max_coarsen_skip + 1;
+    auto hasLocalActive = [&](int row, int col) -> bool {
+        int lo = std::max(0, col - locality_radius);
+        int hi = std::min(nr - 1, col + locality_radius);
+        for (int ii = lo; ii <= hi; ii++) {
+            if (active_cells(row, ii)) return true;
+        }
+        return false;
+    };
+
+    // Step 1: Find enclosing theta-rows (j_bot at or below j_theta, j_top above j_theta)
+    int j_bot = -1, j_top = -1;
+    for (int jj = j_theta; jj >= 0; jj--) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+    }
+    if (j_bot < 0 && theta_periodic) {
+        for (int jj = ntheta - 1; jj > j_theta; jj--) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+        }
+    }
+    for (int jj = j_theta + 1; jj < ntheta; jj++) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+    }
+    if (j_top < 0 && theta_periodic) {
+        for (int jj = 0; jj < j_theta; jj++) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+        }
+    }
+    if (j_top < 0 && j_bot >= 0) j_top = j_bot;
+    if (j_bot < 0) return 0.0;
+
+    // Compute fy (theta fraction, periodic-aware)
+    double fy = 0.0;
+    if (j_top != j_bot) {
+        if (j_bot <= j_theta && j_top > j_theta) {
+            fy = double(j_theta - j_bot) / double(j_top - j_bot);
+        } else if (theta_periodic && j_bot > j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = (ntheta - j_bot) + j_theta;
+            fy = double(dist_from_bot) / double(dist_total);
+        } else if (theta_periodic && j_top < j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = j_theta - j_bot;
+            fy = double(dist_from_bot) / double(dist_total);
+        }
+    }
+
+    // Step 2: Find r-columns active on BOTH j_bot and j_top rows
+    int il = -1, ir_col = -1;
+    for (int ii = i_r; ii >= 0; ii--) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            il = ii; break;
+        }
+    }
+    for (int ii = i_r + 1; ii < nr; ii++) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            ir_col = ii; break;
+        }
+    }
+
+    // Compute fx (r fraction)
+    double fx = 0.0;
+    if (il >= 0 && ir_col >= 0 && il != ir_col && il <= i_r && ir_col > i_r) {
+        fx = double(i_r - il) / double(ir_col - il);
+    }
+
+    // Step 3: 4-corner bilinear interpolation
+    if (il >= 0 && ir_col >= 0 && j_bot >= 0 && j_top >= 0) {
+        auto it_bl = fine_to_coarse.find({il,     j_bot});
+        auto it_br = fine_to_coarse.find({ir_col, j_bot});
+        auto it_tl = fine_to_coarse.find({il,     j_top});
+        auto it_tr = fine_to_coarse.find({ir_col, j_top});
+
+        if (it_bl != fine_to_coarse.end() && it_br != fine_to_coarse.end() &&
+            it_tl != fine_to_coarse.end() && it_tr != fine_to_coarse.end()) {
+            return (1-fx)*(1-fy)*Az_coarse(it_bl->second)
+                 + fx   *(1-fy)*Az_coarse(it_br->second)
+                 + (1-fx)*fy   *Az_coarse(it_tl->second)
+                 + fx   *fy   *Az_coarse(it_tr->second);
+        }
+    }
+
+    // Fallback: 1D theta interpolation if only one r-column found
+    if (il >= 0 && j_bot >= 0 && j_top >= 0 && j_top != j_bot) {
+        auto it_b = fine_to_coarse.find({il, j_bot});
+        auto it_t = fine_to_coarse.find({il, j_top});
+        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+            return (1-fy)*Az_coarse(it_b->second) + fy*Az_coarse(it_t->second);
+        }
+    }
+
+    // Last fallback: nearest active neighbor (theta-periodic-aware)
+    for (int dj = -1; dj <= 1; dj++) {
+        for (int di = -1; di <= 1; di++) {
+            int ni = i_r + di;
+            int nj = j_theta + dj;
+            if (theta_periodic) { nj = ((nj % ntheta) + ntheta) % ntheta; }
+            if (ni >= 0 && ni < nr && nj >= 0 && nj < ntheta && active_cells(nj, ni)) {
+                auto it = fine_to_coarse.find({ni, nj});
+                if (it != fine_to_coarse.end()) return Az_coarse(it->second);
+            }
+        }
+    }
+    return 0.0;
+}
+
 // ============================================================================
 // Phase 7: Cubic Hermite interpolation for smooth Az
 // ============================================================================
@@ -2996,63 +3111,10 @@ double MagneticFieldAnalyzer::calculateThetaInterpolationWeight(int j_theta, int
 }
 
 double MagneticFieldAnalyzer::interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const {
-    // Interpolation that exactly matches buildProlongationMatrixPolar.
-    // Uses axis-aligned neighbors (same row/column), not 4-corner bilinear.
-    // This ensures interpolateInactiveCellsPolar(Az_c) == P_prolongation * Az_c,
-    // which is required for Galerkin consistency in defect correction.
-    //
-    // Formula (matching buildProlongationMatrixPolar):
-    //   have_r && have_theta: 0.5*(r-interp) + 0.5*(theta-interp)
-    //   have_r only:          r-interp
-    //   have_theta only:      theta-interp
-    //   fallback:             nearest active neighbor
-
-    int i_inner = findNextActiveRadial(i_r, j_theta, -1);
-    int i_outer = findNextActiveRadial(i_r, j_theta, +1);
-    int j_prev  = findNextActiveTheta(i_r, j_theta, -1);
-    int j_next  = findNextActiveTheta(i_r, j_theta, +1);
-
-    auto it_inner = fine_to_coarse.find({i_inner, j_theta});
-    auto it_outer = fine_to_coarse.find({i_outer, j_theta});
-    auto it_prev  = fine_to_coarse.find({i_r, j_prev});
-    auto it_next  = fine_to_coarse.find({i_r, j_next});
-
-    bool have_r     = (it_inner != fine_to_coarse.end() && it_outer != fine_to_coarse.end() &&
-                       i_inner != i_outer);
-    bool have_theta = (it_prev  != fine_to_coarse.end() && it_next  != fine_to_coarse.end() &&
-                       j_prev != j_next);
-
-    if (have_r && have_theta) {
-        double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
-        double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-        double v_r = (1.0 - fr) * Az_coarse(it_inner->second) + fr * Az_coarse(it_outer->second);
-        double v_t = (1.0 - ft) * Az_coarse(it_prev->second)  + ft * Az_coarse(it_next->second);
-        return 0.5 * (v_r + v_t);
-    } else if (have_r) {
-        double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
-        return (1.0 - fr) * Az_coarse(it_inner->second) + fr * Az_coarse(it_outer->second);
-    } else if (have_theta) {
-        double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-        return (1.0 - ft) * Az_coarse(it_prev->second) + ft * Az_coarse(it_next->second);
-    } else {
-        // Fallback: nearest active neighbor (same as buildProlongationMatrixPolar)
-        double min_dist = std::numeric_limits<double>::max();
-        int nearest_idx = -1;
-        for (int di = -2; di <= 2; di++) {
-            for (int dj = -2; dj <= 2; dj++) {
-                int ni = i_r + di;
-                int nj = (j_theta + dj + ntheta) % ntheta;
-                if (ni >= 0 && ni < nr && active_cells(nj, ni)) {
-                    auto it = fine_to_coarse.find({ni, nj});
-                    if (it != fine_to_coarse.end()) {
-                        double dist = std::sqrt(double(di * di + dj * dj));
-                        if (dist < min_dist) { min_dist = dist; nearest_idx = it->second; }
-                    }
-                }
-            }
-        }
-        return (nearest_idx >= 0) ? Az_coarse(nearest_idx) : 0.0;
-    }
+    // Delegate to bilinearInterpolateFromCoarsePolar, which uses 4-corner bilinear interpolation.
+    // This exactly matches buildInterpolationWeightsPolar (used in buildProlongationMatrixPolar),
+    // ensuring P * Az_c == Az_full exactly (required for Galerkin consistency).
+    return bilinearInterpolateFromCoarsePolar(i_r, j_theta, Az_coarse);
 }
 
 void MagneticFieldAnalyzer::interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse) {
@@ -3437,6 +3499,139 @@ void MagneticFieldAnalyzer::buildInterpolationWeights(
     }
 }
 
+void MagneticFieldAnalyzer::buildInterpolationWeightsPolar(
+    int i_r, int j_theta, int fine_idx,
+    std::vector<Eigen::Triplet<double>>& triplets)
+{
+    // Polar version of buildInterpolationWeights, matching bilinearInterpolateFromCoarsePolar.
+    // Row = theta direction (j_theta), column = r direction (i_r).
+    // fine_idx must be set by caller (polar: i_r * ntheta + j_theta).
+
+    bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    int locality_radius = max_coarsen_skip + 1;
+    auto hasLocalActive = [&](int row, int col) -> bool {
+        int lo = std::max(0, col - locality_radius);
+        int hi = std::min(nr - 1, col + locality_radius);
+        for (int ii = lo; ii <= hi; ii++) {
+            if (active_cells(row, ii)) return true;
+        }
+        return false;
+    };
+
+    // Step 1: Find enclosing theta-rows
+    int j_bot = -1, j_top = -1;
+    for (int jj = j_theta; jj >= 0; jj--) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+    }
+    if (j_bot < 0 && theta_periodic) {
+        for (int jj = ntheta - 1; jj > j_theta; jj--) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+        }
+    }
+    for (int jj = j_theta + 1; jj < ntheta; jj++) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+    }
+    if (j_top < 0 && theta_periodic) {
+        for (int jj = 0; jj < j_theta; jj++) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+        }
+    }
+    if (j_top < 0 && j_bot >= 0) j_top = j_bot;
+    if (j_bot < 0) return;
+
+    // Compute fy
+    double fy = 0.0;
+    if (j_top != j_bot) {
+        if (j_bot <= j_theta && j_top > j_theta) {
+            fy = double(j_theta - j_bot) / double(j_top - j_bot);
+        } else if (theta_periodic && j_bot > j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = (ntheta - j_bot) + j_theta;
+            fy = double(dist_from_bot) / double(dist_total);
+        } else if (theta_periodic && j_top < j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = j_theta - j_bot;
+            fy = double(dist_from_bot) / double(dist_total);
+        }
+    }
+
+    // Step 2: Find r-columns active on BOTH rows
+    int il = -1, ir_col = -1;
+    for (int ii = i_r; ii >= 0; ii--) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            il = ii; break;
+        }
+    }
+    for (int ii = i_r + 1; ii < nr; ii++) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            ir_col = ii; break;
+        }
+    }
+
+    // Compute fx
+    double fx = 0.0;
+    if (il >= 0 && ir_col >= 0 && il != ir_col && il <= i_r && ir_col > i_r) {
+        fx = double(i_r - il) / double(ir_col - il);
+    }
+
+    // Step 3: 4-corner bilinear weights
+    if (il >= 0 && ir_col >= 0 && j_bot >= 0 && j_top >= 0) {
+        auto it_bl = fine_to_coarse.find({il,     j_bot});
+        auto it_br = fine_to_coarse.find({ir_col, j_bot});
+        auto it_tl = fine_to_coarse.find({il,     j_top});
+        auto it_tr = fine_to_coarse.find({ir_col, j_top});
+
+        if (it_bl != fine_to_coarse.end() && it_br != fine_to_coarse.end() &&
+            it_tl != fine_to_coarse.end() && it_tr != fine_to_coarse.end()) {
+            double w_bl = (1.0 - fx) * (1.0 - fy);
+            double w_br = fx * (1.0 - fy);
+            double w_tl = (1.0 - fx) * fy;
+            double w_tr = fx * fy;
+            if (w_bl > 1e-15) triplets.push_back({fine_idx, it_bl->second, w_bl});
+            if (w_br > 1e-15) triplets.push_back({fine_idx, it_br->second, w_br});
+            if (w_tl > 1e-15) triplets.push_back({fine_idx, it_tl->second, w_tl});
+            if (w_tr > 1e-15) triplets.push_back({fine_idx, it_tr->second, w_tr});
+            return;
+        }
+    }
+
+    // Fallback: 1D theta interpolation if only one r-column found
+    if (il >= 0 && j_bot >= 0 && j_top >= 0 && j_top != j_bot) {
+        auto it_b = fine_to_coarse.find({il, j_bot});
+        auto it_t = fine_to_coarse.find({il, j_top});
+        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+            triplets.push_back({fine_idx, it_b->second, 1.0 - fy});
+            triplets.push_back({fine_idx, it_t->second, fy});
+            return;
+        }
+    }
+
+    // Last fallback: nearest active neighbor (theta-periodic-aware)
+    double min_dist = std::numeric_limits<double>::max();
+    int nearest_coarse_idx = -1;
+    for (int dj = -1; dj <= 1; dj++) {
+        for (int di = -1; di <= 1; di++) {
+            int ni = i_r + di;
+            int nj = j_theta + dj;
+            if (theta_periodic) { nj = ((nj % ntheta) + ntheta) % ntheta; }
+            if (ni >= 0 && ni < nr && nj >= 0 && nj < ntheta && active_cells(nj, ni)) {
+                double dist = std::sqrt(double(di * di + dj * dj));
+                if (dist < min_dist) {
+                    auto it = fine_to_coarse.find({ni, nj});
+                    if (it != fine_to_coarse.end()) {
+                        min_dist = dist;
+                        nearest_coarse_idx = it->second;
+                    }
+                }
+            }
+        }
+    }
+    if (nearest_coarse_idx >= 0) {
+        triplets.push_back({fine_idx, nearest_coarse_idx, 1.0});
+    }
+}
+
 void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
     std::vector<Eigen::Triplet<double>>& triplets)
 {
@@ -3457,70 +3652,8 @@ void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
                     triplets.push_back({fine_idx, it->second, 1.0});
                 }
             } else {
-                // Inactive cell: interpolation from surrounding active cells
-                // Find neighbors in r and theta directions
-                int i_inner = findNextActiveRadial(i_r, j_theta, -1);
-                int i_outer = findNextActiveRadial(i_r, j_theta, +1);
-                int j_prev = findNextActiveTheta(i_r, j_theta, -1);
-                int j_next = findNextActiveTheta(i_r, j_theta, +1);
-
-                auto it_inner = fine_to_coarse.find({i_inner, j_theta});
-                auto it_outer = fine_to_coarse.find({i_outer, j_theta});
-                auto it_prev = fine_to_coarse.find({i_r, j_prev});
-                auto it_next = fine_to_coarse.find({i_r, j_next});
-
-                bool have_r = (it_inner != fine_to_coarse.end() && it_outer != fine_to_coarse.end() &&
-                               i_inner != i_outer);
-                bool have_theta = (it_prev != fine_to_coarse.end() && it_next != fine_to_coarse.end() &&
-                                   j_prev != j_next);
-
-                if (have_r && have_theta) {
-                    // Bilinear in r-theta
-                    double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
-                    double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-
-                    triplets.push_back({fine_idx, it_inner->second, 0.5 * (1.0 - fr)});
-                    triplets.push_back({fine_idx, it_outer->second, 0.5 * fr});
-                    triplets.push_back({fine_idx, it_prev->second, 0.5 * (1.0 - ft)});
-                    triplets.push_back({fine_idx, it_next->second, 0.5 * ft});
-                } else if (have_r) {
-                    double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
-                    triplets.push_back({fine_idx, it_inner->second, 1.0 - fr});
-                    triplets.push_back({fine_idx, it_outer->second, fr});
-                } else if (have_theta) {
-                    double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-                    triplets.push_back({fine_idx, it_prev->second, 1.0 - ft});
-                    triplets.push_back({fine_idx, it_next->second, ft});
-                } else {
-                    // Fallback: nearest active neighbor
-                    double min_dist = std::numeric_limits<double>::max();
-                    int nearest_coarse_idx = -1;
-
-                    for (int di = -2; di <= 2; di++) {
-                        for (int dj = -2; dj <= 2; dj++) {
-                            int ni = i_r + di;
-                            int nj = (j_theta + dj + ntheta) % ntheta;
-                            if (ni >= 0 && ni < nr) {
-                                // active_cells is ALWAYS (ntheta, nr) = (nj, ni)
-                                bool neighbor_active = active_cells(nj, ni);
-                                if (neighbor_active) {
-                                    double dist = std::sqrt(di * di + dj * dj);
-                                    if (dist < min_dist) {
-                                        auto it = fine_to_coarse.find({ni, nj});
-                                        if (it != fine_to_coarse.end()) {
-                                            min_dist = dist;
-                                            nearest_coarse_idx = it->second;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (nearest_coarse_idx >= 0) {
-                        triplets.push_back({fine_idx, nearest_coarse_idx, 1.0});
-                    }
-                }
+                // Inactive cell: 4-corner bilinear weights (matching bilinearInterpolateFromCoarsePolar)
+                buildInterpolationWeightsPolar(i_r, j_theta, fine_idx, triplets);
             }
         }
     }
