@@ -1381,18 +1381,20 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
         }
     } else if (activeMask) {
         // Cartesian with coarsening-aware differentiation
-        // Step 1: Compute B at active cells using nearest active neighbors
-        // Step 2: Bilinear interpolate B at inactive cells from enclosing active cells
+        // Material-aware: if one stencil neighbor is across a material boundary
+        // (μ ratio > threshold), use 1-sided stencil on the same-material side.
         const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
         const x_periodic = bc && bc.left && bc.right &&
                           bc.left.type === 'periodic' && bc.right.type === 'periodic';
         const y_periodic = bc && bc.bottom && bc.top &&
                           bc.bottom.type === 'periodic' && bc.top.type === 'periodic';
+        const MU_RATIO_THRESH = 5.0;
 
-        // Step 1: B at active cells only (non-uniform central difference)
         for (let j = 0; j < rows; j++) {
             for (let i = 0; i < cols; i++) {
                 if (!activeMask[j][i]) continue;
+
+                const mu_here = (Mu[j] && Mu[j][i] > 0) ? Mu[j][i] : 1;
 
                 // Bx = ∂Az/∂y: find nearest active neighbors in j direction (same column)
                 let j_prev = -1, j_next = -1;
@@ -1412,6 +1414,16 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                     for (let jj = 0; jj < j; jj++) {
                         if (activeMask[jj][i]) { j_next = jj; break; }
                     }
+                }
+
+                // Material boundary check for Bx j-stencil
+                if (j_prev >= 0 && j_next >= 0) {
+                    const rp = ((Mu[j_prev] && Mu[j_prev][i] > 0) ? Mu[j_prev][i] : 1) / mu_here;
+                    const rn = ((Mu[j_next] && Mu[j_next][i] > 0) ? Mu[j_next][i] : 1) / mu_here;
+                    const cp = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
+                    const cn = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                    if (cp && !cn) j_prev = -1;
+                    else if (cn && !cp) j_next = -1;
                 }
 
                 if (j_prev >= 0 && j_next >= 0) {
@@ -1443,6 +1455,16 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                     for (let ii = 0; ii < i; ii++) {
                         if (activeMask[j][ii]) { i_next = ii; break; }
                     }
+                }
+
+                // Material boundary check for By i-stencil
+                if (i_prev >= 0 && i_next >= 0) {
+                    const rp = ((Mu[j] && Mu[j][i_prev] > 0) ? Mu[j][i_prev] : 1) / mu_here;
+                    const rn = ((Mu[j] && Mu[j][i_next] > 0) ? Mu[j][i_next] : 1) / mu_here;
+                    const cp = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
+                    const cn = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                    if (cp && !cn) i_prev = -1;
+                    else if (cn && !cp) i_next = -1;
                 }
 
                 if (i_prev >= 0 && i_next >= 0) {
