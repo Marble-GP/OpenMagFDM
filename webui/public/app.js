@@ -1206,17 +1206,27 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             return r_orientation === 'horizontal' ? activeMask[jt][ir] : activeMask[ir][jt];
         };
 
+        // Helper: get permeability at (ir, jt)
+        const getMuPolar = (ir, jt) => {
+            const row = r_orientation === 'horizontal' ? Mu[jt] : Mu[ir];
+            const col = r_orientation === 'horizontal' ? ir : jt;
+            return (row && row[col] != null && row[col] > 0) ? row[col] : 1;
+        };
+
         if (activeMask) {
             // Coarsening-aware: nearest-active-neighbor stencil at active cells.
-            // Same approach as Cartesian coarsening path — avoids surface-concentration
-            // artifact caused by differentiating across interpolated inactive cells.
+            // Uses material-aware 1-sided fallback: if one stencil neighbor is in a
+            // different material (μ ratio > threshold), drop it to avoid cross-boundary
+            // gradient that causes surface-concentration artifacts.
             // Inactive cells remain 0; _fillInactiveScalar() fills them after Bx/By conversion.
+            const MU_RATIO_THRESH = 5.0;
             for (let jt = 0; jt < ntheta; jt++) {
                 for (let ir = 0; ir < nr; ir++) {
                     if (!getActivePolar(ir, jt)) continue;
 
                     const r = r_coords[ir];
                     const safe_r = Math.max(r, 1e-15);
+                    const mu_here = getMuPolar(ir, jt);
 
                     // Br = (1/r) * ∂Az/∂θ — find nearest active theta neighbors at same ir
                     let jt_prev = -1, jt_next = -1;
@@ -1235,6 +1245,16 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                         for (let jj = 0; jj < jt; jj++) {
                             if (getActivePolar(ir, jj)) { jt_next = jj; break; }
                         }
+                    }
+
+                    // Material boundary check for Br theta-stencil
+                    if (jt_prev >= 0 && jt_next >= 0) {
+                        const rp = getMuPolar(ir, jt_prev) / mu_here;
+                        const rn = getMuPolar(ir, jt_next) / mu_here;
+                        const cross_prev = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
+                        const cross_next = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                        if (cross_prev && !cross_next) jt_prev = -1;
+                        else if (cross_next && !cross_prev) jt_next = -1;
                     }
 
                     let Br_val = 0;
@@ -1263,6 +1283,16 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                     }
                     for (let ii = ir + 1; ii < nr; ii++) {
                         if (getActivePolar(ii, jt)) { ir_next = ii; break; }
+                    }
+
+                    // Material boundary check for Bθ radial-stencil
+                    if (ir_prev >= 0 && ir_next >= 0) {
+                        const rp = getMuPolar(ir_prev, jt) / mu_here;
+                        const rn = getMuPolar(ir_next, jt) / mu_here;
+                        const cross_prev = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
+                        const cross_next = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                        if (cross_prev && !cross_next) ir_prev = -1;
+                        else if (cross_next && !cross_prev) ir_next = -1;
                     }
 
                     let Btheta_val = 0;
