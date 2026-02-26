@@ -1247,12 +1247,17 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                         }
                     }
 
-                    // Material boundary check for Br theta-stencil
+                    // Material boundary check for Br theta-stencil.
+                    // Only apply when stencil spans inactive cells (step > 1).
+                    // At step=1 (adjacent fine cells), use cross-material central diff
+                    // like the non-coarsened solver to avoid artificial surface concentration.
                     if (jt_prev >= 0 && jt_next >= 0) {
+                        const h_p = jt_prev > jt ? (jt + ntheta - jt_prev) : (jt - jt_prev);
+                        const h_n = jt_next < jt ? (jt_next + ntheta - jt) : (jt_next - jt);
                         const rp = getMuPolar(ir, jt_prev) / mu_here;
                         const rn = getMuPolar(ir, jt_next) / mu_here;
-                        const cross_prev = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
-                        const cross_next = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                        const cross_prev = h_p > 1 && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
+                        const cross_next = h_n > 1 && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
                         if (cross_prev && !cross_next) jt_prev = -1;
                         else if (cross_next && !cross_prev) jt_next = -1;
                     }
@@ -1285,12 +1290,14 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                         if (getActivePolar(ii, jt)) { ir_next = ii; break; }
                     }
 
-                    // Material boundary check for Bθ radial-stencil
+                    // Material boundary check for Bθ radial-stencil.
+                    // Only apply when stencil spans inactive cells (step > 1).
                     if (ir_prev >= 0 && ir_next >= 0) {
+                        const step_p = ir - ir_prev, step_n = ir_next - ir;
                         const rp = getMuPolar(ir_prev, jt) / mu_here;
                         const rn = getMuPolar(ir_next, jt) / mu_here;
-                        const cross_prev = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
-                        const cross_next = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                        const cross_prev = step_p > 1 && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
+                        const cross_next = step_n > 1 && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
                         if (cross_prev && !cross_next) ir_prev = -1;
                         else if (cross_next && !cross_prev) ir_next = -1;
                     }
@@ -1416,12 +1423,15 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                     }
                 }
 
-                // Material boundary check for Bx j-stencil
+                // Material boundary check for Bx j-stencil.
+                // Only apply when stencil spans inactive cells (step > 1).
                 if (j_prev >= 0 && j_next >= 0) {
+                    const h_p = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
+                    const h_n = j_next < j ? (j_next + rows - j) : (j_next - j);
                     const rp = ((Mu[j_prev] && Mu[j_prev][i] > 0) ? Mu[j_prev][i] : 1) / mu_here;
                     const rn = ((Mu[j_next] && Mu[j_next][i] > 0) ? Mu[j_next][i] : 1) / mu_here;
-                    const cp = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
-                    const cn = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                    const cp = h_p > 1 && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
+                    const cn = h_n > 1 && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
                     if (cp && !cn) j_prev = -1;
                     else if (cn && !cp) j_next = -1;
                 }
@@ -1457,12 +1467,15 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
                     }
                 }
 
-                // Material boundary check for By i-stencil
+                // Material boundary check for By i-stencil.
+                // Only apply when stencil spans inactive cells (step > 1).
                 if (i_prev >= 0 && i_next >= 0) {
+                    const h_p = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
+                    const h_n = i_next < i ? (i_next + cols - i) : (i_next - i);
                     const rp = ((Mu[j] && Mu[j][i_prev] > 0) ? Mu[j][i_prev] : 1) / mu_here;
                     const rn = ((Mu[j] && Mu[j][i_next] > 0) ? Mu[j][i_next] : 1) / mu_here;
-                    const cp = rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH;
-                    const cn = rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH;
+                    const cp = h_p > 1 && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
+                    const cn = h_n > 1 && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
                     if (cp && !cn) i_prev = -1;
                     else if (cn && !cp) i_next = -1;
                 }
