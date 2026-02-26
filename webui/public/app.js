@@ -1206,114 +1206,52 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             return r_orientation === 'horizontal' ? activeMask[jt][ir] : activeMask[ir][jt];
         };
 
-        // Helper: get permeability at (ir, jt)
-        const getMuPolar = (ir, jt) => {
-            const row = r_orientation === 'horizontal' ? Mu[jt] : Mu[ir];
-            const col = r_orientation === 'horizontal' ? ir : jt;
-            return (row && row[col] != null && row[col] > 0) ? row[col] : 1;
-        };
-
         if (activeMask) {
-            // Coarsening-aware: nearest-active-neighbor stencil at active cells.
-            // Uses material-aware 1-sided fallback: if one stencil neighbor is in a
-            // different material (μ ratio > threshold), drop it to avoid cross-boundary
-            // gradient that causes surface-concentration artifacts.
+            // Full-grid step=1 stencil at active cells.
+            // C++ exports interpolated Az at ALL cells (active + inactive via interpolateToFullGrid),
+            // so immediate ±1 neighbors are always valid. This matches the non-coarsened solver
+            // behavior exactly at material boundaries, eliminating surface concentration artifacts.
             // Inactive cells remain 0; _fillInactiveScalar() fills them after Bx/By conversion.
-            const MU_RATIO_THRESH = 5.0;
             for (let jt = 0; jt < ntheta; jt++) {
                 for (let ir = 0; ir < nr; ir++) {
                     if (!getActivePolar(ir, jt)) continue;
 
                     const r = r_coords[ir];
                     const safe_r = Math.max(r, 1e-15);
-                    const mu_here = getMuPolar(ir, jt);
 
-                    // Br = (1/r) * ∂Az/∂θ — find nearest active theta neighbors at same ir
-                    let jt_prev = -1, jt_next = -1;
-                    for (let jj = jt - 1; jj >= 0; jj--) {
-                        if (getActivePolar(ir, jj)) { jt_prev = jj; break; }
-                    }
-                    for (let jj = jt + 1; jj < ntheta; jj++) {
-                        if (getActivePolar(ir, jj)) { jt_next = jj; break; }
-                    }
-                    if (jt_prev < 0 && thetaPeriodic) {
-                        for (let jj = ntheta - 1; jj > jt; jj--) {
-                            if (getActivePolar(ir, jj)) { jt_prev = jj; break; }
-                        }
-                    }
-                    if (jt_next < 0 && thetaPeriodic) {
-                        for (let jj = 0; jj < jt; jj++) {
-                            if (getActivePolar(ir, jj)) { jt_next = jj; break; }
-                        }
-                    }
-
-                    // Material boundary check for Br theta-stencil.
-                    // Only apply when BOTH stencil sides span inactive cells (both_coarse).
-                    // If either side is step=1 (in protection zone), use cross-material
-                    // central diff like non-coarsened solver to avoid surface concentration.
-                    if (jt_prev >= 0 && jt_next >= 0) {
-                        const h_p = jt_prev > jt ? (jt + ntheta - jt_prev) : (jt - jt_prev);
-                        const h_n = jt_next < jt ? (jt_next + ntheta - jt) : (jt_next - jt);
-                        const both_coarse = h_p > 1 && h_n > 1;
-                        const rp = getMuPolar(ir, jt_prev) / mu_here;
-                        const rn = getMuPolar(ir, jt_next) / mu_here;
-                        const cross_prev = both_coarse && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
-                        const cross_next = both_coarse && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
-                        if (cross_prev && !cross_next) jt_prev = -1;
-                        else if (cross_next && !cross_prev) jt_next = -1;
-                    }
+                    // Br = (1/r) * ∂Az/∂θ — full-grid step=1 stencil.
+                    // C++ exports interpolated Az at ALL cells (active + inactive),
+                    // so use immediate ±1 neighbors to match non-coarsened behavior exactly.
+                    let jt_prev = jt - 1, jt_next = jt + 1;
+                    if (jt_prev < 0) jt_prev = thetaPeriodic ? ntheta - 1 : -1;
+                    if (jt_next >= ntheta) jt_next = thetaPeriodic ? 0 : -1;
 
                     let Br_val = 0;
                     if (jt_prev >= 0 && jt_next >= 0) {
-                        const h_back = jt_prev > jt ? (jt + ntheta - jt_prev) : (jt - jt_prev);
-                        const h_fwd  = jt_next < jt ? (jt_next + ntheta - jt)  : (jt_next - jt);
                         let Az_next = getAz(ir, jt_next), Az_prev = getAz(ir, jt_prev);
                         if (thetaAntiperiodic) {
                             if (jt_next < jt) Az_next = -Az_next;
                             if (jt_prev > jt) Az_prev = -Az_prev;
                         }
-                        Br_val = (Az_next - Az_prev) / ((h_back + h_fwd) * dtheta) / safe_r;
+                        Br_val = (Az_next - Az_prev) / (2 * dtheta) / safe_r;
                     } else if (jt_next >= 0) {
-                        const h = jt_next < jt ? (jt_next + ntheta - jt) : (jt_next - jt);
-                        Br_val = (getAz(ir, jt_next) - getAz(ir, jt)) / (h * dtheta) / safe_r;
+                        Br_val = (getAz(ir, jt_next) - getAz(ir, jt)) / dtheta / safe_r;
                     } else if (jt_prev >= 0) {
-                        const h = jt_prev > jt ? (jt + ntheta - jt_prev) : (jt - jt_prev);
-                        Br_val = (getAz(ir, jt) - getAz(ir, jt_prev)) / (h * dtheta) / safe_r;
+                        Br_val = (getAz(ir, jt) - getAz(ir, jt_prev)) / dtheta / safe_r;
                     }
                     setField(Br, ir, jt, Br_val);
 
-                    // Bθ = -∂Az/∂r — find nearest active radial neighbors at same jt
-                    let ir_prev = -1, ir_next = -1;
-                    for (let ii = ir - 1; ii >= 0; ii--) {
-                        if (getActivePolar(ii, jt)) { ir_prev = ii; break; }
-                    }
-                    for (let ii = ir + 1; ii < nr; ii++) {
-                        if (getActivePolar(ii, jt)) { ir_next = ii; break; }
-                    }
-
-                    // Material boundary check for Bθ radial-stencil.
-                    // Only apply when BOTH stencil sides span inactive cells (both_coarse).
-                    // If either side is step=1 (in protection zone), use cross-material
-                    // central diff like non-coarsened solver to avoid surface concentration.
-                    if (ir_prev >= 0 && ir_next >= 0) {
-                        const step_p = ir - ir_prev, step_n = ir_next - ir;
-                        const both_coarse = step_p > 1 && step_n > 1;
-                        const rp = getMuPolar(ir_prev, jt) / mu_here;
-                        const rn = getMuPolar(ir_next, jt) / mu_here;
-                        const cross_prev = both_coarse && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
-                        const cross_next = both_coarse && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
-                        if (cross_prev && !cross_next) ir_prev = -1;
-                        else if (cross_next && !cross_prev) ir_next = -1;
-                    }
+                    // Bθ = -∂Az/∂r — full-grid step=1 stencil (same rationale as Br).
+                    const ir_prev = ir > 0 ? ir - 1 : -1;
+                    const ir_next = ir < nr - 1 ? ir + 1 : -1;
 
                     let Btheta_val = 0;
                     if (ir_prev >= 0 && ir_next >= 0) {
-                        const h_back = ir - ir_prev, h_fwd = ir_next - ir;
-                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir_prev, jt)) / ((h_back + h_fwd) * dr);
+                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir_prev, jt)) / (2 * dr);
                     } else if (ir_next >= 0) {
-                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir, jt)) / ((ir_next - ir) * dr);
+                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir, jt)) / dr;
                     } else if (ir_prev >= 0) {
-                        Btheta_val = -(getAz(ir, jt) - getAz(ir_prev, jt)) / ((ir - ir_prev) * dr);
+                        Btheta_val = -(getAz(ir, jt) - getAz(ir_prev, jt)) / dr;
                     }
                     setField(Btheta, ir, jt, Btheta_val);
                 }
@@ -1391,115 +1329,43 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             }
         }
     } else if (activeMask) {
-        // Cartesian with coarsening-aware differentiation
-        // Material-aware: if one stencil neighbor is across a material boundary
-        // (μ ratio > threshold), use 1-sided stencil on the same-material side.
+        // Cartesian with coarsening: full-grid step=1 stencil.
+        // C++ exports interpolated Az at ALL cells (active + inactive via interpolateToFullGrid),
+        // so use immediate ±1 neighbors to match non-coarsened behavior at material boundaries.
         const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
         const x_periodic = bc && bc.left && bc.right &&
                           bc.left.type === 'periodic' && bc.right.type === 'periodic';
         const y_periodic = bc && bc.bottom && bc.top &&
                           bc.bottom.type === 'periodic' && bc.top.type === 'periodic';
-        const MU_RATIO_THRESH = 5.0;
 
         for (let j = 0; j < rows; j++) {
             for (let i = 0; i < cols; i++) {
                 if (!activeMask[j][i]) continue;
 
-                const mu_here = (Mu[j] && Mu[j][i] > 0) ? Mu[j][i] : 1;
-
-                // Bx = ∂Az/∂y: find nearest active neighbors in j direction (same column)
-                let j_prev = -1, j_next = -1;
-                for (let jj = j - 1; jj >= 0; jj--) {
-                    if (activeMask[jj][i]) { j_prev = jj; break; }
-                }
-                for (let jj = j + 1; jj < rows; jj++) {
-                    if (activeMask[jj][i]) { j_next = jj; break; }
-                }
-                // Periodic wrap
-                if (j_prev < 0 && y_periodic) {
-                    for (let jj = rows - 1; jj > j; jj--) {
-                        if (activeMask[jj][i]) { j_prev = jj; break; }
-                    }
-                }
-                if (j_next < 0 && y_periodic) {
-                    for (let jj = 0; jj < j; jj++) {
-                        if (activeMask[jj][i]) { j_next = jj; break; }
-                    }
-                }
-
-                // Material boundary check for Bx j-stencil.
-                // Only apply when BOTH stencil sides span inactive cells (both_coarse).
-                // If either side is step=1 (in protection zone), use cross-material
-                // central diff like non-coarsened solver to avoid surface concentration.
-                if (j_prev >= 0 && j_next >= 0) {
-                    const h_p = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
-                    const h_n = j_next < j ? (j_next + rows - j) : (j_next - j);
-                    const both_coarse = h_p > 1 && h_n > 1;
-                    const rp = ((Mu[j_prev] && Mu[j_prev][i] > 0) ? Mu[j_prev][i] : 1) / mu_here;
-                    const rn = ((Mu[j_next] && Mu[j_next][i] > 0) ? Mu[j_next][i] : 1) / mu_here;
-                    const cp = both_coarse && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
-                    const cn = both_coarse && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
-                    if (cp && !cn) j_prev = -1;
-                    else if (cn && !cp) j_next = -1;
-                }
+                // Bx = ∂Az/∂y — full-grid step=1 stencil
+                let j_prev = j - 1, j_next = j + 1;
+                if (j_prev < 0) j_prev = y_periodic ? rows - 1 : -1;
+                if (j_next >= rows) j_next = y_periodic ? 0 : -1;
 
                 if (j_prev >= 0 && j_next >= 0) {
-                    const h_back = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
-                    const h_fwd = j_next < j ? (j_next + rows - j) : (j_next - j);
-                    Bx[j][i] = (Az[j_next][i] - Az[j_prev][i]) / ((h_back + h_fwd) * dy);
+                    Bx[j][i] = (Az[j_next][i] - Az[j_prev][i]) / (2 * dy);
                 } else if (j_next >= 0) {
-                    const h = j_next < j ? (j_next + rows - j) : (j_next - j);
-                    Bx[j][i] = (Az[j_next][i] - Az[j][i]) / (h * dy);
+                    Bx[j][i] = (Az[j_next][i] - Az[j][i]) / dy;
                 } else if (j_prev >= 0) {
-                    const h = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
-                    Bx[j][i] = (Az[j][i] - Az[j_prev][i]) / (h * dy);
+                    Bx[j][i] = (Az[j][i] - Az[j_prev][i]) / dy;
                 }
 
-                // By = -∂Az/∂x: find nearest active neighbors in i direction (same row)
-                let i_prev = -1, i_next = -1;
-                for (let ii = i - 1; ii >= 0; ii--) {
-                    if (activeMask[j][ii]) { i_prev = ii; break; }
-                }
-                for (let ii = i + 1; ii < cols; ii++) {
-                    if (activeMask[j][ii]) { i_next = ii; break; }
-                }
-                if (i_prev < 0 && x_periodic) {
-                    for (let ii = cols - 1; ii > i; ii--) {
-                        if (activeMask[j][ii]) { i_prev = ii; break; }
-                    }
-                }
-                if (i_next < 0 && x_periodic) {
-                    for (let ii = 0; ii < i; ii++) {
-                        if (activeMask[j][ii]) { i_next = ii; break; }
-                    }
-                }
-
-                // Material boundary check for By i-stencil.
-                // Only apply when BOTH stencil sides span inactive cells (both_coarse).
-                // If either side is step=1 (in protection zone), use cross-material
-                // central diff like non-coarsened solver to avoid surface concentration.
-                if (i_prev >= 0 && i_next >= 0) {
-                    const h_p = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
-                    const h_n = i_next < i ? (i_next + cols - i) : (i_next - i);
-                    const both_coarse = h_p > 1 && h_n > 1;
-                    const rp = ((Mu[j] && Mu[j][i_prev] > 0) ? Mu[j][i_prev] : 1) / mu_here;
-                    const rn = ((Mu[j] && Mu[j][i_next] > 0) ? Mu[j][i_next] : 1) / mu_here;
-                    const cp = both_coarse && (rp > MU_RATIO_THRESH || rp < 1 / MU_RATIO_THRESH);
-                    const cn = both_coarse && (rn > MU_RATIO_THRESH || rn < 1 / MU_RATIO_THRESH);
-                    if (cp && !cn) i_prev = -1;
-                    else if (cn && !cp) i_next = -1;
-                }
+                // By = -∂Az/∂x — full-grid step=1 stencil
+                let i_prev = i - 1, i_next = i + 1;
+                if (i_prev < 0) i_prev = x_periodic ? cols - 1 : -1;
+                if (i_next >= cols) i_next = x_periodic ? 0 : -1;
 
                 if (i_prev >= 0 && i_next >= 0) {
-                    const h_back = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
-                    const h_fwd = i_next < i ? (i_next + cols - i) : (i_next - i);
-                    By[j][i] = -(Az[j][i_next] - Az[j][i_prev]) / ((h_back + h_fwd) * dx);
+                    By[j][i] = -(Az[j][i_next] - Az[j][i_prev]) / (2 * dx);
                 } else if (i_next >= 0) {
-                    const h = i_next < i ? (i_next + cols - i) : (i_next - i);
-                    By[j][i] = -(Az[j][i_next] - Az[j][i]) / (h * dx);
+                    By[j][i] = -(Az[j][i_next] - Az[j][i]) / dx;
                 } else if (i_prev >= 0) {
-                    const h = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
-                    By[j][i] = -(Az[j][i] - Az[j][i_prev]) / (h * dx);
+                    By[j][i] = -(Az[j][i] - Az[j][i_prev]) / dx;
                 }
             }
         }
