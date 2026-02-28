@@ -399,6 +399,66 @@ app.post('/api/config', async (req, res) => {
     }
 });
 
+// Validate YAML configuration without saving
+app.post('/api/validate-config', async (req, res) => {
+    try {
+        const { config } = req.body;
+        if (!config || typeof config !== 'string') {
+            return res.status(400).json({ valid: false, errors: [{ field: 'config', message: 'config field is required' }] });
+        }
+
+        const errors = [];
+
+        // 1. YAML syntax check
+        let parsed;
+        try {
+            parsed = yaml.load(config);
+        } catch (yamlError) {
+            return res.json({ valid: false, errors: [{ field: 'yaml', message: `YAML syntax error: ${yamlError.message}` }] });
+        }
+
+        if (!parsed || typeof parsed !== 'object') {
+            return res.json({ valid: false, errors: [{ field: 'yaml', message: 'Config must be a YAML mapping' }] });
+        }
+
+        // 2. coordinate_system
+        const cs = parsed['coordinate_system'];
+        if (!cs) {
+            errors.push({ field: 'coordinate_system', message: 'coordinate_system is required (cartesian or polar)' });
+        } else if (!['cartesian', 'polar'].includes(cs)) {
+            errors.push({ field: 'coordinate_system', message: `Unknown coordinate_system: "${cs}". Must be cartesian or polar` });
+        }
+
+        // 3. materials
+        if (!parsed['materials'] || typeof parsed['materials'] !== 'object') {
+            errors.push({ field: 'materials', message: 'materials section is required' });
+        }
+
+        // 4. Coordinate-system specific checks
+        if (cs === 'cartesian') {
+            if (!parsed['boundary_conditions']) {
+                errors.push({ field: 'boundary_conditions', message: 'boundary_conditions is required for cartesian coordinate system' });
+            }
+            if (!parsed['mesh']) {
+                errors.push({ field: 'mesh', message: 'mesh section (dx, dy) is required for cartesian coordinate system' });
+            }
+        } else if (cs === 'polar') {
+            if (!parsed['polar_domain']) {
+                errors.push({ field: 'polar_domain', message: 'polar_domain is required for polar coordinate system' });
+            } else {
+                const pd = parsed['polar_domain'];
+                if (pd['r_start'] === undefined) errors.push({ field: 'polar_domain.r_start', message: 'polar_domain.r_start is required' });
+                if (pd['r_end'] === undefined) errors.push({ field: 'polar_domain.r_end', message: 'polar_domain.r_end is required' });
+                if (pd['theta_range'] === undefined) errors.push({ field: 'polar_domain.theta_range', message: 'polar_domain.theta_range is required' });
+            }
+        }
+
+        res.json({ valid: errors.length === 0, errors });
+    } catch (error) {
+        res.status(500).json({ valid: false, errors: [{ field: 'server', message: error.message }] });
+    }
+});
+
 // 画像ファイルのアップロード（ユーザーごとのディレクトリ）
 app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     try {
