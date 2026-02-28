@@ -933,6 +933,79 @@ function formatBytes(bytes) {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
 }
 
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+    try {
+        const checks = {};
+
+        // Check solver binary
+        try {
+            await fs.access(SOLVER_PATH);
+            checks.solver = 'ok';
+        } catch {
+            checks.solver = 'missing';
+        }
+
+        // Check directories writable
+        for (const [name, dir] of [['uploads', UPLOAD_DIR], ['configs', USER_CONFIGS_DIR], ['outputs', OUTPUTS_DIR]]) {
+            try {
+                await fs.access(dir, fsSync.constants.W_OK);
+                checks[name] = 'ok';
+            } catch {
+                checks[name] = 'not_writable';
+            }
+        }
+
+        const allOk = Object.values(checks).every(v => v === 'ok');
+        res.status(allOk ? 200 : 503).json({
+            status: allOk ? 'ok' : 'degraded',
+            checks,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ status: 'error', error: error.message });
+    }
+});
+
+// Solver info endpoint
+app.get('/api/solver/info', async (req, res) => {
+    try {
+        // Get version from solver binary
+        let version = 'unknown';
+        try {
+            await new Promise((resolve) => {
+                const proc = spawn(SOLVER_PATH, ['--version']);
+                let output = '';
+                proc.stdout.on('data', d => { output += d.toString(); });
+                proc.stderr.on('data', d => { output += d.toString(); });
+                proc.on('close', () => {
+                    const match = output.match(/[\d]+\.[\d]+\.[\d]+/);
+                    if (match) version = match[0];
+                    resolve();
+                });
+                proc.on('error', resolve);
+                setTimeout(() => { proc.kill(); resolve(); }, 3000);
+            });
+        } catch { /* ignore */ }
+
+        res.json({
+            version,
+            solverPath: SOLVER_PATH,
+            capabilities: {
+                coordinate_systems: ['cartesian', 'polar'],
+                nonlinear_solvers: ['picard', 'newton_krylov'],
+                features: ['coarsening', 'adaptive_mesh', 'transient', 'sliding_mesh', 'force_calculation']
+            },
+            build: {
+                nodeVersion: process.version,
+                platform: process.platform
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Get list of user output folders with details
 app.get('/api/user-outputs', async (req, res) => {
     try {
