@@ -30,7 +30,9 @@ const AppState = {
     // Plotly mode bar visibility
     showPlotlyModeBar: false,  // Show/hide Plotly mode bar for all plots
     // Plot configuration (ranges, colorscales, etc.)
-    plotConfigs: {}  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
+    plotConfigs: {},  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
+    // Detect Colors result cache
+    lastDetectResult: null   // Last result from /api/materials/detect
 };
 
 // ===== Utility Functions =====
@@ -666,6 +668,7 @@ async function handleImageUpload(event) {
         const result = await response.json();
         AppState.uploadedImageFilename = result.filename;
         showStatus('solverStatus', `Image uploaded: ${result.filename}`, 'success');
+        document.getElementById('detectColorsBtn').style.display = 'block';
 
         // Refresh image list
         await refreshImageList();
@@ -711,6 +714,7 @@ function loadSelectedImage() {
     const img = document.getElementById('uploadedImage');
     img.src = `/uploads/${AppState.userId}/${filename}`;
     img.classList.remove('hidden');
+    document.getElementById('detectColorsBtn').style.display = 'block';
     showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
 }
 
@@ -738,9 +742,172 @@ async function deleteSelectedImage() {
         if (AppState.uploadedImageFilename === filename) {
             AppState.uploadedImageFilename = null;
             document.getElementById('uploadedImage').classList.add('hidden');
+            document.getElementById('detectColorsBtn').style.display = 'none';
         }
     } catch (error) {
         showStatus('solverStatus', `Delete error: ${error.message}`, 'error');
+    }
+}
+
+// =====================================================
+// Detect Colors Feature
+// =====================================================
+
+async function detectColors() {
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'Please upload or select an image first', 'error');
+        return;
+    }
+
+    const rareThreshold = parseFloat(document.getElementById('detectRareThreshold').value || '5') / 100;
+    const blendTolerance = parseInt(document.getElementById('detectBlendTolerance').value || '8', 10);
+
+    try {
+        // Fetch the image file as a blob
+        const imgResponse = await fetch(`/uploads/${AppState.userId}/${AppState.uploadedImageFilename}`);
+        if (!imgResponse.ok) throw new Error('Failed to fetch image');
+        const blob = await imgResponse.blob();
+
+        // Post to detect endpoint
+        const formData = new FormData();
+        formData.append('image', blob, AppState.uploadedImageFilename);
+        formData.append('userId', AppState.userId);
+
+        const params = new URLSearchParams({
+            rareThreshold: rareThreshold.toString(),
+            blendTolerance: blendTolerance.toString()
+        });
+
+        const response = await fetch(`/api/materials/detect?${params}`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!response.ok) {
+            const err = await response.json();
+            throw new Error(err.error || 'Detection failed');
+        }
+
+        const result = await response.json();
+        AppState.lastDetectResult = result;
+        renderDetectModal(result);
+        document.getElementById('detectColorsModal').style.display = 'flex';
+
+    } catch (error) {
+        showStatus('solverStatus', `Detect error: ${error.message}`, 'error');
+    }
+}
+
+function renderDetectModal(result) {
+    // Render dominant color grid
+    const grid = document.getElementById('detectColorGrid');
+    grid.innerHTML = '';
+    (result.colors || []).forEach(c => {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const isAA = c.antialias === true;
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex; align-items:center; gap:6px; background:#f8f9fa; border-radius:4px; padding:5px 8px; font-size:0.8rem;';
+        item.innerHTML = `
+            <div style="width:20px; height:20px; background:${hex}; border:1px solid #ccc; border-radius:2px; flex-shrink:0;"></div>
+            <span style="font-family:monospace;">${hex}</span>
+            <span style="color:#6c757d;">${(c.ratio * 100).toFixed(1)}%</span>
+            ${isAA ? '<span style="background:#fff3cd; color:#856404; border-radius:10px; padding:1px 6px; font-size:0.75rem;">AA base</span>' : ''}
+        `;
+        grid.appendChild(item);
+    });
+
+    // Render AA blends section
+    const aaSection = document.getElementById('detectAASection');
+    const aaList = document.getElementById('detectAAList');
+    aaList.innerHTML = '';
+    const blends = result.aaBlends || [];
+    if (blends.length > 0) {
+        blends.forEach(b => {
+            const hexC = `#${b.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            const hexA = `#${b.baseA.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            const hexB = `#${b.baseB.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex; align-items:center; gap:8px; font-size:0.8rem; margin-bottom:5px;';
+            row.innerHTML = `
+                <div style="width:18px; height:18px; background:${hexC}; border:1px solid #ccc; border-radius:2px;"></div>
+                <span style="font-family:monospace;">${hexC}</span>
+                <span style="color:#6c757d;">(${(b.ratio * 100).toFixed(1)}%)</span>
+                <span style="color:#aaa;">≈</span>
+                <div style="width:14px; height:14px; background:${hexA}; border:1px solid #ccc; border-radius:2px;"></div>
+                <span style="font-family:monospace; color:#6c757d;">${hexA}</span>
+                <span style="color:#aaa;">×${(1 - b.t).toFixed(2)} + </span>
+                <div style="width:14px; height:14px; background:${hexB}; border:1px solid #ccc; border-radius:2px;"></div>
+                <span style="font-family:monospace; color:#6c757d;">${hexB}</span>
+                <span style="color:#aaa;">×${b.t.toFixed(2)}</span>
+            `;
+            aaList.appendChild(row);
+        });
+        aaSection.style.display = 'block';
+    } else {
+        aaSection.style.display = 'none';
+    }
+
+    // Render YAML template
+    document.getElementById('detectYamlPreview').textContent = result.yamlTemplate || '';
+}
+
+async function rerunDetect() {
+    await detectColors();
+}
+
+function closeDetectColorsModal() {
+    document.getElementById('detectColorsModal').style.display = 'none';
+}
+
+async function copyDetectedYaml() {
+    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(AppState.lastDetectResult.yamlTemplate);
+        showStatus('solverStatus', 'YAML template copied to clipboard', 'success');
+    } catch (e) {
+        showStatus('solverStatus', 'Clipboard write failed', 'error');
+    }
+}
+
+function insertMaterialsSection() {
+    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
+        return;
+    }
+    if (!AppState.aceEditor) {
+        showStatus('solverStatus', 'Config editor not initialized', 'error');
+        return;
+    }
+
+    try {
+        // Parse detected materials
+        const detectedDoc = jsyaml.load(AppState.lastDetectResult.yamlTemplate);
+        if (!detectedDoc || !detectedDoc.materials) {
+            showStatus('solverStatus', 'No materials found in detected template', 'error');
+            return;
+        }
+
+        // Parse current editor content
+        const currentYaml = AppState.aceEditor.getValue();
+        let currentDoc = {};
+        try {
+            currentDoc = jsyaml.load(currentYaml) || {};
+        } catch (e) {
+            currentDoc = {};
+        }
+
+        // Replace only the materials section
+        currentDoc.materials = detectedDoc.materials;
+
+        const merged = jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 });
+        AppState.aceEditor.setValue(merged, -1);
+
+        closeDetectColorsModal();
+        switchTab('config');
+        showStatus('configStatus', 'materials: section updated from detected colors', 'success');
+    } catch (e) {
+        showStatus('solverStatus', `Insert failed: ${e.message}`, 'error');
     }
 }
 

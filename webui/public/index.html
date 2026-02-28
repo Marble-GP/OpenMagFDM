@@ -768,6 +768,11 @@
                     </div>
                     <input type="file" id="imageUpload" accept="image/*" style="display: none;" onchange="handleImageUpload(event)">
                     <img id="uploadedImage" class="preview-image hidden" alt="Uploaded image">
+                    <button class="btn-secondary" id="detectColorsBtn"
+                            onclick="detectColors()"
+                            style="width: 100%; margin-top: 10px; display: none;">
+                        Detect Colors &amp; Generate YAML Template
+                    </button>
                 </div>
 
                 <!-- Right Panel: Solver Control -->
@@ -1012,6 +1017,47 @@
             <div class="modal-footer">
                 <button class="btn-secondary" onclick="resetAllPlotConfigs()">Reset All to Auto</button>
                 <button class="btn-primary" onclick="applyPlotConfigs()">Apply</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Detect Colors Modal -->
+    <div id="detectColorsModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 700px; max-height: 85vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3>Detected Colors &amp; YAML Template</h3>
+                <button onclick="closeDetectColorsModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
+            </div>
+            <div class="modal-body" style="flex: 1; overflow-y: auto;">
+                <!-- Threshold controls -->
+                <div style="display: flex; gap: 15px; margin-bottom: 12px; align-items: center; flex-wrap: wrap;">
+                    <label style="font-size: 0.85rem;">Rare threshold:
+                        <input type="number" id="detectRareThreshold" value="5" min="0" max="50"
+                               style="width: 60px; padding: 3px 5px; margin-left: 4px;"> %
+                    </label>
+                    <label style="font-size: 0.85rem;">Blend tolerance:
+                        <input type="number" id="detectBlendTolerance" value="8" min="1" max="50"
+                               style="width: 60px; padding: 3px 5px; margin-left: 4px;"> /255
+                    </label>
+                    <button class="btn-secondary" onclick="rerunDetect()" style="padding: 4px 12px; font-size: 0.85rem;">Re-detect</button>
+                </div>
+                <!-- Dominant colors grid -->
+                <h4 style="margin: 0 0 8px 0; font-size: 0.9rem;">Detected Colors (dominant)</h4>
+                <div id="detectColorGrid" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px;"></div>
+                <!-- AA blends section -->
+                <div id="detectAASection" style="display: none; margin-bottom: 15px;">
+                    <h4 style="margin: 0 0 8px 0; font-size: 0.9rem;">Anti-aliasing Blends (excluded from materials)</h4>
+                    <div id="detectAAList"></div>
+                </div>
+                <!-- YAML template preview -->
+                <h4 style="margin: 0 0 8px 0; font-size: 0.9rem;">Generated YAML Template</h4>
+                <pre id="detectYamlPreview" style="background: #1e1e1e; color: #d4d4d4; padding: 12px;
+                     border-radius: 5px; max-height: 250px; overflow-y: auto; font-size: 0.82rem;
+                     white-space: pre-wrap; margin: 0;"></pre>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="copyDetectedYaml()">Copy to Clipboard</button>
+                <button class="btn-primary" onclick="insertMaterialsSection()">Insert materials: section into Editor</button>
             </div>
         </div>
     </div>
