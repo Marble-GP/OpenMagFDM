@@ -50,6 +50,10 @@ const MAX_IMAGES_PER_USER = 20;
 // Running solver processes (userId -> process)
 const runningProcesses = new Map();
 
+// Async job queue (jobId -> job record)
+// job: { jobId, userId, status, progress, log, resultPath, process, created, finished }
+const jobs = new Map();
+
 /**
  * Generate timestamp-based output folder name
  * @returns {string} Folder name in format: output_YYYYMMDD_HHMMSS
@@ -1582,6 +1586,167 @@ app.put('/api/user-outputs/:folderName/description', async (req, res) => {
             success: false,
             error: error.message
         });
+    }
+});
+
+// ============================================================
+// Async Job Queue API
+// ============================================================
+
+// Submit async solve job (non-blocking, returns jobId immediately)
+app.post('/api/jobs', async (req, res) => {
+    try {
+        const { configFile, imageFile, userId } = req.body;
+        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        if (!configFile || !imageFile) {
+            return res.status(400).json({ success: false, error: 'configFile and imageFile are required' });
+        }
+
+        // Build paths
+        const userDir = getUserDir(userIdKey);
+        const configPath = path.join(userDir, path.basename(configFile));
+        const userUploadDir = getUserUploadsDir(userIdKey);
+        const imagePath = path.join(userUploadDir, path.basename(imageFile));
+
+        // Validate files exist
+        await fs.access(configPath);
+        await fs.access(imagePath);
+        await fs.access(SOLVER_PATH);
+
+        const jobId = require('crypto').randomUUID();
+        const outputPath = await prepareUserOutputDirectory(userIdKey);
+
+        const job = {
+            jobId,
+            userId: userIdKey,
+            status: 'running',
+            progress: 0,
+            log: [],
+            resultPath: null,
+            process: null,
+            created: new Date().toISOString(),
+            finished: null
+        };
+        jobs.set(jobId, job);
+
+        // Spawn solver in background
+        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], { cwd: BASE_DIR });
+        job.process = solverProcess;
+
+        let outputBuffer = '';
+        solverProcess.stdout.on('data', (data) => {
+            outputBuffer += data.toString();
+            const lines = outputBuffer.split('\n');
+            outputBuffer = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                job.log.push(line);
+                if (job.log.length > 500) job.log.shift(); // cap log
+
+                const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
+                if (stepMatch) {
+                    const current = parseInt(stepMatch[1]);
+                    const total = parseInt(stepMatch[2]);
+                    job.progress = Math.round(((current - 1) / total) * 100);
+                }
+                if (line.includes('completed successfully')) {
+                    job.progress = 100;
+                }
+            }
+        });
+        solverProcess.stderr.on('data', (data) => {
+            const text = data.toString();
+            for (const line of text.split('\n')) {
+                if (line.trim()) job.log.push(`[err] ${line}`);
+            }
+        });
+        solverProcess.on('close', (code) => {
+            job.status = code === 0 ? 'completed' : 'failed';
+            job.finished = new Date().toISOString();
+            job.process = null;
+            if (code === 0) {
+                job.resultPath = outputPath;
+                job.progress = 100;
+            }
+            console.log(`Job ${jobId} finished with code ${code}`);
+        });
+        solverProcess.on('error', (err) => {
+            job.status = 'failed';
+            job.finished = new Date().toISOString();
+            job.process = null;
+            job.log.push(`[error] ${err.message}`);
+        });
+
+        res.json({ success: true, jobId, status: 'running' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// List jobs for a user
+app.get('/api/jobs', (req, res) => {
+    try {
+        const { userId } = req.query;
+        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        const userJobs = Array.from(jobs.values())
+            .filter(j => j.userId === userIdKey)
+            .map(({ jobId, status, progress, resultPath, created, finished }) =>
+                ({ jobId, status, progress, resultPath, created, finished }))
+            .sort((a, b) => new Date(b.created) - new Date(a.created));
+
+        res.json({ success: true, jobs: userJobs });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get single job status and log tail
+app.get('/api/jobs/:jobId', (req, res) => {
+    try {
+        const job = jobs.get(req.params.jobId);
+        if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+
+        const logTail = job.log.slice(-50);
+        res.json({
+            success: true,
+            jobId: job.jobId,
+            status: job.status,
+            progress: job.progress,
+            resultPath: job.resultPath,
+            created: job.created,
+            finished: job.finished,
+            logTail
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Cancel a running job
+app.delete('/api/jobs/:jobId', async (req, res) => {
+    try {
+        const job = jobs.get(req.params.jobId);
+        if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+
+        if (job.status !== 'running' || !job.process) {
+            return res.json({ success: true, message: `Job already ${job.status}` });
+        }
+
+        job.process.kill('SIGTERM');
+        const killTimer = setTimeout(() => {
+            if (job.process) job.process.kill('SIGKILL');
+        }, 5000);
+        job.process.once('close', () => clearTimeout(killTimer));
+
+        job.status = 'cancelled';
+        job.finished = new Date().toISOString();
+        job.process = null;
+
+        res.json({ success: true, message: 'Job cancelled' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
