@@ -7519,30 +7519,35 @@ async function loadBHMaterialList() {
         for (const name of names) {
             const props = presets[name];
             const mur   = props && props.mu_r;
-            // Classify: array / formula / constant
-            const isArray   = Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]);
-            const isFormula = typeof mur === 'string' && mur.trim() !== '';
-            const isConst   = typeof mur === 'number';
-            const hasPlot   = isArray || isFormula || isConst;
+            const bh    = props && props['B-H'];
+            // Classify: B-H array / mu_r array / formula / constant
+            const isBH      = Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]);
+            const isArray   = !isBH && Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]);
+            const isFormula = !isBH && typeof mur === 'string' && mur.trim() !== '';
+            const isConst   = !isBH && typeof mur === 'number';
+            const hasPlot   = isBH || isArray || isFormula || isConst;
 
             const item = document.createElement('div');
             item.className  = 'lib-file-item';
             item.dataset.matname = name;
             item.style.cssText = 'padding:5px 8px; cursor:pointer; border-radius:3px;'
                                + ' font-size:0.82rem; word-break:break-all; line-height:1.4;';
-            item.title = isArray   ? 'Array μr(H)'
+            item.title = isBH      ? 'B-H curve [[H],[B]]'
+                       : isArray   ? 'Array μr(H)'
                        : isFormula ? 'Formula μr($H)'
                        : isConst   ? `Constant μr = ${mur}`
-                       :             'No μr data';
+                       :             'No B-H / μr data';
 
             // Badge
             const badge = document.createElement('span');
             badge.style.cssText = 'float:right; font-size:0.68rem; border-radius:8px; padding:1px 5px; margin-left:4px;'
-                                + (isArray   ? 'background:#d4edda; color:#155724;'
+                                + (isBH      ? 'background:#fff3cd; color:#856404;'
+                                  : isArray   ? 'background:#d4edda; color:#155724;'
                                   : isFormula ? 'background:#cce5ff; color:#004085;'
                                   : isConst   ? 'background:#f8d7da; color:#721c24;'
                                   :             'background:#f0f0f0; color:#888;');
-            badge.textContent = isArray   ? 'arr'
+            badge.textContent = isBH      ? 'B-H'
+                              : isArray   ? 'arr'
                               : isFormula ? 'fn'
                               : isConst   ? 'const'
                               :             '—';
@@ -7553,7 +7558,7 @@ async function loadBHMaterialList() {
                 listEl.querySelectorAll('.lib-file-item[data-matname]').forEach(el => el.classList.remove('active'));
                 item.classList.add('active');
                 if (hasPlot) renderBHCurveForMaterial(name, props);
-                else plotEl.innerHTML = '<div style="color:#888; text-align:center; padding:30px;">No μr data for this material.</div>';
+                else plotEl.innerHTML = '<div style="color:#888; text-align:center; padding:30px;">No B-H / μr data for this material.</div>';
             };
 
             listEl.appendChild(item);
@@ -7563,10 +7568,13 @@ async function loadBHMaterialList() {
         // Auto-select the first material with plottable data (or just first)
         const autoSelect = names.reduce((found, name) => {
             if (found) return found;
-            const mur = presets[name] && presets[name].mu_r;
-            if ((Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]))
+            const p   = presets[name];
+            const bh  = p && p['B-H'];
+            const mur = p && p.mu_r;
+            if ((Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]))
+                || (Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]))
                 || typeof mur === 'string' || typeof mur === 'number') {
-                return { name, props: presets[name] };
+                return { name, props: p };
             }
             return null;
         }, null) || (names.length > 0 ? { name: names[0], props: presets[names[0]] } : null);
@@ -7582,7 +7590,11 @@ async function loadBHMaterialList() {
     }
 }
 
-// Render dual-axis μr-H / B-H Plotly chart for a single material.
+// Render dual-axis B-H / μr-H Plotly chart for a single material.
+// Handles three data sources:
+//   1. B-H: [[H,...],[B,...]]   — B values are direct; μr derived from B/μ₀H
+//   2. mu_r: [[H,...],[μr,...]] — μr direct; B = μ₀·μr·H
+//   3. mu_r: formula / constant
 function renderBHCurveForMaterial(name, props) {
     const container = document.getElementById('libBHPlotContainer');
     const toolbar   = document.getElementById('libBHToolbar');
@@ -7591,6 +7603,7 @@ function renderBHCurveForMaterial(name, props) {
     AppState.currentBHMaterial = { name, props };
 
     const MU_0 = 4 * Math.PI * 1e-7;
+    const bh   = props && props['B-H'];
     const mur  = props && props.mu_r;
 
     // Determine X-axis type from checkbox (default: log)
@@ -7600,14 +7613,50 @@ function renderBHCurveForMaterial(name, props) {
     // Log-spaced H axis for formula / constant evaluation (1 to 1e6 A/m)
     const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, i * 6 / 199));
 
-    let H_arr = null, mur_arr = null;
+    let H_arr = null, B_arr = null, mur_arr = null;
+    let isDashed = false;
 
-    if (Array.isArray(mur) && mur.length === 2 &&
-        Array.isArray(mur[0]) && Array.isArray(mur[1]) &&
-        mur[0].length === mur[1].length && mur[0].length > 0) {
+    // --- Case 1: B-H: [[H],[B]] ---
+    if (Array.isArray(bh) && bh.length === 2 &&
+        Array.isArray(bh[0]) && Array.isArray(bh[1]) &&
+        bh[0].length === bh[1].length && bh[0].length >= 2) {
+
+        const H_raw = [...bh[0]];
+        const B_raw = [...bh[1]];
+
+        // Detect remanence: if H[0]=0 and B[0]≠0
+        const Br = (Math.abs(H_raw[0]) < 1e-12 && Math.abs(B_raw[0]) > 1e-12) ? B_raw[0] : 0;
+
+        // Prepend implicit (0,0) if first H > 0
+        if (H_raw[0] > 1e-12) { H_raw.unshift(0); B_raw.unshift(0); }
+
+        B_arr = B_raw;
+
+        // Compute μr: μr(H=0) from initial slope; μr(H>0) = (B-Br)/(μ₀H)
+        mur_arr = [];
+        if (H_raw.length >= 2 && H_raw[1] > 0) {
+            const mu0_val = (B_raw[1] - Br) / (MU_0 * H_raw[1]);
+            mur_arr.push(Math.max(1, mu0_val));
+        } else {
+            mur_arr.push(1);
+        }
+        for (let i = 1; i < H_raw.length; i++) {
+            if (H_raw[i] <= 1e-15) continue;
+            mur_arr.push(Math.max(1, (B_raw[i] - Br) / (MU_0 * H_raw[i])));
+        }
+
+        // Build matching H arrays (skip H=0 on log scale to avoid −∞)
+        H_arr = H_raw;
+
+    // --- Case 2: mu_r: [[H],[μr]] ---
+    } else if (Array.isArray(mur) && mur.length === 2 &&
+               Array.isArray(mur[0]) && Array.isArray(mur[1]) &&
+               mur[0].length === mur[1].length && mur[0].length > 0) {
         H_arr   = mur[0];
         mur_arr = mur[1];
+        B_arr   = H_arr.map((H, i) => MU_0 * mur_arr[i] * H);
 
+    // --- Case 3: mu_r: formula string ---
     } else if (typeof mur === 'string' && mur.trim() !== '') {
         const pts = H_log
             .map(H => ({ H, mu: evaluateMuFormula(mur, H) }))
@@ -7615,43 +7664,49 @@ function renderBHCurveForMaterial(name, props) {
         if (pts.length > 0) {
             H_arr   = pts.map(p => p.H);
             mur_arr = pts.map(p => p.mu);
+            B_arr   = H_arr.map((H, i) => MU_0 * mur_arr[i] * H);
         }
 
+    // --- Case 4: mu_r: constant ---
     } else if (typeof mur === 'number') {
         H_arr   = [1, 1e6];
         mur_arr = [mur, mur];
+        B_arr   = H_arr.map(H => MU_0 * mur * H);
+        isDashed = true;
     }
 
-    if (!H_arr) {
+    if (!H_arr || !B_arr) {
         container.innerHTML = '<div style="color:#888; text-align:center; padding:40px; font-size:0.9rem;">'
-                            + 'No plottable μr data for this material.</div>';
+                            + 'No plottable B-H / μr data for this material.</div>';
         if (toolbar) toolbar.style.display = 'none';
         return;
     }
 
-    const B_arr = H_arr.map((H, i) => MU_0 * mur_arr[i] * H);
-
-    const isConst   = typeof mur === 'number';
-    const isFormula = typeof mur === 'string';
+    const markerSize = (Array.isArray(bh) || Array.isArray(mur)) ? 4 : 0;
+    const mode = isDashed ? 'lines' : (markerSize > 0 ? 'lines+markers' : 'lines');
 
     // B on left axis (y1), μr on right axis (y2)
+    // For log X axis: skip H=0 point (Plotly handles gracefully but avoids log(0))
+    const useLog = xtype === 'log';
+    const hFilter = (_, i) => !useLog || H_arr[i] > 0;
+
+    const H_plot    = H_arr.filter(hFilter);
+    const B_plot    = B_arr.filter((_, i) => hFilter(null, i));
+    const mur_plot  = mur_arr.filter((_, i) => hFilter(null, i));
+
     const traceB = {
-        x: H_arr, y: B_arr,
-        mode: isConst ? 'lines' : 'lines+markers',
-        name: 'B [T]',
-        yaxis: 'y1',
-        line:   { width: 2, color: '#e05252', dash: isConst ? 'dash' : 'solid' },
-        marker: isConst ? undefined : { size: isFormula ? 3 : 5, color: '#e05252' },
+        x: H_plot, y: B_plot,
+        mode, name: 'B [T]', yaxis: 'y1',
+        line:   { width: 2, color: '#e05252', dash: isDashed ? 'dash' : 'solid' },
+        marker: markerSize > 0 ? { size: markerSize, color: '#e05252' } : undefined,
         hovertemplate: 'H=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>'
     };
 
     const traceMur = {
-        x: H_arr, y: mur_arr,
-        mode: isConst ? 'lines' : 'lines+markers',
-        name: 'μr',
-        yaxis: 'y2',
-        line:   { width: 2, color: '#667eea', dash: isConst ? 'dash' : 'solid' },
-        marker: isConst ? undefined : { size: isFormula ? 3 : 5, color: '#667eea' },
+        x: H_plot, y: mur_plot,
+        mode, name: 'μr', yaxis: 'y2',
+        line:   { width: 2, color: '#667eea', dash: isDashed ? 'dash' : 'solid' },
+        marker: markerSize > 0 ? { size: markerSize, color: '#667eea' } : undefined,
         hovertemplate: 'H=%{x:.4g} A/m<br>μr=%{y:.4g}<extra></extra>'
     };
 
