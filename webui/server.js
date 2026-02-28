@@ -21,12 +21,14 @@ const SOLVER_PATH = isPkg
 const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
 const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
 const OUTPUTS_DIR = path.join(BASE_DIR, 'outputs');
+const USER_LIBS_DIR = path.join(BASE_DIR, 'user-libs');
 
 // 基本ディレクトリを同期的に作成（Multerが使用する前に必要）
 try {
     if (!fsSync.existsSync(UPLOAD_DIR)) fsSync.mkdirSync(UPLOAD_DIR, { recursive: true });
     if (!fsSync.existsSync(USER_CONFIGS_DIR)) fsSync.mkdirSync(USER_CONFIGS_DIR, { recursive: true });
     if (!fsSync.existsSync(OUTPUTS_DIR)) fsSync.mkdirSync(OUTPUTS_DIR, { recursive: true });
+    if (!fsSync.existsSync(USER_LIBS_DIR)) fsSync.mkdirSync(USER_LIBS_DIR, { recursive: true });
 } catch (error) {
     console.error('Error creating base directories:', error);
 }
@@ -37,6 +39,7 @@ async function initializeDirectories() {
         await fs.mkdir(UPLOAD_DIR, { recursive: true });
         await fs.mkdir(USER_CONFIGS_DIR, { recursive: true });
         await fs.mkdir(OUTPUTS_DIR, { recursive: true });
+        await fs.mkdir(USER_LIBS_DIR, { recursive: true });
         console.log('Directories initialized successfully');
     } catch (error) {
         console.error('Error creating directories:', error);
@@ -154,6 +157,33 @@ function getUserDir(userId) {
 function getUserUploadsDir(userId) {
     const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
     return path.join(UPLOAD_DIR, safeUserId);
+}
+
+// Helper: Get user material libraries directory
+function getUserLibsDir(userId) {
+    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
+    return path.join(USER_LIBS_DIR, safeUserId);
+}
+
+// Helper: Merge material library YAML into analysis config YAML
+// Library material_presets and library materials (without rgb) become presets
+// Analysis config overrides library presets if same key exists
+function mergeLibraryIntoConfig(analysisYamlStr, libraryYamlStr) {
+    const analysis = yaml.load(analysisYamlStr);
+    const library  = yaml.load(libraryYamlStr);
+    const merged   = Object.assign({}, analysis);
+
+    // Collect library presets: explicit material_presets + materials stripped of rgb
+    const libPresets = Object.assign({}, library.material_presets || {});
+    for (const [name, props] of Object.entries(library.materials || {})) {
+        const { rgb, ...rest } = props; // eslint-disable-line no-unused-vars
+        libPresets[name] = rest;
+    }
+
+    // Analysis material_presets override library presets with the same key
+    merged.material_presets = Object.assign({}, libPresets, analysis.material_presets || {});
+
+    return yaml.dump(merged, { lineWidth: -1 });
 }
 
 // Helper: Get user-specific config file path
@@ -827,7 +857,7 @@ app.post('/api/solve', async (req, res) => {
 // ソルバーの実行（プログレス付きSSEストリーミング）
 app.post('/api/solve-stream', async (req, res) => {
     try {
-        const { configFile, imageFile, userId } = req.body;
+        const { configFile, imageFile, userId, materialLibraryFile } = req.body;
 
         // パスの構築
         let configPath;
@@ -849,6 +879,24 @@ app.post('/api/solve-stream', async (req, res) => {
         await fs.access(imagePath);
         await fs.access(SOLVER_PATH);
 
+        // Merge material library if provided
+        const userIdKey = userId || 'default';
+        let effectiveConfigPath = configPath;
+        let mergedTempPath = null;
+        if (materialLibraryFile) {
+            const libDir  = getUserLibsDir(userIdKey);
+            const libPath = path.join(libDir, path.basename(materialLibraryFile));
+            if (!path.resolve(libPath).startsWith(path.resolve(libDir))) {
+                throw new Error('Invalid library path');
+            }
+            const configYaml = await fs.readFile(configPath, 'utf8');
+            const libYaml    = await fs.readFile(libPath, 'utf8');
+            const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
+            mergedTempPath   = path.join(getUserDir(userIdKey), `.merged_${Date.now()}.yaml`);
+            await fs.writeFile(mergedTempPath, mergedYaml);
+            effectiveConfigPath = mergedTempPath;
+        }
+
         // SSEヘッダーの設定
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -857,14 +905,12 @@ app.post('/api/solve-stream', async (req, res) => {
 
         console.log('Executing solver with streaming:', SOLVER_PATH);
 
-        const userIdKey = userId || 'default';
-
         // Prepare user-specific output directory
         const outputPath = await prepareUserOutputDirectory(userId);
         console.log(`Output directory for user ${userIdKey}: ${outputPath}`);
 
         // spawnを使用してリアルタイムで出力を取得（第3引数に出力パスを追加）
-        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], {
+        const solverProcess = spawn(SOLVER_PATH, [effectiveConfigPath, imagePath, outputPath], {
             cwd: BASE_DIR,
         });
 
@@ -947,6 +993,12 @@ app.post('/api/solve-stream', async (req, res) => {
             // プロセスをマップから削除
             runningProcesses.delete(userIdKey);
             console.log(`Removed solver process for user: ${userIdKey}`);
+
+            // Clean up merged temp config if used
+            if (mergedTempPath) {
+                fs.unlink(mergedTempPath).catch(() => {});
+                mergedTempPath = null;
+            }
 
             // 最後のバッファを送信
             if (outputBuffer.trim()) {
@@ -1809,7 +1861,7 @@ app.get('/api/results/:resultFolder/field-at-point', async (req, res) => {
 // Submit async solve job (non-blocking, returns jobId immediately)
 app.post('/api/jobs', async (req, res) => {
     try {
-        const { configFile, imageFile, userId } = req.body;
+        const { configFile, imageFile, userId, materialLibraryFile } = req.body;
         const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
 
         if (!configFile || !imageFile) {
@@ -1826,6 +1878,23 @@ app.post('/api/jobs', async (req, res) => {
         await fs.access(configPath);
         await fs.access(imagePath);
         await fs.access(SOLVER_PATH);
+
+        // Merge material library if provided
+        let effectiveConfigPath = configPath;
+        let mergedTempPath = null;
+        if (materialLibraryFile) {
+            const libDir  = getUserLibsDir(userIdKey);
+            const libPath = path.join(libDir, path.basename(materialLibraryFile));
+            if (!path.resolve(libPath).startsWith(path.resolve(libDir))) {
+                throw new Error('Invalid library path');
+            }
+            const configYaml = await fs.readFile(configPath, 'utf8');
+            const libYaml    = await fs.readFile(libPath, 'utf8');
+            const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
+            mergedTempPath   = path.join(userDir, `.merged_${Date.now()}.yaml`);
+            await fs.writeFile(mergedTempPath, mergedYaml);
+            effectiveConfigPath = mergedTempPath;
+        }
 
         const jobId = require('crypto').randomUUID();
         const outputPath = await prepareUserOutputDirectory(userIdKey);
@@ -1844,7 +1913,7 @@ app.post('/api/jobs', async (req, res) => {
         jobs.set(jobId, job);
 
         // Spawn solver in background
-        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], { cwd: BASE_DIR });
+        const solverProcess = spawn(SOLVER_PATH, [effectiveConfigPath, imagePath, outputPath], { cwd: BASE_DIR });
         job.process = solverProcess;
 
         let outputBuffer = '';
@@ -1882,6 +1951,10 @@ app.post('/api/jobs', async (req, res) => {
                 job.resultPath = outputPath;
                 job.progress = 100;
             }
+            if (mergedTempPath) {
+                fs.unlink(mergedTempPath).catch(() => {});
+                mergedTempPath = null;
+            }
             console.log(`Job ${jobId} finished with code ${code}`);
         });
         solverProcess.on('error', (err) => {
@@ -1889,6 +1962,10 @@ app.post('/api/jobs', async (req, res) => {
             job.finished = new Date().toISOString();
             job.process = null;
             job.log.push(`[error] ${err.message}`);
+            if (mergedTempPath) {
+                fs.unlink(mergedTempPath).catch(() => {});
+                mergedTempPath = null;
+            }
         });
 
         res.json({ success: true, jobId, status: 'running' });
@@ -1960,6 +2037,156 @@ app.delete('/api/jobs/:jobId', async (req, res) => {
         res.json({ success: true, message: 'Job cancelled' });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =====================================================
+// Material Library API
+// =====================================================
+
+// List library files for a user
+app.get('/api/material-libraries', async (req, res) => {
+    try {
+        const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const libDir = getUserLibsDir(userId);
+        await fs.mkdir(libDir, { recursive: true });
+
+        const files = await fs.readdir(libDir);
+        const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
+
+        const entries = await Promise.all(yamlFiles.map(async (filename) => {
+            const fp = path.join(libDir, filename);
+            const stat = await fs.stat(fp);
+            return { filename, size: stat.size, modified: stat.mtime.toISOString() };
+        }));
+
+        res.json({ success: true, libraries: entries });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Upload a new library file (multipart)
+app.post('/api/material-libraries', upload.single('library'), async (req, res) => {
+    try {
+        const userId = (req.body.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No file uploaded' });
+        }
+
+        const filename = path.basename(req.file.originalname).replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+        if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) {
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.status(400).json({ success: false, error: 'Only .yaml/.yml files are allowed' });
+        }
+
+        const libDir = getUserLibsDir(userId);
+        await fs.mkdir(libDir, { recursive: true });
+
+        const destPath = path.join(libDir, filename);
+        if (!path.resolve(destPath).startsWith(path.resolve(libDir))) {
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        const content = await fs.readFile(req.file.path, 'utf8');
+        await fs.unlink(req.file.path).catch(() => {});
+
+        // Validate YAML syntax
+        try {
+            yaml.load(content);
+        } catch (yamlErr) {
+            return res.status(400).json({ success: false, error: `YAML parse error: ${yamlErr.message}` });
+        }
+
+        await fs.writeFile(destPath, content, 'utf8');
+        res.json({ success: true, filename });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get library file content
+app.get('/api/material-libraries/:filename', async (req, res) => {
+    try {
+        const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const filename = path.basename(req.params.filename);
+        const libDir = getUserLibsDir(userId);
+        const filePath = path.join(libDir, filename);
+
+        if (!path.resolve(filePath).startsWith(path.resolve(libDir))) {
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        const content = await fs.readFile(filePath, 'utf8');
+        res.type('text/plain').send(content);
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            res.status(404).json({ success: false, error: 'Library file not found' });
+        } else {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    }
+});
+
+// Save (create or update) library file content via JSON body
+app.put('/api/material-libraries/:filename', async (req, res) => {
+    try {
+        const userId = (req.body.userId || req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const filename = path.basename(req.params.filename).replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+
+        if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) {
+            return res.status(400).json({ success: false, error: 'Only .yaml/.yml files are allowed' });
+        }
+
+        const content = req.body.content;
+        if (typeof content !== 'string') {
+            return res.status(400).json({ success: false, error: 'content field (string) is required' });
+        }
+
+        // Validate YAML syntax
+        try {
+            yaml.load(content);
+        } catch (yamlErr) {
+            return res.status(400).json({ success: false, error: `YAML parse error: ${yamlErr.message}` });
+        }
+
+        const libDir = getUserLibsDir(userId);
+        await fs.mkdir(libDir, { recursive: true });
+
+        const filePath = path.join(libDir, filename);
+        if (!path.resolve(filePath).startsWith(path.resolve(libDir))) {
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        await fs.writeFile(filePath, content, 'utf8');
+        res.json({ success: true, filename });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Delete a library file
+app.delete('/api/material-libraries/:filename', async (req, res) => {
+    try {
+        const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const filename = path.basename(req.params.filename);
+        const libDir = getUserLibsDir(userId);
+        const filePath = path.join(libDir, filename);
+
+        if (!path.resolve(filePath).startsWith(path.resolve(libDir))) {
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        await fs.unlink(filePath);
+        res.json({ success: true, message: `Deleted ${filename}` });
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            res.status(404).json({ success: false, error: 'Library file not found' });
+        } else {
+            res.status(500).json({ success: false, error: error.message });
+        }
     }
 });
 
