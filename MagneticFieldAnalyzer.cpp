@@ -664,6 +664,67 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             }
         }
 
+        // Parse permanent magnet magnetization block
+        if (props["magnetization"]) {
+            const YAML::Node& mag = props["magnetization"];
+            MagnetizationConfig mc;
+            mc.enabled = true;
+            mc.Hc = mag["Hc"].as<double>(0.0);
+            mc.pattern = mag["pattern"].as<std::string>("parallel");
+
+            if (mc.pattern == "parallel") {
+                mc.angle_deg = mag["angle"].as<double>(0.0);
+                double angle_rad = mc.angle_deg * M_PI / 180.0;
+                // Pre-compute constant expressions (no per-cell variables needed)
+                std::ostringstream sx, sy;
+                sx << std::setprecision(17) << mc.Hc * std::cos(angle_rad);
+                sy << std::setprecision(17) << mc.Hc * std::sin(angle_rad);
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: parallel angle=" << mc.angle_deg << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "halbach_continuous") {
+                mc.p = mag["p"].as<int>(1);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                // Build tinyexpr formulas with numeric p, cx, cy substituted
+                std::ostringstream sx, sy;
+                // Mx = Hc * cos(p * atan2(y - cy, x - cx))
+                sx << std::setprecision(17) << mc.Hc << "*cos(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*sin(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: halbach_continuous p=" << mc.p << ", Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "polar_anisotropy") {
+                mc.p = mag["p"].as<int>(1);
+                mc.R_pc = mag["R_pc"].as<double>(0.05);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                // polar_anisotropy uses dedicated C++ loop (not tinyexpr)
+                mc.Mx_expr = "";
+                mc.My_expr = "";
+                std::cout << "  [" << name << "] magnetization: polar_anisotropy p=" << mc.p << ", R_pc=" << mc.R_pc << " m, Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "custom") {
+                mc.Mx_expr = mag["Mx"].as<std::string>("");
+                mc.My_expr = mag["My"].as<std::string>("");
+                // Replace Hc token with numeric value
+                std::ostringstream hc_str;
+                hc_str << std::setprecision(17) << mc.Hc;
+                auto replaceAll = [](std::string& s, const std::string& from, const std::string& to) {
+                    size_t pos = 0;
+                    while ((pos = s.find(from, pos)) != std::string::npos) {
+                        s.replace(pos, from.length(), to);
+                        pos += to.length();
+                    }
+                };
+                replaceAll(mc.Mx_expr, "Hc", hc_str.str());
+                replaceAll(mc.My_expr, "Hc", hc_str.str());
+                std::cout << "  [" << name << "] magnetization: custom Mx=\"" << mag["Mx"].as<std::string>("") << "\", Hc=" << mc.Hc << " A/m" << std::endl;
+            } else {
+                throw std::runtime_error("Unknown magnetization pattern '" + mc.pattern + "' for material '" + name + "'");
+            }
+            material_magnetization[name] = mc;
+        }
+
         // Get pixel info for display
         const auto& pix_info = material_pixel_info[name];
 
@@ -758,6 +819,275 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         }
 
         std::cout << "Anti-aliasing: " << antialias_count << " gradient pixels interpolated" << std::endl;
+    }
+
+    // Compute magnetization grids if any material has magnetization defined
+    if (!material_magnetization.empty()) {
+        computeMagnetizationGrids();
+    } else {
+        // Ensure maps are zero-initialized when no magnetization is defined
+        if (coordinate_system == "polar") {
+            int rows = (r_orientation == "horizontal") ? ntheta : nr;
+            int cols = (r_orientation == "horizontal") ? nr : ntheta;
+            Jz_mag_map = Eigen::MatrixXd::Zero(rows, cols);
+        } else {
+            Jz_mag_map = Eigen::MatrixXd::Zero(ny, nx);
+        }
+    }
+}
+
+// ============================================================================
+// Permanent magnet magnetization model
+// ============================================================================
+
+void MagneticFieldAnalyzer::computeMagnetizationGrids() {
+    // Builds Mx_map, My_map from per-material MagnetizationConfig, then calls curl.
+    //
+    // For parallel/halbach_continuous/custom patterns: uses tinyexpr compile-once/
+    // eval-many with variables x, y, r, theta bound to pointers.
+    //
+    // For polar_anisotropy: uses 2p wire-current superposition model where
+    // wires at radius R_pc create a p-pole field whose direction defines the
+    // easy axis of magnetization.
+
+    bool is_polar = (coordinate_system == "polar");
+
+    if (is_polar) {
+        int rows = (r_orientation == "horizontal") ? ntheta : nr;
+        int cols = (r_orientation == "horizontal") ? nr : ntheta;
+        Mx_map = Eigen::MatrixXd::Zero(rows, cols);
+        My_map = Eigen::MatrixXd::Zero(rows, cols);
+    } else {
+        Mx_map = Eigen::MatrixXd::Zero(ny, nx);
+        My_map = Eigen::MatrixXd::Zero(ny, nx);
+    }
+
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    for (const auto& [mat_name, mc] : material_magnetization) {
+        if (!mc.enabled || mc.Hc == 0.0) continue;
+
+        // Get material RGB for pixel matching
+        std::vector<int> rgb_vec = {255, 255, 255};
+        for (const auto& mat : config["materials"]) {
+            if (mat.first.as<std::string>() == mat_name) {
+                rgb_vec = mat.second["rgb"].as<std::vector<int>>(rgb_vec);
+                break;
+            }
+        }
+        cv::Vec3b rgb(rgb_vec[0], rgb_vec[1], rgb_vec[2]);
+
+        if (mc.pattern == "polar_anisotropy") {
+            // 2p concentrated wire currents on pitch circle → superposed B direction
+            int grid_rows = is_polar ? (int)Mx_map.rows() : ny;
+            int grid_cols = is_polar ? (int)Mx_map.cols() : nx;
+
+            for (int j = 0; j < grid_rows; j++) {
+                for (int i = 0; i < grid_cols; i++) {
+                    // Check pixel match
+                    int img_i, img_j;
+                    if (is_polar) {
+                        if (r_orientation == "horizontal") { img_i = i; img_j = j; }
+                        else { img_i = j; img_j = i; }
+                    } else {
+                        img_i = i; img_j = j;
+                    }
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+                    if (pixel != rgb) continue;
+
+                    // Physical coordinates of this cell
+                    double x_phys, y_phys;
+                    if (is_polar) {
+                        int i_r   = (r_orientation == "horizontal") ? i : j;
+                        int j_theta = (r_orientation == "horizontal") ? j : i;
+                        double r_phys = r_start + i_r * dr;
+                        double theta_phys = j_theta * dtheta;
+                        x_phys = r_phys * std::cos(theta_phys);
+                        y_phys = r_phys * std::sin(theta_phys);
+                    } else {
+                        x_phys = i * dx;
+                        y_phys = j * dy;
+                    }
+
+                    // Superpose field of 2p wire currents at R_pc
+                    double Bx_sum = 0.0, By_sum = 0.0;
+                    for (int k = 0; k < 2 * mc.p; k++) {
+                        double theta_k = M_PI * k / mc.p;
+                        double sign = (k % 2 == 0) ? 1.0 : -1.0;
+                        double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
+                        double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
+                        double r2 = dx_w * dx_w + dy_w * dy_w;
+                        if (r2 < 1e-20) continue;
+                        // μ₀I/2π factor omitted — only direction matters
+                        Bx_sum += sign * (-dy_w) / r2;
+                        By_sum += sign * ( dx_w) / r2;
+                    }
+                    double B_norm = std::sqrt(Bx_sum * Bx_sum + By_sum * By_sum);
+                    Mx_map(j, i) = mc.Hc * Bx_sum / (B_norm + 1e-20);
+                    My_map(j, i) = mc.Hc * By_sum / (B_norm + 1e-20);
+                }
+            }
+        } else {
+            // tinyexpr compile-once/eval-many for parallel / halbach / custom
+            double x_val = 0.0, y_val = 0.0, r_val = 0.0, theta_val = 0.0;
+
+            te_parser px, py;
+            px.add_variable_or_function({"x",     &x_val});
+            px.add_variable_or_function({"y",     &y_val});
+            px.add_variable_or_function({"r",     &r_val});
+            px.add_variable_or_function({"theta", &theta_val});
+            py.add_variable_or_function({"x",     &x_val});
+            py.add_variable_or_function({"y",     &y_val});
+            py.add_variable_or_function({"r",     &r_val});
+            py.add_variable_or_function({"theta", &theta_val});
+
+            if (!px.compile(mc.Mx_expr)) {
+                throw std::runtime_error("Failed to compile Mx_expr for material '" + mat_name + "': " + mc.Mx_expr);
+            }
+            if (!py.compile(mc.My_expr)) {
+                throw std::runtime_error("Failed to compile My_expr for material '" + mat_name + "': " + mc.My_expr);
+            }
+
+            int grid_rows = is_polar ? (int)Mx_map.rows() : ny;
+            int grid_cols = is_polar ? (int)Mx_map.cols() : nx;
+
+            for (int j = 0; j < grid_rows; j++) {
+                for (int i = 0; i < grid_cols; i++) {
+                    int img_i, img_j;
+                    if (is_polar) {
+                        if (r_orientation == "horizontal") { img_i = i; img_j = j; }
+                        else { img_i = j; img_j = i; }
+                    } else {
+                        img_i = i; img_j = j;
+                    }
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+                    if (pixel != rgb) continue;
+
+                    // Physical coordinates
+                    if (is_polar) {
+                        int i_r   = (r_orientation == "horizontal") ? i : j;
+                        int j_th  = (r_orientation == "horizontal") ? j : i;
+                        r_val     = r_start + i_r * dr;
+                        theta_val = j_th * dtheta;
+                        x_val     = r_val * std::cos(theta_val);
+                        y_val     = r_val * std::sin(theta_val);
+                    } else {
+                        x_val     = i * dx;
+                        y_val     = j * dy;
+                        r_val     = std::sqrt(x_val * x_val + y_val * y_val);
+                        theta_val = std::atan2(y_val, x_val);
+                    }
+
+                    Mx_map(j, i) = px.evaluate();
+                    My_map(j, i) = py.evaluate();
+                }
+            }
+        }
+
+        std::cout << "Magnetization computed for '" << mat_name << "' (" << mc.pattern << ")" << std::endl;
+    }
+
+    // Compute equivalent magnetization current Jz_mag = curl(M)
+    if (is_polar) {
+        computeMagnetizationCurlPolar();
+    } else {
+        computeMagnetizationCurl();
+    }
+}
+
+void MagneticFieldAnalyzer::computeMagnetizationCurl() {
+    // Cartesian: Jz_mag = ∂My/∂x - ∂Mx/∂y
+    // Uses central differences in interior, one-sided at boundaries.
+    Jz_mag_map = Eigen::MatrixXd::Zero(ny, nx);
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            // dMy/dx
+            double dMy_dx;
+            if (i > 0 && i < nx - 1) {
+                dMy_dx = (My_map(j, i+1) - My_map(j, i-1)) / (2.0 * dx);
+            } else if (i == 0) {
+                dMy_dx = (My_map(j, 1) - My_map(j, 0)) / dx;
+            } else {
+                dMy_dx = (My_map(j, nx-1) - My_map(j, nx-2)) / dx;
+            }
+
+            // dMx/dy
+            double dMx_dy;
+            if (j > 0 && j < ny - 1) {
+                dMx_dy = (Mx_map(j+1, i) - Mx_map(j-1, i)) / (2.0 * dy);
+            } else if (j == 0) {
+                dMx_dy = (Mx_map(1, i) - Mx_map(0, i)) / dy;
+            } else {
+                dMx_dy = (Mx_map(ny-1, i) - Mx_map(ny-2, i)) / dy;
+            }
+
+            Jz_mag_map(j, i) = dMy_dx - dMx_dy;
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::computeMagnetizationCurlPolar() {
+    // Polar: Jz_mag = (1/r)·∂(r·Mθ)/∂r − (1/r)·∂Mr/∂θ
+    // Mr  = Mx·cos(θ) + My·sin(θ)
+    // Mθ  = −Mx·sin(θ) + My·cos(θ)
+    //
+    // Map indexing mirrors mu_map / jz_map:
+    //   horizontal: (ntheta, nr) → (j, i) = (theta_idx, r_idx)
+    //   vertical:   (nr, ntheta) → (j, i) = (r_idx, theta_idx)
+    int rows = (int)Mx_map.rows();
+    int cols = (int)Mx_map.cols();
+    Jz_mag_map = Eigen::MatrixXd::Zero(rows, cols);
+
+    bool horiz = (r_orientation == "horizontal");
+
+    for (int j = 0; j < rows; j++) {
+        for (int i = 0; i < cols; i++) {
+            int i_r   = horiz ? i : j;
+            int j_th  = horiz ? j : i;
+            double r     = r_start + i_r * dr;
+            double theta = j_th * dtheta;
+
+            // Convert Mx/My to radial/tangential
+            double cos_t = std::cos(theta), sin_t = std::sin(theta);
+            auto getMr = [&](int ir, int jt) -> double {
+                int row = horiz ? jt : ir, col = horiz ? ir : jt;
+                return Mx_map(row, col) * cos_t + My_map(row, col) * sin_t;
+            };
+            auto getMth = [&](int ir, int jt) -> double {
+                int row = horiz ? jt : ir, col = horiz ? ir : jt;
+                return -Mx_map(row, col) * sin_t + My_map(row, col) * cos_t;
+            };
+
+            // d(r·Mθ)/dr using adjacent r-cells
+            int ir_m = std::max(i_r - 1, 0);
+            int ir_p = std::min(i_r + 1, nr - 1);
+            double r_m = r_start + ir_m * dr;
+            double r_p = r_start + ir_p * dr;
+            double denom_r = (ir_p - ir_m) * dr;
+
+            double d_rMth_dr = 0.0;
+            if (denom_r > 1e-15 && r > 1e-10) {
+                double val_p = r_p * getMth(ir_p, j_th);
+                double val_m = r_m * getMth(ir_m, j_th);
+                d_rMth_dr = (val_p - val_m) / denom_r;
+            }
+
+            // dMr/dθ using adjacent theta-cells
+            int jt_m = std::max(j_th - 1, 0);
+            int jt_p = std::min(j_th + 1, ntheta - 1);
+            double denom_th = (jt_p - jt_m) * dtheta;
+
+            double dMr_dth = 0.0;
+            if (denom_th > 1e-15 && r > 1e-10) {
+                dMr_dth = (getMr(i_r, jt_p) - getMr(i_r, jt_m)) / denom_th;
+            }
+
+            if (r > 1e-10) {
+                Jz_mag_map(j, i) = d_rMth_dr / r - dMr_dth / r;
+            }
+        }
     }
 }
 
@@ -2524,8 +2854,9 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
         local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
         // Right-hand side: source term (no area scaling for FDM)
+        // Include permanent magnet magnetization equivalent current Jz_mag = dMy/dx - dMx/dy
         // Use += to preserve any accumulated Dirichlet boundary contributions
-        rhs(idx) += -jz_map(j, i);
+        rhs(idx) += -(jz_map(j, i) + Jz_mag_map(j, i));
     }  // end omp for
 
         #pragma omp critical
@@ -4889,9 +5220,10 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
             // Center coefficient
             local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
-            // Right-hand side (current density)
+            // Right-hand side (current density + magnetization equivalent current)
+            // Jz_mag_map = dMy/dx - dMx/dy (equivalent current from magnetization)
             // Use += to preserve any accumulated Dirichlet boundary contributions
-            rhs(idx) += -jz_map(j, i);
+            rhs(idx) += -(jz_map(j, i) + Jz_mag_map(j, i));
         }  // end omp for
 
         #pragma omp critical
@@ -9159,10 +9491,11 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             // Center coefficient
             local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
-            // Right-hand side (current density)
-            // After r-weighting: RHS becomes -r·Jz
+            // Right-hand side (current density + magnetization equivalent current)
+            // After r-weighting: RHS becomes -r·(Jz + Jz_mag)
+            // Jz_mag_map = polar curl of M (1/r·d(r·Mθ)/dr - 1/r·dMr/dθ)
             // Use += to preserve any accumulated Dirichlet boundary contributions
-            rhs(idx) += -getJzPolar(jz_map, i, j, r_orientation) * r;
+            rhs(idx) += -(getJzPolar(jz_map, i, j, r_orientation) + getJzPolar(Jz_mag_map, i, j, r_orientation)) * r;
         }  // end omp for
 
         #pragma omp critical
@@ -9762,9 +10095,9 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
             triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
             // RHS: pure Cartesian formulation (no r-weighting)
-            // This gives a physically consistent pseudo-Cartesian approximation
+            // Include magnetization equivalent current Jz_mag
             // Use += to preserve any accumulated Dirichlet boundary contributions
-            rhs(idx) += -getJzPolar(jz_map, i, j, r_orientation);
+            rhs(idx) += -(getJzPolar(jz_map, i, j, r_orientation) + getJzPolar(Jz_mag_map, i, j, r_orientation));
         }
     }
 
@@ -10232,6 +10565,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         multigrid_operators_built = false;
         precond_factorization_valid = false;
         full_matrix_cache_valid = false;
+    }
+
+    // Recompute magnetization grids (Mx_map, My_map, Jz_mag_map) for this step
+    // Required for transient/sliding cases where material positions change
+    if (!material_magnetization.empty()) {
+        computeMagnetizationGrids();
     }
 }
 

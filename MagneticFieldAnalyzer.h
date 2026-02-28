@@ -517,6 +517,22 @@ private:
     };
     std::map<std::string, CoarsenConfig> material_coarsen;  // Coarsening config per material
 
+    // Permanent magnet magnetization model
+    struct MagnetizationConfig {
+        bool enabled = false;
+        double Hc = 0.0;          // Coercive field strength [A/m]
+        std::string pattern;       // "parallel", "halbach_continuous", "polar_anisotropy", "custom"
+        double angle_deg = 0.0;    // Magnetization angle [deg] (parallel)
+        int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy)
+        double cx = 0.0, cy = 0.0; // Rotation center [m]
+        double R_pc = 0.0;         // Pitch circle radius [m] (polar_anisotropy)
+        std::string Mx_expr, My_expr;  // tinyexpr expressions for Mx, My (parallel/halbach/custom)
+    };
+    std::map<std::string, MagnetizationConfig> material_magnetization;
+    Eigen::MatrixXd Mx_map;      // (ny, nx) or (ntheta, nr) — magnetization x-component
+    Eigen::MatrixXd My_map;      // same shape — magnetization y-component
+    Eigen::MatrixXd Jz_mag_map;  // equivalent magnetization current (curl of M)
+
     // Adaptive mesh coarsening data
     Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> active_cells;  // True if cell is active (not coarsened)
     Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic> cell_skip_level;  // Per-cell skip level (1,2,4,8...)
@@ -600,6 +616,11 @@ private:
     double calculateCoEnergyDensity(int j, int i, double B_magnitude);  // Co-energy density w' [J/m³]
     void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
     void updateMuDistribution();  // Update mu_map based on current H_map
+
+    // Permanent magnet magnetization model
+    void computeMagnetizationGrids();        // Build Mx_map, My_map from material_magnetization configs
+    void computeMagnetizationCurl();         // Cartesian: Jz_mag = ∂My/∂x - ∂Mx/∂y
+    void computeMagnetizationCurlPolar();    // Polar: Jz_mag = (1/r)∂(r·Mθ)/∂r - (1/r)∂Mr/∂θ
 
     // Anti-aliasing interpolation methods
     double calculateRGBDistance(const cv::Vec3b& a, const cv::Vec3b& b) const;
