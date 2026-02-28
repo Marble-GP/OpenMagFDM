@@ -1,0 +1,59 @@
+# OpenMagFDM Sample Material Library
+#
+# This file provides material presets for common soft magnetic materials.
+# The B-H characteristics are modeled as continuous functions approximating
+# typical catalog data. These are simplified models intended for engineering
+# estimates and should be verified against actual material specifications
+# for production use.
+#
+# Usage in analysis config:
+#   materials:
+#     iron_core:
+#       rgb: [128, 128, 128]
+#       preset: pure_iron_model   # <-- reference preset name
+#       jz: 0.0
+#
+# Alternatively, override any property after referencing a preset:
+#   materials:
+#     iron_core:
+#       rgb: [128, 128, 128]
+#       preset: structural_steel_model
+#       calc_force: true
+#
+# -----------------------------------------------------------------------
+# Defining B-H curves with measured data points (table format):
+#
+#   mu_r: [[H1, H2, H3, ...],          # H [A/m]
+#           [mur1, mur2, mur3, ...]]    # relative permeability (dimensionless)
+#
+#   B-H:  [[H1, H2, H3, ...],          # H [A/m]
+#           [B1, B2, B3, ...]]          # flux density [T]
+#
+# Both are interpolated with PCHIP (monotone cubic Hermite) internally.
+# If H[0]=0 and B[0]!=0, the value is treated as residual flux density Br.
+#
+# -----------------------------------------------------------------------
+# Formula notation (for continuous-function definitions like below):
+#   $H   : magnetic field intensity [A/m]
+#   mu0  : vacuum permeability = 4pi x 10^-7 [H/m]
+#   pi   : 3.14159...
+#   exp  : natural exponential function
+# -----------------------------------------------------------------------
+
+material_presets:
+
+  # Pure Iron (soft magnetic iron)
+  # Characteristics: very high permeability, low coercivity, high saturation (~2.1 T)
+  pure_iron_model:
+    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))
+
+  # Permendur (Fe-Co 49/49 alloy)
+  # Characteristics: highest saturation of common soft magnetics (~2.4 T),
+  # used in pole tips and actuators requiring maximum flux density
+  permendur_model:
+    B-H: ($H/(14.5 + 0.45*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 25))))
+
+  # Structural steel (mild steel / SS400 equivalent)
+  # Characteristics: moderate permeability, widely available structural material
+  structural_steel_model:
+    B-H: ($H/(97.0 + 0.625*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 20))))
