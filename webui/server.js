@@ -513,7 +513,10 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     }
 });
 
-// Detect unique colors in an image and generate YAML material template
+// Detect unique colors in an image and generate YAML material template.
+// Anti-aliasing detection: rare colors (≤ rareThreshold of total pixels) that can be
+// expressed as a linear blend of two dominant colors are identified as AA pixels.
+// Their base colors get antialias:true in the YAML template.
 app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
     const tmpPath = req.file ? req.file.path : null;
     try {
@@ -521,41 +524,145 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             return res.status(400).json({ success: false, error: 'No image file provided' });
         }
 
+        // Configurable thresholds (query params override defaults)
+        const RARE_THRESHOLD  = parseFloat(req.query.rareThreshold  ?? '0.05'); // coverage ratio
+        const BLEND_TOLERANCE = parseFloat(req.query.blendTolerance  ?? '8');   // per-channel [0-255]
+        const MIN_COLOR_DIST  = parseFloat(req.query.minColorDist    ?? '30');  // Euclidean distance
+
+        // Returns t∈[0,1] if C ≈ t·A + (1-t)·B, otherwise null.
+        function isLinearBlend(C, A, B) {
+            // A and B must be sufficiently different to form a meaningful pair
+            const distSq = A.reduce((s, a, k) => s + (a - B[k]) ** 2, 0);
+            if (distSq < MIN_COLOR_DIST * MIN_COLOR_DIST) return null;
+
+            // Estimate t from non-degenerate channels (|A[ch]-B[ch]| > 10)
+            const tEsts = [];
+            for (let ch = 0; ch < 3; ch++) {
+                const denom = A[ch] - B[ch];
+                if (Math.abs(denom) > 10) {
+                    tEsts.push((C[ch] - B[ch]) / denom);
+                } else {
+                    // Degenerate channel: A≈B, so C must also ≈A
+                    if (Math.abs(C[ch] - A[ch]) > BLEND_TOLERANCE) return null;
+                }
+            }
+            if (tEsts.length === 0) return null; // A≈B in all channels
+
+            // All t estimates must be mutually consistent
+            const tMin = Math.min(...tEsts), tMax = Math.max(...tEsts);
+            if (tMax - tMin > 0.15) return null;
+
+            const t = tEsts.reduce((a, b) => a + b) / tEsts.length;
+            if (t < -0.05 || t > 1.05) return null; // outside blend range
+
+            // Final residual check across all channels
+            for (let ch = 0; ch < 3; ch++) {
+                const expected = t * A[ch] + (1 - t) * B[ch];
+                if (Math.abs(C[ch] - expected) > BLEND_TOLERANCE) return null;
+            }
+            return Math.max(0, Math.min(1, t));
+        }
+
         const Jimp = require('jimp');
         const image = await Jimp.read(tmpPath);
+        const totalPixels = image.bitmap.width * image.bitmap.height;
 
-        // Collect unique RGB colors (ignore fully transparent pixels)
-        const colorSet = new Set();
+        // Count occurrences of each unique RGB color (ignore fully transparent pixels)
+        const colorCounts = new Map();
         image.scan(0, 0, image.bitmap.width, image.bitmap.height, (x, y, idx) => {
             const r = image.bitmap.data[idx];
             const g = image.bitmap.data[idx + 1];
             const b = image.bitmap.data[idx + 2];
             const a = image.bitmap.data[idx + 3];
-            if (a > 0) colorSet.add(`${r},${g},${b}`);
+            if (a > 0) {
+                const key = `${r},${g},${b}`;
+                colorCounts.set(key, (colorCounts.get(key) || 0) + 1);
+            }
         });
 
-        const colors = Array.from(colorSet).map(s => s.split(',').map(Number));
+        // Sort by count descending, compute coverage ratio
+        const sorted = Array.from(colorCounts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([key, count]) => ({
+                rgb:   key.split(',').map(Number),
+                count,
+                ratio: count / totalPixels
+            }));
 
-        // Generate YAML template
+        // Split: dominant = coverage > RARE_THRESHOLD, rare = candidates for AA detection
+        const dominant = sorted.filter(c => c.ratio >  RARE_THRESHOLD);
+        const rare     = sorted.filter(c => c.ratio <= RARE_THRESHOLD);
+
+        // Anti-aliasing detection: find rare colors that are linear blends of two dominant colors
+        const antialiasBaseIdx = new Set(); // indices into dominant[]
+        const aaBlends = [];               // detected blend records
+
+        for (const rareColor of rare) {
+            let found = false;
+            for (let i = 0; i < dominant.length && !found; i++) {
+                for (let j = i + 1; j < dominant.length && !found; j++) {
+                    const t = isLinearBlend(rareColor.rgb, dominant[i].rgb, dominant[j].rgb);
+                    if (t !== null) {
+                        antialiasBaseIdx.add(i);
+                        antialiasBaseIdx.add(j);
+                        aaBlends.push({
+                            rgb:   rareColor.rgb,
+                            count: rareColor.count,
+                            ratio: rareColor.ratio,
+                            baseA: dominant[i].rgb,
+                            baseB: dominant[j].rgb,
+                            t:     Math.round(t * 1000) / 1000
+                        });
+                        found = true;
+                    }
+                }
+            }
+        }
+
+        // Build YAML template (dominant colors only; AA bases get antialias:true)
+        const toHex = ([r, g, b]) =>
+            r.toString(16).padStart(2, '0') +
+            g.toString(16).padStart(2, '0') +
+            b.toString(16).padStart(2, '0');
+
         const lines = [
-            `# Auto-generated from ${req.file.originalname} (${colors.length} colors detected)`,
+            `# Auto-generated from ${req.file.originalname}`,
+            `# ${dominant.length} material color(s) detected` +
+                (aaBlends.length > 0
+                    ? `, ${aaBlends.length} anti-aliasing blend(s) excluded`
+                    : ''),
             `# Fill in mu_r and jz for each material`,
             `coordinate_system: cartesian`,
             ``,
             `materials:`
         ];
-        for (const [r, g, b] of colors) {
-            const hex = `${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+        for (let i = 0; i < dominant.length; i++) {
+            const { rgb: [r, g, b], ratio } = dominant[i];
+            const hex = toHex([r, g, b]);
             lines.push(`  material_${hex}:`);
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
-            lines.push(`    mu_r: 1.0       # TODO: set permeability`);
+            lines.push(`    mu_r: 1.0       # TODO: set permeability  (coverage: ${(ratio * 100).toFixed(1)}%)`);
             lines.push(`    jz: 0.0`);
+            if (antialiasBaseIdx.has(i)) lines.push(`    antialias: true`);
+        }
+        if (aaBlends.length > 0) {
+            lines.push(``, `# Anti-aliasing blends detected (excluded from materials):`);
+            for (const blend of aaBlends) {
+                const pct = (blend.ratio * 100).toFixed(2);
+                lines.push(`#   [${blend.rgb}]  ${pct}%  =  t=${blend.t} · [${blend.baseA}]  +  (1-t) · [${blend.baseB}]`);
+            }
         }
 
         // Clean up temp file
         await fs.unlink(tmpPath);
 
-        res.json({ success: true, colors, yamlTemplate: lines.join('\n') });
+        res.json({
+            success:      true,
+            colors:       dominant.map(c => c.rgb),  // dominant colors (materials)
+            allColors:    sorted.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
+            aaBlends,
+            yamlTemplate: lines.join('\n')
+        });
     } catch (error) {
         if (tmpPath) { try { await fs.unlink(tmpPath); } catch { /* ignore */ } }
         res.status(500).json({ success: false, error: error.message });
