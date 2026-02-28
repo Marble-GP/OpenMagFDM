@@ -1107,8 +1107,8 @@
             </div>
             <div class="modal-body" style="display: flex; gap: 0; padding: 0; flex: 1; overflow: hidden;">
 
-                <!-- Left: file list -->
-                <div style="width: 220px; border-right: 1px solid #dee2e6; padding: 15px;
+                <!-- Left: file list (Edit tab only) -->
+                <div id="libLeftPanel" style="width: 220px; border-right: 1px solid #dee2e6; padding: 15px;
                             display: flex; flex-direction: column; gap: 8px; flex-shrink: 0;">
                     <div style="font-weight: 600; font-size: 0.9rem; margin-bottom: 4px;">Library Files</div>
                     <div id="libraryFileList" style="flex: 1; overflow-y: auto; min-height: 0;"></div>
@@ -1120,12 +1120,12 @@
                     <div id="libraryListStatus" style="font-size: 0.78rem; color: #666; min-height: 1em;"></div>
                 </div>
 
-                <!-- Right: editor + BH curves -->
+                <!-- Right: editor (Edit tab) + BH Curves (B-H tab) -->
                 <div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0;">
                     <!-- Tab bar -->
                     <div style="display: flex; border-bottom: 1px solid #dee2e6; padding: 0 10px; flex-shrink: 0;">
                         <button id="libTabEdit" class="lib-tab lib-tab-active" onclick="switchLibTab('edit')">Edit</button>
-                        <button id="libTabBH"   class="lib-tab"               onclick="switchLibTab('bh')">B-H Curves</button>
+                        <button id="libTabBH"   class="lib-tab"               onclick="switchLibTab('bh')">μr-H Curves</button>
                     </div>
                     <!-- Edit pane -->
                     <div id="libPaneEdit" style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0;">
@@ -1135,9 +1135,18 @@
                         </div>
                         <div id="libraryAceEditor" style="flex: 1; min-height: 0;"></div>
                     </div>
-                    <!-- B-H Curves pane -->
-                    <div id="libPaneBH" style="flex: 1; display: none; padding: 15px; overflow-y: auto; min-height: 0;">
-                        <div id="libBHPlotContainer" style="height: 100%; min-height: 350px;"></div>
+                    <!-- μr-H Curves pane: two-column layout (material list | chart) -->
+                    <div id="libPaneBH" style="flex: 1; display: none; min-height: 0; overflow: hidden; flex-direction: row;">
+                        <!-- Material list column -->
+                        <div id="libBHMaterialList"
+                             style="width: 180px; border-right: 1px solid #dee2e6; padding: 10px;
+                                    overflow-y: auto; flex-shrink: 0; font-size: 0.83rem;">
+                        </div>
+                        <!-- Chart column -->
+                        <div style="flex: 1; min-width: 0; padding: 10px; overflow: hidden;
+                                    display: flex; flex-direction: column;">
+                            <div id="libBHPlotContainer" style="flex: 1; min-height: 0;"></div>
+                        </div>
                     </div>
                 </div>
             </div>

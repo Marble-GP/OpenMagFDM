@@ -7420,38 +7420,34 @@ async function selectLibraryFile(filename) {
             el.classList.toggle('active', el.textContent === filename);
         });
 
-        if (document.getElementById('libPaneBH').style.display !== 'none') {
-            renderBHCurves(content);
-        }
+        // B-H Curves tab sources from the active library, not the editor — no update needed here
     } catch (e) {
         document.getElementById('libraryListStatus').textContent = `Error: ${e.message}`;
     }
 }
 
 function switchLibTab(tab) {
-    const editPane = document.getElementById('libPaneEdit');
-    const bhPane   = document.getElementById('libPaneBH');
-    const editBtn  = document.getElementById('libTabEdit');
-    const bhBtn    = document.getElementById('libTabBH');
+    const editPane  = document.getElementById('libPaneEdit');
+    const bhPane    = document.getElementById('libPaneBH');
+    const leftPanel = document.getElementById('libLeftPanel');
+    const editBtn   = document.getElementById('libTabEdit');
+    const bhBtn     = document.getElementById('libTabBH');
 
     if (tab === 'edit') {
-        editPane.style.display = 'flex';
-        bhPane.style.display = 'none';
+        editPane.style.display  = 'flex';
+        bhPane.style.display    = 'none';
+        leftPanel.style.display = 'flex';
         editBtn.classList.add('lib-tab-active');
         bhBtn.classList.remove('lib-tab-active');
         if (AppState.libraryAceEditor) AppState.libraryAceEditor.resize();
     } else {
-        editPane.style.display = 'none';
-        bhPane.style.display = 'flex';
-        bhPane.style.flexDirection = 'column';
+        editPane.style.display  = 'none';
+        bhPane.style.display    = 'flex';
+        leftPanel.style.display = 'none';
         editBtn.classList.remove('lib-tab-active');
         bhBtn.classList.add('lib-tab-active');
-        if (AppState.libraryAceEditor) {
-            // Defer render so the pane is fully laid out before Plotly measures it
-            requestAnimationFrame(() => {
-                renderBHCurves(AppState.libraryAceEditor.getValue());
-            });
-        }
+        // Defer so the pane is fully laid out before Plotly measures the container
+        requestAnimationFrame(() => loadBHMaterialList());
     }
 }
 
@@ -7479,75 +7475,175 @@ function evaluateMuFormula(formula, H) {
     }
 }
 
-function renderBHCurves(yamlContent) {
-    const container = document.getElementById('libBHPlotContainer');
+// Load the active library (AppState.selectedLibrary) and populate the
+// material list in the B-H Curves pane left column.
+async function loadBHMaterialList() {
+    const listEl    = document.getElementById('libBHMaterialList');
+    const plotEl    = document.getElementById('libBHPlotContainer');
+    listEl.innerHTML = '';
+    plotEl.innerHTML = '';
+
+    if (!AppState.selectedLibrary) {
+        listEl.innerHTML = `<div style="color:#888; font-size:0.82rem; padding:8px; line-height:1.5;">
+            No active library.<br>
+            Open a library file,<br>click <em>Use This Library</em>,<br>then return here.</div>`;
+        return;
+    }
+
     try {
-        const doc = jsyaml.load(yamlContent) || {};
-        // Collect both material_presets and top-level materials entries
+        const response = await fetch(
+            `/api/material-libraries/${encodeURIComponent(AppState.selectedLibrary)}?userId=${AppState.userId}`
+        );
+        if (!response.ok) throw new Error('Failed to load library');
+        const content = await response.text();
+
+        const doc = jsyaml.load(content) || {};
+        // Combine material_presets and materials sections
         const presets = Object.assign({}, doc.material_presets || {}, doc.materials || {});
-        const traces = [];
+        const names   = Object.keys(presets);
 
-        // Log-spaced H axis for formula evaluation: 1 A/m … 1e5 A/m, 120 points
-        const H_log = Array.from({ length: 120 }, (_, i) => Math.pow(10, i * 5 / 119));
-
-        for (const [name, props] of Object.entries(presets)) {
-            if (!props || typeof props !== 'object') continue;
-            const mur = props.mu_r;
-            if (mur === undefined || mur === null) continue;
-
-            if (Array.isArray(mur) && mur.length === 2 &&
-                Array.isArray(mur[0]) && Array.isArray(mur[1]) &&
-                mur[0].length === mur[1].length && mur[0].length > 0) {
-                // Format: mu_r: [[H_array], [mu_r_array]]
-                traces.push({
-                    x: mur[0], y: mur[1],
-                    mode: 'lines+markers',
-                    name: name,
-                    line: { width: 2 },
-                    marker: { size: 4 }
-                });
-
-            } else if (typeof mur === 'string' && mur.trim() !== '') {
-                // Format: mu_r: "formula($H)"
-                const pts = H_log
-                    .map(H => ({ H, mu: evaluateMuFormula(mur, H) }))
-                    .filter(p => !isNaN(p.mu));
-                if (pts.length > 0) {
-                    traces.push({
-                        x: pts.map(p => p.H),
-                        y: pts.map(p => p.mu),
-                        mode: 'lines',
-                        name: name + ' (formula)',
-                        line: { width: 2, dash: 'dot' }
-                    });
-                }
-            }
-            // Scalar mu_r values are constant — skip (no H-dependence to plot)
-        }
-
-        if (traces.length === 0) {
-            container.innerHTML = `<div style="color:#888; text-align:center; padding:40px;">
-                No nonlinear μr data found in this file.<br>
-                <small>Add materials with:<br>
-                <code>mu_r:</code><br>
-                <code>&nbsp;&nbsp;- [H1, H2, ...]&nbsp;&nbsp;# H [A/m]</code><br>
-                <code>&nbsp;&nbsp;- [mr1, mr2, ...]&nbsp;# mu_r</code><br>
-                or a formula: <code>mu_r: "1000/(1+$H/500)"</code>
-                </small></div>`;
+        if (names.length === 0) {
+            listEl.innerHTML = '<div style="color:#888; font-size:0.82rem; padding:8px;">No materials in library.</div>';
             return;
         }
 
-        container.innerHTML = '';
-        Plotly.newPlot(container, traces, {
-            title: 'μr − H Curves',
-            xaxis: { title: 'H [A/m]', type: 'log' },
-            yaxis: { title: 'μr (relative permeability)' },
-            margin: { t: 40, l: 65, r: 20, b: 55 },
-            legend: { orientation: 'h', y: -0.2 }
-        }, { responsive: true, displayModeBar: false });
+        // Header showing which library is active
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'font-weight:600; font-size:0.8rem; margin-bottom:8px; color:#495057; word-break:break-all;';
+        hdr.textContent   = AppState.selectedLibrary;
+        listEl.appendChild(hdr);
+
+        // Build clickable material list
+        let firstItem = null;
+        for (const name of names) {
+            const props = presets[name];
+            const mur   = props && props.mu_r;
+            // Classify: array / formula / constant
+            const isArray   = Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]);
+            const isFormula = typeof mur === 'string' && mur.trim() !== '';
+            const isConst   = typeof mur === 'number';
+            const hasPlot   = isArray || isFormula || isConst;
+
+            const item = document.createElement('div');
+            item.className  = 'lib-file-item';
+            item.dataset.matname = name;
+            item.style.cssText = 'padding:5px 8px; cursor:pointer; border-radius:3px;'
+                               + ' font-size:0.82rem; word-break:break-all; line-height:1.4;';
+            item.title = isArray   ? 'Array μr(H)'
+                       : isFormula ? 'Formula μr($H)'
+                       : isConst   ? `Constant μr = ${mur}`
+                       :             'No μr data';
+
+            // Badge
+            const badge = document.createElement('span');
+            badge.style.cssText = 'float:right; font-size:0.68rem; border-radius:8px; padding:1px 5px; margin-left:4px;'
+                                + (isArray   ? 'background:#d4edda; color:#155724;'
+                                  : isFormula ? 'background:#cce5ff; color:#004085;'
+                                  : isConst   ? 'background:#f8d7da; color:#721c24;'
+                                  :             'background:#f0f0f0; color:#888;');
+            badge.textContent = isArray   ? 'arr'
+                              : isFormula ? 'fn'
+                              : isConst   ? 'const'
+                              :             '—';
+            item.appendChild(badge);
+            item.appendChild(document.createTextNode(name));
+
+            item.onclick = () => {
+                listEl.querySelectorAll('.lib-file-item[data-matname]').forEach(el => el.classList.remove('active'));
+                item.classList.add('active');
+                if (hasPlot) renderBHCurveForMaterial(name, props);
+                else plotEl.innerHTML = '<div style="color:#888; text-align:center; padding:30px;">No μr data for this material.</div>';
+            };
+
+            listEl.appendChild(item);
+            if (!firstItem) firstItem = { item, name, props, hasPlot };
+        }
+
+        // Auto-select the first material with plottable data (or just first)
+        const autoSelect = names.reduce((found, name) => {
+            if (found) return found;
+            const mur = presets[name] && presets[name].mu_r;
+            if ((Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]))
+                || typeof mur === 'string' || typeof mur === 'number') {
+                return { name, props: presets[name] };
+            }
+            return null;
+        }, null) || (names.length > 0 ? { name: names[0], props: presets[names[0]] } : null);
+
+        if (autoSelect) {
+            const target = listEl.querySelector(`[data-matname="${CSS.escape(autoSelect.name)}"]`);
+            if (target) target.classList.add('active');
+            renderBHCurveForMaterial(autoSelect.name, autoSelect.props);
+        }
+
     } catch (e) {
-        container.innerHTML = `<div style="color:#c62828; padding:10px;">Parse error: ${e.message}</div>`;
+        listEl.innerHTML = `<div style="color:#c62828; font-size:0.82rem; padding:8px;">Error: ${e.message}</div>`;
     }
+}
+
+// Render a μr-H Plotly chart for a single material.
+function renderBHCurveForMaterial(name, props) {
+    const container = document.getElementById('libBHPlotContainer');
+    container.innerHTML = '';
+
+    const mur = props && props.mu_r;
+
+    // Log-spaced H axis for formula / constant evaluation
+    const H_log = Array.from({ length: 150 }, (_, i) => Math.pow(10, i * 5 / 149)); // 1..1e5
+
+    let trace = null;
+    let xtype = 'log';
+
+    if (Array.isArray(mur) && mur.length === 2 &&
+        Array.isArray(mur[0]) && Array.isArray(mur[1]) &&
+        mur[0].length === mur[1].length && mur[0].length > 0) {
+        // [[H_array], [mu_r_array]]
+        trace = {
+            x: mur[0], y: mur[1],
+            mode: 'lines+markers',
+            name: name,
+            line: { width: 2, color: '#667eea' },
+            marker: { size: 5, color: '#667eea' }
+        };
+
+    } else if (typeof mur === 'string' && mur.trim() !== '') {
+        // Formula: evaluate over log-spaced H range
+        const pts = H_log.map(H => ({ H, mu: evaluateMuFormula(mur, H) })).filter(p => !isNaN(p.mu));
+        if (pts.length > 0) {
+            trace = {
+                x: pts.map(p => p.H),
+                y: pts.map(p => p.mu),
+                mode: 'lines',
+                name: name,
+                line: { width: 2, color: '#e67e22' },
+                hovertemplate: 'H=%{x:.3g} A/m<br>μr=%{y:.4g}<extra></extra>'
+            };
+        }
+
+    } else if (typeof mur === 'number') {
+        // Constant — horizontal line over the H range
+        trace = {
+            x: [1, 1e5], y: [mur, mur],
+            mode: 'lines',
+            name: `${name} (μr = ${mur})`,
+            line: { width: 2, dash: 'dash', color: '#6c757d' },
+        };
+        xtype = 'log';
+    }
+
+    if (!trace) {
+        container.innerHTML = '<div style="color:#888; text-align:center; padding:40px; font-size:0.9rem;">'
+                            + 'No plottable μr data for this material.</div>';
+        return;
+    }
+
+    Plotly.newPlot(container, [trace], {
+        title: { text: `μr − H: <b>${name}</b>`, font: { size: 14 } },
+        xaxis: { title: 'H [A/m]', type: xtype, exponentformat: 'power' },
+        yaxis: { title: 'μr', exponentformat: 'power' },
+        margin: { t: 50, l: 65, r: 20, b: 55 },
+        showlegend: false
+    }, { responsive: true, displayModeBar: false });
 }
 
 function uploadLibrary() {
