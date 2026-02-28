@@ -282,6 +282,12 @@ double MagneticFieldAnalyzer::evaluateMu(const MuValue& mu_val, double H_magnitu
                 vars.insert(user_var);
             }
 
+            // Predefined physical constant: mu0 (vacuum permeability = 4π×10⁻⁷ H/m)
+            te_variable mu0_var;
+            mu0_var.m_name = "mu0";
+            mu0_var.m_value = MU_0;
+            vars.insert(mu0_var);
+
             parser.set_variables_and_functions(vars);
 
             double mu_r = parser.evaluate(mu_val.formula);

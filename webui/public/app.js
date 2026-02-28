@@ -7457,6 +7457,7 @@ function switchLibTab(tab) {
 function evaluateMuFormula(formula, H) {
     const expr = formula
         .replace(/\$H/g, `(${H})`)
+        .replace(/\bmu0\b/g, '(4*Math.PI*1e-7)')  // vacuum permeability
         .replace(/\bpi\b/g, 'Math.PI')
         .replace(/\bexp\s*\(/g, 'Math.exp(')
         .replace(/\bsin\s*\(/g, 'Math.sin(')
@@ -7622,11 +7623,11 @@ function renderBHCurveForMaterial(name, props) {
     if (typeof bh === 'string' && bh.trim() !== '') {
         // Evaluate over the same log-spaced H range used by C++ (1e-3..1e6)
         const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, -3 + i * 9 / 199));
-        // Use evaluateMuFormula but for B(H): replace $H as-is, no mu0 conversion needed
         const bhFormula = bh.trim();
         const evalB = (H) => {
             const expr = bhFormula
                 .replace(/\$H/g, `(${H})`)
+                .replace(/\bmu0\b/g, '(4*Math.PI*1e-7)')  // vacuum permeability
                 .replace(/\bpi\b/g, 'Math.PI')
                 .replace(/\bexp\s*\(/g, 'Math.exp(')
                 .replace(/\bsin\s*\(/g, 'Math.sin(')

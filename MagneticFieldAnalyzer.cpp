@@ -403,7 +403,8 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         "dx", "dy",        // Cartesian cell size
         "dr", "dtheta",    // Polar cell size
         "N", "A",          // Jz: material pixel count and area
-        "pi", "e"          // tinyexpr built-in constants
+        "pi", "e",         // tinyexpr built-in constants
+        "mu0"              // Predefined physical constant: vacuum permeability (4π×10⁻⁷ H/m)
     };
 
     if (!config["variables"]) {
@@ -418,7 +419,7 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         // Check for reserved variable names
         if (reserved_vars.count(var_name) > 0) {
             throw std::runtime_error("Variable '" + var_name + "' is a reserved variable name. "
-                                     "Reserved variables: step, H, dx, dy, dr, dtheta, N, A, pi, e");
+                                     "Reserved variables: step, H, dx, dy, dr, dtheta, N, A, pi, e, mu0");
         }
 
         // Get the value (can be number or formula string)
@@ -447,7 +448,12 @@ void MagneticFieldAnalyzer::parseUserVariables() {
             }
 
             // Try to evaluate as formula using tinyexpr
+            // Inject mu0 so users can write e.g. "mu0 * 1000" in variable definitions
             te_parser parser;
+            {
+                te_variable mu0_var; mu0_var.m_name = "mu0"; mu0_var.m_value = MU_0;
+                parser.set_variables_and_functions({mu0_var});
+            }
             var_value = parser.evaluate(val_str);
 
             if (!parser.success()) {
@@ -657,6 +663,9 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                         te_variable uv; uv.m_name = vn.c_str(); uv.m_value = vv;
                         vars.insert(uv);
                     }
+                    // Predefined physical constant: mu0 (vacuum permeability = 4π×10⁻⁷ H/m)
+                    te_variable mu0_var; mu0_var.m_name = "mu0"; mu0_var.m_value = MU_0;
+                    vars.insert(mu0_var);
                     parser.set_variables_and_functions(vars);
                     double val = parser.evaluate(te_expr);
                     if (!parser.success())
@@ -1132,16 +1141,19 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
         } else {
             // tinyexpr compile-once/eval-many for parallel / halbach / custom
             double x_val = 0.0, y_val = 0.0, r_val = 0.0, theta_val = 0.0;
+            const double mu0_phys = MU_0;  // Predefined constant for magnetization expressions
 
             te_parser px, py;
             px.add_variable_or_function({"x",     &x_val});
             px.add_variable_or_function({"y",     &y_val});
             px.add_variable_or_function({"r",     &r_val});
             px.add_variable_or_function({"theta", &theta_val});
+            px.add_variable_or_function({"mu0",   &mu0_phys});
             py.add_variable_or_function({"x",     &x_val});
             py.add_variable_or_function({"y",     &y_val});
             py.add_variable_or_function({"r",     &r_val});
             py.add_variable_or_function({"theta", &theta_val});
+            py.add_variable_or_function({"mu0",   &mu0_phys});
 
             if (!px.compile(mc.Mx_expr)) {
                 throw std::runtime_error("Failed to compile Mx_expr for material '" + mat_name + "': " + mc.Mx_expr);
@@ -10646,6 +10658,12 @@ double MagneticFieldAnalyzer::evaluateJz(const JzValue& jz_val, int step, const 
                 user_var.m_value = var_value;
                 vars.insert(user_var);
             }
+
+            // Predefined physical constant: mu0 (vacuum permeability = 4π×10⁻⁷ H/m)
+            te_variable mu0_var;
+            mu0_var.m_name = "mu0";
+            mu0_var.m_value = MU_0;
+            vars.insert(mu0_var);
 
             parser.set_variables_and_functions(vars);
 

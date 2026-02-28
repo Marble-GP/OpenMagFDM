@@ -122,13 +122,13 @@
       "validParents": ["materials"]
     },
     "mu_r": {
-      "description": "Relative permeability (dimensionless). Supports: constant, formula (quotes optional, with $H, $dx/$dy for Cartesian, $dr/$dtheta for polar, and user-defined $variables), or table [[H_values], [mu_r_values]]",
+      "description": "Relative permeability (dimensionless). Supports: constant, formula (quotes optional, with $H, $dx/$dy for Cartesian, $dr/$dtheta for polar, and user-defined $variables), or table [[H_values], [mu_r_values]]. Predefined constants: pi, e, mu0 (vacuum permeability = 4π×10⁻⁷ H/m)",
       "type": "number|string|array",
       "example": "mu_r: 1.0",
       "validParents": ["materials"]
     },
     "jz": {
-      "description": "Current density [A/m²]. Supports: constant, formula (quotes optional), or array. Formula variables: $step, $dx/$dy (Cartesian), $dr/$dtheta (polar), $N (pixel count), $A (area [m²]), and user-defined $variables",
+      "description": "Current density [A/m²]. Supports: constant, formula (quotes optional), or array. Formula variables: $step, $dx/$dy (Cartesian), $dr/$dtheta (polar), $N (pixel count), $A (area [m²]), and user-defined $variables. Predefined constants: pi, e, mu0 (4π×10⁻⁷ H/m)",
       "type": "number|string|array",
       "example": "jz: 1.0e9",
       "validParents": ["materials"]
@@ -332,9 +332,9 @@
       "validParents": ["nonlinear_solver"]
     },
     "B-H": {
-      "description": "B-H curve for a material. Two formats supported:\n  Array: [[H,...],[B,...]] [A/m, T]\n  Formula: \"expression with $H\" [A/m → T]\nIn both cases μr(H)=(B(H)-Br)/(μ₀H) is derived internally. If H[0]=0 and B[0]≠0, residual magnetization Br is auto-detected. Formula is sampled on a log-spaced H grid at setup time. Supports $H and user-defined $variables",
+      "description": "B-H curve for a material. Two formats supported:\n  Array: [[H,...],[B,...]] [A/m, T]\n  Formula: \"expression with $H\" [A/m → T]\nIn both cases μr(H)=(B(H)-Br)/(μ₀H) is derived internally. If H[0]=0 and B[0]≠0, residual magnetization Br is auto-detected. Formula is sampled on a log-spaced H grid at setup time. Supports $H, user-defined $variables, and predefined constants: pi, e, mu0 (4π×10⁻⁷ H/m)",
       "type": "array|string",
-      "example": "B-H: [[0, 100, 500, 2000, 5000],\n      [0, 0.30, 1.00, 1.50, 1.70]]\n# or formula:\nB-H: \"1.2 + 4*pi*1e-7 * 1000 * $H\"",
+      "example": "B-H: [[0, 100, 500, 2000, 5000],\n      [0, 0.30, 1.00, 1.50, 1.70]]\n# or formula:\nB-H: \"mu0 * 1000 * $H\"",
       "validParents": ["materials", "material_presets"]
     },
     "magnetization": {
