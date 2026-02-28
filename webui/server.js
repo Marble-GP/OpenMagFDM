@@ -688,7 +688,11 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
 
         res.json({
             success:      true,
-            colors:       dominant.map(c => c.rgb),  // dominant colors (materials)
+            colors:       dominant.map((c, i) => ({
+                rgb:       c.rgb,
+                ratio:     c.ratio,
+                antialias: antialiasBaseIdx.has(i)
+            })),
             allColors:    sorted.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
             aaBlends,
             yamlTemplate: lines.join('\n')

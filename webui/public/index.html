@@ -767,11 +767,13 @@
                     <button class="btn-danger" onclick="deleteConfig()">Delete</button>
                     <button class="btn-primary" onclick="saveConfig()">Save</button>
                     <button class="btn-secondary" onclick="saveConfigAs()">Save As...</button>
+                    <span style="margin-left: 12px; padding-left: 12px; border-left: 1px solid #dee2e6;">
+                        <button class="btn-secondary" onclick="openLibraryManager()">Material Library Manager</button>
+                    </span>
                 </div>
                 <div id="yamlEditor" class="yaml-editor"></div>
                 <div id="configStatus" style="margin-top: 10px;"></div>
-                <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-                    <button class="btn-secondary" onclick="openLibraryManager()">Material Library Manager</button>
+                <div style="margin-top: 6px;">
                     <span id="activeLibraryBadge" style="display: none; background: #e3f2fd; border: 1px solid #90caf9;
                           border-radius: 12px; padding: 3px 10px; font-size: 0.82rem; color: #1565c0;">
                         Library: <strong id="activeLibraryName"></strong>
@@ -1099,7 +1101,7 @@
 
     <!-- Material Library Manager Modal -->
     <div id="libraryManagerModal" class="modal" style="display: none;">
-        <div class="modal-content" style="max-width: 1000px; width: 95%; max-height: 90vh; display: flex; flex-direction: column;">
+        <div class="modal-content" style="max-width: 1000px; width: 95%; height: 85vh; max-height: 95vh; display: flex; flex-direction: column;">
             <div class="modal-header">
                 <h3>Material Library Manager</h3>
                 <button onclick="closeLibraryManager()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
@@ -1135,8 +1137,8 @@
                         <div id="libraryAceEditor" style="flex: 1; min-height: 0;"></div>
                     </div>
                     <!-- B-H Curves pane -->
-                    <div id="libPaneBH" style="flex: 1; display: none; padding: 15px; overflow-y: auto;">
-                        <div id="libBHPlotContainer" style="min-height: 300px;"></div>
+                    <div id="libPaneBH" style="flex: 1; display: none; padding: 15px; overflow-y: auto; min-height: 0;">
+                        <div id="libBHPlotContainer" style="height: 100%; min-height: 350px;"></div>
                     </div>
                 </div>
             </div>

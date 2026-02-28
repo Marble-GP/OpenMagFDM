@@ -7437,11 +7437,15 @@ function switchLibTab(tab) {
         if (AppState.libraryAceEditor) AppState.libraryAceEditor.resize();
     } else {
         editPane.style.display = 'none';
-        bhPane.style.display = 'block';
+        bhPane.style.display = 'flex';
+        bhPane.style.flexDirection = 'column';
         editBtn.classList.remove('lib-tab-active');
         bhBtn.classList.add('lib-tab-active');
         if (AppState.libraryAceEditor) {
-            renderBHCurves(AppState.libraryAceEditor.getValue());
+            // Defer render so the pane is fully laid out before Plotly measures it
+            requestAnimationFrame(() => {
+                renderBHCurves(AppState.libraryAceEditor.getValue());
+            });
         }
     }
 }
