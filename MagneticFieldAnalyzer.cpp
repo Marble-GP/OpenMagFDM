@@ -563,8 +563,65 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
 
-        // Parse mu_r value (static, formula, or table) - Nonlinear support
-        MuValue mu_value = parseMuValue(props["mu_r"]);
+        // Parse permeability: B-H: [[H,...],[B,...]] or mu_r: (scalar/formula/table)
+        // B-H takes precedence; mu_r is ignored with a warning if both are present.
+        double bh_remanence_Br = 0.0;   // Br [T] from B-H first point (0 if none)
+        bool   bh_has_remanence = false; // true if B(H=0) != 0
+
+        MuValue mu_value;
+
+        if (props["B-H"]) {
+            if (props["mu_r"]) {
+                std::cout << "[WARNING] Material '" << name << "': both 'B-H' and 'mu_r' defined. Using 'B-H'." << std::endl;
+            }
+            const YAML::Node& bh_node = props["B-H"];
+            if (!bh_node.IsSequence() || bh_node.size() != 2
+                || !bh_node[0].IsSequence() || !bh_node[1].IsSequence()) {
+                throw std::runtime_error("B-H for material '" + name + "' must be [[H,...],[B,...]]");
+            }
+            std::vector<double> H_data = bh_node[0].as<std::vector<double>>();
+            std::vector<double> B_data = bh_node[1].as<std::vector<double>>();
+            if (H_data.size() != B_data.size() || H_data.size() < 2) {
+                throw std::runtime_error("B-H for material '" + name + "': H and B arrays must have equal length >= 2");
+            }
+
+            // Detect remanence or prepend implicit (0,0)
+            double Br = 0.0;
+            if (H_data[0] > 1e-12) {
+                // First H > 0: prepend implicit (0, 0)
+                H_data.insert(H_data.begin(), 0.0);
+                B_data.insert(B_data.begin(), 0.0);
+            } else if (std::abs(B_data[0]) > 1e-9) {
+                // H=0, B≠0: residual magnetization
+                Br = B_data[0];
+                bh_remanence_Br  = Br;
+                bh_has_remanence = true;
+                std::cout << "  [" << name << "] B-H: residual magnetization Br=" << Br << " T" << std::endl;
+            }
+
+            // Convert B(H) → mu_r(H) table
+            // mu_r(H>0) = (B(H) - Br) / (mu0 * H)
+            // mu_r(H=0) = initial differential permeability = (B[1]-Br)/(mu0*H[1])
+            mu_value.type = MuType::TABLE;
+            {
+                double dB = B_data[1] - Br;
+                double dH = H_data[1];
+                double mu_r0 = (dH > 1e-15) ? std::max(1.0, dB / (MU_0 * dH)) : 1.0;
+                mu_value.H_table.push_back(0.0);
+                mu_value.mu_table.push_back(mu_r0);
+            }
+            for (size_t k = 1; k < H_data.size(); k++) {
+                if (H_data[k] < 1e-15) continue;
+                double mu_r_k = (B_data[k] - Br) / (MU_0 * H_data[k]);
+                mu_value.H_table.push_back(H_data[k]);
+                mu_value.mu_table.push_back(std::max(1.0, mu_r_k));
+            }
+            std::cout << "  [" << name << "] B-H: " << (H_data.size() - 1) << " points, "
+                      << "mu_r range [" << mu_value.mu_table.front() << ", "
+                      << *std::max_element(mu_value.mu_table.begin(), mu_value.mu_table.end()) << "]" << std::endl;
+        } else {
+            mu_value = parseMuValue(props["mu_r"]);
+        }
 
         // Parse dmu_r_extrapolation if specified (for TABLE type only)
         if (props["dmu_r_extrapolation"]) {
@@ -689,17 +746,21 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             MagnetizationConfig mc;
             mc.enabled = true;
 
-            // Accept either Br [T] or Hc [A/m] as magnetization strength.
-            // Br is preferred (listed directly in datasheets).
-            // Internally, we store the equivalent magnetization magnitude M0 in mc.Hc [A/m]:
-            //   From Br:  M0 = Br / mu0
-            //   From Hc:  M0 = Hc  (user must set Hc = Br/mu0 for physical accuracy)
+            // Accept Br [T], Hc [A/m], or derive from B-H remanence (fallback).
+            // Internally, M0 = Br/mu0 is stored in mc.Hc [A/m].
             if (mag["Br"]) {
                 double Br = mag["Br"].as<double>(0.0);
-                mc.Hc = Br / MU_0;  // M0 = Br / mu0 [A/m]
+                mc.Hc = Br / MU_0;
                 std::cout << "  [" << name << "] magnetization: Br=" << Br << " T → M0=" << mc.Hc << " A/m" << std::endl;
-            } else {
+            } else if (mag["Hc"]) {
                 mc.Hc = mag["Hc"].as<double>(0.0);
+            } else if (bh_has_remanence) {
+                // No explicit Hc/Br in magnetization block — derive from B-H remanence
+                mc.Hc = bh_remanence_Br / MU_0;
+                std::cout << "  [" << name << "] magnetization: Hc derived from B-H Br="
+                          << bh_remanence_Br << " T → M0=" << mc.Hc << " A/m" << std::endl;
+            } else {
+                mc.Hc = 0.0;
             }
 
             mc.pattern = mag["pattern"].as<std::string>("parallel");
@@ -777,6 +838,23 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             } else {
                 throw std::runtime_error("Unknown magnetization pattern '" + mc.pattern + "' for material '" + name + "'");
             }
+            material_magnetization[name] = mc;
+        } else if (bh_has_remanence) {
+            // B-H has remanence but no magnetization: block — warn and default to parallel angle=0
+            std::cout << "[WARNING] Material '" << name << "': B-H remanence (Br="
+                      << bh_remanence_Br << " T) detected but no 'magnetization:' block defined.\n"
+                      << "  Defaulting to pattern:parallel, angle:0. "
+                      << "Add a 'magnetization:' block to specify orientation." << std::endl;
+            MagnetizationConfig mc;
+            mc.enabled   = true;
+            mc.Hc        = bh_remanence_Br / MU_0;
+            mc.pattern   = "parallel";
+            mc.angle_deg = 0.0;
+            std::ostringstream sx, sy;
+            sx << std::setprecision(17) << mc.Hc;  // cos(0) = 1
+            sy << "0.0";                            // sin(0) = 0
+            mc.Mx_expr = sx.str();
+            mc.My_expr = sy.str();
             material_magnetization[name] = mc;
         }
 
