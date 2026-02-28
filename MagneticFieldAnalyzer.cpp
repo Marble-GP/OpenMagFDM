@@ -6,6 +6,9 @@
 #include <cmath>
 #include <chrono>
 #include <set>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _WIN32
 #include <direct.h>
@@ -1322,59 +1325,68 @@ void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(
     cv::Mat image_flipped;
     cv::flip(image, image_flipped, 0);
 
+    // Pre-compute pixel RGB → max_skip mapping to avoid YAML lookups in the parallel section.
+    // This also pre-populates gradient_levels_cache so the parallel section only reads it.
+    std::vector<std::pair<cv::Vec3b, int>> rgb_to_maxskip;
+    for (const auto& mat_pair : material_coarsen) {
+        const auto& cfg = mat_pair.second;
+        if (!cfg.enabled || cfg.max_skip_iso <= 1) continue;
+        for (const auto& material : config["materials"]) {
+            if (material.first.as<std::string>() != mat_pair.first) continue;
+            auto rgb = material.second["rgb"].as<std::vector<int>>();
+            rgb_to_maxskip.push_back({cv::Vec3b(rgb[0], rgb[1], rgb[2]), cfg.max_skip_iso});
+        }
+    }
+    // Pre-populate gradient_levels_cache for all unique max_skip values (triggers logging once).
+    // After this, all parallel calls to getGradientLevels are cache-hits (read-only).
+    for (const auto& [rgb, ms] : rgb_to_maxskip) {
+        getGradientLevels(ms);
+    }
+
     int coarsened_count = 0;
 
-    // Mark cells for coarsening based on distance and material settings
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            // Canny boundary cells - always full resolution
-            if (boundaries.at<uchar>(j, i) > 0) {
-                cell_skip_level(j, i) = 1;
-                continue;
-            }
+    // Mark cells for coarsening based on distance and material settings.
+    // flat k = j*nx+i for MSVC OpenMP 2.0 compatibility; cell_skip_level / active_cells
+    // writes are unique per (j,i). gradient_levels_cache is read-only (pre-populated above).
+    #pragma omp parallel for schedule(static) reduction(+:coarsened_count)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
 
-            // Domain boundary cells - always full resolution
-            if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1) {
-                cell_skip_level(j, i) = 1;
-                continue;
-            }
+        // Canny boundary cells - always full resolution
+        if (boundaries.at<uchar>(j, i) > 0) {
+            cell_skip_level(j, i) = 1;
+            continue;
+        }
 
-            // Find which material this cell belongs to
-            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+        // Domain boundary cells - always full resolution
+        if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1) {
+            cell_skip_level(j, i) = 1;
+            continue;
+        }
 
-            // Look up material coarsening settings to find max_skip
-            int max_skip = 1;
-            for (const auto& mat_pair : material_coarsen) {
-                const auto& cfg = mat_pair.second;
-                if (!cfg.enabled) continue;
-                if (cfg.max_skip_iso <= 1) continue;
+        // Find which material this cell belongs to
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
 
-                for (const auto& material : config["materials"]) {
-                    std::string mat_name = material.first.as<std::string>();
-                    if (mat_name != mat_pair.first) continue;
+        // Look up max_skip from pre-computed map (no YAML access in parallel section)
+        int max_skip = 1;
+        for (const auto& [rgb, ms] : rgb_to_maxskip) {
+            if (pixel == rgb) { max_skip = ms; break; }
+        }
 
-                    auto rgb = material.second["rgb"].as<std::vector<int>>();
-                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                        max_skip = cfg.max_skip_iso;
-                    }
-                }
-            }
+        if (max_skip <= 1) {
+            cell_skip_level(j, i) = 1;
+            continue;
+        }
 
-            if (max_skip <= 1) {
-                cell_skip_level(j, i) = 1;
-                continue;
-            }
+        // Compute gradient skip level from distance to boundary
+        float dist = dist_map.at<float>(j, i);
+        int local_skip = computeGradientSkipLevel(dist, max_skip);
+        cell_skip_level(j, i) = local_skip;
 
-            // Compute gradient skip level from distance to boundary
-            float dist = dist_map.at<float>(j, i);
-            int local_skip = computeGradientSkipLevel(dist, max_skip);
-            cell_skip_level(j, i) = local_skip;
-
-            // Apply modulo test: mark inactive if not aligned to local skip grid
-            if (local_skip > 1 && (i % local_skip != 0 || j % local_skip != 0)) {
-                active_cells(j, i) = false;
-                coarsened_count++;
-            }
+        // Apply modulo test: mark inactive if not aligned to local skip grid
+        if (local_skip > 1 && (i % local_skip != 0 || j % local_skip != 0)) {
+            active_cells(j, i) = false;
+            coarsened_count++;
         }
     }
 
@@ -1448,68 +1460,76 @@ void MagneticFieldAnalyzer::generateCoarseningMaskPolar(
     cv::flip(image, image_flipped, 0);
 
     bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    // Pre-compute pixel RGB → max_skip mapping and pre-populate gradient_levels_cache.
+    std::vector<std::pair<cv::Vec3b, int>> rgb_to_maxskip;
+    for (const auto& mat_pair : material_coarsen) {
+        const auto& cfg = mat_pair.second;
+        if (!cfg.enabled || cfg.max_skip_iso <= 1) continue;
+        for (const auto& material : config["materials"]) {
+            if (material.first.as<std::string>() != mat_pair.first) continue;
+            auto rgb = material.second["rgb"].as<std::vector<int>>();
+            rgb_to_maxskip.push_back({cv::Vec3b(rgb[0], rgb[1], rgb[2]), cfg.max_skip_iso});
+        }
+    }
+    for (const auto& [rgb, ms] : rgb_to_maxskip) {
+        getGradientLevels(ms);
+    }
+
     int coarsened_count = 0;
 
-    for (int i_r = 0; i_r < nr; i_r++) {
-        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
-            // Convert polar indices to flipped image coordinates
-            int img_i, img_j;
-            polarToImageIndices(i_r, j_theta, img_i, img_j);
+    // flat k = i_r*ntheta+j_theta for MSVC OpenMP 2.0 compatibility.
+    // cell_skip_level / active_cells writes are unique per (j_theta,i_r).
+    // polarToImageIndices() is a pure function — safe to call from multiple threads.
+    #pragma omp parallel for schedule(static) reduction(+:coarsened_count)
+    for (int k = 0; k < nr * ntheta; k++) {
+        int i_r = k / ntheta, j_theta = k % ntheta;
 
-            // Canny boundary cells - always full resolution
-            if (boundaries.at<uchar>(img_j, img_i) > 0) {
-                cell_skip_level(j_theta, i_r) = 1;
-                continue;
-            }
+        // Convert polar indices to flipped image coordinates
+        int img_i, img_j;
+        polarToImageIndices(i_r, j_theta, img_i, img_j);
 
-            // R-direction boundaries - always full resolution
-            if (i_r == 0 || i_r == nr - 1) {
-                cell_skip_level(j_theta, i_r) = 1;
-                continue;
-            }
+        // Canny boundary cells - always full resolution
+        if (boundaries.at<uchar>(img_j, img_i) > 0) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
 
-            // Theta-direction boundaries (if not periodic) - always full resolution
-            if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) {
-                cell_skip_level(j_theta, i_r) = 1;
-                continue;
-            }
+        // R-direction boundaries - always full resolution
+        if (i_r == 0 || i_r == nr - 1) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
 
-            // Find which material this cell belongs to
-            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+        // Theta-direction boundaries (if not periodic) - always full resolution
+        if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
 
-            // Look up material coarsening settings to find max_skip
-            int max_skip = 1;
-            for (const auto& mat_pair : material_coarsen) {
-                const auto& cfg = mat_pair.second;
-                if (!cfg.enabled) continue;
-                if (cfg.max_skip_iso <= 1) continue;
+        // Find which material this cell belongs to
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
 
-                for (const auto& material : config["materials"]) {
-                    std::string mat_name = material.first.as<std::string>();
-                    if (mat_name != mat_pair.first) continue;
+        // Look up max_skip from pre-computed map (no YAML access in parallel section)
+        int max_skip = 1;
+        for (const auto& [rgb, ms] : rgb_to_maxskip) {
+            if (pixel == rgb) { max_skip = ms; break; }
+        }
 
-                    auto rgb = material.second["rgb"].as<std::vector<int>>();
-                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                        max_skip = cfg.max_skip_iso;
-                    }
-                }
-            }
+        if (max_skip <= 1) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
 
-            if (max_skip <= 1) {
-                cell_skip_level(j_theta, i_r) = 1;
-                continue;
-            }
+        // Compute gradient skip level from distance to boundary
+        float dist = dist_map.at<float>(img_j, img_i);
+        int local_skip = computeGradientSkipLevel(dist, max_skip);
+        cell_skip_level(j_theta, i_r) = local_skip;
 
-            // Compute gradient skip level from distance to boundary
-            float dist = dist_map.at<float>(img_j, img_i);
-            int local_skip = computeGradientSkipLevel(dist, max_skip);
-            cell_skip_level(j_theta, i_r) = local_skip;
-
-            // Apply modulo test: mark inactive if not aligned to local skip grid
-            if (local_skip > 1 && (i_r % local_skip != 0 || j_theta % local_skip != 0)) {
-                active_cells(j_theta, i_r) = false;
-                coarsened_count++;
-            }
+        // Apply modulo test: mark inactive if not aligned to local skip grid
+        if (local_skip > 1 && (i_r % local_skip != 0 || j_theta % local_skip != 0)) {
+            active_cells(j_theta, i_r) = false;
+            coarsened_count++;
         }
     }
 
@@ -2281,7 +2301,15 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
     bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    // Build equation for each active cell
+    // Build equation for each active cell.
+    // Thread-local triplets merged via critical section; rhs(idx) writes unique per idx.
+    // findNextActive* / fine_to_coarse / mu_map are all read-only → thread-safe.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        local_triplets.reserve(5 * n_active_cells / (1 + omp_get_num_threads()) + 16);
+
+    #pragma omp for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
 
@@ -2292,19 +2320,19 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
 
         // Dirichlet boundary conditions
         if (is_left && bc_left.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_left.value;
             continue;
         } else if (is_right && bc_right.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_right.value;
             continue;
         } else if (is_bottom && bc_bottom.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_bottom.value;
             continue;
         } else if (is_top && bc_top.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_top.value;
             continue;
         }
@@ -2317,10 +2345,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             // Find next active cell in +x direction for the derivative term
             int i_east = findNextActiveX(i, j, +1);
             double h_east = (i_east - i) * dx;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_east));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_east));
             auto it_east = fine_to_coarse.find({i_east, j});
             if (it_east != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, -b/h_east));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, -b/h_east));
             }
             rhs(idx) = g;
             continue;
@@ -2330,10 +2358,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double g = bc_right.gamma;
             int i_west = findNextActiveX(i, j, -1);
             double h_west = (i - i_west) * dx;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_west));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_west));
             auto it_west = fine_to_coarse.find({i_west, j});
             if (it_west != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, -b/h_west));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, -b/h_west));
             }
             rhs(idx) = g;
             continue;
@@ -2343,10 +2371,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double g = bc_bottom.gamma;
             int j_north = findNextActiveY(i, j, +1);
             double h_north = (j_north - j) * dy;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_north));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_north));
             auto it_north = fine_to_coarse.find({i, j_north});
             if (it_north != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, -b/h_north));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, -b/h_north));
             }
             rhs(idx) = g;
             continue;
@@ -2356,10 +2384,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double g = bc_top.gamma;
             int j_south = findNextActiveY(i, j, -1);
             double h_south = (j - j_south) * dy;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_south));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_south));
             auto it_south = fine_to_coarse.find({i, j_south});
             if (it_south != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, -b/h_south));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, -b/h_south));
             }
             rhs(idx) = g;
             continue;
@@ -2429,7 +2457,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool west_is_dirichlet = (i_west == 0) && (bc_left.type == "dirichlet");
 
             if (!west_is_dirichlet && it_west != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, coeff_west));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, coeff_west));
             } else if (west_is_dirichlet) {
                 rhs(idx) -= coeff_west * bc_left.value;
             }
@@ -2447,7 +2475,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool east_is_dirichlet = (i_east == nx - 1) && (bc_right.type == "dirichlet");
 
             if (!east_is_dirichlet && it_east != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, coeff_east));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, coeff_east));
             } else if (east_is_dirichlet) {
                 rhs(idx) -= coeff_east * bc_right.value;
             }
@@ -2467,7 +2495,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool south_is_dirichlet = (j_south == 0) && (bc_bottom.type == "dirichlet");
 
             if (!south_is_dirichlet && it_south != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, coeff_south));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, coeff_south));
             } else if (south_is_dirichlet) {
                 rhs(idx) -= coeff_south * bc_bottom.value;
             }
@@ -2485,7 +2513,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool north_is_dirichlet = (j_north == ny - 1) && (bc_top.type == "dirichlet");
 
             if (!north_is_dirichlet && it_north != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, coeff_north));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, coeff_north));
             } else if (north_is_dirichlet) {
                 rhs(idx) -= coeff_north * bc_top.value;
             }
@@ -2493,12 +2521,18 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
         }
 
         // Center coefficient
-        triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+        local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
         // Right-hand side: source term (no area scaling for FDM)
         // Use += to preserve any accumulated Dirichlet boundary contributions
         rhs(idx) += -jz_map(j, i);
-    }
+    }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
+        }
+    }  // end omp parallel
 
     A.setFromTriplets(triplets.begin(), triplets.end());
     A.makeCompressed();
@@ -2518,23 +2552,26 @@ void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coar
     Az.setZero();
 
     // Step 1: Set active cells directly from solver output
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (active_cells(j, i)) {
-                auto it = fine_to_coarse.find({i, j});
-                if (it != fine_to_coarse.end()) {
-                    Az(j, i) = Az_coarse(it->second);
-                }
+    // Active cells get exact Az_coarse values; reads fine_to_coarse (read-only map).
+    // flat k = j*nx+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        if (active_cells(j, i)) {
+            auto it = fine_to_coarse.find({i, j});
+            if (it != fine_to_coarse.end()) {
+                Az(j, i) = Az_coarse(it->second);
             }
         }
     }
 
     // Step 2: Interpolate inactive cells with bilinear
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (!active_cells(j, i)) {
-                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
-            }
+    // Reads Az_coarse only (not Az), so no race with Step 1.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        if (!active_cells(j, i)) {
+            Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
         }
     }
 }
@@ -2725,6 +2762,10 @@ void MagneticFieldAnalyzer::calculateBFieldAtActiveCells(
     bool x_periodic = (!is_polar) && (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (!is_polar) && (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
+    // Bx_active(idx) / By_active(idx) writes are unique per idx.
+    // All reads (Az_coarse, coarse_to_fine, fine_to_coarse, active_cells) are read-only.
+    // findNextActive* helpers are pure reads → thread-safe.
+    #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
 
@@ -3157,11 +3198,13 @@ void MagneticFieldAnalyzer::interpolateInactiveCells(const Eigen::VectorXd& Az_c
     // Uses bilinear (not Hermite) to preserve solver convergence behavior.
     // Hermite is only used in interpolateToFullGrid() for final output quality.
 
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (!active_cells(j, i)) {
-                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
-            }
+    // flat k = j*nx+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility.
+    // active_cells / fine_to_coarse / Az_coarse are read-only; Az(j,i) writes are unique.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        if (!active_cells(j, i)) {
+            Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
         }
     }
 }
@@ -3170,19 +3213,21 @@ void MagneticFieldAnalyzer::interpolateInactiveCellsPolar(const Eigen::VectorXd&
     // Update ONLY inactive cells by interpolation from active cells (Polar version)
     // Active cells in Az are assumed to already have correct values
 
-    for (int i_r = 0; i_r < nr; i_r++) {
-        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
-            if (!active_cells(j_theta, i_r)) {  // Note: active_cells is (theta, r)
-                // Inactive cell - interpolate from surrounding active cells
-                double interpolated_value = interpolateFromCoarseGridPolar(i_r, j_theta, Az_coarse);
-                if (r_orientation == "horizontal") {
-                    Az(j_theta, i_r) = interpolated_value;
-                } else {
-                    Az(i_r, j_theta) = interpolated_value;
-                }
+    // flat k = i_r*ntheta+j_theta for MSVC OpenMP 2.0 compatibility.
+    // active_cells / fine_to_coarse / Az_coarse are read-only; Az writes are unique per (i_r,j_theta).
+    bool is_horizontal = (r_orientation == "horizontal");
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < nr * ntheta; k++) {
+        int i_r = k / ntheta, j_theta = k % ntheta;
+        if (!active_cells(j_theta, i_r)) {  // Note: active_cells is (theta, r)
+            double interpolated_value = interpolateFromCoarseGridPolar(i_r, j_theta, Az_coarse);
+            if (is_horizontal) {
+                Az(j_theta, i_r) = interpolated_value;
+            } else {
+                Az(i_r, j_theta) = interpolated_value;
             }
-            // Active cells: keep existing values (already updated from Az_coarse)
         }
+        // Active cells: keep existing values (already updated from Az_coarse)
     }
 }
 
@@ -4637,18 +4682,18 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
     bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    // Periodic boundary detection messages (commented out to reduce log verbosity)
-    // if (x_periodic) {
-    //     std::cout << "Periodic boundary detected in X direction (left-right)" << std::endl;
-    // }
-    // if (y_periodic) {
-    //     std::cout << "Periodic boundary detected in Y direction (bottom-top)" << std::endl;
-    // }
+    // Build equation for each grid point.
+    // Thread-local triplets are merged after the loop; rhs(idx) writes are unique per idx.
+    // flat k = j*nx+i for MSVC OpenMP 2.0 compatibility.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        local_triplets.reserve(5 * n / (1 + omp_get_num_threads()) + 16);
 
-    // Build equation for each grid point
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            int idx = j * nx + i;
+    #pragma omp for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        int idx = k;
 
             bool is_left = (i == 0);
             bool is_right = (i == nx - 1);
@@ -4657,19 +4702,19 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
             // Dirichlet boundary conditions (skip if periodic)
             if (is_left && bc_left.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_left.value;
                 continue;
             } else if (is_right && bc_right.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_right.value;
                 continue;
             } else if (is_bottom && bc_bottom.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_bottom.value;
                 continue;
             } else if (is_top && bc_top.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_top.value;
                 continue;
             }
@@ -4682,8 +4727,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_left.alpha;
                 double b = bc_left.beta;
                 double g = bc_left.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx + 1, -b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx + 1, -b/dx));
                 rhs(idx) = g;
                 continue;
             }
@@ -4694,8 +4739,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_right.alpha;
                 double b = bc_right.beta;
                 double g = bc_right.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx - 1, -b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx - 1, -b/dx));
                 rhs(idx) = g;
                 continue;
             }
@@ -4706,8 +4751,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_bottom.alpha;
                 double b = bc_bottom.beta;
                 double g = bc_bottom.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx + nx, -b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx + nx, -b/dy));
                 rhs(idx) = g;
                 continue;
             }
@@ -4718,8 +4763,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_top.alpha;
                 double b = bc_top.beta;
                 double g = bc_top.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx - nx, -b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx - nx, -b/dy));
                 rhs(idx) = g;
                 continue;
             }
@@ -4753,7 +4798,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!left_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_west, coeff_west));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_west, coeff_west));
                 } else {
                     // Left neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_west * bc_left.value;
@@ -4776,7 +4821,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!right_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_east, coeff_east));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_east, coeff_east));
                 } else {
                     // Right neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_east * bc_right.value;
@@ -4810,7 +4855,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!bottom_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_south, coeff_south));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_south, coeff_south));
                 } else {
                     // Bottom neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_south * bc_bottom.value;
@@ -4833,7 +4878,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!top_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_north, coeff_north));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_north, coeff_north));
                 } else {
                     // Top neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_north * bc_top.value;
@@ -4842,13 +4887,18 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
             }
 
             // Center coefficient
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
             // Right-hand side (current density)
             // Use += to preserve any accumulated Dirichlet boundary contributions
             rhs(idx) += -jz_map(j, i);
+        }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
         }
-    }
+    }  // end omp parallel
 
     // Construct sparse matrix
     A.setFromTriplets(triplets.begin(), triplets.end());
@@ -8901,23 +8951,31 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
     bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
     double periodic_sign = is_antiperiodic ? -1.0 : 1.0;  // Sign for coupling across theta boundary
 
-    // Build equation for each grid point
-    for (int i = 0; i < nr; i++) {  // Radial direction
-        for (int j = 0; j < ntheta; j++) {  // Angular direction
-            int idx = i * ntheta + j;
+    // Build equation for each grid point.
+    // Thread-local triplets merged via critical section; rhs(idx) writes unique per idx.
+    // flat k = i*ntheta+j for MSVC OpenMP 2.0 compatibility.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        local_triplets.reserve(7 * n / (1 + omp_get_num_threads()) + 16);
+
+    #pragma omp for schedule(static)
+    for (int k = 0; k < nr * ntheta; k++) {  // Flat loop: radial × angular
+        int i = k / ntheta, j = k % ntheta;
+        int idx = k;
             double r = r_coords[i];
 
             // Angular boundary conditions (only for non-periodic boundaries)
             if (!is_periodic) {
                 // Handle theta_min boundary (j == 0)
                 if (j == 0 && bc_theta_min.type == "dirichlet") {
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                     rhs(idx) = bc_theta_min.value;
                     continue;
                 }
                 // Handle theta_max boundary (j == ntheta - 1)
                 if (j == ntheta - 1 && bc_theta_max.type == "dirichlet") {
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                     rhs(idx) = bc_theta_max.value;
                     continue;
                 }
@@ -8926,13 +8984,13 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             // Radial boundary conditions (Dirichlet only handled here)
             // Neumann boundaries use ghost-elimination in interior stencil below
             if (i == 0 && bc_inner.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_inner.value;
                 continue;
             }
 
             if (i == nr - 1 && bc_outer.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_outer.value;
                 continue;
             }
@@ -8945,8 +9003,8 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 double a = bc_inner.alpha;
                 double b = bc_inner.beta;
                 double g = bc_inner.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
                 rhs(idx) = g;
                 continue;
             }
@@ -8958,8 +9016,8 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 double a = bc_outer.alpha;
                 double b = bc_outer.beta;
                 double g = bc_outer.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
                 rhs(idx) = g;
                 continue;
             }
@@ -9005,17 +9063,17 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                     std::cerr << "Warning: r_imh <= 0 at inner Neumann BC (r=" << r << "), using mirror approximation" << std::endl;
                     double r_imh_eff = r_iph;  // Mirror approximation
                     double a_im_eff = r_imh_eff / (mu_inner * dr * dr);
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im_eff + a_ip));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im_eff + a_ip));
                     coeff_center -= (a_im_eff + a_ip);
                 } else {
                     // Standard ghost elimination
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im + a_ip));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im + a_ip));
                     coeff_center -= (a_im + a_ip);
                 }
             } else if (i == nr - 1 && bc_outer.type == "neumann") {
                 // Ghost elimination: Az_{nr} = Az_{nr-2}
                 // Stencil: a_im·Az_{nr-2} + a_ip·Az_{nr} → (a_im + a_ip)·Az_{nr-2}
-                triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im + a_ip));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im + a_ip));
                 coeff_center -= (a_im + a_ip);
             } else {
                 // Standard interior stencil
@@ -9024,14 +9082,14 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 bool outer_neighbor_is_dirichlet = (i == nr - 2) && (bc_outer.type == "dirichlet");
 
                 if (!inner_neighbor_is_dirichlet) {
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
                 } else {
                     // Inner neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= a_im * bc_inner.value;
                 }
 
                 if (!outer_neighbor_is_dirichlet) {
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
                 } else {
                     // Outer neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= a_ip * bc_outer.value;
@@ -9082,7 +9140,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             if (!theta_prev_is_dirichlet) {
                 double sign = prev_crosses_boundary ? periodic_sign : 1.0;
-                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, sign * coeff_theta_prev));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, sign * coeff_theta_prev));
             } else {
                 // Theta_min neighbor is Dirichlet: move bc value to RHS
                 rhs(idx) -= coeff_theta_prev * bc_theta_min.value;
@@ -9090,7 +9148,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             if (!theta_next_is_dirichlet) {
                 double sign = next_crosses_boundary ? periodic_sign : 1.0;
-                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, sign * coeff_theta_next));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, sign * coeff_theta_next));
             } else {
                 // Theta_max neighbor is Dirichlet: move bc value to RHS
                 rhs(idx) -= coeff_theta_next * bc_theta_max.value;
@@ -9099,14 +9157,19 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             coeff_center -= (coeff_theta_prev + coeff_theta_next);
 
             // Center coefficient
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
             // Right-hand side (current density)
             // After r-weighting: RHS becomes -r·Jz
             // Use += to preserve any accumulated Dirichlet boundary contributions
             rhs(idx) += -getJzPolar(jz_map, i, j, r_orientation) * r;
+        }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
         }
-    }
+    }  // end omp parallel
 
     // Check for potential singularity (all-Neumann + periodic case)
     // In this case, the solution is only defined up to a constant
@@ -9248,7 +9311,14 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
     bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
     double periodic_sign = is_antiperiodic ? -1.0 : 1.0;
 
-    // Build equation for each active cell
+    // Build equation for each active cell.
+    // Thread-local triplets merged via critical section; rhs(idx) writes unique per idx.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        local_triplets.reserve(7 * n_active_cells / (1 + omp_get_num_threads()) + 16);
+
+    #pragma omp for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i_r, j_theta] = coarse_to_fine[idx];  // {r, theta} order
         double r = r_coords[i_r];
@@ -9256,12 +9326,12 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         // Angular boundary conditions (non-periodic only)
         if (!is_periodic) {
             if (j_theta == 0 && bc_theta_min.type == "dirichlet") {
-                triplets.push_back({idx, idx, 1.0});
+                local_triplets.push_back({idx, idx, 1.0});
                 rhs(idx) = bc_theta_min.value;
                 continue;
             }
             if (j_theta == ntheta - 1 && bc_theta_max.type == "dirichlet") {
-                triplets.push_back({idx, idx, 1.0});
+                local_triplets.push_back({idx, idx, 1.0});
                 rhs(idx) = bc_theta_max.value;
                 continue;
             }
@@ -9269,12 +9339,12 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
 
         // Radial boundary conditions (Dirichlet)
         if (i_r == 0 && bc_inner.type == "dirichlet") {
-            triplets.push_back({idx, idx, 1.0});
+            local_triplets.push_back({idx, idx, 1.0});
             rhs(idx) = bc_inner.value;
             continue;
         }
         if (i_r == nr - 1 && bc_outer.type == "dirichlet") {
-            triplets.push_back({idx, idx, 1.0});
+            local_triplets.push_back({idx, idx, 1.0});
             rhs(idx) = bc_outer.value;
             continue;
         }
@@ -9290,8 +9360,8 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             auto it_next = fine_to_coarse.find({i_next, j_theta});
             if (it_next != fine_to_coarse.end()) {
                 double h_plus = (i_next - i_r) * dr;
-                triplets.push_back({idx, idx, a + b/h_plus});
-                triplets.push_back({idx, it_next->second, -b/h_plus});
+                local_triplets.push_back({idx, idx, a + b/h_plus});
+                local_triplets.push_back({idx, it_next->second, -b/h_plus});
             }
             rhs(idx) = g;
             continue;
@@ -9306,8 +9376,8 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             auto it_prev = fine_to_coarse.find({i_prev, j_theta});
             if (it_prev != fine_to_coarse.end()) {
                 double h_minus = (i_r - i_prev) * dr;
-                triplets.push_back({idx, idx, a + b/h_minus});
-                triplets.push_back({idx, it_prev->second, -b/h_minus});
+                local_triplets.push_back({idx, idx, a + b/h_minus});
+                local_triplets.push_back({idx, it_prev->second, -b/h_minus});
             }
             rhs(idx) = g;
             continue;
@@ -9362,20 +9432,20 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
                 double a_im_eff = 2.0 * r_imh_eff / (mu_inner_r * h_plus * (h_minus + h_plus));
                 auto it_next = fine_to_coarse.find({i_next, j_theta});
                 if (it_next != fine_to_coarse.end()) {
-                    triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
+                    local_triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
                 }
                 coeff_center -= (a_im_eff + a_ip);
             } else {
                 auto it_next = fine_to_coarse.find({i_next, j_theta});
                 if (it_next != fine_to_coarse.end()) {
-                    triplets.push_back({idx, it_next->second, a_im + a_ip});
+                    local_triplets.push_back({idx, it_next->second, a_im + a_ip});
                 }
                 coeff_center -= (a_im + a_ip);
             }
         } else if (i_r == nr - 1 && bc_outer.type == "neumann") {
             auto it_prev = fine_to_coarse.find({i_prev, j_theta});
             if (it_prev != fine_to_coarse.end()) {
-                triplets.push_back({idx, it_prev->second, a_im + a_ip});
+                local_triplets.push_back({idx, it_prev->second, a_im + a_ip});
             }
             coeff_center -= (a_im + a_ip);
         } else {
@@ -9387,13 +9457,13 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             auto it_next = fine_to_coarse.find({i_next, j_theta});
 
             if (!inner_neighbor_is_dirichlet && it_prev != fine_to_coarse.end()) {
-                triplets.push_back({idx, it_prev->second, a_im});
+                local_triplets.push_back({idx, it_prev->second, a_im});
             } else if (inner_neighbor_is_dirichlet) {
                 rhs(idx) -= a_im * bc_inner.value;
             }
 
             if (!outer_neighbor_is_dirichlet && it_next != fine_to_coarse.end()) {
-                triplets.push_back({idx, it_next->second, a_ip});
+                local_triplets.push_back({idx, it_next->second, a_ip});
             } else if (outer_neighbor_is_dirichlet) {
                 rhs(idx) -= a_ip * bc_outer.value;
             }
@@ -9421,24 +9491,30 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
                 ((j_theta == 0 && j_prev_theta > j_theta) ||
                  (j_theta > 0 && j_prev_theta > j_theta));
             double sign = crosses_boundary ? periodic_sign : 1.0;
-            triplets.push_back({idx, it_theta_prev->second, sign * a_theta_m});
+            local_triplets.push_back({idx, it_theta_prev->second, sign * a_theta_m});
         }
         if (it_theta_next != fine_to_coarse.end()) {
             bool crosses_boundary = is_periodic &&
                 ((j_theta == ntheta-1 && j_next_theta < j_theta) ||
                  (j_theta < ntheta-1 && j_next_theta < j_theta));
             double sign = crosses_boundary ? periodic_sign : 1.0;
-            triplets.push_back({idx, it_theta_next->second, sign * a_theta_p});
+            local_triplets.push_back({idx, it_theta_next->second, sign * a_theta_p});
         }
         coeff_center -= (a_theta_m + a_theta_p);
 
         // Center coefficient
-        triplets.push_back({idx, idx, coeff_center});
+        local_triplets.push_back({idx, idx, coeff_center});
 
         // Source term: -Jz * r (r-weighted, no area scaling for FDM)
         double jz = getJzPolar(jz_map, i_r, j_theta, r_orientation);
         rhs(idx) -= jz * r;
-    }
+    }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
+        }
+    }  // end omp parallel
 
     A.setFromTriplets(triplets.begin(), triplets.end());
 }

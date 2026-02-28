@@ -19,6 +19,9 @@
 #include <fstream>
 #include <cmath>
 #include <Eigen/Dense>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /**
  * @brief Main Newton-Krylov solver
@@ -97,6 +100,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Phase 8: Wide-stencil B/H/μ at active cells only.
             // Avoids stripe artifacts from bilinear-interpolated inactive cell Az.
             Eigen::VectorXd Az_coarse_for_B(n_active_cells);
+            // coarse_to_fine / Az are read-only per cidx; Az_coarse_for_B(cidx) unique.
+            #pragma omp parallel for schedule(static)
             for (int cidx = 0; cidx < n_active_cells; cidx++) {
                 auto [ci, cj] = coarse_to_fine[cidx];
                 Az_coarse_for_B(cidx) = Az(cj, ci);
