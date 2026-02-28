@@ -1145,6 +1145,13 @@
                         <!-- Chart column -->
                         <div style="flex: 1; min-width: 0; padding: 10px;
                                     display: flex; flex-direction: column; position: relative;">
+                            <div id="libBHToolbar" style="flex-shrink: 0; padding: 0 0 6px 2px;
+                                                           font-size: 0.83rem; color: #495057; display: none;">
+                                <label style="user-select: none; cursor: pointer;">
+                                    <input type="checkbox" id="libBHLogX" checked onchange="onLibBHAxisChange()">
+                                    Log X axis
+                                </label>
+                            </div>
                             <div id="libBHPlotContainer" style="flex: 1; min-height: 350px;"></div>
                         </div>
                     </div>

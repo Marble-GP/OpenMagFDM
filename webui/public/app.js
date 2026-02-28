@@ -36,7 +36,8 @@ const AppState = {
     // Material Library
     selectedLibrary: null,       // Active library filename (null = none)
     libraryAceEditor: null,      // Ace Editor instance inside Library modal
-    currentLibraryFile: null     // Currently selected filename in Library modal
+    currentLibraryFile: null,    // Currently selected filename in Library modal
+    currentBHMaterial: null      // Last rendered BH material {name, props} for axis toggle
 };
 
 // ===== Utility Functions =====
@@ -7581,71 +7582,101 @@ async function loadBHMaterialList() {
     }
 }
 
-// Render a μr-H Plotly chart for a single material.
+// Render dual-axis μr-H / B-H Plotly chart for a single material.
 function renderBHCurveForMaterial(name, props) {
     const container = document.getElementById('libBHPlotContainer');
+    const toolbar   = document.getElementById('libBHToolbar');
     container.innerHTML = '';
 
-    const mur = props && props.mu_r;
+    AppState.currentBHMaterial = { name, props };
 
-    // Log-spaced H axis for formula / constant evaluation
-    const H_log = Array.from({ length: 150 }, (_, i) => Math.pow(10, i * 5 / 149)); // 1..1e5
+    const MU_0 = 4 * Math.PI * 1e-7;
+    const mur  = props && props.mu_r;
 
-    let trace = null;
-    let xtype = 'log';
+    // Determine X-axis type from checkbox (default: log)
+    const logCb = document.getElementById('libBHLogX');
+    const xtype = (logCb && !logCb.checked) ? 'linear' : 'log';
+
+    // Log-spaced H axis for formula / constant evaluation (1 to 1e6 A/m)
+    const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, i * 6 / 199));
+
+    let H_arr = null, mur_arr = null;
 
     if (Array.isArray(mur) && mur.length === 2 &&
         Array.isArray(mur[0]) && Array.isArray(mur[1]) &&
         mur[0].length === mur[1].length && mur[0].length > 0) {
-        // [[H_array], [mu_r_array]]
-        trace = {
-            x: mur[0], y: mur[1],
-            mode: 'lines+markers',
-            name: name,
-            line: { width: 2, color: '#667eea' },
-            marker: { size: 5, color: '#667eea' }
-        };
+        H_arr   = mur[0];
+        mur_arr = mur[1];
 
     } else if (typeof mur === 'string' && mur.trim() !== '') {
-        // Formula: evaluate over log-spaced H range
-        const pts = H_log.map(H => ({ H, mu: evaluateMuFormula(mur, H) })).filter(p => !isNaN(p.mu));
+        const pts = H_log
+            .map(H => ({ H, mu: evaluateMuFormula(mur, H) }))
+            .filter(p => !isNaN(p.mu) && p.mu > 0);
         if (pts.length > 0) {
-            trace = {
-                x: pts.map(p => p.H),
-                y: pts.map(p => p.mu),
-                mode: 'lines',
-                name: name,
-                line: { width: 2, color: '#e67e22' },
-                hovertemplate: 'H=%{x:.3g} A/m<br>μr=%{y:.4g}<extra></extra>'
-            };
+            H_arr   = pts.map(p => p.H);
+            mur_arr = pts.map(p => p.mu);
         }
 
     } else if (typeof mur === 'number') {
-        // Constant — horizontal line over the H range
-        trace = {
-            x: [1, 1e5], y: [mur, mur],
-            mode: 'lines',
-            name: `${name} (μr = ${mur})`,
-            line: { width: 2, dash: 'dash', color: '#6c757d' },
-        };
-        xtype = 'log';
+        H_arr   = [1, 1e6];
+        mur_arr = [mur, mur];
     }
 
-    if (!trace) {
+    if (!H_arr) {
         container.innerHTML = '<div style="color:#888; text-align:center; padding:40px; font-size:0.9rem;">'
                             + 'No plottable μr data for this material.</div>';
+        if (toolbar) toolbar.style.display = 'none';
         return;
     }
 
+    const B_arr = H_arr.map((H, i) => MU_0 * mur_arr[i] * H);
+
+    const isConst   = typeof mur === 'number';
+    const isFormula = typeof mur === 'string';
+
+    // B on left axis (y1), μr on right axis (y2)
+    const traceB = {
+        x: H_arr, y: B_arr,
+        mode: isConst ? 'lines' : 'lines+markers',
+        name: 'B [T]',
+        yaxis: 'y1',
+        line:   { width: 2, color: '#e05252', dash: isConst ? 'dash' : 'solid' },
+        marker: isConst ? undefined : { size: isFormula ? 3 : 5, color: '#e05252' },
+        hovertemplate: 'H=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>'
+    };
+
+    const traceMur = {
+        x: H_arr, y: mur_arr,
+        mode: isConst ? 'lines' : 'lines+markers',
+        name: 'μr',
+        yaxis: 'y2',
+        line:   { width: 2, color: '#667eea', dash: isConst ? 'dash' : 'solid' },
+        marker: isConst ? undefined : { size: isFormula ? 3 : 5, color: '#667eea' },
+        hovertemplate: 'H=%{x:.4g} A/m<br>μr=%{y:.4g}<extra></extra>'
+    };
+
     const plotH = Math.max(350, container.offsetHeight || 0);
-    Plotly.newPlot(container, [trace], {
-        title: { text: `μr − H: <b>${name}</b>`, font: { size: 14 } },
-        xaxis: { title: 'H [A/m]', type: xtype, exponentformat: 'power' },
-        yaxis: { title: 'μr', exponentformat: 'power' },
-        margin: { t: 50, l: 65, r: 20, b: 55 },
-        height: plotH,
-        showlegend: false
+    Plotly.newPlot(container, [traceB, traceMur], {
+        title:  { text: `<b>${name}</b>`, font: { size: 14 } },
+        xaxis:  { title: 'H [A/m]', type: xtype, exponentformat: 'power' },
+        yaxis:  { title: 'B [T]', exponentformat: 'power',
+                  titlefont: { color: '#e05252' }, tickfont: { color: '#e05252' } },
+        yaxis2: { title: 'μr', overlaying: 'y', side: 'right', exponentformat: 'power',
+                  titlefont: { color: '#667eea' }, tickfont: { color: '#667eea' } },
+        margin:     { t: 45, l: 65, r: 70, b: 55 },
+        height:     plotH,
+        legend:     { x: 0.02, y: 0.98, bgcolor: 'rgba(255,255,255,0.8)', bordercolor: '#ccc', borderwidth: 1 },
+        showlegend: true
     }, { responsive: true, displayModeBar: false });
+
+    if (toolbar) toolbar.style.display = '';
+}
+
+// Called when the log/linear checkbox changes.
+function onLibBHAxisChange() {
+    if (AppState.currentBHMaterial) {
+        renderBHCurveForMaterial(AppState.currentBHMaterial.name, AppState.currentBHMaterial.props);
+    }
 }
 
 function uploadLibrary() {
@@ -7755,7 +7786,6 @@ function setActiveLibrary() {
     AppState.selectedLibrary = filename;
     document.getElementById('activeLibraryName').textContent = filename;
     document.getElementById('activeLibraryBadge').style.display = 'inline-flex';
-    closeLibraryManager();
     showStatus('configStatus', `Material library set: ${filename}`, 'success');
 }
 
