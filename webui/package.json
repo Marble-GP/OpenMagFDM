@@ -17,6 +17,7 @@
   "license": "MIT",
   "dependencies": {
     "express": "^4.21.2",
+    "jimp": "^0.22.12",
     "js-yaml": "^4.1.0",
     "multer": "^1.4.5-lts.1"
   }

@@ -509,6 +509,55 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     }
 });
 
+// Detect unique colors in an image and generate YAML material template
+app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
+    const tmpPath = req.file ? req.file.path : null;
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No image file provided' });
+        }
+
+        const Jimp = require('jimp');
+        const image = await Jimp.read(tmpPath);
+
+        // Collect unique RGB colors (ignore fully transparent pixels)
+        const colorSet = new Set();
+        image.scan(0, 0, image.bitmap.width, image.bitmap.height, (x, y, idx) => {
+            const r = image.bitmap.data[idx];
+            const g = image.bitmap.data[idx + 1];
+            const b = image.bitmap.data[idx + 2];
+            const a = image.bitmap.data[idx + 3];
+            if (a > 0) colorSet.add(`${r},${g},${b}`);
+        });
+
+        const colors = Array.from(colorSet).map(s => s.split(',').map(Number));
+
+        // Generate YAML template
+        const lines = [
+            `# Auto-generated from ${req.file.originalname} (${colors.length} colors detected)`,
+            `# Fill in mu_r and jz for each material`,
+            `coordinate_system: cartesian`,
+            ``,
+            `materials:`
+        ];
+        for (const [r, g, b] of colors) {
+            const hex = `${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+            lines.push(`  material_${hex}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # TODO: set permeability`);
+            lines.push(`    jz: 0.0`);
+        }
+
+        // Clean up temp file
+        await fs.unlink(tmpPath);
+
+        res.json({ success: true, colors, yamlTemplate: lines.join('\n') });
+    } catch (error) {
+        if (tmpPath) { try { await fs.unlink(tmpPath); } catch { /* ignore */ } }
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // アップロードされた画像の一覧（ユーザーごと）
 app.get('/api/images', async (req, res) => {
     try {
