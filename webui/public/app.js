@@ -7733,16 +7733,16 @@ function renderBHCurveForMaterial(name, props) {
     const traceB = {
         x: H_plot, y: B_plot,
         mode, name: 'B [T]', yaxis: 'y1',
-        line:   { width: 2, color: '#e05252', dash: isDashed ? 'dash' : 'solid' },
-        marker: markerSize > 0 ? { size: markerSize, color: '#e05252' } : undefined,
+        line: { width: 2, color: '#e05252', dash: isDashed ? 'dash' : 'solid' },
+        ...(markerSize > 0 ? { marker: { size: markerSize, color: '#e05252' } } : {}),
         hovertemplate: 'H=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>'
     };
 
     const traceMur = {
         x: H_plot, y: mur_plot,
         mode, name: 'μr', yaxis: 'y2',
-        line:   { width: 2, color: '#667eea', dash: isDashed ? 'dash' : 'solid' },
-        marker: markerSize > 0 ? { size: markerSize, color: '#667eea' } : undefined,
+        line: { width: 2, color: '#667eea', dash: isDashed ? 'dash' : 'solid' },
+        ...(markerSize > 0 ? { marker: { size: markerSize, color: '#667eea' } } : {}),
         hovertemplate: 'H=%{x:.4g} A/m<br>μr=%{y:.4g}<extra></extra>'
     };
 
