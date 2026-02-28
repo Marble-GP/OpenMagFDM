@@ -1,6 +1,7 @@
 # OpenMagFDM Sample Material Library
 #
-# This file provides material presets for common soft magnetic materials.
+# This file provides material presets for common soft magnetic materials
+# and permanent magnets.
 # The B-H characteristics are modeled as continuous functions approximating
 # typical catalog data. These are simplified models intended for engineering
 # estimates and should be verified against actual material specifications
@@ -13,12 +14,14 @@
 #       preset: pure_iron_model   # <-- reference preset name
 #       jz: 0.0
 #
-# Alternatively, override any property after referencing a preset:
-#   materials:
-#     iron_core:
-#       rgb: [128, 128, 128]
-#       preset: structural_steel_model
-#       calc_force: true
+#     magnet:
+#       rgb: [255, 200, 0]
+#       preset: NdFeB_N40
+#       # override magnetization direction if needed:
+#       magnetization:
+#         Br: 1.27
+#         pattern: parallel
+#         angle: 90    # +Y direction
 #
 # -----------------------------------------------------------------------
 # Defining B-H curves with measured data points (table format):
@@ -42,6 +45,10 @@
 
 material_presets:
 
+  # ===========================================================================
+  # Soft magnetic materials
+  # ===========================================================================
+
   # Pure Iron (soft magnetic iron)
   # Characteristics: very high permeability, low coercivity, high saturation (~2.1 T)
   pure_iron_model:
@@ -57,3 +64,52 @@ material_presets:
   # Characteristics: moderate permeability, widely available structural material
   structural_steel_model:
     B-H: ($H/(97.0 + 0.625*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 20))))
+
+  # ===========================================================================
+  # Permanent magnets (IEC 60404-8-1 / JIS C 2502 typical values)
+  #
+  # Notes:
+  #   - Br: residual flux density [T]  (drives the magnetization model)
+  #   - mu_r: reversible permeability of the magnet body (~1.05 for NdFeB)
+  #   - magnetization.angle: 0 = +X direction (parallel magnetization)
+  #   - All values are typical midpoints of the grade range.
+  #     Verify with actual datasheet for production use.
+  # ===========================================================================
+
+  # Neodymium sintered magnet — Grade N40
+  # IEC 60404-8-1 / JIS C 2502
+  #   Br   = 1.26–1.29 T  (typical 1.27 T)
+  #   Hcb  >= 836 kA/m    (B-coercivity)
+  #   Hcj  >= 955 kA/m    (intrinsic coercivity)
+  #   BHmax = 310–350 kJ/m3  (~40 MGOe)
+  NdFeB_N40:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.27
+      pattern: parallel
+      angle: 0
+
+  # Neodymium sintered magnet — Grade N45
+  # IEC 60404-8-1 / JIS C 2502
+  #   Br   = 1.32–1.37 T  (typical 1.34 T)
+  #   Hcb  >= 836 kA/m    (B-coercivity)
+  #   Hcj  >= 876 kA/m    (intrinsic coercivity)
+  #   BHmax = 342–390 kJ/m3  (~45 MGOe)
+  NdFeB_N45:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.34
+      pattern: parallel
+      angle: 0
+
+  # Ferrite sintered magnet — High-Br type (FB9B equivalent)
+  # JIS C 2502 / IEC 60404-8-1
+  #   Br   = ~0.44 T
+  #   Hcb  >= 255 kA/m    (B-coercivity)
+  #   Hcj  >= 280 kA/m    (intrinsic coercivity)
+  ferrite_high_B:
+    mu_r: 1.05
+    magnetization:
+      Br: 0.44
+      pattern: parallel
+      angle: 0
