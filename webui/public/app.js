@@ -7637,11 +7637,13 @@ function renderBHCurveForMaterial(name, props) {
         return;
     }
 
+    const plotH = Math.max(350, container.offsetHeight || 0);
     Plotly.newPlot(container, [trace], {
         title: { text: `μr − H: <b>${name}</b>`, font: { size: 14 } },
         xaxis: { title: 'H [A/m]', type: xtype, exponentformat: 'power' },
         yaxis: { title: 'μr', exponentformat: 'power' },
         margin: { t: 50, l: 65, r: 20, b: 55 },
+        height: plotH,
         showlegend: false
     }, { responsive: true, displayModeBar: false });
 }
