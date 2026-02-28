@@ -1590,6 +1590,112 @@ app.put('/api/user-outputs/:folderName/description', async (req, res) => {
 });
 
 // ============================================================
+// Field Query: Get field values at a physical coordinate
+// ============================================================
+
+// GET /api/results/:resultFolder/field-at-point
+// Query params:
+//   userId - user id
+//   x      - physical x [m] (Cartesian) or r [m] (Polar)
+//   y      - physical y [m] (Cartesian) or theta [rad] (Polar)
+//   step   - step number (0-based, default 0)
+app.get('/api/results/:resultFolder/field-at-point', async (req, res) => {
+    try {
+        const { resultFolder } = req.params;
+        const { userId, x, y, step } = req.query;
+
+        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeFolderName = path.basename(resultFolder);
+        const folderPath = path.join(OUTPUTS_DIR, userIdKey, safeFolderName);
+
+        // Security: verify path stays inside user's output dir
+        const resolvedFolder = path.resolve(folderPath);
+        const resolvedBase = path.resolve(path.join(OUTPUTS_DIR, userIdKey));
+        if (!resolvedFolder.startsWith(resolvedBase)) {
+            return res.status(403).json({ success: false, error: 'Access denied' });
+        }
+
+        // Load conditions
+        const conditionsPath = path.join(folderPath, 'conditions.json');
+        const conditions = JSON.parse(await fs.readFile(conditionsPath, 'utf8'));
+
+        const cs = conditions.coordinate_system || 'cartesian';
+        const xVal = parseFloat(x);
+        const yVal = parseFloat(y);
+        const stepNum = parseInt(step || '0');
+
+        if (isNaN(xVal) || isNaN(yVal)) {
+            return res.status(400).json({ success: false, error: 'x and y must be numeric' });
+        }
+
+        // Determine grid dimensions and convert to fractional indices
+        let nx, ny, dx, dy, i_float, j_float;
+        if (cs === 'polar') {
+            const rStart = conditions.polar?.r_start ?? 0;
+            dx = conditions.dr;
+            dy = conditions.dtheta;
+            nx = conditions.image_width;  // nr = columns
+            ny = conditions.image_height; // ntheta = rows
+            i_float = (xVal - rStart) / dx; // x = r
+            j_float = yVal / dy;            // y = theta
+        } else {
+            dx = conditions.dx;
+            dy = conditions.dy;
+            nx = conditions.image_width;
+            ny = conditions.image_height;
+            i_float = xVal / dx;
+            j_float = yVal / dy;
+        }
+
+        // Clamp to valid range
+        i_float = Math.max(0, Math.min(nx - 1, i_float));
+        j_float = Math.max(0, Math.min(ny - 1, j_float));
+
+        // Load Az CSV
+        const stepStr = String(stepNum).padStart(4, '0');
+        const csvPath = path.join(folderPath, 'Az', `step_${stepStr}.csv`);
+        const csvContent = await fs.readFile(csvPath, 'utf8');
+
+        // Parse CSV into 2D array (rows = j, cols = i)
+        const rows = csvContent.trim().split('\n').map(r => r.split(',').map(Number));
+        const getAz = (i, j) => {
+            const ri = Math.max(0, Math.min(ny - 1, j));
+            const ci = Math.max(0, Math.min(nx - 1, i));
+            return (rows[ri] && rows[ri][ci] !== undefined) ? rows[ri][ci] : 0;
+        };
+
+        // Bilinear interpolation for Az
+        const i0 = Math.floor(i_float), i1 = Math.min(i0 + 1, nx - 1);
+        const j0 = Math.floor(j_float), j1 = Math.min(j0 + 1, ny - 1);
+        const fi = i_float - i0, fj = j_float - j0;
+        const Az = getAz(i0, j0) * (1 - fi) * (1 - fj)
+                 + getAz(i1, j0) * fi * (1 - fj)
+                 + getAz(i0, j1) * (1 - fi) * fj
+                 + getAz(i1, j1) * fi * fj;
+
+        // Central difference for B = curl A (Cartesian: Bx=dAz/dy, By=-dAz/dx)
+        const Bx = (getAz(Math.round(i_float), Math.min(Math.round(j_float) + 1, ny - 1))
+                  - getAz(Math.round(i_float), Math.max(Math.round(j_float) - 1, 0))) / (2 * dy);
+        const By = -(getAz(Math.min(Math.round(i_float) + 1, nx - 1), Math.round(j_float))
+                   - getAz(Math.max(Math.round(i_float) - 1, 0), Math.round(j_float))) / (2 * dx);
+        const Babs = Math.sqrt(Bx * Bx + By * By);
+
+        res.json({
+            success: true,
+            coordinate_system: cs,
+            x: xVal, y: yVal,
+            step: stepNum,
+            Az, Bx, By, Babs
+        });
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return res.status(404).json({ success: false, error: 'Result folder or step not found' });
+        }
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ============================================================
 // Async Job Queue API
 // ============================================================
 
