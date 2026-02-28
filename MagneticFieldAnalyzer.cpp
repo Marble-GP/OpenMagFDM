@@ -1,4 +1,5 @@
 #include "MagneticFieldAnalyzer.h"
+#include "tinyexpr/tinyexpr.h"
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -6,6 +7,7 @@
 #include <cmath>
 #include <chrono>
 #include <set>
+#include <algorithm>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -575,50 +577,116 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                 std::cout << "[WARNING] Material '" << name << "': both 'B-H' and 'mu_r' defined. Using 'B-H'." << std::endl;
             }
             const YAML::Node& bh_node = props["B-H"];
-            if (!bh_node.IsSequence() || bh_node.size() != 2
-                || !bh_node[0].IsSequence() || !bh_node[1].IsSequence()) {
-                throw std::runtime_error("B-H for material '" + name + "' must be [[H,...],[B,...]]");
-            }
-            std::vector<double> H_data = bh_node[0].as<std::vector<double>>();
-            std::vector<double> B_data = bh_node[1].as<std::vector<double>>();
-            if (H_data.size() != B_data.size() || H_data.size() < 2) {
-                throw std::runtime_error("B-H for material '" + name + "': H and B arrays must have equal length >= 2");
-            }
 
-            // Detect remanence or prepend implicit (0,0)
-            double Br = 0.0;
-            if (H_data[0] > 1e-12) {
-                // First H > 0: prepend implicit (0, 0)
-                H_data.insert(H_data.begin(), 0.0);
-                B_data.insert(B_data.begin(), 0.0);
-            } else if (std::abs(B_data[0]) > 1e-9) {
-                // H=0, B≠0: residual magnetization
-                Br = B_data[0];
-                bh_remanence_Br  = Br;
-                bh_has_remanence = true;
-                std::cout << "  [" << name << "] B-H: residual magnetization Br=" << Br << " T" << std::endl;
-            }
+            // Helper: build mu_r TABLE from parallel H_data / B_data vectors (Br already extracted)
+            auto buildBHTable = [&](std::vector<double> H_data, std::vector<double> B_data, double Br) {
+                mu_value.type = MuType::TABLE;
+                // H=0: initial differential permeability
+                {
+                    double dB = B_data[1] - Br;
+                    double dH = H_data[1];
+                    double mu_r0 = (dH > 1e-15) ? std::max(1.0, dB / (MU_0 * dH)) : 1.0;
+                    mu_value.H_table.push_back(0.0);
+                    mu_value.mu_table.push_back(mu_r0);
+                }
+                for (size_t k = 1; k < H_data.size(); k++) {
+                    if (H_data[k] < 1e-15) continue;
+                    double mu_r_k = (B_data[k] - Br) / (MU_0 * H_data[k]);
+                    mu_value.H_table.push_back(H_data[k]);
+                    mu_value.mu_table.push_back(std::max(1.0, mu_r_k));
+                }
+                std::cout << "  [" << name << "] B-H: "
+                          << (H_data.size() - 1) << " points, "
+                          << "mu_r range [" << mu_value.mu_table.front() << ", "
+                          << *std::max_element(mu_value.mu_table.begin(), mu_value.mu_table.end()) << "]" << std::endl;
+            };
 
-            // Convert B(H) → mu_r(H) table
-            // mu_r(H>0) = (B(H) - Br) / (mu0 * H)
-            // mu_r(H=0) = initial differential permeability = (B[1]-Br)/(mu0*H[1])
-            mu_value.type = MuType::TABLE;
-            {
-                double dB = B_data[1] - Br;
-                double dH = H_data[1];
-                double mu_r0 = (dH > 1e-15) ? std::max(1.0, dB / (MU_0 * dH)) : 1.0;
-                mu_value.H_table.push_back(0.0);
-                mu_value.mu_table.push_back(mu_r0);
+            if (bh_node.IsSequence() && bh_node.size() == 2
+                && bh_node[0].IsSequence() && bh_node[1].IsSequence()) {
+                // ---- Array format: B-H: [[H,...],[B,...]] ----
+                std::vector<double> H_data = bh_node[0].as<std::vector<double>>();
+                std::vector<double> B_data = bh_node[1].as<std::vector<double>>();
+                if (H_data.size() != B_data.size() || H_data.size() < 2) {
+                    throw std::runtime_error("B-H for material '" + name + "': H and B arrays must have equal length >= 2");
+                }
+                double Br = 0.0;
+                if (H_data[0] > 1e-12) {
+                    // Prepend implicit (0, 0)
+                    H_data.insert(H_data.begin(), 0.0);
+                    B_data.insert(B_data.begin(), 0.0);
+                } else if (std::abs(B_data[0]) > 1e-9) {
+                    Br = B_data[0];
+                    bh_remanence_Br  = Br;
+                    bh_has_remanence = true;
+                    std::cout << "  [" << name << "] B-H: residual magnetization Br=" << Br << " T" << std::endl;
+                }
+                buildBHTable(H_data, B_data, Br);
+
+            } else if (bh_node.IsScalar()) {
+                // ---- Formula format: B-H: "expression with $H" ----
+                std::string B_formula_raw = bh_node.as<std::string>();
+                // Build tinyexpr expression: replace $varname (longest first), then $H
+                std::string te_expr = B_formula_raw;
+                {
+                    std::vector<std::pair<std::string, std::string>> subs;
+                    for (const auto& [vn, _] : user_variables)
+                        subs.push_back({"$" + vn, vn});
+                    std::sort(subs.begin(), subs.end(),
+                              [](const auto& a, const auto& b){ return a.first.size() > b.first.size(); });
+                    for (const auto& [from, to] : subs) {
+                        size_t pos = 0;
+                        while ((pos = te_expr.find(from, pos)) != std::string::npos) {
+                            te_expr.replace(pos, from.size(), to);
+                            pos += to.size();
+                        }
+                    }
+                    size_t pos = 0;
+                    while ((pos = te_expr.find("$H", pos)) != std::string::npos) {
+                        te_expr.replace(pos, 2, "H"); pos += 1;
+                    }
+                }
+                std::cout << "  [" << name << "] B-H formula: " << B_formula_raw << std::endl;
+
+                // tinyexpr evaluator for B(H)
+                auto evalB = [&](double H_val) -> double {
+                    te_parser parser;
+                    std::set<te_variable> vars;
+                    te_variable H_var; H_var.m_name = "H"; H_var.m_value = H_val;
+                    vars.insert(H_var);
+                    for (const auto& [vn, vv] : user_variables) {
+                        te_variable uv; uv.m_name = vn.c_str(); uv.m_value = vv;
+                        vars.insert(uv);
+                    }
+                    parser.set_variables_and_functions(vars);
+                    double val = parser.evaluate(te_expr);
+                    if (!parser.success())
+                        throw std::runtime_error("Failed to evaluate B-H formula '" + B_formula_raw + "'");
+                    return val;
+                };
+
+                // Detect remanence from B(0)
+                double Br = evalB(0.0);
+                if (std::abs(Br) > 1e-9) {
+                    bh_remanence_Br  = Br;
+                    bh_has_remanence = true;
+                    std::cout << "  [" << name << "] B-H formula: residual magnetization Br=" << Br << " T" << std::endl;
+                }
+
+                // Sample into a log-spaced table: H ∈ [1e-3, 1e6] A/m (500 points)
+                const int N_PTS = 500;
+                const double LOG_MIN = -3.0, LOG_MAX = 6.0;
+                std::vector<double> H_data, B_data;
+                H_data.push_back(0.0); B_data.push_back(Br);
+                for (int k = 0; k < N_PTS; k++) {
+                    double H = std::pow(10.0, LOG_MIN + k * (LOG_MAX - LOG_MIN) / (N_PTS - 1));
+                    H_data.push_back(H);
+                    B_data.push_back(evalB(H));
+                }
+                buildBHTable(H_data, B_data, Br);
+
+            } else {
+                throw std::runtime_error("B-H for material '" + name + "' must be [[H,...],[B,...]] or a formula string");
             }
-            for (size_t k = 1; k < H_data.size(); k++) {
-                if (H_data[k] < 1e-15) continue;
-                double mu_r_k = (B_data[k] - Br) / (MU_0 * H_data[k]);
-                mu_value.H_table.push_back(H_data[k]);
-                mu_value.mu_table.push_back(std::max(1.0, mu_r_k));
-            }
-            std::cout << "  [" << name << "] B-H: " << (H_data.size() - 1) << " points, "
-                      << "mu_r range [" << mu_value.mu_table.front() << ", "
-                      << *std::max_element(mu_value.mu_table.begin(), mu_value.mu_table.end()) << "]" << std::endl;
         } else {
             mu_value = parseMuValue(props["mu_r"]);
         }

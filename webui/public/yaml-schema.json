@@ -332,9 +332,9 @@
       "validParents": ["nonlinear_solver"]
     },
     "B-H": {
-      "description": "B-H curve [[H,...],[B,...]] [A/m, T]. Alternative to mu_r:. Converted internally to μr(H)=(B(H)-Br)/(μ₀H). If H[0]=0 and B[0]≠0, residual magnetization Br=B[0] is auto-detected. Implicit (0,0) prepended when first H>0",
-      "type": "array",
-      "example": "B-H: [[0, 100, 500, 2000, 5000],\n      [0, 0.30, 1.00, 1.50, 1.70]]",
+      "description": "B-H curve for a material. Two formats supported:\n  Array: [[H,...],[B,...]] [A/m, T]\n  Formula: \"expression with $H\" [A/m → T]\nIn both cases μr(H)=(B(H)-Br)/(μ₀H) is derived internally. If H[0]=0 and B[0]≠0, residual magnetization Br is auto-detected. Formula is sampled on a log-spaced H grid at setup time. Supports $H and user-defined $variables",
+      "type": "array|string",
+      "example": "B-H: [[0, 100, 500, 2000, 5000],\n      [0, 0.30, 1.00, 1.50, 1.70]]\n# or formula:\nB-H: \"1.2 + 4*pi*1e-7 * 1000 * $H\"",
       "validParents": ["materials", "material_presets"]
     },
     "magnetization": {
@@ -525,9 +525,14 @@
       "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 50\ntolerance: 1.0e-5\ngmres_restart: 30\nanderson:\n  enabled: true\n  depth: 5\n  beta: 0.3\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
     },
     "material_bh_curve": {
-      "name": "Material - B-H Curve (nonlinear iron)",
+      "name": "Material - B-H Curve Array (nonlinear iron)",
       "trigger": "material",
       "snippet": "rgb: [128, 128, 128]\nB-H: [[0, 100, 500, 1000, 2000, 5000],\n      [0, 0.20, 0.80, 1.20, 1.50, 1.70]]\njz: 0.0"
+    },
+    "material_bh_formula": {
+      "name": "Material - B-H Formula (tinyexpr with $H)",
+      "trigger": "material",
+      "snippet": "rgb: [128, 128, 128]\nB-H: \"1.8 * tanh($H / 200)\"\njz: 0.0"
     },
     "material_permanent_magnet": {
       "name": "Material - Permanent Magnet (NdFeB-like)",

@@ -7521,7 +7521,8 @@ async function loadBHMaterialList() {
             const mur   = props && props.mu_r;
             const bh    = props && props['B-H'];
             // Classify: B-H array / mu_r array / formula / constant
-            const isBH      = Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]);
+            const isBH      = (Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]))
+                           || (typeof bh === 'string' && bh.trim() !== '');
             const isArray   = !isBH && Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]);
             const isFormula = !isBH && typeof mur === 'string' && mur.trim() !== '';
             const isConst   = !isBH && typeof mur === 'number';
@@ -7572,6 +7573,7 @@ async function loadBHMaterialList() {
             const bh  = p && p['B-H'];
             const mur = p && p.mu_r;
             if ((Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]))
+                || (typeof bh === 'string' && bh.trim() !== '')
                 || (Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]))
                 || typeof mur === 'string' || typeof mur === 'number') {
                 return { name, props: p };
@@ -7616,8 +7618,41 @@ function renderBHCurveForMaterial(name, props) {
     let H_arr = null, B_arr = null, mur_arr = null;
     let isDashed = false;
 
-    // --- Case 1: B-H: [[H],[B]] ---
-    if (Array.isArray(bh) && bh.length === 2 &&
+    // --- Case 1a: B-H: formula string "expr($H)" ---
+    if (typeof bh === 'string' && bh.trim() !== '') {
+        // Evaluate over the same log-spaced H range used by C++ (1e-3..1e6)
+        const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, -3 + i * 9 / 199));
+        // Use evaluateMuFormula but for B(H): replace $H as-is, no mu0 conversion needed
+        const bhFormula = bh.trim();
+        const evalB = (H) => {
+            const expr = bhFormula
+                .replace(/\$H/g, `(${H})`)
+                .replace(/\bpi\b/g, 'Math.PI')
+                .replace(/\bexp\s*\(/g, 'Math.exp(')
+                .replace(/\bsin\s*\(/g, 'Math.sin(')
+                .replace(/\bcos\s*\(/g, 'Math.cos(')
+                .replace(/\btanh\s*\(/g, 'Math.tanh(')
+                .replace(/\bsqrt\s*\(/g, 'Math.sqrt(')
+                .replace(/\babs\s*\(/g, 'Math.abs(')
+                .replace(/\bln\s*\(/g, 'Math.log(')
+                .replace(/\blog\s*\(/g, 'Math.log10(')
+                .replace(/\bpow\s*\(/g, 'Math.pow(')
+                .replace(/\^/g, '**');
+            try { return Function(`'use strict'; return (${expr})`)(); }
+            catch (_) { return NaN; }
+        };
+        const Br   = evalB(0);
+        const safeH = H_log;
+        const safeB = safeH.map(H => evalB(H)).filter((b, i) => isFinite(b));
+        const H_ok  = safeH.filter((_, i) => isFinite(evalB(safeH[i])));
+        if (H_ok.length > 1) {
+            H_arr   = H_ok;
+            B_arr   = H_arr.map(H => evalB(H));
+            mur_arr = H_arr.map((H, i) => Math.max(1, (B_arr[i] - (isFinite(Br) ? Br : 0)) / (MU_0 * H)));
+        }
+
+    // --- Case 1b: B-H: [[H],[B]] ---
+    } else if (Array.isArray(bh) && bh.length === 2 &&
         Array.isArray(bh[0]) && Array.isArray(bh[1]) &&
         bh[0].length === bh[1].length && bh[0].length >= 2) {
 
