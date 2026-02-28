@@ -32,7 +32,11 @@ const AppState = {
     // Plot configuration (ranges, colorscales, etc.)
     plotConfigs: {},  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
     // Detect Colors result cache
-    lastDetectResult: null   // Last result from /api/materials/detect
+    lastDetectResult: null,  // Last result from /api/materials/detect
+    // Material Library
+    selectedLibrary: null,       // Active library filename (null = none)
+    libraryAceEditor: null,      // Ace Editor instance inside Library modal
+    currentLibraryFile: null     // Currently selected filename in Library modal
 };
 
 // ===== Utility Functions =====
@@ -1800,7 +1804,8 @@ async function runSolver() {
             body: JSON.stringify({
                 configFile: configFile,
                 imageFile: AppState.uploadedImageFilename,
-                userId: AppState.userId
+                userId: AppState.userId,
+                materialLibraryFile: AppState.selectedLibrary || null
             })
         });
 
@@ -7312,4 +7317,286 @@ function refreshAllPlots() {
             }
         });
     }
+}
+
+// =====================================================
+// Material Library Manager
+// =====================================================
+
+const LIB_TEMPLATE = `# Material Library
+# Define material presets (mu_r, B-H curves, magnetization) here.
+# Reference them in analysis configs via:
+#   materials:
+#     my_iron:
+#       rgb: [128, 128, 128]
+#       preset: silicon_steel_m19
+
+material_presets:
+  silicon_steel_m19:
+    mu_r:
+      type: bh_curve
+      H: [0, 200, 500, 1000, 2000, 5000, 10000]
+      B: [0, 0.6,  1.0,  1.3,  1.55, 1.75, 1.85]
+
+  neodymium_n42:
+    mu_r: 1.05
+    magnetization:
+      Hc: 950000
+      pattern: parallel
+      angle: 0
+`;
+
+async function openLibraryManager() {
+    if (!AppState.libraryAceEditor) {
+        const editor = ace.edit('libraryAceEditor');
+        editor.setTheme('ace/theme/monokai');
+        editor.session.setMode('ace/mode/yaml');
+        editor.setOptions({
+            fontSize: '13px',
+            showPrintMargin: false,
+            tabSize: 2,
+            useSoftTabs: true
+        });
+        AppState.libraryAceEditor = editor;
+    }
+    await refreshLibraryList();
+    document.getElementById('libraryManagerModal').style.display = 'flex';
+}
+
+function closeLibraryManager() {
+    document.getElementById('libraryManagerModal').style.display = 'none';
+}
+
+async function refreshLibraryList() {
+    const listEl = document.getElementById('libraryFileList');
+    const statusEl = document.getElementById('libraryListStatus');
+    listEl.innerHTML = '';
+    statusEl.textContent = 'Loading...';
+    try {
+        const response = await fetch(`/api/material-libraries?userId=${AppState.userId}`);
+        if (!response.ok) throw new Error('Failed to load library list');
+        const result = await response.json();
+
+        statusEl.textContent = '';
+        if (result.libraries.length === 0) {
+            listEl.innerHTML = '<div style="color:#aaa; font-size:0.8rem; padding:5px;">No files yet</div>';
+            return;
+        }
+
+        result.libraries.forEach(lib => {
+            const item = document.createElement('div');
+            item.className = 'lib-file-item' + (AppState.currentLibraryFile === lib.filename ? ' active' : '');
+            item.textContent = lib.filename;
+            item.title = `${(lib.size / 1024).toFixed(1)} KB  ${new Date(lib.modified).toLocaleString()}`;
+            item.onclick = () => selectLibraryFile(lib.filename);
+            listEl.appendChild(item);
+        });
+    } catch (e) {
+        statusEl.textContent = `Error: ${e.message}`;
+    }
+}
+
+async function selectLibraryFile(filename) {
+    try {
+        const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}?userId=${AppState.userId}`);
+        if (!response.ok) throw new Error('Failed to load file');
+        const content = await response.text();
+
+        AppState.currentLibraryFile = filename;
+        if (AppState.libraryAceEditor) {
+            AppState.libraryAceEditor.setValue(content, -1);
+        }
+        document.getElementById('libEditFilename').textContent = filename;
+        document.getElementById('libDeleteBtn').style.display = 'inline-block';
+        document.getElementById('libSaveBtn').style.display = 'inline-block';
+        document.getElementById('libUseBtn').style.display = 'inline-block';
+
+        document.querySelectorAll('.lib-file-item').forEach(el => {
+            el.classList.toggle('active', el.textContent === filename);
+        });
+
+        if (document.getElementById('libPaneBH').style.display !== 'none') {
+            renderBHCurves(content);
+        }
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Error: ${e.message}`;
+    }
+}
+
+function switchLibTab(tab) {
+    const editPane = document.getElementById('libPaneEdit');
+    const bhPane   = document.getElementById('libPaneBH');
+    const editBtn  = document.getElementById('libTabEdit');
+    const bhBtn    = document.getElementById('libTabBH');
+
+    if (tab === 'edit') {
+        editPane.style.display = 'flex';
+        bhPane.style.display = 'none';
+        editBtn.classList.add('lib-tab-active');
+        bhBtn.classList.remove('lib-tab-active');
+        if (AppState.libraryAceEditor) AppState.libraryAceEditor.resize();
+    } else {
+        editPane.style.display = 'none';
+        bhPane.style.display = 'block';
+        editBtn.classList.remove('lib-tab-active');
+        bhBtn.classList.add('lib-tab-active');
+        if (AppState.libraryAceEditor) {
+            renderBHCurves(AppState.libraryAceEditor.getValue());
+        }
+    }
+}
+
+function renderBHCurves(yamlContent) {
+    const container = document.getElementById('libBHPlotContainer');
+    try {
+        const doc = jsyaml.load(yamlContent) || {};
+        const presets = Object.assign({}, doc.material_presets || {}, doc.materials || {});
+        const traces = [];
+
+        for (const [name, props] of Object.entries(presets)) {
+            const mur = props.mu_r;
+            if (!mur || typeof mur !== 'object' || mur.type !== 'bh_curve') continue;
+            const H = mur.H;
+            const B = mur.B;
+            if (!Array.isArray(H) || !Array.isArray(B) || H.length !== B.length) continue;
+            traces.push({
+                x: H, y: B,
+                mode: 'lines+markers',
+                name: name,
+                line: { width: 2 }
+            });
+        }
+
+        if (traces.length === 0) {
+            container.innerHTML = '<div style="color:#888; text-align:center; padding:40px;">No B-H curve data found in this file.</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        Plotly.newPlot(container, traces, {
+            title: 'B-H Curves',
+            xaxis: { title: 'H [A/m]' },
+            yaxis: { title: 'B [T]' },
+            margin: { t: 40, l: 60, r: 20, b: 50 },
+            legend: { orientation: 'h', y: -0.15 }
+        }, { responsive: true });
+    } catch (e) {
+        container.innerHTML = `<div style="color:#c62828; padding:10px;">Parse error: ${e.message}</div>`;
+    }
+}
+
+function uploadLibrary() {
+    document.getElementById('libraryUpload').click();
+}
+
+async function newLibrary() {
+    const name = prompt('New library filename (must end with .yaml):');
+    if (!name) return;
+    const filename = (name.endsWith('.yaml') || name.endsWith('.yml')) ? name : name + '.yaml';
+
+    AppState.currentLibraryFile = filename;
+    if (AppState.libraryAceEditor) {
+        AppState.libraryAceEditor.setValue(LIB_TEMPLATE, -1);
+    }
+    document.getElementById('libEditFilename').textContent = filename + '  (unsaved)';
+    document.getElementById('libDeleteBtn').style.display = 'none';
+    document.getElementById('libSaveBtn').style.display = 'inline-block';
+    document.getElementById('libUseBtn').style.display = 'none';
+}
+
+async function handleLibraryUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+
+    const formData = new FormData();
+    formData.append('library', file);
+    formData.append('userId', AppState.userId);
+
+    try {
+        const response = await fetch('/api/material-libraries', {
+            method: 'POST',
+            body: formData
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        await refreshLibraryList();
+        await selectLibraryFile(result.filename);
+        document.getElementById('libraryListStatus').textContent = 'Uploaded successfully';
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Upload error: ${e.message}`;
+    }
+}
+
+async function saveLibrary() {
+    if (!AppState.libraryAceEditor) return;
+
+    let filename = AppState.currentLibraryFile;
+    if (!filename) {
+        filename = prompt('Save as (must end with .yaml):');
+        if (!filename) return;
+        if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) filename += '.yaml';
+        AppState.currentLibraryFile = filename;
+    }
+
+    const content = AppState.libraryAceEditor.getValue();
+    try {
+        const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content, userId: AppState.userId })
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        document.getElementById('libEditFilename').textContent = filename;
+        document.getElementById('libDeleteBtn').style.display = 'inline-block';
+        document.getElementById('libUseBtn').style.display = 'inline-block';
+        document.getElementById('libraryListStatus').textContent = 'Saved';
+        await refreshLibraryList();
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Save error: ${e.message}`;
+    }
+}
+
+async function deleteLibrary() {
+    const filename = AppState.currentLibraryFile;
+    if (!filename) return;
+    if (!confirm(`Delete "${filename}"?`)) return;
+
+    try {
+        const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}?userId=${AppState.userId}`, {
+            method: 'DELETE'
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+
+        AppState.currentLibraryFile = null;
+        if (AppState.libraryAceEditor) AppState.libraryAceEditor.setValue('', -1);
+        document.getElementById('libEditFilename').textContent = 'No file selected';
+        document.getElementById('libDeleteBtn').style.display = 'none';
+        document.getElementById('libSaveBtn').style.display = 'none';
+        document.getElementById('libUseBtn').style.display = 'none';
+
+        if (AppState.selectedLibrary === filename) {
+            clearActiveLibrary();
+        }
+        await refreshLibraryList();
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Delete error: ${e.message}`;
+    }
+}
+
+function setActiveLibrary() {
+    const filename = AppState.currentLibraryFile;
+    if (!filename) return;
+    AppState.selectedLibrary = filename;
+    document.getElementById('activeLibraryName').textContent = filename;
+    document.getElementById('activeLibraryBadge').style.display = 'inline-flex';
+    closeLibraryManager();
+    showStatus('configStatus', `Material library set: ${filename}`, 'success');
+}
+
+function clearActiveLibrary() {
+    AppState.selectedLibrary = null;
+    document.getElementById('activeLibraryBadge').style.display = 'none';
 }

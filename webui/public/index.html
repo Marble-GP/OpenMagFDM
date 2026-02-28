@@ -709,6 +709,32 @@
             color: #6c757d;
             font-style: italic;
         }
+
+        /* Library Manager Modal tabs */
+        .lib-tab {
+            background: none;
+            border: none;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            font-size: 0.9rem;
+            color: #495057;
+        }
+        .lib-tab:hover { color: #667eea; }
+        .lib-tab-active {
+            border-bottom-color: #667eea;
+            color: #667eea;
+            font-weight: 600;
+        }
+        .lib-file-item {
+            padding: 7px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            word-break: break-all;
+        }
+        .lib-file-item:hover { background: #f0f4ff; }
+        .lib-file-item.active { background: #e8ecff; color: #3a4ecc; font-weight: 600; }
     </style>
 </head>
 <body>
@@ -744,6 +770,15 @@
                 </div>
                 <div id="yamlEditor" class="yaml-editor"></div>
                 <div id="configStatus" style="margin-top: 10px;"></div>
+                <div style="margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                    <button class="btn-secondary" onclick="openLibraryManager()">Material Library Manager</button>
+                    <span id="activeLibraryBadge" style="display: none; background: #e3f2fd; border: 1px solid #90caf9;
+                          border-radius: 12px; padding: 3px 10px; font-size: 0.82rem; color: #1565c0;">
+                        Library: <strong id="activeLibraryName"></strong>
+                        <button onclick="clearActiveLibrary()" style="background: none; border: none; cursor: pointer;
+                                color: #1565c0; font-size: 0.9rem; margin-left: 4px; padding: 0;">×</button>
+                    </span>
+                </div>
             </div>
         </div>
 
@@ -1058,6 +1093,62 @@
             <div class="modal-footer">
                 <button class="btn-secondary" onclick="copyDetectedYaml()">Copy to Clipboard</button>
                 <button class="btn-primary" onclick="insertMaterialsSection()">Insert materials: section into Editor</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Material Library Manager Modal -->
+    <div id="libraryManagerModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 1000px; width: 95%; max-height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3>Material Library Manager</h3>
+                <button onclick="closeLibraryManager()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
+            </div>
+            <div class="modal-body" style="display: flex; gap: 0; padding: 0; flex: 1; overflow: hidden;">
+
+                <!-- Left: file list -->
+                <div style="width: 220px; border-right: 1px solid #dee2e6; padding: 15px;
+                            display: flex; flex-direction: column; gap: 8px; flex-shrink: 0;">
+                    <div style="font-weight: 600; font-size: 0.9rem; margin-bottom: 4px;">Library Files</div>
+                    <div id="libraryFileList" style="flex: 1; overflow-y: auto; min-height: 0;"></div>
+                    <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                        <button class="btn-secondary" onclick="uploadLibrary()" style="flex: 1; padding: 6px;">Upload</button>
+                        <button class="btn-secondary" onclick="newLibrary()" style="flex: 1; padding: 6px;">New</button>
+                    </div>
+                    <input type="file" id="libraryUpload" accept=".yaml,.yml" style="display: none;" onchange="handleLibraryUpload(event)">
+                    <div id="libraryListStatus" style="font-size: 0.78rem; color: #666; min-height: 1em;"></div>
+                </div>
+
+                <!-- Right: editor + BH curves -->
+                <div style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0;">
+                    <!-- Tab bar -->
+                    <div style="display: flex; border-bottom: 1px solid #dee2e6; padding: 0 10px; flex-shrink: 0;">
+                        <button id="libTabEdit" class="lib-tab lib-tab-active" onclick="switchLibTab('edit')">Edit</button>
+                        <button id="libTabBH"   class="lib-tab"               onclick="switchLibTab('bh')">B-H Curves</button>
+                    </div>
+                    <!-- Edit pane -->
+                    <div id="libPaneEdit" style="flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 0;">
+                        <div id="libEditFilename" style="padding: 5px 12px; background: #f8f9fa; font-size: 0.8rem;
+                             color: #666; border-bottom: 1px solid #eee; flex-shrink: 0; font-style: italic;">
+                            No file selected
+                        </div>
+                        <div id="libraryAceEditor" style="flex: 1; min-height: 0;"></div>
+                    </div>
+                    <!-- B-H Curves pane -->
+                    <div id="libPaneBH" style="flex: 1; display: none; padding: 15px; overflow-y: auto;">
+                        <div id="libBHPlotContainer" style="min-height: 300px;"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer" style="justify-content: space-between;">
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn-danger"    id="libDeleteBtn" onclick="deleteLibrary()"   style="display: none;">Delete File</button>
+                    <button class="btn-secondary" id="libUseBtn"    onclick="setActiveLibrary()" style="display: none;">Use This Library</button>
+                </div>
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn-primary"   id="libSaveBtn"   onclick="saveLibrary()"     style="display: none;">Save</button>
+                    <button class="btn-secondary" onclick="closeLibraryManager()">Close</button>
+                </div>
             </div>
         </div>
     </div>
