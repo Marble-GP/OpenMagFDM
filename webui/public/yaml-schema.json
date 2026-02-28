@@ -113,7 +113,7 @@
     "materials": {
       "description": "Material definitions (any material name is allowed)",
       "acceptsAnyChild": true,
-      "childrenProperties": ["rgb", "mu_r", "jz", "calc_force", "anti_aliasing", "coarsen", "coarsen_ratio", "preset"]
+      "childrenProperties": ["rgb", "mu_r", "B-H", "jz", "calc_force", "anti_aliasing", "coarsen", "coarsen_ratio", "preset", "magnetization"]
     },
     "rgb": {
       "description": "RGB color for material identification in input image [R, G, B]",
@@ -166,8 +166,8 @@
     "material_presets": {
       "description": "User-defined material presets for reuse. Define B-H curves or formulas once, reference by name",
       "acceptsAnyChild": true,
-      "childrenProperties": ["mu_r"],
-      "example": "material_presets:\n  my_steel:\n    mu_r: [[0, 100, 500], [5000, 4500, 3000]]"
+      "childrenProperties": ["mu_r", "B-H"],
+      "example": "material_presets:\n  my_steel:\n    mu_r: [[0, 100, 500], [5000, 4500, 3000]]\n  my_bh:\n    B-H: [[0, 100, 500, 2000], [0, 0.3, 1.0, 1.5]]"
     },
     "flux_linkage": {
       "description": "Flux linkage calculation paths. Each path defines start/end points for Φ = Az(end) - Az(start)",
@@ -330,6 +330,87 @@
       "type": "boolean",
       "example": "export_convergence: true",
       "validParents": ["nonlinear_solver"]
+    },
+    "B-H": {
+      "description": "B-H curve [[H,...],[B,...]] [A/m, T]. Alternative to mu_r:. Converted internally to μr(H)=(B(H)-Br)/(μ₀H). If H[0]=0 and B[0]≠0, residual magnetization Br=B[0] is auto-detected. Implicit (0,0) prepended when first H>0",
+      "type": "array",
+      "example": "B-H: [[0, 100, 500, 2000, 5000],\n      [0, 0.30, 1.00, 1.50, 1.70]]",
+      "validParents": ["materials", "material_presets"]
+    },
+    "magnetization": {
+      "description": "Permanent magnet magnetization model. Implements equivalent magnetization current Jz_mag=∇×M. Specify Br (preferred) or Hc, then pattern and direction parameters",
+      "children": ["Br", "Hc", "pattern", "angle", "p", "cx", "cy", "R_pc", "Mx", "My"],
+      "validParents": ["materials"]
+    },
+    "pattern": {
+      "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward from center (cx, cy)\n  tangential — counter-clockwise from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy)\n  polar_anisotropy — pole-following easy axis (p, R_pc, cx, cy)\n  custom — user expression (Mx, My)",
+      "values": ["parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "custom"],
+      "example": "pattern: parallel",
+      "validParents": ["magnetization"]
+    },
+    "Br": {
+      "description": "Residual flux density [T] for permanent magnets (remanence). Preferred over Hc — directly available from datasheets. Internally converts to M0=Br/μ₀. Can also be derived automatically from B-H: data when H[0]=0",
+      "type": "number",
+      "example": "Br: 1.2",
+      "validParents": ["magnetization"]
+    },
+    "Hc": {
+      "description": "Coercive force [A/m] for permanent magnets. Use Br: instead when the remanence value is known. When B-H: is defined with remanence and no Hc:/Br:, M0 is derived from B-H automatically",
+      "type": "number",
+      "example": "Hc: 900000",
+      "validParents": ["magnetization"]
+    },
+    "angle": {
+      "description": "Magnetization angle [deg] for 'parallel' pattern. 0=+x direction, 90=+y, 180=-x, 270=-y",
+      "type": "number",
+      "example": "angle: 90",
+      "validParents": ["magnetization"]
+    },
+    "p": {
+      "description": "Number of pole pairs for 'halbach_continuous' or 'polar_anisotropy' patterns",
+      "type": "integer",
+      "example": "p: 4",
+      "validParents": ["magnetization"]
+    },
+    "cx": {
+      "description": "Center x-coordinate [m] for 'radial', 'tangential', 'halbach_continuous', 'polar_anisotropy' patterns",
+      "type": "number",
+      "example": "cx: 0.0",
+      "validParents": ["magnetization"]
+    },
+    "cy": {
+      "description": "Center y-coordinate [m] for 'radial', 'tangential', 'halbach_continuous', 'polar_anisotropy' patterns",
+      "type": "number",
+      "example": "cy: 0.0",
+      "validParents": ["magnetization"]
+    },
+    "R_pc": {
+      "description": "Pitch circle radius [m] for 'polar_anisotropy' pattern. Defines the reference circle for virtual concentrated currents that set the easy-axis direction",
+      "type": "number",
+      "example": "R_pc: 0.075",
+      "validParents": ["magnetization"]
+    },
+    "Mx": {
+      "description": "Custom magnetization x-component expression for 'custom' pattern. Available variables: x, y, r, theta (atan2(y-cy,x-cx)), Hc",
+      "type": "string",
+      "example": "Mx: \"Hc * cos(2 * theta)\"",
+      "validParents": ["magnetization"]
+    },
+    "My": {
+      "description": "Custom magnetization y-component expression for 'custom' pattern. Available variables: x, y, r, theta (atan2(y-cy,x-cx)), Hc",
+      "type": "string",
+      "example": "My: \"Hc * sin(2 * theta)\"",
+      "validParents": ["magnetization"]
+    },
+    "solver": {
+      "description": "Solver performance configuration",
+      "children": ["omp_threads"]
+    },
+    "omp_threads": {
+      "description": "Number of OpenMP threads for parallel computation. 0 or omitted = use system default (all available cores). Overrides OMP_NUM_THREADS environment variable",
+      "type": "integer",
+      "example": "omp_threads: 4",
+      "validParents": ["solver"]
     }
   },
   "snippets": {
@@ -411,7 +492,7 @@
     "material_presets_template": {
       "name": "Material Presets Section",
       "trigger": "material_presets",
-      "snippet": "my_steel:\n  mu_r: [[0, 100, 500, 1000], [5000, 4500, 3000, 2000]]\nmy_formula:\n  mu_r: \"5000 / (1 + ($H/500)^2)\""
+      "snippet": "my_steel:\n  mu_r: [[0, 100, 500, 1000], [5000, 4500, 3000, 2000]]\nmy_formula:\n  mu_r: \"5000 / (1 + ($H/500)^2)\"\nmy_bh_material:\n  B-H: [[0, 100, 500, 2000, 5000],\n        [0, 0.30, 1.00, 1.50, 1.70]]"
     },
     "flux_linkage_template": {
       "name": "Flux Linkage Paths",
@@ -442,6 +523,56 @@
       "name": "Nonlinear Solver - Newton-Krylov + Anderson (Recommended)",
       "trigger": "nonlinear_solver",
       "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 50\ntolerance: 1.0e-5\ngmres_restart: 30\nanderson:\n  enabled: true\n  depth: 5\n  beta: 0.3\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
+    },
+    "material_bh_curve": {
+      "name": "Material - B-H Curve (nonlinear iron)",
+      "trigger": "material",
+      "snippet": "rgb: [128, 128, 128]\nB-H: [[0, 100, 500, 1000, 2000, 5000],\n      [0, 0.20, 0.80, 1.20, 1.50, 1.70]]\njz: 0.0"
+    },
+    "material_permanent_magnet": {
+      "name": "Material - Permanent Magnet (NdFeB-like)",
+      "trigger": "material",
+      "snippet": "rgb: [255, 200, 0]\nmu_r: 1.05\nmagnetization:\n  Br: 1.2\n  pattern: parallel\n  angle: 90"
+    },
+    "material_permanent_magnet_bh": {
+      "name": "Material - Permanent Magnet via B-H (with remanence)",
+      "trigger": "material",
+      "snippet": "rgb: [255, 200, 0]\nmu_r: 1.05\nB-H: [[0, 1.0e6],\n      [1.2, 2.25]]\nmagnetization:\n  pattern: parallel\n  angle: 90"
+    },
+    "magnetization_parallel": {
+      "name": "Magnetization - Parallel (uniform direction)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: parallel\nangle: 90"
+    },
+    "magnetization_radial": {
+      "name": "Magnetization - Radial (outward from center)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: radial\ncx: 0.0\ncy: 0.0"
+    },
+    "magnetization_tangential": {
+      "name": "Magnetization - Tangential (counter-clockwise)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: tangential\ncx: 0.0\ncy: 0.0"
+    },
+    "magnetization_halbach": {
+      "name": "Magnetization - Halbach Array (continuous)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: halbach_continuous\np: 4\ncx: 0.0\ncy: 0.0"
+    },
+    "magnetization_polar_anisotropy": {
+      "name": "Magnetization - Polar Anisotropy",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: polar_anisotropy\np: 4\nR_pc: 0.075\ncx: 0.0\ncy: 0.0"
+    },
+    "magnetization_custom": {
+      "name": "Magnetization - Custom Expression",
+      "trigger": "magnetization",
+      "snippet": "Hc: 900000\npattern: custom\nMx: \"Hc * cos(2 * theta)\"\nMy: \"Hc * sin(2 * theta)\""
+    },
+    "solver_omp": {
+      "name": "Solver - OpenMP Thread Count",
+      "trigger": "solver",
+      "snippet": "omp_threads: 4"
     }
   },
   "templates": {
