@@ -7324,7 +7324,7 @@ function refreshAllPlots() {
 // =====================================================
 
 const LIB_TEMPLATE = `# Material Library
-# Define material presets (mu_r, B-H curves, magnetization) here.
+# Define material presets (mu_r, magnetization) here.
 # Reference them in analysis configs via:
 #   materials:
 #     my_iron:
@@ -7333,10 +7333,10 @@ const LIB_TEMPLATE = `# Material Library
 
 material_presets:
   silicon_steel_m19:
+    # mu_r as [[H_array], [mu_r_array]]  (H in A/m)
     mu_r:
-      type: bh_curve
-      H: [0, 200, 500, 1000, 2000, 5000, 10000]
-      B: [0, 0.6,  1.0,  1.3,  1.55, 1.75, 1.85]
+      - [0,    200,  500,  1000, 2000, 5000, 10000]  # H [A/m]
+      - [5000, 4500, 3000, 2000, 1000,  500,   200]  # mu_r
 
   neodymium_n42:
     mu_r: 1.05
@@ -7361,6 +7361,11 @@ async function openLibraryManager() {
     }
     await refreshLibraryList();
     document.getElementById('libraryManagerModal').style.display = 'flex';
+    // Ace editor needs an explicit resize after the modal becomes visible,
+    // otherwise it renders as only a few lines tall (container had 0 height while hidden).
+    requestAnimationFrame(() => {
+        if (AppState.libraryAceEditor) AppState.libraryAceEditor.resize();
+    });
 }
 
 function closeLibraryManager() {
@@ -7450,40 +7455,96 @@ function switchLibTab(tab) {
     }
 }
 
+// Evaluate a tinyexpr-style mu_r formula string at a given H value.
+// Replaces $H with the numeric value and maps tinyexpr names to JS Math.
+function evaluateMuFormula(formula, H) {
+    const expr = formula
+        .replace(/\$H/g, `(${H})`)
+        .replace(/\bpi\b/g, 'Math.PI')
+        .replace(/\bexp\s*\(/g, 'Math.exp(')
+        .replace(/\bsin\s*\(/g, 'Math.sin(')
+        .replace(/\bcos\s*\(/g, 'Math.cos(')
+        .replace(/\bsqrt\s*\(/g, 'Math.sqrt(')
+        .replace(/\babs\s*\(/g, 'Math.abs(')
+        .replace(/\bln\s*\(/g, 'Math.log(')      // ln = natural log
+        .replace(/\blog\s*\(/g, 'Math.log10(')   // tinyexpr log = log10
+        .replace(/\bpow\s*\(/g, 'Math.pow(')
+        .replace(/\^/g, '**');                    // tinyexpr power operator
+    try {
+        // eslint-disable-next-line no-new-func
+        const v = Function(`'use strict'; return (${expr})`)();
+        return (isFinite(v) && v > 0) ? v : NaN;
+    } catch (_) {
+        return NaN;
+    }
+}
+
 function renderBHCurves(yamlContent) {
     const container = document.getElementById('libBHPlotContainer');
     try {
         const doc = jsyaml.load(yamlContent) || {};
+        // Collect both material_presets and top-level materials entries
         const presets = Object.assign({}, doc.material_presets || {}, doc.materials || {});
         const traces = [];
 
+        // Log-spaced H axis for formula evaluation: 1 A/m … 1e5 A/m, 120 points
+        const H_log = Array.from({ length: 120 }, (_, i) => Math.pow(10, i * 5 / 119));
+
         for (const [name, props] of Object.entries(presets)) {
+            if (!props || typeof props !== 'object') continue;
             const mur = props.mu_r;
-            if (!mur || typeof mur !== 'object' || mur.type !== 'bh_curve') continue;
-            const H = mur.H;
-            const B = mur.B;
-            if (!Array.isArray(H) || !Array.isArray(B) || H.length !== B.length) continue;
-            traces.push({
-                x: H, y: B,
-                mode: 'lines+markers',
-                name: name,
-                line: { width: 2 }
-            });
+            if (mur === undefined || mur === null) continue;
+
+            if (Array.isArray(mur) && mur.length === 2 &&
+                Array.isArray(mur[0]) && Array.isArray(mur[1]) &&
+                mur[0].length === mur[1].length && mur[0].length > 0) {
+                // Format: mu_r: [[H_array], [mu_r_array]]
+                traces.push({
+                    x: mur[0], y: mur[1],
+                    mode: 'lines+markers',
+                    name: name,
+                    line: { width: 2 },
+                    marker: { size: 4 }
+                });
+
+            } else if (typeof mur === 'string' && mur.trim() !== '') {
+                // Format: mu_r: "formula($H)"
+                const pts = H_log
+                    .map(H => ({ H, mu: evaluateMuFormula(mur, H) }))
+                    .filter(p => !isNaN(p.mu));
+                if (pts.length > 0) {
+                    traces.push({
+                        x: pts.map(p => p.H),
+                        y: pts.map(p => p.mu),
+                        mode: 'lines',
+                        name: name + ' (formula)',
+                        line: { width: 2, dash: 'dot' }
+                    });
+                }
+            }
+            // Scalar mu_r values are constant — skip (no H-dependence to plot)
         }
 
         if (traces.length === 0) {
-            container.innerHTML = '<div style="color:#888; text-align:center; padding:40px;">No B-H curve data found in this file.</div>';
+            container.innerHTML = `<div style="color:#888; text-align:center; padding:40px;">
+                No nonlinear μr data found in this file.<br>
+                <small>Add materials with:<br>
+                <code>mu_r:</code><br>
+                <code>&nbsp;&nbsp;- [H1, H2, ...]&nbsp;&nbsp;# H [A/m]</code><br>
+                <code>&nbsp;&nbsp;- [mr1, mr2, ...]&nbsp;# mu_r</code><br>
+                or a formula: <code>mu_r: "1000/(1+$H/500)"</code>
+                </small></div>`;
             return;
         }
 
         container.innerHTML = '';
         Plotly.newPlot(container, traces, {
-            title: 'B-H Curves',
-            xaxis: { title: 'H [A/m]' },
-            yaxis: { title: 'B [T]' },
-            margin: { t: 40, l: 60, r: 20, b: 50 },
-            legend: { orientation: 'h', y: -0.15 }
-        }, { responsive: true });
+            title: 'μr − H Curves',
+            xaxis: { title: 'H [A/m]', type: 'log' },
+            yaxis: { title: 'μr (relative permeability)' },
+            margin: { t: 40, l: 65, r: 20, b: 55 },
+            legend: { orientation: 'h', y: -0.2 }
+        }, { responsive: true, displayModeBar: false });
     } catch (e) {
         container.innerHTML = `<div style="color:#c62828; padding:10px;">Parse error: ${e.message}</div>`;
     }

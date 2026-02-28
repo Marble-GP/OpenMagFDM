@@ -767,20 +767,19 @@
                     <button class="btn-danger" onclick="deleteConfig()">Delete</button>
                     <button class="btn-primary" onclick="saveConfig()">Save</button>
                     <button class="btn-secondary" onclick="saveConfigAs()">Save As...</button>
-                    <span style="margin-left: 12px; padding-left: 12px; border-left: 1px solid #dee2e6;">
+                    <span style="margin-left: 12px; padding-left: 12px; border-left: 1px solid #dee2e6;
+                                display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                         <button class="btn-secondary" onclick="openLibraryManager()">Material Library Manager</button>
+                        <span id="activeLibraryBadge" style="display: none; background: #e3f2fd; border: 1px solid #90caf9;
+                              border-radius: 12px; padding: 3px 10px; font-size: 0.82rem; color: #1565c0; white-space: nowrap;">
+                            Library: <strong id="activeLibraryName"></strong>
+                            <button onclick="clearActiveLibrary()" style="background: none; border: none; cursor: pointer;
+                                    color: #1565c0; font-size: 0.9rem; margin-left: 4px; padding: 0;">×</button>
+                        </span>
                     </span>
                 </div>
                 <div id="yamlEditor" class="yaml-editor"></div>
                 <div id="configStatus" style="margin-top: 10px;"></div>
-                <div style="margin-top: 6px;">
-                    <span id="activeLibraryBadge" style="display: none; background: #e3f2fd; border: 1px solid #90caf9;
-                          border-radius: 12px; padding: 3px 10px; font-size: 0.82rem; color: #1565c0;">
-                        Library: <strong id="activeLibraryName"></strong>
-                        <button onclick="clearActiveLibrary()" style="background: none; border: none; cursor: pointer;
-                                color: #1565c0; font-size: 0.9rem; margin-left: 4px; padding: 0;">×</button>
-                    </span>
-                </div>
             </div>
         </div>
 
