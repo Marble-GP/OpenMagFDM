@@ -76,6 +76,19 @@ material_presets:
   #     Verify with actual datasheet for production use.
   # ===========================================================================
 
+  # Neodymium sintered magnet — Grade N35
+  # IEC 60404-8-1 / JIS C 2502
+  #   Br   = 1.17–1.22 T  (typical 1.19 T)
+  #   Hcb  >= 764 kA/m    (B-coercivity)
+  #   Hcj  >= 955 kA/m    (intrinsic coercivity)
+  #   BHmax = 263–302 kJ/m3  (~35 MGOe)
+  NdFeB_N35:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.19
+      pattern: parallel
+      angle: 0
+
   # Neodymium sintered magnet — Grade N40
   # IEC 60404-8-1 / JIS C 2502
   #   Br   = 1.26–1.29 T  (typical 1.27 T)
@@ -99,6 +112,19 @@ material_presets:
     mu_r: 1.05
     magnetization:
       Br: 1.34
+      pattern: parallel
+      angle: 0
+
+  # Neodymium sintered magnet — Grade N50
+  # IEC 60404-8-1 / JIS C 2502
+  #   Br   = 1.40–1.45 T  (typical 1.42 T)
+  #   Hcb  >= 796 kA/m    (B-coercivity)
+  #   Hcj  >= 876 kA/m    (intrinsic coercivity)
+  #   BHmax = 382–422 kJ/m3  (~50 MGOe)
+  NdFeB_N50:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.42
       pattern: parallel
       angle: 0
 

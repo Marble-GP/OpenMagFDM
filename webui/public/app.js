@@ -7324,25 +7324,91 @@ function refreshAllPlots() {
 // Material Library Manager
 // =====================================================
 
-const LIB_TEMPLATE = `# Material Library
-# Define material presets (mu_r, magnetization) here.
-# Reference them in analysis configs via:
+const LIB_TEMPLATE = `# OpenMagFDM Material Library
+# Reference presets in analysis configs via:
 #   materials:
-#     my_iron:
+#     iron_core:
 #       rgb: [128, 128, 128]
-#       preset: silicon_steel_m19
+#       preset: pure_iron_model
+#
+# -----------------------------------------------------------------------
+# Key formats:
+#   mu_r: table    mu_r: [[H1,H2,...],[mur1,mur2,...]]  (PCHIP interpolated)
+#   mu_r: formula  mu_r: "5000 / (1 + ($H/200)^2)"
+#   B-H:  table    B-H:  [[H1,H2,...],[B1,B2,...]]      (PCHIP interpolated)
+#   B-H:  formula  B-H:  "expression with $H"
+#
+# Permanent magnets: specify Br [T] + magnetization block.
+# Formula constants available: mu0 (4pi*1e-7 H/m), pi, exp, sin, cos, ...
+# -----------------------------------------------------------------------
 
 material_presets:
+
+  # =========================================================================
+  # Soft magnetic materials
+  # =========================================================================
+
+  # Silicon steel M19 — example using mu_r point table
   silicon_steel_m19:
-    # mu_r as [[H_array], [mu_r_array]]  (H in A/m)
     mu_r:
       - [0,    200,  500,  1000, 2000, 5000, 10000]  # H [A/m]
       - [5000, 4500, 3000, 2000, 1000,  500,   200]  # mu_r
 
-  neodymium_n42:
+  # Pure Iron — continuous function model (~2.1 T saturation)
+  pure_iron_model:
+    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))
+
+  # Permendur (Fe-Co 49/49) — highest saturation of common soft magnetics (~2.4 T)
+  permendur_model:
+    B-H: ($H/(14.5 + 0.45*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 25))))
+
+  # Structural steel (SS400 equivalent) — moderate permeability
+  structural_steel_model:
+    B-H: ($H/(97.0 + 0.625*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 20))))
+
+  # =========================================================================
+  # Permanent magnets — IEC 60404-8-1 / JIS C 2502 typical values
+  #   Br: residual flux density [T]  mu_r: reversible permeability (~1.05 for NdFeB)
+  #   angle: 0 = +X direction  (90 = +Y, 180 = -X, 270 = -Y)
+  # =========================================================================
+
+  # NdFeB sintered N35  Br=1.19T  Hcb>=764kA/m  Hcj>=955kA/m  BHmax~35MGOe
+  NdFeB_N35:
     mu_r: 1.05
     magnetization:
-      Hc: 950000
+      Br: 1.19
+      pattern: parallel
+      angle: 0
+
+  # NdFeB sintered N40  Br=1.27T  Hcb>=836kA/m  Hcj>=955kA/m  BHmax~40MGOe
+  NdFeB_N40:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.27
+      pattern: parallel
+      angle: 0
+
+  # NdFeB sintered N45  Br=1.34T  Hcb>=836kA/m  Hcj>=876kA/m  BHmax~45MGOe
+  NdFeB_N45:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.34
+      pattern: parallel
+      angle: 0
+
+  # NdFeB sintered N50  Br=1.42T  Hcb>=796kA/m  Hcj>=876kA/m  BHmax~50MGOe
+  NdFeB_N50:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.42
+      pattern: parallel
+      angle: 0
+
+  # Ferrite sintered high-Br (FB9B equivalent)  Br=0.44T  Hcb>=255kA/m  Hcj>=280kA/m
+  ferrite_high_B:
+    mu_r: 1.05
+    magnetization:
+      Br: 0.44
       pattern: parallel
       angle: 0
 `;
