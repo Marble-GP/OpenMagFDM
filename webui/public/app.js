@@ -7613,16 +7613,16 @@ function renderBHCurveForMaterial(name, props) {
     const logCb = document.getElementById('libBHLogX');
     const xtype = (logCb && !logCb.checked) ? 'linear' : 'log';
 
-    // Log-spaced H axis for formula / constant evaluation (1 to 1e6 A/m)
-    const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, i * 6 / 199));
+    // Log-spaced H axis for formula / constant evaluation (1 to 1e5 A/m)
+    const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, i * 5 / 199));
 
     let H_arr = null, B_arr = null, mur_arr = null;
     let isDashed = false;
 
     // --- Case 1a: B-H: formula string "expr($H)" ---
     if (typeof bh === 'string' && bh.trim() !== '') {
-        // Evaluate over the same log-spaced H range used by C++ (1e-3..1e6)
-        const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, -3 + i * 9 / 199));
+        // Evaluate over H range 1e-3..1e5 A/m (real materials saturate well below 1e5)
+        const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, -3 + i * 8 / 199));
         const bhFormula = bh.trim();
         const evalB = (H) => {
             const expr = bhFormula
@@ -7705,7 +7705,7 @@ function renderBHCurveForMaterial(name, props) {
 
     // --- Case 4: mu_r: constant ---
     } else if (typeof mur === 'number') {
-        H_arr   = [1, 1e6];
+        H_arr   = [1, 1e5];
         mur_arr = [mur, mur];
         B_arr   = H_arr.map(H => MU_0 * mur * H);
         isDashed = true;
