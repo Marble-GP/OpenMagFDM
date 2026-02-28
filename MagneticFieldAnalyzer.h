@@ -520,8 +520,8 @@ private:
     // Permanent magnet magnetization model
     struct MagnetizationConfig {
         bool enabled = false;
-        double Hc = 0.0;          // Coercive field strength [A/m]
-        std::string pattern;       // "parallel", "halbach_continuous", "polar_anisotropy", "custom"
+        double Hc = 0.0;          // Effective magnetization magnitude [A/m] (resolved from Br or Hc in YAML)
+        std::string pattern;       // "parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "custom"
         double angle_deg = 0.0;    // Magnetization angle [deg] (parallel)
         int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy)
         double cx = 0.0, cy = 0.0; // Rotation center [m]

@@ -161,6 +161,25 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
             std::cout << "Loaded " << material_presets.size() << " material preset(s)" << std::endl;
         }
 
+        // Parse OpenMP thread count (optional)
+        // YAML: solver: { omp_threads: 4 }
+        // Set to 0 or omit to use default (OMP_NUM_THREADS env var or all cores)
+        if (config["solver"] && config["solver"]["omp_threads"]) {
+            int omp_threads = config["solver"]["omp_threads"].as<int>(0);
+#ifdef _OPENMP
+            if (omp_threads > 0) {
+                omp_set_num_threads(omp_threads);
+                std::cout << "OpenMP: thread count set to " << omp_threads << " (via YAML solver.omp_threads)" << std::endl;
+            } else {
+                std::cout << "OpenMP: using default thread count (OMP_NUM_THREADS or all cores)" << std::endl;
+            }
+#else
+            if (omp_threads > 0) {
+                std::cout << "OpenMP: solver.omp_threads=" << omp_threads << " specified, but OpenMP is not enabled in this build." << std::endl;
+            }
+#endif
+        }
+
         // Parse flux linkage paths
         parseFluxLinkagePaths();
 
@@ -669,7 +688,20 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             const YAML::Node& mag = props["magnetization"];
             MagnetizationConfig mc;
             mc.enabled = true;
-            mc.Hc = mag["Hc"].as<double>(0.0);
+
+            // Accept either Br [T] or Hc [A/m] as magnetization strength.
+            // Br is preferred (listed directly in datasheets).
+            // Internally, we store the equivalent magnetization magnitude M0 in mc.Hc [A/m]:
+            //   From Br:  M0 = Br / mu0
+            //   From Hc:  M0 = Hc  (user must set Hc = Br/mu0 for physical accuracy)
+            if (mag["Br"]) {
+                double Br = mag["Br"].as<double>(0.0);
+                mc.Hc = Br / MU_0;  // M0 = Br / mu0 [A/m]
+                std::cout << "  [" << name << "] magnetization: Br=" << Br << " T → M0=" << mc.Hc << " A/m" << std::endl;
+            } else {
+                mc.Hc = mag["Hc"].as<double>(0.0);
+            }
+
             mc.pattern = mag["pattern"].as<std::string>("parallel");
 
             if (mc.pattern == "parallel") {
@@ -694,6 +726,29 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                 mc.Mx_expr = sx.str();
                 mc.My_expr = sy.str();
                 std::cout << "  [" << name << "] magnetization: halbach_continuous p=" << mc.p << ", Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "radial") {
+                // Radial magnetization: M points outward along r̂ from (cx, cy)
+                // Mx = Hc * cos(theta),  My = Hc * sin(theta)
+                // where theta = atan2(y - cy, x - cx)
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                std::ostringstream sx, sy;
+                sx << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: radial (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "tangential") {
+                // Tangential magnetization: M points counter-clockwise along θ̂ from (cx, cy)
+                // Mx = -Hc * sin(theta),  My = Hc * cos(theta)
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                std::ostringstream sx, sy;
+                sx << std::setprecision(17) << (-mc.Hc) << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: tangential (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "polar_anisotropy") {
                 mc.p = mag["p"].as<int>(1);
                 mc.R_pc = mag["R_pc"].as<double>(0.05);
