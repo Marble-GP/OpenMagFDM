@@ -308,46 +308,49 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         // ===== Step 5: Compute Newton step δA =====
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // Phase 6: Nonlinear Defect Correction
-            // J_matrix (diagonal Jacobian correction) is NOT needed here — the defect
-            // correction uses coarse LU solve via applyPreconditioner instead.
+            // Phase 6: FVM-consistent Newton step
+            //
+            // Previous approach used Galerkin matrix A_c = P^T * A_f * P as Newton matrix:
+            //   delta_A = A_c_galerkin^{-1} * (-R_FVM)
+            // Problem: A_c_galerkin ≠ A_FVM — Galerkin includes all 250k fine-grid cells
+            // (including inactive cells with interpolated μ) through P and P^T, while
+            // A_FVM discretizes only the 67k active cells directly.
+            // The operator mismatch makes the Galerkin Newton direction a poor (often
+            // non-descent) direction for the FVM residual ||R_FVM||, causing the true
+            // nonlinear line search to fail at every α ≥ α_min (all 18 trials rejected).
+            //
+            // Fix: solve A_FVM × δ = -R_FVM directly using SparseLU on A_matrix.
+            // Since d = A_FVM^{-1} × (-R_FVM), the frozen linearized trial residual is:
+            //   A_FVM × (Az + α×d) - b = (1-α) × R_FVM
+            // The directional derivative ∇f^T × d = -||R_FVM||² < 0, guaranteeing
+            // d is a descent direction. The true nonlinear Armijo condition is then
+            // satisfied for some α ∈ (0, 1] (descent lemma for smooth objectives).
+            //
+            // Performance: eliminates updatePreconditioner() — no more full-grid 250k×250k
+            // matrix build or Galerkin triple product P^T*A_f*P per Newton iteration.
             if (VERBOSE && iter == 0) {
-                std::cout << "Using Defect Correction (Phase 6) for Newton step" << std::endl;
+                std::cout << "Using FVM Newton step (Phase 6)" << std::endl;
             }
 
-            // Update coarse operator A_c = P^T * A_f(μ) * P and LU factorize
-            updatePreconditioner(iter);
-
-            // Step 1: Compute fine-grid residual vector R_fine = A_f * Az_full - b_f
-            // A_full_cached is already built by updatePreconditioner → updateFullMatrixCache
-            //
-            // CRITICAL: Use P_prolongation * Az_vec (Galerkin-consistent interpolation)
-            // instead of reading from the Az matrix directly.
-            // This ensures P^T * R_fine = P^T * A_f * P * Az_c - P^T * b_f = A_c * Az_c - b_c
-            // i.e., R_c_defect == residual_coarse, so the Newton direction is consistent
-            // with the Armijo condition in the frozen-Jacobian line search.
-            // Defect correction: A_c^{-1} × R_FVM
-            //
-            // Previous approach computed R_coarse = R * (A_full * P * Az_c - b_full)
-            // (Galerkin restriction of the full-grid residual).
-            // Problem: A_full * P * Az_c includes inactive-cell interpolation errors
-            // that are permanent (cannot be reduced by coarse-space corrections).
-            // The fine-grid residual ||A_full * P * Az - b_full|| is dominated by
-            // these interpolation errors, so the line search's Armijo condition
-            // is never satisfied above α_min → residual stagnates.
-            //
-            // Fix: use the FVM coarsened residual directly (already computed above
-            // as residual_coarse = A_matrix * Az_vec - b_vec).
-            // A_c_galerkin^{-1} * R_FVM is a valid descent direction because
-            // A_c_galerkin ≈ A_FVM (both are consistent coarse representations of A_f).
-            // The line search Armijo condition is also evaluated with the FVM residual,
-            // ensuring full consistency and allowing α > α_min.
-            //
             dc_R_fine_norm = residual_coarse_norm;  // FVM residual as Armijo baseline
-            delta_A = applyPreconditioner(-residual_coarse);  // A_c^{-1} * R_FVM
+            {
+                Eigen::SparseLU<Eigen::SparseMatrix<double>> fvm_lu;
+                fvm_lu.compute(A_matrix);
+                if (fvm_lu.info() == Eigen::Success) {
+                    delta_A = fvm_lu.solve(-residual_coarse);
+                } else {
+                    // Fallback: diagonal (Jacobi) scaling step
+                    if (VERBOSE) std::cout << " [FVM LU failed, using Jacobi step]";
+                    delta_A.resize(residual_coarse.size());
+                    for (int k = 0; k < A_matrix.rows(); k++) {
+                        double diag = A_matrix.coeff(k, k);
+                        delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
+                    }
+                }
+            }
 
             if (nonlinear_config.precond_verbose) {
-                std::cout << "Defect correction: ||R_FVM||=" << residual_coarse_norm << std::endl;
+                std::cout << "FVM Newton: ||R_FVM||=" << residual_coarse_norm << std::endl;
             }
 
         } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
