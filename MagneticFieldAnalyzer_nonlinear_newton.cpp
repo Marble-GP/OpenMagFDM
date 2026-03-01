@@ -523,6 +523,117 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_0 = (dc_R_fine_norm >= 0.0) ? dc_R_fine_norm : residual_norm;
         Eigen::VectorXd Az_vec_0 = Az_vec;
 
+        // ===== Phase 6: Anderson-Picard (replaces backtracking line search) =====
+        // Standard backtracking fails for Phase 6 because the true nonlinear residual
+        // is non-smooth: all 18 trials in [0.0073, 1.0] reject while the "good" α
+        // is ≈ α_min (~6.6e-4), far below the 18th backtracking step.
+        // Root cause: piecewise-linear B-H curve creates μ jumps at larger steps,
+        // violating the smoothness assumption that the Armijo descent lemma requires.
+        //
+        // Fix: use Anderson(m) acceleration on FULL Picard iterates G_k = Az_k + δ_k.
+        // Anderson extrapolates from {G_{k-m}, ..., G_k} to find a better direction
+        // without any line search. First 2 iterations use damped Picard (ω=0.5) for
+        // stability before the Anderson history is populated.
+        //
+        // Note: Step 7 Anderson is skipped when phase6_anderson_done = true because
+        // this block already manages Az_history / g_history with full Picard residuals.
+        bool phase6_anderson_done = false;
+        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
+            // Full Picard iterate: G_k = Az_k + δ_k = A_FVM^{-1} × b
+            Eigen::VectorXd G_k = Az_vec_0 + delta_A;
+
+            // Anderson depth: at least 3 even if user configured lower
+            const int m_phase6 = std::max(3, m_AA);
+
+            Eigen::VectorXd Az_next;
+
+            if (static_cast<int>(Az_history.size()) < 2) {
+                // Not enough history: conservative damped Picard for early iterations
+                // ω=0.5 keeps step below the B-H knee jump threshold
+                const double omega_init = 0.5;
+                Az_next = Az_vec_0 + omega_init * delta_A;
+                if (VERBOSE) {
+                    std::cout << " [P6: damped Picard ω=" << omega_init << "]";
+                }
+            } else {
+                // Anderson extrapolation from Picard residual history
+                // CRITICAL: g_history contains full δ_k (not damped steps)
+                int m_k = std::min(m_phase6, static_cast<int>(g_history.size()));
+
+                // DG: column j = (δ_{k-m_k+j} - δ_k), differences of Picard residuals
+                Eigen::MatrixXd DG(delta_A.size(), m_k);
+                for (int j = 0; j < m_k; j++) {
+                    int hidx = static_cast<int>(g_history.size()) - m_k + j;
+                    DG.col(j) = g_history[hidx] - delta_A;
+                }
+
+                // Solve: min_θ ||DG θ + δ_k||²  (normal equations, regularized)
+                Eigen::MatrixXd DTD = DG.transpose() * DG;
+                double reg = 1e-10 * std::max(DTD.diagonal().maxCoeff(), 1.0);
+                DTD.diagonal().array() += reg;
+                Eigen::VectorXd theta = DTD.ldlt().solve(-DG.transpose() * delta_A);
+
+                // Anderson extrapolation: G_AA = G_k + Σ θ_j (G_{k-j} - G_k)
+                Eigen::VectorXd G_anderson = G_k;
+                for (int j = 0; j < m_k; j++) {
+                    int hidx = static_cast<int>(g_history.size()) - m_k + j;
+                    // DX_j = Az_{k-j} - Az_k, DG.col(j) = δ_{k-j} - δ_k
+                    // (Az_{k-j} + δ_{k-j}) - (Az_k + δ_k) = DX_j + DG.col(j)
+                    Eigen::VectorXd DX_j = Az_history[hidx] - Az_vec_0;
+                    G_anderson += theta(j) * (DX_j + DG.col(j));
+                }
+
+                // Apply mixing parameter β (1.0 = pure Anderson, <1 = conservative)
+                const double beta_p6 = (beta_AA > 0.0 && beta_AA <= 1.0) ? beta_AA : 1.0;
+                Az_next = beta_p6 * G_anderson + (1.0 - beta_p6) * G_k;
+
+                // Safety: if Anderson step is ≥3× full Picard step, fall back to Picard
+                double picard_norm  = delta_A.norm();
+                double anderson_norm = (Az_next - Az_vec_0).norm();
+                bool anderson_ok = (picard_norm < 1e-30) ||
+                                   (anderson_norm <= 3.0 * picard_norm);
+                if (!anderson_ok) {
+                    Az_next = G_k;  // Fall back to full Picard
+                    if (VERBOSE) {
+                        std::cout << " [P6: Anderson diverged→Picard]";
+                    }
+                } else if (VERBOSE) {
+                    std::cout << " [P6: Anderson m=" << m_k
+                              << " step=" << std::scientific << std::setprecision(2)
+                              << anderson_norm << "]";
+                }
+            }
+
+            // Store FULL Picard residual δ_k in history (not the damped step)
+            Az_history.push_back(Az_vec_0);
+            g_history.push_back(delta_A);
+            if (static_cast<int>(Az_history.size()) > m_phase6 + 1) {
+                Az_history.erase(Az_history.begin());
+                g_history.erase(g_history.begin());
+            }
+
+            // Apply Az_next to active cells and interpolate inactive cells
+            Az_vec = Az_next;
+            for (int cidx = 0; cidx < n_active_cells; cidx++) {
+                auto [ci, cj] = coarse_to_fine[cidx];
+                Az(cj, ci) = Az_vec(cidx);
+            }
+            if (is_polar) {
+                interpolateInactiveCellsPolar(Az_vec);
+            } else {
+                interpolateInactiveCells(Az_vec);
+            }
+            // Re-sync Az_vec with Az (interpolation updates the matrix but not the vector)
+            for (int cidx = 0; cidx < n_active_cells; cidx++) {
+                auto [ci, cj] = coarse_to_fine[cidx];
+                Az_vec(cidx) = Az(cj, ci);
+            }
+
+            alpha_prev = 1.0;  // Conceptually "full step taken" for adaptive init next iter
+            phase6_anderson_done = true;
+        }
+
+        if (!phase6_anderson_done) {
         for (int ls = 0; ls < max_line_search; ls++) {
             // Trial step: A_trial = A + α·δA
             Eigen::VectorXd Az_trial = Az_vec_0 + alpha * delta_A;
@@ -724,12 +835,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
         }
+        }  // end if (!phase6_anderson_done) [line search block]
 
         // Update previous step length for next iteration's adaptive algorithm
-        alpha_prev = alpha;
+        // Phase 6 already set alpha_prev = 1.0 inside its block; don't overwrite.
+        if (!phase6_anderson_done) {
+            alpha_prev = alpha;
+        }
 
         // ===== Step 7: Anderson Acceleration =====
-        if (USE_ANDERSON && m_AA > 0) {
+        // Skipped for Phase 6: history management is done inside the Phase 6 block,
+        // which stores full Picard residuals (δ_k) rather than the tiny α_min*δ steps
+        // that the line search produces — mixing the latter gives negligible acceleration.
+        if (!phase6_anderson_done && USE_ANDERSON && m_AA > 0) {
             Eigen::VectorXd g_k = Az_vec - Az_vec_0;  // Actual update
 
             if (iter >= 1 && g_history.size() > 0) {
