@@ -96,6 +96,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
         // ===== Step 1: Calculate B and H fields, update μ =====
+        // H_active_saved: stored outside the coarsening block so Phase 6 Jacobian
+        // correction can access H values without re-computation.
+        Eigen::VectorXd H_active_saved;
         if (using_coarsening) {
             // Phase 8: Wide-stencil B/H/μ at active cells only.
             // Avoids stripe artifacts from bilinear-interpolated inactive cell Az.
@@ -109,6 +112,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             Eigen::VectorXd Bx_active, By_active, H_active;
             calculateBFieldAtActiveCells(Az_coarse_for_B, Bx_active, By_active);
             calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+            H_active_saved = H_active;  // Save for Jacobian correction in Phase 6
             updateMuAtActiveCells(H_active);
             interpolateMuToFullGrid();  // Fill inactive cells (needed for Galerkin A_f)
         } else {
@@ -333,18 +337,120 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             }
 
             dc_R_fine_norm = residual_coarse_norm;  // FVM residual as Armijo baseline
+
+            // ---- Jacobian diagonal correction for nonlinear materials ----
+            // The FVM matrix A is built with frozen μ (Picard linearization).
+            // Near the B-H knee, dμ/dH is large, making Picard convergence ~1-5%/iter.
+            // Adding the diagonal Jacobian correction ∂R/∂Az_diag improves convergence
+            // from first-order (Picard) toward second-order (Newton).
+            //
+            // For PDE:  ∇·(1/μ ∇Az) = -Jz  (Cartesian)  or  ∇·(r/μ ∇Az) = -r·Jz  (Polar)
+            // The true Jacobian has:  J_ii = A_ii + Σ_j (∂A_ij/∂μ × dμ/dAz_i × Az_j)
+            // Simplified diagonal approximation (same as non-FVM path):
+            //   correction_i = -r_i × (dμ/dH_i) / μ_i² × dr²
             {
+                const double MU_0 = 4.0 * M_PI * 1e-7;
+                Eigen::SparseMatrix<double> J_matrix = A_matrix;
+
+                cv::Mat image_flipped;
+                cv::flip(image, image_flipped, 0);
+
+                int n_corrected = 0;
+                for (int idx = 0; idx < n_active_cells; idx++) {
+                    auto [i, j] = coarse_to_fine[idx];
+
+                    // Get image coordinates for material lookup
+                    int img_i, img_j;
+                    if (is_polar) {
+                        polarToImageIndices(i, j, img_i, img_j);
+                    } else {
+                        img_i = i;
+                        img_j = j;
+                    }
+
+                    if (img_j < 0 || img_j >= image_flipped.rows ||
+                        img_i < 0 || img_i >= image_flipped.cols) {
+                        continue;
+                    }
+
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+                    cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+
+                    for (const auto& mat : config["materials"]) {
+                        std::string name = mat.first.as<std::string>();
+                        YAML::Node props = mat.second;
+                        if (!props["rgb"]) continue;
+
+                        cv::Scalar mat_rgb(
+                            props["rgb"][0].as<int>(),
+                            props["rgb"][1].as<int>(),
+                            props["rgb"][2].as<int>()
+                        );
+
+                        if (rgb[0] == mat_rgb[0] && rgb[1] == mat_rgb[1] && rgb[2] == mat_rgb[2]) {
+                            auto mu_it = material_mu.find(name);
+                            if (mu_it == material_mu.end() || mu_it->second.type == MuType::STATIC) break;
+
+                            double mu_current = mu_map(j, i);
+                            if (mu_current < 1e-20) break;
+
+                            // Use H from Step 1 (stored in H_active_saved)
+                            double H_val = (idx < H_active_saved.size()) ? H_active_saved(idx) : 0.0;
+                            if (H_val < 0.0 || std::isnan(H_val) || std::isinf(H_val)) break;
+
+                            double mu_eff = evaluateMu(mu_it->second, H_val);
+                            double dmu_eff_dH = evaluateMuDerivative(mu_it->second, H_val);
+
+                            if (std::abs(dmu_eff_dH) < 1e-15) break;  // Linear region, no correction
+
+                            double dB_dH = MU_0 * (mu_eff + H_val * dmu_eff_dH);
+                            double dmu_dH = 0.0;
+                            if (H_val > 1.0) {
+                                double mu_actual = mu_eff * MU_0;
+                                dmu_dH = (dB_dH - mu_actual) / H_val;
+                            } else {
+                                dmu_dH = MU_0 * dmu_eff_dH;
+                            }
+
+                            double correction_factor;
+                            if (is_polar) {
+                                double r = r_coords[i];
+                                correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
+                                correction_factor *= (dr * dr);
+                            } else {
+                                correction_factor = -dmu_dH / (mu_current * mu_current + 1e-20);
+                                correction_factor *= (dx * dy);
+                            }
+
+                            J_matrix.coeffRef(idx, idx) += correction_factor;
+                            n_corrected++;
+                            break;
+                        }
+                    }
+                }
+
+                if (VERBOSE && iter == 0) {
+                    std::cout << "Jacobian diagonal correction: " << n_corrected << " cells" << std::endl;
+                }
+
+                // Solve J × δ = -R (Newton with Jacobian correction)
                 Eigen::SparseLU<Eigen::SparseMatrix<double>> fvm_lu;
-                fvm_lu.compute(A_matrix);
+                fvm_lu.compute(J_matrix);
                 if (fvm_lu.info() == Eigen::Success) {
                     delta_A = fvm_lu.solve(-residual_coarse);
                 } else {
-                    // Fallback: diagonal (Jacobi) scaling step
-                    if (VERBOSE) std::cout << " [FVM LU failed, using Jacobi step]";
-                    delta_A.resize(residual_coarse.size());
-                    for (int k = 0; k < A_matrix.rows(); k++) {
-                        double diag = A_matrix.coeff(k, k);
-                        delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
+                    // Fallback: try without correction
+                    if (VERBOSE) std::cout << " [Jacobian LU failed, trying Picard]";
+                    fvm_lu.compute(A_matrix);
+                    if (fvm_lu.info() == Eigen::Success) {
+                        delta_A = fvm_lu.solve(-residual_coarse);
+                    } else {
+                        if (VERBOSE) std::cout << " [Picard LU also failed, using Jacobi step]";
+                        delta_A.resize(residual_coarse.size());
+                        for (int k = 0; k < A_matrix.rows(); k++) {
+                            double diag = A_matrix.coeff(k, k);
+                            delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
+                        }
                     }
                 }
             }
