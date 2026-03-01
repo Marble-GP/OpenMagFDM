@@ -523,39 +523,69 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_0 = (dc_R_fine_norm >= 0.0) ? dc_R_fine_norm : residual_norm;
         Eigen::VectorXd Az_vec_0 = Az_vec;
 
-        // ===== Phase 6: Anderson-Picard with residual-based restart =====
+        // ===== Phase 6: Damped Picard + Anderson acceleration =====
         //
-        // Standard backtracking line search fails here because the B-H piecewise-linear
-        // knee causes the true nonlinear residual to INCREASE for steps larger than some
-        // geometry-dependent threshold (≈ α_min ≈ 6.6e-4). Backtracking from α=1.0
-        // with rho=0.65 reaches only α≈0.007 in 18 trials — never reaching the good
-        // region. Forcing α_min as a fallback gives only 0.001–2% per-iter progress.
+        // Standard backtracking line search fails for defect correction because the
+        // B-H piecewise-linear knee causes the true nonlinear residual to INCREASE
+        // for steps larger than some geometry-dependent threshold. Backtracking from
+        // α=1.0 with rho=0.65 cannot reach the good region in max_trials steps.
         //
-        // This block replaces the line search with Anderson(m≥3) acceleration:
-        //   1. Compute Anderson step from history of FULL Picard residuals δ_k = A^{-1}(-R)
-        //      (degenerates to pure Picard G_k = Az + δ when history is empty)
-        //   2. Evaluate true nonlinear residual at the proposed step (1 matrix rebuild,
-        //      vs 18 in the old line search → 18x cheaper per iteration)
-        //   3. If residual INCREASED (>10%): restart Anderson history (discard corrupted
-        //      iterates) and fall back to ω=0.1 damped Picard (safe for all geometries)
-        //   4. Store full δ_k (not the accepted step) in Anderson history so future
-        //      extrapolations use the full Newton correction, not the damped one.
+        // This block replaces the line search with damped Picard + Anderson(m≥3):
+        //   1. Early iterations (no Anderson history): use ω-damped Picard step
+        //      Az_{k+1} = Az_k + ω·δ_k  (ω starts at 0.5)
+        //   2. Once Anderson history has ≥2 entries: compute Anderson extrapolation
+        //      from full Picard residuals δ_k, with safety cap at 3× Picard step
+        //   3. REACTIVE restart: if residual increased for 2+ consecutive iterations,
+        //      halve ω (0.5→0.25→0.1→0.05) and clear Anderson history
+        //   4. No proactive residual check — this avoids the regression caused by
+        //      evaluating true nonlinear residual (which rejects frozen-Jacobian
+        //      steps that would otherwise converge).
         //
-        // Note: Step 7 Anderson is skipped (phase6_anderson_done=true) since this block
-        // manages Az_history/g_history with correct Picard residuals.
+        // The damped ω=0.5 approach keeps iterates in a safe B-H region, letting
+        // the μ update between iterations gradually resolve nonlinearity.
         bool phase6_anderson_done = false;
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
             const int m_phase6 = std::max(3, m_AA);
 
-            // ---- Anderson extrapolation (or pure Picard if history empty) ----
-            Eigen::VectorXd G_k = Az_vec_0 + delta_A;   // Full Picard iterate
+            // Adaptive damping ω: starts at 0.5, halves on consecutive residual increases.
+            // Stored as static-like state via residual_history (already tracked).
+            // Detect consecutive increases from residual_history.
+            static double p6_omega = 0.5;
+            if (iter == 0) p6_omega = 0.5;  // Reset at start of solve
+
+            int n_consec_increase = 0;
+            if (residual_history.size() >= 2) {
+                for (int rh = static_cast<int>(residual_history.size()) - 1; rh >= 1; rh--) {
+                    if (residual_history[rh] >= residual_history[rh - 1] * 0.999) {
+                        n_consec_increase++;
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // REACTIVE restart: 2+ consecutive increases → halve ω and clear history
+            if (n_consec_increase >= 2) {
+                double old_omega = p6_omega;
+                p6_omega = std::max(0.05, p6_omega * 0.5);
+                if (!Az_history.empty()) {
+                    Az_history.clear();
+                    g_history.clear();
+                }
+                if (VERBOSE && old_omega != p6_omega) {
+                    std::cout << " [P6: " << n_consec_increase
+                              << " consec R↑ → ω=" << p6_omega << ", restart]";
+                }
+            }
+
+            // ---- Anderson extrapolation (or ω-damped Picard if history < 2) ----
             Eigen::VectorXd Az_next;
             {
                 int m_k = std::min(m_phase6, static_cast<int>(g_history.size()));
-                if (m_k == 0) {
-                    // No history yet: pure full Picard step
-                    Az_next = G_k;
-                    if (VERBOSE) std::cout << " [P6: Picard]";
+                if (m_k < 2) {
+                    // Not enough history for meaningful Anderson: use ω-damped Picard
+                    Az_next = Az_vec_0 + p6_omega * delta_A;
+                    if (VERBOSE) std::cout << " [P6: Picard ω=" << p6_omega << "]";
                 } else {
                     // Anderson extrapolation: DG = differences of Picard residuals
                     Eigen::MatrixXd DG(delta_A.size(), m_k);
@@ -570,6 +600,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     Eigen::VectorXd theta = DTD.ldlt().solve(-DG.transpose() * delta_A);
 
                     // G_AA = G_k + Σ_j θ_j · ((Az_{k-j} + δ_{k-j}) - (Az_k + δ_k))
+                    Eigen::VectorXd G_k = Az_vec_0 + delta_A;
                     Eigen::VectorXd G_anderson = G_k;
                     for (int j = 0; j < m_k; j++) {
                         int hidx = static_cast<int>(g_history.size()) - m_k + j;
@@ -584,8 +615,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     double picard_norm  = delta_A.norm();
                     double anderson_norm = (Az_next - Az_vec_0).norm();
                     if (picard_norm > 1e-30 && anderson_norm > 3.0 * picard_norm) {
-                        Az_next = G_k;   // Fall back to full Picard
-                        if (VERBOSE) std::cout << " [P6: Anderson→Picard(safety)]";
+                        Az_next = Az_vec_0 + p6_omega * delta_A;  // Fall back to damped Picard
+                        if (VERBOSE) std::cout << " [P6: Anderson→Picard(safety) ω=" << p6_omega << "]";
                     } else if (VERBOSE) {
                         std::cout << " [P6: Anderson m=" << m_k
                                   << " step=" << std::scientific << std::setprecision(2)
@@ -594,65 +625,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
 
-            // ---- True nonlinear residual check (1 rebuild, vs 18 in old line search) ----
-            // Apply Az_next, update μ, rebuild A_FVM, measure residual.
-            // If residual increased (>10%): restart history and use ω=0.1 fallback.
-            auto p6_apply_eval = [&](const Eigen::VectorXd& Az_cand) -> double {
-                for (int cidx = 0; cidx < n_active_cells; cidx++) {
-                    auto [ci, cj] = coarse_to_fine[cidx];
-                    Az(cj, ci) = Az_cand(cidx);
-                }
-                if (is_polar) interpolateInactiveCellsPolar(Az_cand);
-                else          interpolateInactiveCells(Az_cand);
-                {
-                    Eigen::VectorXd Bx_a, By_a, H_a;
-                    calculateBFieldAtActiveCells(Az_cand, Bx_a, By_a);
-                    calculateHFieldAtActiveCells(Bx_a, By_a, H_a);
-                    updateMuAtActiveCells(H_a);
-                    interpolateMuToFullGrid();
-                }
-                Eigen::SparseMatrix<double> A_chk; Eigen::VectorXd b_chk;
-                if (is_polar) buildMatrixPolarCoarsened(A_chk, b_chk);
-                else          buildMatrixCoarsened(A_chk, b_chk);
-                full_matrix_cache_valid = false;
-                return (A_chk * Az_cand - b_chk).norm();
-            };
-
-            double res_next = p6_apply_eval(Az_next);
-            bool step_ok = (res_next <= residual_0 * 1.1);  // Allow ≤10% increase
-
-            if (!step_ok) {
-                // Step increased residual: discard corrupted Anderson history, then
-                // try ω=0.1 (avoids B-H knee crossing for most geometries).
-                // If ω=0.1 also fails, use alpha_min (matches old code worst-case).
-                if (!Az_history.empty()) {
-                    Az_history.clear();
-                    g_history.clear();
-                }
-                if (VERBOSE) {
-                    std::cout << " [P6: R↑(" << std::setprecision(2)
-                              << res_next / residual_0 << "x)->";
-                }
-                // Try ω=0.1
-                Eigen::VectorXd Az_fallback = Az_vec_0 + 0.1 * delta_A;
-                double res_fallback = p6_apply_eval(Az_fallback);
-                if (res_fallback <= residual_0 * 1.1) {
-                    Az_next = Az_fallback;
-                    if (VERBOSE) std::cout << "ω=0.1 OK]";
-                } else {
-                    // ω=0.1 also increases residual: use α_min (guaranteed safe floor)
-                    // This matches the old forced-fallback behavior so we never regress.
-                    Eigen::VectorXd Az_amin = Az_vec_0 + alpha_min * delta_A;
-                    p6_apply_eval(Az_amin);
-                    Az_next = Az_amin;
-                    if (VERBOSE) {
-                        std::cout << "ω=0.1 R↑("
-                                  << res_fallback / residual_0 << "x)->α_min]";
-                    }
-                }
-            }
-
-            // Store full Picard residual δ_k in history (critical: not the accepted step)
+            // Store full Picard residual δ_k in history (critical: not the damped step)
             Az_history.push_back(Az_vec_0);
             g_history.push_back(delta_A);
             if (static_cast<int>(Az_history.size()) > m_phase6 + 1) {
@@ -660,12 +633,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 g_history.erase(g_history.begin());
             }
 
-            // Sync Az_vec from Az (p6_apply_eval already set Az; resync active cells)
+            // Apply Az_next: set active cells, interpolate inactive, sync
             Az_vec = Az_next;
             for (int cidx = 0; cidx < n_active_cells; cidx++) {
                 auto [ci, cj] = coarse_to_fine[cidx];
-                Az_vec(cidx) = Az(cj, ci);
+                Az(cj, ci) = Az_next(cidx);
             }
+            if (is_polar) interpolateInactiveCellsPolar(Az_next);
+            else          interpolateInactiveCells(Az_next);
 
             alpha_prev = 1.0;  // Conceptually "full step" for adaptive init next iter
             phase6_anderson_done = true;
