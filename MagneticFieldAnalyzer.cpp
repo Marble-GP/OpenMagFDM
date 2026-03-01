@@ -10113,9 +10113,17 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         double r_imh = r - h_minus / 2.0;  // r_{i-1/2}
         double r_iph = r + h_plus / 2.0;   // r_{i+1/2}
 
-        // Interface permeabilities
-        double mu_inner_r = getMuAtInterfacePolar(i_r - 0.5, j_theta, "r");
-        double mu_outer_r = getMuAtInterfacePolar(i_r + 0.5, j_theta, "r");
+        // Interface permeabilities (harmonic mean of ACTIVE cells only)
+        // getMuAtInterfacePolar(i_r ± 0.5) uses fine-grid neighbors (i_r ± 1) which
+        // are INACTIVE cells with μ reset to H=0 value (e.g. μ_r=5000) by
+        // interpolateMuToFullGrid(). This causes wrong FVM coefficients and prevents
+        // convergence. Use harmonic mean between the two ACTIVE cells instead,
+        // consistent with how the theta-direction interfaces are computed.
+        double mu_center_r = getMuPolar(mu_map, i_r,    j_theta, r_orientation);
+        double mu_prev_r   = getMuPolar(mu_map, i_prev,  j_theta, r_orientation);
+        double mu_next_r   = getMuPolar(mu_map, i_next,  j_theta, r_orientation);
+        double mu_inner_r = 2.0 / (1.0/mu_center_r + 1.0/mu_prev_r);
+        double mu_outer_r = 2.0 / (1.0/mu_center_r + 1.0/mu_next_r);
 
         // Non-uniform FDM radial coefficients: 2 * r_face / (μ · h_r · (h_minus + h_plus))
         double a_im = 2.0 * r_imh / (mu_inner_r * h_minus * (h_minus + h_plus));
