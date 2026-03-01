@@ -7885,11 +7885,11 @@ function renderBHCurveForMaterial(name, props) {
         const treatAsSoft   = (bhType === 'soft');
 
         if (treatAsMagnet && !treatAsSoft) {
-            // Demagnetization formula: sample H ∈ [-5e6, -1] A/m, log-spaced in |H|
+            // Demagnetization formula: sample H ∈ [-1e6, -1] A/m, log-spaced in |H|
             // Extended to 5 MA/m to cover strong demagnetizing fields
             const N = 200;
             const H_neg = Array.from({ length: N }, (_, i) =>
-                -Math.pow(10, i * Math.log10(5e6) / (N - 1)));  // magnitude: 1 → 5e6
+                -Math.pow(10, i * Math.log10(1e6) / (N - 1)));  // magnitude: 1 → 1e6
             const pairs = H_neg.map(H => [H, evalB(H)]).filter(([, B]) => isFinite(B));
             if (isFinite(Br)) pairs.push([0, Br]);   // remanence point at H=0
             pairs.sort((a, b) => a[0] - b[0]);        // ascending H (most-negative first)
@@ -7981,7 +7981,7 @@ function renderBHCurveForMaterial(name, props) {
         const Br_val   = props.magnetization.Br;
         const mu_r_val = (typeof mur === 'number') ? mur : 1.05;  // default recoil μr for NdFeB
         const Hcb      = Br_val / (MU_0 * mu_r_val);
-        const H_max_demag = 5e6;  // extend to 5 MA/m to cover strong demagnetizing fields
+        const H_max_demag = 1e6;  // extend to 1 MA/m to cover strong demagnetizing fields
         const H_min = -Math.max(Hcb, H_max_demag);
         const N = 200;
         H_arr   = Array.from({ length: N + 1 }, (_, i) => H_min + i * (-H_min) / N);
