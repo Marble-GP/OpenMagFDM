@@ -7671,9 +7671,10 @@ function renderBHCurveForMaterial(name, props) {
 
     AppState.currentBHMaterial = { name, props };
 
-    const MU_0 = 4 * Math.PI * 1e-7;
-    const bh   = props && props['B-H'];
-    const mur  = props && props.mu_r;
+    const MU_0   = 4 * Math.PI * 1e-7;
+    const bh     = props && props['B-H'];
+    const mur    = props && props.mu_r;
+    const bhType = (props && props['bh_type']) || 'auto';
 
     // Determine X-axis type from checkbox (default: log)
     const logCb = document.getElementById('libBHLogX');
@@ -7709,14 +7710,33 @@ function renderBHCurveForMaterial(name, props) {
             try { return Function(`'use strict'; return (${expr})`)(); }
             catch (_) { return NaN; }
         };
-        const Br   = evalB(0);
-        const safeH = H_log;
-        const safeB = safeH.map(H => evalB(H)).filter((b, i) => isFinite(b));
-        const H_ok  = safeH.filter((_, i) => isFinite(evalB(safeH[i])));
-        if (H_ok.length > 1) {
-            H_arr   = H_ok;
-            B_arr   = H_arr.map(H => evalB(H));
-            mur_arr = H_arr.map((H, i) => Math.max(1, (B_arr[i] - (isFinite(Br) ? Br : 0)) / (MU_0 * H)));
+        const Br            = evalB(0);
+        const treatAsMagnet = (bhType === 'magnet') || (bhType === 'auto' && isFinite(Br) && Math.abs(Br) > 1e-9);
+        const treatAsSoft   = (bhType === 'soft');
+
+        if (treatAsMagnet && !treatAsSoft) {
+            // Demagnetization formula: sample H ∈ [-1e5, -1] A/m, log-spaced in |H|
+            const N = 200;
+            const H_neg = Array.from({ length: N }, (_, i) =>
+                -Math.pow(10, i * 5 / (N - 1)));  // magnitude: 1 → 1e5
+            const pairs = H_neg.map(H => [H, evalB(H)]).filter(([, B]) => isFinite(B));
+            if (isFinite(Br)) pairs.push([0, Br]);   // remanence point at H=0
+            pairs.sort((a, b) => a[0] - b[0]);        // ascending H (most-negative first)
+            if (pairs.length > 1) {
+                H_arr   = pairs.map(p => p[0]);
+                B_arr   = pairs.map(p => p[1]);
+                mur_arr = null;
+                isDemag = true;
+            }
+        } else {
+            // Soft magnet or no remanence: sample H ∈ [1e-3, 1e5] A/m
+            const useBr = treatAsSoft ? 0 : (isFinite(Br) ? Br : 0);
+            const H_ok  = H_log.filter(H => isFinite(evalB(H)));
+            if (H_ok.length > 1) {
+                H_arr   = H_ok;
+                B_arr   = H_arr.map(H => evalB(H));
+                mur_arr = H_arr.map((H, i) => Math.max(1, (B_arr[i] - useBr) / (MU_0 * H)));
+            }
         }
 
     // --- Case 1b: B-H: [[H],[B]] ---
@@ -7798,46 +7818,81 @@ function renderBHCurveForMaterial(name, props) {
 
     const plotH = Math.max(350, container.offsetHeight || 0);
 
-    // ---- Demagnetization curve (H < 0): single B trace, linear scale ----
-    if (isDemag) {
-        if (toolbar) toolbar.style.display = 'none';  // hide log/linear checkbox
+    // Keep checkbox label in sync: "Log |H| axis" for demagnetization, "Log X axis" otherwise
+    const logLabelNode = logCb && logCb.nextSibling;
+    if (logLabelNode) logLabelNode.textContent = isDemag ? ' Log |H| axis' : ' Log X axis';
 
-        // Find Br (B at rightmost point ≈ H=0) and Hcb (H where B≈0)
-        const Br_demag  = B_arr[B_arr.length - 1];
-        const Hcb_demag = H_arr[0];  // most negative H (where B≈0)
+    // ---- Demagnetization curve (H < 0): single B trace ----
+    if (isDemag) {
+        if (toolbar) toolbar.style.display = '';  // show log/linear checkbox
+
+        const useLogH   = logCb && logCb.checked;
+        const Br_demag  = B_arr[B_arr.length - 1];  // B at H closest to 0
+        const Hcb_demag = H_arr[0];                  // most negative H
+
+        let x_data, y_data, x_title, x_type;
+        if (useLogH) {
+            // Show |H| on log scale (exclude H=0)
+            const filtered = H_arr.map((h, i) => [Math.abs(h), B_arr[i]])
+                                   .filter(([h]) => h > 1e-12)
+                                   .sort((a, b) => a[0] - b[0]);  // ascending |H|
+            x_data  = filtered.map(p => p[0]);
+            y_data  = filtered.map(p => p[1]);
+            x_title = '|H| [A/m]';
+            x_type  = 'log';
+        } else {
+            x_data  = H_arr;
+            y_data  = B_arr;
+            x_title = 'H [A/m]';
+            x_type  = 'linear';
+        }
+
+        const annotations = useLogH ? [
+            { x: x_data[0], y: y_data[0], xref: 'x', yref: 'y',
+              text: `Br ≈ ${Br_demag.toFixed(3)} T`,
+              showarrow: true, arrowhead: 2, ax: 50, ay: -20,
+              font: { color: '#e05252', size: 11 } },
+            { x: x_data[x_data.length - 1], y: y_data[y_data.length - 1],
+              xref: 'x', yref: 'y',
+              text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
+              showarrow: true, arrowhead: 2, ax: -30, ay: -25,
+              font: { color: '#555', size: 11 } }
+        ] : [
+            { x: 0, y: Br_demag, xref: 'x', yref: 'y',
+              text: `Br = ${Br_demag.toFixed(3)} T`,
+              showarrow: true, arrowhead: 2, ax: 40, ay: -20,
+              font: { color: '#e05252', size: 11 } },
+            { x: Hcb_demag, y: 0, xref: 'x', yref: 'y',
+              text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
+              showarrow: true, arrowhead: 2, ax: 30, ay: -25,
+              font: { color: '#555', size: 11 } }
+        ];
 
         Plotly.newPlot(container, [{
-            x: H_arr, y: B_arr,
+            x: x_data, y: y_data,
             mode: 'lines+markers',
             name: 'B [T]',
             line:   { width: 2, color: '#e05252' },
             marker: { size: 4, color: '#e05252' },
-            hovertemplate: 'H=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>'
+            hovertemplate: `${useLogH ? '|H|' : 'H'}=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>`
         }], {
-            title: { text: `<b>${name}</b>`, font: { size: 14 } },
-            xaxis: { title: 'H [A/m]', type: 'linear', exponentformat: 'power' },
-            yaxis: { title: 'B [T]', rangemode: 'tozero', exponentformat: 'power',
-                     titlefont: { color: '#e05252' }, tickfont: { color: '#e05252' } },
-            shapes: [
-                // Vertical dashed line at H=0
+            title:  { text: `<b>${name}</b>`, font: { size: 14 } },
+            xaxis:  { title: x_title, type: x_type, exponentformat: 'power' },
+            yaxis:  { title: 'B [T]', rangemode: 'tozero', exponentformat: 'power',
+                      titlefont: { color: '#e05252' }, tickfont: { color: '#e05252' } },
+            shapes: useLogH ? [
+                { type: 'line', x0: 0, x1: 1, y0: 0, y1: 0,
+                  xref: 'paper', yref: 'y',
+                  line: { color: '#bbb', dash: 'dot', width: 1 } }
+            ] : [
                 { type: 'line', x0: 0, x1: 0, y0: 0, y1: 1,
                   xref: 'x', yref: 'paper',
                   line: { color: '#bbb', dash: 'dot', width: 1 } },
-                // Horizontal dashed line at B=0
                 { type: 'line', x0: 0, x1: 1, y0: 0, y1: 0,
                   xref: 'paper', yref: 'y',
                   line: { color: '#bbb', dash: 'dot', width: 1 } }
             ],
-            annotations: [
-                { x: 0, y: Br_demag, xref: 'x', yref: 'y',
-                  text: `Br = ${Br_demag.toFixed(3)} T`,
-                  showarrow: true, arrowhead: 2, ax: 40, ay: -20,
-                  font: { color: '#e05252', size: 11 } },
-                { x: Hcb_demag, y: 0, xref: 'x', yref: 'y',
-                  text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
-                  showarrow: true, arrowhead: 2, ax: 30, ay: -25,
-                  font: { color: '#555', size: 11 } }
-            ],
+            annotations,
             margin:     { t: 45, l: 65, r: 30, b: 55 },
             height:     plotH,
             showlegend: false

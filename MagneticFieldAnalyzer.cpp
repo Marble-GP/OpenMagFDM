@@ -576,6 +576,19 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         double bh_remanence_Br = 0.0;   // Br [T] from B-H first point (0 if none)
         bool   bh_has_remanence = false; // true if B(H=0) != 0
 
+        // Optional classification flag for B-H curves.
+        // Controls whether a non-zero B at H=0 is treated as:
+        //   "magnet" (demagnetization curve, Br+recoil μr extracted)
+        //   "soft"   (magnetization curve with a bias, TABLE built for H>=0)
+        //   "auto"   (default: infer from B(0) — magnet if B(0)!=0, soft otherwise)
+        std::string bh_type = "auto";
+        if (props["bh_type"]) {
+            bh_type = props["bh_type"].as<std::string>("auto");
+            if (bh_type == "demagnetization" || bh_type == "demag") bh_type = "magnet";
+            if (bh_type == "magnetization"   || bh_type == "symmetric") bh_type = "soft";
+            if (bh_type != "magnet" && bh_type != "soft") bh_type = "auto";
+        }
+
         MuValue mu_value;
 
         if (props["B-H"]) {
@@ -737,23 +750,49 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 
                 // Detect remanence from B(0)
                 double Br = evalB(0.0);
-                if (std::abs(Br) > 1e-9) {
+
+                // Decide interpretation based on bh_type flag + auto-detection
+                bool treat_as_magnet = (bh_type == "magnet")
+                    || (bh_type == "auto" && std::abs(Br) > 1e-9);
+                bool treat_as_soft = (bh_type == "soft");
+
+                if (treat_as_magnet && !treat_as_soft) {
+                    // --- Demagnetization curve (permanent magnet) ---
+                    // Use recoil μr from formula derivative at H→0⁻
+                    // μr = ΔB / (μ₀ · |ΔH|) with ΔH = -1 A/m
+                    const double dH_neg = -1.0;
+                    double mu_r_recoil = 1.05;  // safe default
+                    double B_step = evalB(dH_neg);
+                    if (std::isfinite(B_step)) {
+                        // (Br - B(-1)) / (μ₀ · 1) — both numerator and Δ|H| positive
+                        mu_r_recoil = std::max(1.0, (Br - B_step) / (MU_0 * std::abs(dH_neg)));
+                    }
+                    mu_value.type         = MuType::STATIC;
+                    mu_value.static_value = mu_r_recoil;
                     bh_remanence_Br  = Br;
                     bh_has_remanence = true;
-                    std::cout << "  [" << name << "] B-H formula: residual magnetization Br=" << Br << " T" << std::endl;
+                    std::cout << "  [" << name << "] B-H formula (demagnetization):"
+                              << " Br=" << Br << " T, recoil mu_r=" << mu_r_recoil << std::endl;
+                } else {
+                    // --- Magnetization curve (soft magnet, H >= 0) ---
+                    // bh_type=="soft" → ignore any non-zero B(0) as a bias, build TABLE
+                    double table_Br = treat_as_soft ? 0.0 : Br;
+                    if (treat_as_soft && std::abs(Br) > 1e-9) {
+                        std::cout << "  [" << name << "] B-H formula: bh_type=soft, "
+                                  << "bias B(0)=" << Br << " T ignored (treated as soft magnet)" << std::endl;
+                    }
+                    // Sample into a log-spaced table: H ∈ [1e-3, 1e6] A/m (500 points)
+                    const int N_PTS = 500;
+                    const double LOG_MIN = -3.0, LOG_MAX = 6.0;
+                    std::vector<double> H_data, B_data;
+                    H_data.push_back(0.0); B_data.push_back(table_Br);
+                    for (int k = 0; k < N_PTS; k++) {
+                        double H = std::pow(10.0, LOG_MIN + k * (LOG_MAX - LOG_MIN) / (N_PTS - 1));
+                        double B = evalB(H);
+                        if (std::isfinite(B)) { H_data.push_back(H); B_data.push_back(B); }
+                    }
+                    buildBHTable(H_data, B_data, table_Br);
                 }
-
-                // Sample into a log-spaced table: H ∈ [1e-3, 1e6] A/m (500 points)
-                const int N_PTS = 500;
-                const double LOG_MIN = -3.0, LOG_MAX = 6.0;
-                std::vector<double> H_data, B_data;
-                H_data.push_back(0.0); B_data.push_back(Br);
-                for (int k = 0; k < N_PTS; k++) {
-                    double H = std::pow(10.0, LOG_MIN + k * (LOG_MAX - LOG_MIN) / (N_PTS - 1));
-                    H_data.push_back(H);
-                    B_data.push_back(evalB(H));
-                }
-                buildBHTable(H_data, B_data, Br);
 
             } else {
                 throw std::runtime_error("B-H for material '" + name + "' must be [[H,...],[B,...]] or a formula string");
