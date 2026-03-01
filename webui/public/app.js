@@ -8033,15 +8033,17 @@ function renderBHCurveForMaterial(name, props) {
             x_type  = 'linear';
         }
 
+        // log|H| mode: axis is reversed (Hcb on left, Br on right).
+        // ax offsets are flipped vs the non-reversed case so text stays inside the plot.
         const annotations = useLogH ? [
             { x: x_data[0], y: y_data[0], xref: 'x', yref: 'y',
               text: `Br ≈ ${Br_demag.toFixed(3)} T`,
-              showarrow: true, arrowhead: 2, ax: 50, ay: -20,
+              showarrow: true, arrowhead: 2, ax: -50, ay: -20,
               font: { color: '#e05252', size: 11 } },
             { x: x_data[x_data.length - 1], y: y_data[y_data.length - 1],
               xref: 'x', yref: 'y',
               text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
-              showarrow: true, arrowhead: 2, ax: -30, ay: -25,
+              showarrow: true, arrowhead: 2, ax: 30, ay: -25,
               font: { color: '#555', size: 11 } }
         ] : [
             { x: 0, y: Br_demag, xref: 'x', yref: 'y',
@@ -8063,7 +8065,8 @@ function renderBHCurveForMaterial(name, props) {
             hovertemplate: `${useLogH ? '|H|' : 'H'}=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>`
         }], {
             title:  { text: `<b>${name}</b>`, font: { size: 14 } },
-            xaxis:  { title: x_title, type: x_type, exponentformat: 'power' },
+            xaxis:  { title: x_title, type: x_type, exponentformat: 'power',
+                      ...(useLogH ? { autorange: 'reversed' } : {}) },
             yaxis:  { title: 'B [T]', rangemode: 'tozero', exponentformat: 'power',
                       titlefont: { color: '#e05252' }, tickfont: { color: '#e05252' } },
             shapes: useLogH ? [
