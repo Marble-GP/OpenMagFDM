@@ -189,20 +189,45 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             }
         }
 
-        // Coarse residual (used for Newton step direction)
+        // Coarse residual (used for Newton step direction in non-DC paths)
         Eigen::VectorXd residual_coarse = A_matrix * Az_vec - b_vec;
         double residual_coarse_norm = residual_coarse.norm();
         double b_vec_coarse_norm = b_vec.norm();
 
+        // True Defect Correction (Phase 6): compute fine-grid residual
+        // R_fine = A_fine(μ) * x_fine - b_fine on the full 250k-DOF grid.
+        // μ is already filled at all cells via interpolateMuToFullGrid() in Step 1.
+        // This residual is physically correct and has a unique zero at the true solution,
+        // unlike R_FVM which can plateau at a non-zero value due to Picard oscillation.
+        Eigen::VectorXd R_fine_dc;
+        double R_fine_dc_norm = 0.0;
+        double b_fine_dc_norm = 0.0;
+        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
+            full_matrix_cache_valid = false;  // Force rebuild with current μ
+            updateFullMatrixCache();           // Builds A_fine (250k) from mu_map
+            int n_full = is_polar ? (nr * ntheta) : (ny * nx);
+            Eigen::VectorXd Az_fine_dc(n_full);
+            if (is_polar) {
+                for (int i = 0; i < nr; i++)
+                    for (int j = 0; j < ntheta; j++)
+                        Az_fine_dc(i * ntheta + j) = (r_orientation == "horizontal")
+                            ? Az(j, i) : Az(i, j);
+            } else {
+                for (int j = 0; j < ny; j++)
+                    for (int i = 0; i < nx; i++)
+                        Az_fine_dc(j * nx + i) = Az(j, i);
+            }
+            R_fine_dc = parallelSpMV(A_full_cached_csr, Az_fine_dc) - rhs_full_cached;
+            R_fine_dc_norm = R_fine_dc.norm();
+            b_fine_dc_norm = rhs_full_cached.norm();
+        }
+
         // Convergence residual selection
         double residual_norm, b_vec_norm;
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // Defect correction: FVM coarsened residual for convergence.
-            // Using the full-grid residual ||A_full * P * Az - b_full|| would include
-            // permanent inactive-cell interpolation errors that cannot be reduced
-            // by coarse-space corrections — causing false non-convergence.
-            residual_norm = residual_coarse_norm;
-            b_vec_norm = b_vec_coarse_norm;
+            // True DC: fine-grid residual is the physically correct convergence criterion.
+            residual_norm = R_fine_dc_norm;
+            b_vec_norm = b_fine_dc_norm;
         } else if (using_coarsening) {
             // Other coarsening modes: full-grid residual for accurate convergence
             residual_norm = computeFullGridResidual(b_vec_norm);
@@ -222,7 +247,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                       << ", ||Az|| = " << Az_vec.norm()
                       << ", ||b_coarse|| = " << b_vec_coarse_norm
                       << ", ||R_coarse||_abs = " << residual_coarse_norm;
-            if (using_coarsening) {
+            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
+                std::cout << ", ||R_fine||_abs = " << R_fine_dc_norm;
+            } else if (using_coarsening) {
                 std::cout << ", ||R_FVM||_abs = " << residual_norm;
             }
             std::cout << std::endl;
@@ -233,9 +260,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                       << ": ||R|| = " << std::scientific << std::setprecision(4) << residual_rel;
             if (using_coarsening && !nonlinear_config.use_phase6_precond_jfnk) {
                 // Show FVM coarsened residual alongside fine-grid for comparison
-                // (in defect correction mode both are the same, so suppress duplicate)
                 double residual_coarse_rel = residual_coarse_norm / (b_vec_coarse_norm + 1e-12);
                 std::cout << " (FVM: " << residual_coarse_rel << ")";
+            } else if (using_coarsening) {
+                // True DC: show coarse residual for reference
+                double residual_coarse_rel = residual_coarse_norm / (b_vec_coarse_norm + 1e-12);
+                std::cout << " (coarse: " << residual_coarse_rel << ")";
             }
             std::cout << std::flush;
         }
@@ -417,151 +447,53 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         // ===== Step 5: Compute Newton step δA =====
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // Phase 6: FVM-consistent Newton step
+            // True Defect Correction (Phase 6 DC):
+            // δ_c = A_FVM^{-1} * (-P^T * R_fine)
             //
-            // Previous approach used Galerkin matrix A_c = P^T * A_f * P as Newton matrix:
-            //   delta_A = A_c_galerkin^{-1} * (-R_FVM)
-            // Problem: A_c_galerkin ≠ A_FVM — Galerkin includes all 250k fine-grid cells
-            // (including inactive cells with interpolated μ) through P and P^T, while
-            // A_FVM discretizes only the 67k active cells directly.
-            // The operator mismatch makes the Galerkin Newton direction a poor (often
-            // non-descent) direction for the FVM residual ||R_FVM||, causing the true
-            // nonlinear line search to fail at every α ≥ α_min (all 18 trials rejected).
+            // R_fine = A_fine(μ) * x_fine - b_fine is computed on the full 250k-DOF grid.
+            // P^T (R_restriction) restricts it to the 67k-DOF coarse space.
+            // A_FVM (A_matrix) provides a fast coarse-grid preconditioner.
             //
-            // Fix: solve A_FVM × δ = -R_FVM directly using SparseLU on A_matrix.
-            // Since d = A_FVM^{-1} × (-R_FVM), the frozen linearized trial residual is:
-            //   A_FVM × (Az + α×d) - b = (1-α) × R_FVM
-            // The directional derivative ∇f^T × d = -||R_FVM||² < 0, guaranteeing
-            // d is a descent direction. The true nonlinear Armijo condition is then
-            // satisfied for some α ∈ (0, 1] (descent lemma for smooth objectives).
-            //
-            // Performance: eliminates updatePreconditioner() — no more full-grid 250k×250k
-            // matrix build or Galerkin triple product P^T*A_f*P per Newton iteration.
+            // Why this converges where Picard-on-coarse fails:
+            //   Picard-on-coarse drives R_FVM → 0, but for strongly nonlinear materials
+            //   the Picard spectral radius can exceed 1, causing oscillation at a non-zero
+            //   plateau. True DC drives R_fine → 0, which has a unique zero at the true
+            //   physical solution regardless of coarsening approximation quality.
             if (VERBOSE && iter == 0) {
-                std::cout << "Using FVM Newton step (Phase 6)" << std::endl;
+                std::cout << "Using True Defect Correction (Phase 6 DC)" << std::endl;
             }
 
-            dc_R_fine_norm = residual_coarse_norm;  // FVM residual as Armijo baseline
+            dc_R_fine_norm = R_fine_dc_norm;  // Fine-grid residual as Armijo baseline
 
-            // ---- Jacobian diagonal correction for nonlinear materials ----
-            // The FVM matrix A is built with frozen μ (Picard linearization).
-            // Near the B-H knee, dμ/dH is large, making Picard convergence ~1-5%/iter.
-            // Adding the diagonal Jacobian correction ∂R/∂Az_diag improves convergence
-            // from first-order (Picard) toward second-order (Newton).
-            //
-            // For PDE:  ∇·(1/μ ∇Az) = -Jz  (Cartesian)  or  ∇·(r/μ ∇Az) = -r·Jz  (Polar)
-            // The true Jacobian has:  J_ii = A_ii + Σ_j (∂A_ij/∂μ × dμ/dAz_i × Az_j)
-            // Simplified diagonal approximation (same as non-FVM path):
-            //   correction_i = -r_i × (dμ/dH_i) / μ_i² × dr²
-            {
-                const double MU_0 = 4.0 * M_PI * 1e-7;
-                Eigen::SparseMatrix<double> J_matrix = A_matrix;
+            // Restrict: r_c = P^T * R_fine  (fine → coarse)
+            if (!multigrid_operators_built) buildProlongationMatrix();
+            Eigen::VectorXd r_c_dc = parallelSpMV(R_restriction_csr, R_fine_dc);
 
-                cv::Mat image_flipped;
-                cv::flip(image, image_flipped, 0);
-
-                int n_corrected = 0;
-                for (int idx = 0; idx < n_active_cells; idx++) {
-                    auto [i, j] = coarse_to_fine[idx];
-
-                    // Get image coordinates for material lookup
-                    int img_i, img_j;
-                    if (is_polar) {
-                        polarToImageIndices(i, j, img_i, img_j);
-                    } else {
-                        img_i = i;
-                        img_j = j;
-                    }
-
-                    if (img_j < 0 || img_j >= image_flipped.rows ||
-                        img_i < 0 || img_i >= image_flipped.cols) {
-                        continue;
-                    }
-
-                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-                    cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
-
-                    for (const auto& mat : config["materials"]) {
-                        std::string name = mat.first.as<std::string>();
-                        YAML::Node props = mat.second;
-                        if (!props["rgb"]) continue;
-
-                        cv::Scalar mat_rgb(
-                            props["rgb"][0].as<int>(),
-                            props["rgb"][1].as<int>(),
-                            props["rgb"][2].as<int>()
-                        );
-
-                        if (rgb[0] == mat_rgb[0] && rgb[1] == mat_rgb[1] && rgb[2] == mat_rgb[2]) {
-                            auto mu_it = material_mu.find(name);
-                            if (mu_it == material_mu.end() || mu_it->second.type == MuType::STATIC) break;
-
-                            double mu_current = mu_map(j, i);
-                            if (mu_current < 1e-20) break;
-
-                            // Use H from Step 1 (stored in H_active_saved)
-                            double H_val = (idx < H_active_saved.size()) ? H_active_saved(idx) : 0.0;
-                            if (H_val < 0.0 || std::isnan(H_val) || std::isinf(H_val)) break;
-
-                            double mu_eff = evaluateMu(mu_it->second, H_val);
-                            double dmu_eff_dH = evaluateMuDerivative(mu_it->second, H_val);
-
-                            if (std::abs(dmu_eff_dH) < 1e-15) break;  // Linear region, no correction
-
-                            double dB_dH = MU_0 * (mu_eff + H_val * dmu_eff_dH);
-                            double dmu_dH = 0.0;
-                            if (H_val > 1.0) {
-                                double mu_actual = mu_eff * MU_0;
-                                dmu_dH = (dB_dH - mu_actual) / H_val;
-                            } else {
-                                dmu_dH = MU_0 * dmu_eff_dH;
-                            }
-
-                            double correction_factor;
-                            if (is_polar) {
-                                double r = r_coords[i];
-                                correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
-                                correction_factor *= (dr * dr);
-                            } else {
-                                correction_factor = -dmu_dH / (mu_current * mu_current + 1e-20);
-                                correction_factor *= (dx * dy);
-                            }
-
-                            J_matrix.coeffRef(idx, idx) += correction_factor;
-                            n_corrected++;
-                            break;
-                        }
+            // Coarse solve: δ_c = A_FVM^{-1} * (-r_c)
+            Eigen::SparseLU<Eigen::SparseMatrix<double>> fvm_lu;
+            fvm_lu.compute(A_matrix);
+            if (fvm_lu.info() == Eigen::Success) {
+                delta_A = fvm_lu.solve(-r_c_dc);
+                if (fvm_lu.info() != Eigen::Success) {
+                    if (VERBOSE) std::cout << " [DC solve failed, Jacobi step]";
+                    delta_A.resize(n_active_cells);
+                    for (int k = 0; k < A_matrix.rows(); k++) {
+                        double diag = A_matrix.coeff(k, k);
+                        delta_A(k) = (std::abs(diag) > 1e-30) ? -r_c_dc(k) / diag : 0.0;
                     }
                 }
-
-                if (VERBOSE && iter == 0) {
-                    std::cout << "Jacobian diagonal correction: " << n_corrected << " cells" << std::endl;
-                }
-
-                // Solve J × δ = -R (Newton with Jacobian correction)
-                Eigen::SparseLU<Eigen::SparseMatrix<double>> fvm_lu;
-                fvm_lu.compute(J_matrix);
-                if (fvm_lu.info() == Eigen::Success) {
-                    delta_A = fvm_lu.solve(-residual_coarse);
-                } else {
-                    // Fallback: try without correction
-                    if (VERBOSE) std::cout << " [Jacobian LU failed, trying Picard]";
-                    fvm_lu.compute(A_matrix);
-                    if (fvm_lu.info() == Eigen::Success) {
-                        delta_A = fvm_lu.solve(-residual_coarse);
-                    } else {
-                        if (VERBOSE) std::cout << " [Picard LU also failed, using Jacobi step]";
-                        delta_A.resize(residual_coarse.size());
-                        for (int k = 0; k < A_matrix.rows(); k++) {
-                            double diag = A_matrix.coeff(k, k);
-                            delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
-                        }
-                    }
+            } else {
+                if (VERBOSE) std::cout << " [DC LU failed, Jacobi step]";
+                delta_A.resize(n_active_cells);
+                for (int k = 0; k < A_matrix.rows(); k++) {
+                    double diag = A_matrix.coeff(k, k);
+                    delta_A(k) = (std::abs(diag) > 1e-30) ? -r_c_dc(k) / diag : 0.0;
                 }
             }
 
             if (nonlinear_config.precond_verbose) {
-                std::cout << "FVM Newton: ||R_FVM||=" << residual_coarse_norm << std::endl;
+                std::cout << "True DC: ||R_fine||=" << R_fine_dc_norm
+                          << " ||r_c||=" << r_c_dc.norm() << std::endl;
             }
 
         } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
