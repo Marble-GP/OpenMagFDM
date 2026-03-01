@@ -332,9 +332,9 @@
       "validParents": ["nonlinear_solver"]
     },
     "B-H": {
-      "description": "B-H curve for a material. Two formats supported:\n  Array: [[H,...],[B,...]] [A/m, T]\n  Formula: \"expression with $H\" [A/m → T]\nIn both cases μr(H)=(B(H)-Br)/(μ₀H) is derived internally. If H[0]=0 and B[0]≠0, residual magnetization Br is auto-detected. Formula is sampled on a log-spaced H grid at setup time. Supports $H, user-defined $variables, and predefined constants: pi, e, mu0 (4π×10⁻⁷ H/m)",
+      "description": "B-H curve for a material. Three formats supported:\n  Normal curve (H >= 0):  [[H,...],[B,...]] [A/m, T]\n  Demagnetization curve (H <= 0):  [[-Hcb,...,0],[0,...,Br]] — Br and mu_r extracted from slope at H=0\n  Formula:  \"expression with $H\" [A/m → T]\nFor normal/formula: μr(H)=(B(H)-Br)/(μ₀H) is derived internally. If H[0]=0 and B[0]≠0, residual Br is detected. Supports $H, user-defined $variables, constants: pi, e, mu0 (4π×10⁻⁷ H/m)",
       "type": "array|string",
-      "example": "B-H: [[0, 100, 500, 2000, 5000],\n      [0, 0.30, 1.00, 1.50, 1.70]]\n# or formula:\nB-H: \"mu0 * 1000 * $H\"",
+      "example": "# Normal B-H (soft magnet):\nB-H: [[0, 100, 500, 2000, 5000],\n      [0, 0.30, 1.00, 1.50, 1.70]]\n# Demagnetization curve (permanent magnet, second quadrant):\nB-H: [[-960000, -700000, -400000, 0],\n      [0,       0.4,     0.9,    1.27]]\n# Formula:\nB-H: \"mu0 * 1000 * $H\"",
       "validParents": ["materials", "material_presets"]
     },
     "magnetization": {

@@ -29,11 +29,21 @@
 #   mu_r: [[H1, H2, H3, ...],          # H [A/m]
 #           [mur1, mur2, mur3, ...]]    # relative permeability (dimensionless)
 #
-#   B-H:  [[H1, H2, H3, ...],          # H [A/m]
-#           [B1, B2, B3, ...]]          # flux density [T]
+#   B-H (normal curve, H >= 0):
+#         [[H1, H2, H3, ...],          # H [A/m]
+#          [B1, B2, B3, ...]]          # flux density [T]
+#   If H[0]=0 and B[0]!=0, treated as residual flux density Br.
+#
+#   B-H (demagnetization curve, H <= 0):
+#         [[-Hcb, ..., 0],             # H [A/m]  left=coercive point, right=remanence
+#          [0,    ..., Br]]            # B [T]
+#   Br and mu_r are extracted automatically from the slope at H=0.
+#   The magnetization block is auto-generated; add one explicitly to set direction.
+#   Example (NdFeB N40 approximation):
+#     B-H: [[-960000, -800000, -600000, -400000, -200000, 0],
+#           [0,       0.05,    0.45,    0.80,    1.05,    1.27]]
 #
 # Both are interpolated with PCHIP (monotone cubic Hermite) internally.
-# If H[0]=0 and B[0]!=0, the value is treated as residual flux density Br.
 #
 # -----------------------------------------------------------------------
 # Formula notation (for continuous-function definitions like below):

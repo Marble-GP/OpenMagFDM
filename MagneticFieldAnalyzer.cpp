@@ -615,18 +615,80 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                 if (H_data.size() != B_data.size() || H_data.size() < 2) {
                     throw std::runtime_error("B-H for material '" + name + "': H and B arrays must have equal length >= 2");
                 }
-                double Br = 0.0;
-                if (H_data[0] > 1e-12) {
-                    // Prepend implicit (0, 0)
-                    H_data.insert(H_data.begin(), 0.0);
-                    B_data.insert(B_data.begin(), 0.0);
-                } else if (std::abs(B_data[0]) > 1e-9) {
-                    Br = B_data[0];
+
+                // Detect demagnetization curve (any H < 0 → second quadrant)
+                bool is_demag = std::any_of(H_data.begin(), H_data.end(),
+                                            [](double h){ return h < -1e-12; });
+
+                if (is_demag) {
+                    // --- Demagnetization curve ---
+                    // Sort pairs by H ascending (most negative first, H=0 at end)
+                    std::vector<std::pair<double,double>> pts;
+                    pts.reserve(H_data.size());
+                    for (size_t k = 0; k < H_data.size(); k++)
+                        pts.push_back({H_data[k], B_data[k]});
+                    std::sort(pts.begin(), pts.end(),
+                              [](const auto& a, const auto& b){ return a.first < b.first; });
+                    size_t n = pts.size();
+
+                    // Br: B at H=0 (interpolate/extrapolate from the two rightmost points)
+                    double Br = 0.0;
+                    if (std::abs(pts[n-1].first) < 1e-12) {
+                        Br = pts[n-1].second;
+                    } else {
+                        // Extrapolate last segment to H=0
+                        double dH = pts[n-1].first - pts[n-2].first;
+                        double dB = pts[n-1].second - pts[n-2].second;
+                        Br = pts[n-1].second + (std::abs(dH) > 1e-12 ? dB / dH : 0.0)
+                             * (0.0 - pts[n-1].first);
+                    }
+
+                    // mu_r from slope of last two points (linear region closest to H=0)
+                    double mu_r_lin = 1.05;
+                    {
+                        double dH = pts[n-1].first - pts[n-2].first;  // > 0 (ascending)
+                        double dB = pts[n-1].second - pts[n-2].second; // > 0
+                        if (std::abs(dH) > 1e-12)
+                            mu_r_lin = std::max(1.0, dB / (MU_0 * dH));
+                    }
+
+                    // Hcb: H value where B = 0 (B-coercivity)
+                    double Hcb = 0.0;
+                    for (size_t k = 0; k + 1 < n; k++) {
+                        if (pts[k].second <= 1e-9 && pts[k+1].second >= 0) {
+                            double dB = pts[k+1].second - pts[k].second;
+                            double frac = (dB > 1e-12) ? pts[k].second / dB : 0.0;
+                            Hcb = std::abs(pts[k].first + frac * (pts[k+1].first - pts[k].first));
+                            break;
+                        }
+                    }
+
+                    // Use linear μr model (solver doesn't iterate in 2nd quadrant)
+                    mu_value.type         = MuType::STATIC;
+                    mu_value.static_value = mu_r_lin;
                     bh_remanence_Br  = Br;
                     bh_has_remanence = true;
-                    std::cout << "  [" << name << "] B-H: residual magnetization Br=" << Br << " T" << std::endl;
-                }
-                buildBHTable(H_data, B_data, Br);
+
+                    std::cout << "  [" << name << "] Demagnetization curve:"
+                              << " Br=" << Br << " T"
+                              << ", Hcb=" << Hcb * 1e-3 << " kA/m"
+                              << ", mu_r=" << mu_r_lin << std::endl;
+
+                } else {
+                    // ---- Normal magnetization curve: H >= 0 ----
+                    double Br = 0.0;
+                    if (H_data[0] > 1e-12) {
+                        // Prepend implicit (0, 0)
+                        H_data.insert(H_data.begin(), 0.0);
+                        B_data.insert(B_data.begin(), 0.0);
+                    } else if (std::abs(B_data[0]) > 1e-9) {
+                        Br = B_data[0];
+                        bh_remanence_Br  = Br;
+                        bh_has_remanence = true;
+                        std::cout << "  [" << name << "] B-H: residual magnetization Br=" << Br << " T" << std::endl;
+                    }
+                    buildBHTable(H_data, B_data, Br);
+                } // end if (is_demag)
 
             } else if (bh_node.IsScalar()) {
                 // ---- Formula format: B-H: "expression with $H" ----

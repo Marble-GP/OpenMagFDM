@@ -7684,6 +7684,7 @@ function renderBHCurveForMaterial(name, props) {
 
     let H_arr = null, B_arr = null, mur_arr = null;
     let isDashed = false;
+    let isDemag = false;  // demagnetization curve (H < 0)
 
     // --- Case 1a: B-H: formula string "expr($H)" ---
     if (typeof bh === 'string' && bh.trim() !== '') {
@@ -7723,32 +7724,43 @@ function renderBHCurveForMaterial(name, props) {
         Array.isArray(bh[0]) && Array.isArray(bh[1]) &&
         bh[0].length === bh[1].length && bh[0].length >= 2) {
 
-        const H_raw = [...bh[0]];
-        const B_raw = [...bh[1]];
+        if (bh[0].some(h => h < -1e-12)) {
+            // --- Demagnetization curve (H < 0, second quadrant) ---
+            // Sort by H ascending (most negative first → H≈0 at end)
+            const pairs = bh[0].map((h, i) => [h, bh[1][i]]).sort((a, b) => a[0] - b[0]);
+            H_arr   = pairs.map(p => p[0]);
+            B_arr   = pairs.map(p => p[1]);
+            mur_arr = null;
+            isDemag = true;
 
-        // Detect remanence: if H[0]=0 and B[0]≠0
-        const Br = (Math.abs(H_raw[0]) < 1e-12 && Math.abs(B_raw[0]) > 1e-12) ? B_raw[0] : 0;
-
-        // Prepend implicit (0,0) if first H > 0
-        if (H_raw[0] > 1e-12) { H_raw.unshift(0); B_raw.unshift(0); }
-
-        B_arr = B_raw;
-
-        // Compute μr: μr(H=0) from initial slope; μr(H>0) = (B-Br)/(μ₀H)
-        mur_arr = [];
-        if (H_raw.length >= 2 && H_raw[1] > 0) {
-            const mu0_val = (B_raw[1] - Br) / (MU_0 * H_raw[1]);
-            mur_arr.push(Math.max(1, mu0_val));
         } else {
-            mur_arr.push(1);
-        }
-        for (let i = 1; i < H_raw.length; i++) {
-            if (H_raw[i] <= 1e-15) continue;
-            mur_arr.push(Math.max(1, (B_raw[i] - Br) / (MU_0 * H_raw[i])));
-        }
+            // --- Normal magnetization curve (H >= 0) ---
+            const H_raw = [...bh[0]];
+            const B_raw = [...bh[1]];
 
-        // Build matching H arrays (skip H=0 on log scale to avoid −∞)
-        H_arr = H_raw;
+            // Detect remanence: if H[0]=0 and B[0]≠0
+            const Br = (Math.abs(H_raw[0]) < 1e-12 && Math.abs(B_raw[0]) > 1e-12) ? B_raw[0] : 0;
+
+            // Prepend implicit (0,0) if first H > 0
+            if (H_raw[0] > 1e-12) { H_raw.unshift(0); B_raw.unshift(0); }
+
+            B_arr = B_raw;
+
+            // Compute μr: μr(H=0) from initial slope; μr(H>0) = (B-Br)/(μ₀H)
+            mur_arr = [];
+            if (H_raw.length >= 2 && H_raw[1] > 0) {
+                const mu0_val = (B_raw[1] - Br) / (MU_0 * H_raw[1]);
+                mur_arr.push(Math.max(1, mu0_val));
+            } else {
+                mur_arr.push(1);
+            }
+            for (let i = 1; i < H_raw.length; i++) {
+                if (H_raw[i] <= 1e-15) continue;
+                mur_arr.push(Math.max(1, (B_raw[i] - Br) / (MU_0 * H_raw[i])));
+            }
+
+            H_arr = H_raw;
+        }
 
     // --- Case 2: mu_r: [[H],[μr]] ---
     } else if (Array.isArray(mur) && mur.length === 2 &&
@@ -7784,6 +7796,56 @@ function renderBHCurveForMaterial(name, props) {
         return;
     }
 
+    const plotH = Math.max(350, container.offsetHeight || 0);
+
+    // ---- Demagnetization curve (H < 0): single B trace, linear scale ----
+    if (isDemag) {
+        if (toolbar) toolbar.style.display = 'none';  // hide log/linear checkbox
+
+        // Find Br (B at rightmost point ≈ H=0) and Hcb (H where B≈0)
+        const Br_demag  = B_arr[B_arr.length - 1];
+        const Hcb_demag = H_arr[0];  // most negative H (where B≈0)
+
+        Plotly.newPlot(container, [{
+            x: H_arr, y: B_arr,
+            mode: 'lines+markers',
+            name: 'B [T]',
+            line:   { width: 2, color: '#e05252' },
+            marker: { size: 4, color: '#e05252' },
+            hovertemplate: 'H=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>'
+        }], {
+            title: { text: `<b>${name}</b>`, font: { size: 14 } },
+            xaxis: { title: 'H [A/m]', type: 'linear', exponentformat: 'power' },
+            yaxis: { title: 'B [T]', rangemode: 'tozero', exponentformat: 'power',
+                     titlefont: { color: '#e05252' }, tickfont: { color: '#e05252' } },
+            shapes: [
+                // Vertical dashed line at H=0
+                { type: 'line', x0: 0, x1: 0, y0: 0, y1: 1,
+                  xref: 'x', yref: 'paper',
+                  line: { color: '#bbb', dash: 'dot', width: 1 } },
+                // Horizontal dashed line at B=0
+                { type: 'line', x0: 0, x1: 1, y0: 0, y1: 0,
+                  xref: 'paper', yref: 'y',
+                  line: { color: '#bbb', dash: 'dot', width: 1 } }
+            ],
+            annotations: [
+                { x: 0, y: Br_demag, xref: 'x', yref: 'y',
+                  text: `Br = ${Br_demag.toFixed(3)} T`,
+                  showarrow: true, arrowhead: 2, ax: 40, ay: -20,
+                  font: { color: '#e05252', size: 11 } },
+                { x: Hcb_demag, y: 0, xref: 'x', yref: 'y',
+                  text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
+                  showarrow: true, arrowhead: 2, ax: 30, ay: -25,
+                  font: { color: '#555', size: 11 } }
+            ],
+            margin:     { t: 45, l: 65, r: 30, b: 55 },
+            height:     plotH,
+            showlegend: false
+        }, { responsive: true, displayModeBar: false });
+        return;
+    }
+
+    // ---- Normal B-H / μr curve ----
     const markerSize = (Array.isArray(bh) || Array.isArray(mur)) ? 4 : 0;
     const mode = isDashed ? 'lines' : (markerSize > 0 ? 'lines+markers' : 'lines');
 
@@ -7812,7 +7874,6 @@ function renderBHCurveForMaterial(name, props) {
         hovertemplate: 'H=%{x:.4g} A/m<br>μr=%{y:.4g}<extra></extra>'
     };
 
-    const plotH = Math.max(350, container.offsetHeight || 0);
     Plotly.newPlot(container, [traceB, traceMur], {
         title:  { text: `<b>${name}</b>`, font: { size: 14 } },
         xaxis:  { title: 'H [A/m]', type: xtype, exponentformat: 'power' },
