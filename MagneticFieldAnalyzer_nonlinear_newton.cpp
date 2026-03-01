@@ -622,21 +622,33 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             bool step_ok = (res_next <= residual_0 * 1.1);  // Allow ≤10% increase
 
             if (!step_ok) {
-                // Step increased residual: discard corrupted Anderson history and
-                // fall back to ω=0.1 conservative Picard.
-                // (Even ω=0.5 can cause >10% increase for polar r-weighted matrices
-                //  with Si_steel near saturation — ω=0.1 avoids B-H knee crossing.)
+                // Step increased residual: discard corrupted Anderson history, then
+                // try ω=0.1 (avoids B-H knee crossing for most geometries).
+                // If ω=0.1 also fails, use alpha_min (matches old code worst-case).
                 if (!Az_history.empty()) {
                     Az_history.clear();
                     g_history.clear();
                 }
-                Eigen::VectorXd Az_fallback = Az_vec_0 + 0.1 * delta_A;
-                p6_apply_eval(Az_fallback);   // Sets Az to fallback state
-                Az_next = Az_fallback;
                 if (VERBOSE) {
-                    std::cout << " [P6: restart+fallback ω=0.1"
-                              << "(R_trial/R0=" << std::setprecision(3) << res_next / residual_0
-                              << ")]";
+                    std::cout << " [P6: R↑(" << std::setprecision(2)
+                              << res_next / residual_0 << "x)->";
+                }
+                // Try ω=0.1
+                Eigen::VectorXd Az_fallback = Az_vec_0 + 0.1 * delta_A;
+                double res_fallback = p6_apply_eval(Az_fallback);
+                if (res_fallback <= residual_0 * 1.1) {
+                    Az_next = Az_fallback;
+                    if (VERBOSE) std::cout << "ω=0.1 OK]";
+                } else {
+                    // ω=0.1 also increases residual: use α_min (guaranteed safe floor)
+                    // This matches the old forced-fallback behavior so we never regress.
+                    Eigen::VectorXd Az_amin = Az_vec_0 + alpha_min * delta_A;
+                    p6_apply_eval(Az_amin);
+                    Az_next = Az_amin;
+                    if (VERBOSE) {
+                        std::cout << "ω=0.1 R↑("
+                                  << res_fallback / residual_0 << "x)->α_min]";
+                    }
                 }
             }
 
