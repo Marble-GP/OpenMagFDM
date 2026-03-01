@@ -644,6 +644,24 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                               [](const auto& a, const auto& b){ return a.first < b.first; });
                     size_t n = pts.size();
 
+                    // Check monotonicity: sorted ascending in H → B must be non-decreasing
+                    // (B increases from ~0 at H=-Hcb to Br at H=0, i.e. curve is monotonically decreasing in |H|)
+                    bool demag_monotone = true;
+                    for (size_t k = 0; k + 1 < n; k++) {
+                        if (pts[k+1].second < pts[k].second - 1e-9) {
+                            demag_monotone = false;
+                            break;
+                        }
+                    }
+                    if (!demag_monotone) {
+                        std::cerr << "\n**************************************************\n"
+                                  << "WARNING: Material '" << name << "'\n"
+                                  << "  Demagnetization B-H curve is NOT monotonically decreasing!\n"
+                                  << "  (B must increase from 0 at H=-Hcb to Br at H=0)\n"
+                                  << "  This may cause inaccurate Br/Hcb extraction.\n"
+                                  << "**************************************************\n" << std::endl;
+                    }
+
                     // Br: B at H=0 (interpolate/extrapolate from the two rightmost points)
                     double Br = 0.0;
                     if (std::abs(pts[n-1].first) < 1e-12) {
@@ -685,7 +703,9 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                     std::cout << "  [" << name << "] Demagnetization curve:"
                               << " Br=" << Br << " T"
                               << ", Hcb=" << Hcb * 1e-3 << " kA/m"
-                              << ", mu_r=" << mu_r_lin << std::endl;
+                              << ", mu_r=" << mu_r_lin
+                              << (demag_monotone ? " [Monotonic: OK]" : " [Monotonic: FAILED]")
+                              << std::endl;
 
                 } else {
                     // ---- Normal magnetization curve: H >= 0 ----
