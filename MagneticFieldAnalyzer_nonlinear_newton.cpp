@@ -114,7 +114,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
             H_active_saved = H_active;  // Save for Jacobian correction in Phase 6
             updateMuAtActiveCells(H_active);
-            interpolateMuToFullGrid();  // Fill inactive cells (needed for Galerkin A_f)
+            // Fill inactive cells with interpolated μ.
+            // Required when use_galerkin_coarsening=true (A_f uses all cells via P^T*A_f*P).
+            // With use_galerkin_coarsening=false (FVM), A_FVM uses only active cells so
+            // this call is a no-op for the matrix, but still keeps mu_map consistent for
+            // diagnostics and the final-output call after convergence.
+            interpolateMuToFullGrid();
         } else {
             // Full-grid path (unchanged)
             if (is_polar) {

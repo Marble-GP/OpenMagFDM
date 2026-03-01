@@ -382,7 +382,7 @@ private:
             relaxation(0.7), anderson(), gmres_restart(30), line_search_c(1e-4),
             line_search_alpha_init(1.0), line_search_alpha_min(1e-3), line_search_rho(0.65),
             line_search_max_trials(50), line_search_adaptive(true),
-            verbose(false), export_convergence(false), use_galerkin_coarsening(true),
+            verbose(false), export_convergence(false), use_galerkin_coarsening(false),
             use_matrix_free_jv(true),
             use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false) {}
     };

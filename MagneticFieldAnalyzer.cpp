@@ -86,7 +86,10 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
 
         // Phase 4: Galerkin coarsening option (for coarsened Newton-Krylov)
-        nonlinear_config.use_galerkin_coarsening = nl_config["use_galerkin_coarsening"].as<bool>(true);
+        // Default false: FVM (buildMatrixPolarCoarsened/buildMatrixCoarsened) is used for
+        // Picard steps. FVM's fixed point is the true physical solution, while Galerkin
+        // (P^T*A_f*P) converges to a projection fixed point that may not satisfy the PDE.
+        nonlinear_config.use_galerkin_coarsening = nl_config["use_galerkin_coarsening"].as<bool>(false);
 
         // Phase 5: Matrix-free Jv option (solves oscillation issue with coarsening + nonlinear)
         nonlinear_config.use_matrix_free_jv = nl_config["use_matrix_free_jv"].as<bool>(true);
