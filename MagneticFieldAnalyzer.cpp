@@ -3351,21 +3351,27 @@ void MagneticFieldAnalyzer::smoothInactiveCells(int iterations) {
 }
 
 void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
-    // Rebuild mu_map for inactive cells directly from the input image.
-    // Active cells keep their B-H curve computed μ (from updateMuAtActiveCells).
-    // Inactive cells get the material-based μ from image pixel lookup (ground truth).
-    // This avoids cross-material contamination from harmonic mean interpolation.
+    // Rebuild mu_map for inactive cells:
+    // - Active cells: keep B-H computed μ (from updateMuAtActiveCells)
+    // - Inactive cells:
+    //   * Linear (STATIC) materials: evaluateMu(H=0) is exact (μ independent of H)
+    //   * Nonlinear (TABLE/FORMULA) materials: use nearest active cell's μ from mu_map
+    //     Rationale: evaluateMu(H=0) gives μ_r≈5000 for silicon steel, but saturated
+    //     iron may have μ_r≈100-200. Using μ(H=0) corrupts A_fine and thus A_G=P^T*A_fine*P,
+    //     causing Galerkin Picard to stagnate at a wrong fixed point.
 
     if (!coarsening_enabled || n_active_cells == 0) return;
 
     const double MU_0 = 4.0 * M_PI * 1e-7;
+    bool is_polar = (coordinate_system == "polar");
+    bool is_horizontal = is_polar && (r_orientation == "horizontal");
     cv::Mat image_flipped;
     cv::flip(image, image_flipped, 0);
 
     int n_rows, n_cols;
-    if (coordinate_system == "polar") {
-        n_rows = (r_orientation == "horizontal") ? ntheta : nr;
-        n_cols = (r_orientation == "horizontal") ? nr : ntheta;
+    if (is_polar) {
+        n_rows = is_horizontal ? ntheta : nr;
+        n_cols = is_horizontal ? nr : ntheta;
     } else {
         n_rows = ny;
         n_cols = nx;
@@ -3377,8 +3383,11 @@ void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
 
             // Get pixel from flipped image (same coordinate system as setupMaterialProperties)
             int img_i = i, img_j = j;
-            if (coordinate_system == "polar") {
-                polarToImageIndices(i, j, img_i, img_j);
+            if (is_polar) {
+                // polarToImageIndices expects (i_r, j_theta)
+                int i_r_img     = is_horizontal ? i : j;
+                int j_theta_img = is_horizontal ? j : i;
+                polarToImageIndices(i_r_img, j_theta_img, img_i, img_j);
             }
             if (img_j < 0 || img_j >= image_flipped.rows ||
                 img_i < 0 || img_i >= image_flipped.cols) continue;
@@ -3395,9 +3404,70 @@ void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
                 if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                     auto it = material_mu.find(name);
                     if (it != material_mu.end()) {
-                        // Use current H=0 for inactive cells (initial/base μ)
-                        double mu_r = evaluateMu(it->second, 0.0);
-                        mu_map(j, i) = mu_r * MU_0;
+                        const MuValue& mv = it->second;
+
+                        if (mv.type != MuType::STATIC) {
+                            // Nonlinear material: find nearest active cell's μ so that
+                            // A_fine reflects the actual operating point, not H=0.
+                            double mu_nearest = 0.0;
+
+                            if (!is_polar) {
+                                // Cartesian: scan ±x and ±y
+                                int i_east  = findNextActiveX(i, j, +1);
+                                int i_west  = findNextActiveX(i, j, -1);
+                                int j_north = findNextActiveY(i, j, +1);
+                                int j_south = findNextActiveY(i, j, -1);
+                                int d_east  = std::abs(i_east  - i);
+                                int d_west  = std::abs(i_west  - i);
+                                int d_north = std::abs(j_north - j);
+                                int d_south = std::abs(j_south - j);
+                                int d_min = std::min({d_east, d_west, d_north, d_south});
+                                if      (d_min == d_east)  mu_nearest = mu_map(j,       i_east);
+                                else if (d_min == d_west)  mu_nearest = mu_map(j,       i_west);
+                                else if (d_min == d_north) mu_nearest = mu_map(j_north, i);
+                                else                       mu_nearest = mu_map(j_south, i);
+                            } else {
+                                // Polar: scan ±radial and ±theta
+                                // is_horizontal: j=j_theta, i=i_r; else j=i_r, i=j_theta
+                                int i_r     = is_horizontal ? i : j;
+                                int j_theta = is_horizontal ? j : i;
+                                int i_next = findNextActiveRadial(i_r, j_theta, +1);
+                                int i_prev = findNextActiveRadial(i_r, j_theta, -1);
+                                int j_next = findNextActiveTheta(i_r, j_theta, +1);
+                                int j_prev = findNextActiveTheta(i_r, j_theta, -1);
+                                int d_rn = std::abs(i_next - i_r);
+                                int d_rp = std::abs(i_prev - i_r);
+                                int d_tn = std::abs(j_next - j_theta);
+                                int d_tp = std::abs(j_prev - j_theta);
+                                int d_min = std::min({d_rn, d_rp, d_tn, d_tp});
+                                // Map active neighbor (i_r', j_theta') back to (row, col)
+                                // horizontal: row=j_theta, col=i_r  → mu_map(j_theta', i_r')
+                                // vertical:   row=i_r,    col=j_theta → mu_map(i_r', j_theta')
+                                if (d_min == d_rn) {
+                                    // radial +: i_r→i_next, j_theta unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j, i_next) : mu_map(i_next, i);
+                                } else if (d_min == d_rp) {
+                                    // radial -: i_r→i_prev, j_theta unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j, i_prev) : mu_map(i_prev, i);
+                                } else if (d_min == d_tn) {
+                                    // theta +: j_theta→j_next, i_r unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j_next, i) : mu_map(j, j_next);
+                                } else {
+                                    // theta -: j_theta→j_prev, i_r unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j_prev, i) : mu_map(j, j_prev);
+                                }
+                            }
+
+                            // Use nearest active cell's μ if valid; fall back to H=0 μ
+                            if (mu_nearest > 0.0) {
+                                mu_map(j, i) = mu_nearest;
+                            } else {
+                                mu_map(j, i) = evaluateMu(mv, 0.0) * MU_0;
+                            }
+                        } else {
+                            // Linear material: μ is constant, H=0 is exact
+                            mu_map(j, i) = evaluateMu(mv, 0.0) * MU_0;
+                        }
                     }
                     break;
                 }
