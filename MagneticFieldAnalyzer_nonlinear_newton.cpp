@@ -188,10 +188,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // Convergence residual selection
         double residual_norm, b_vec_norm;
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // Defect correction: use Galerkin (coarse) residual for convergence
-            // R_c = P^T * R_fine = P^T * (A_f * Az - b_f)
-            // The full-grid residual includes inactive cell interpolation error
-            // that cannot be reduced by coarse-space corrections
+            // Defect correction: FVM coarsened residual for convergence.
+            // Using the full-grid residual ||A_full * P * Az - b_full|| would include
+            // permanent inactive-cell interpolation errors that cannot be reduced
+            // by coarse-space corrections — causing false non-convergence.
             residual_norm = residual_coarse_norm;
             b_vec_norm = b_vec_coarse_norm;
         } else if (using_coarsening) {
@@ -214,7 +214,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                       << ", ||b_coarse|| = " << b_vec_coarse_norm
                       << ", ||R_coarse||_abs = " << residual_coarse_norm;
             if (using_coarsening) {
-                std::cout << ", ||R_full||_abs = " << residual_norm;
+                std::cout << ", ||R_FVM||_abs = " << residual_norm;
             }
             std::cout << std::endl;
         }
@@ -222,9 +222,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         if (VERBOSE) {
             std::cout << "NK iter " << std::setw(3) << iter + 1
                       << ": ||R|| = " << std::scientific << std::setprecision(4) << residual_rel;
-            if (using_coarsening) {
+            if (using_coarsening && !nonlinear_config.use_phase6_precond_jfnk) {
+                // Show FVM coarsened residual alongside fine-grid for comparison
+                // (in defect correction mode both are the same, so suppress duplicate)
                 double residual_coarse_rel = residual_coarse_norm / (b_vec_coarse_norm + 1e-12);
-                std::cout << " (coarse: " << residual_coarse_rel << ")";
+                std::cout << " (FVM: " << residual_coarse_rel << ")";
             }
             std::cout << std::flush;
         }
@@ -324,21 +326,28 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // This ensures P^T * R_fine = P^T * A_f * P * Az_c - P^T * b_f = A_c * Az_c - b_c
             // i.e., R_c_defect == residual_coarse, so the Newton direction is consistent
             // with the Armijo condition in the frozen-Jacobian line search.
-            buildProlongationMatrix();  // Ensure P and R are built (also syncs CSR copies)
-            Eigen::VectorXd Az_full_vec = parallelSpMV(P_prolongation_csr, Az_vec);
-
-            Eigen::VectorXd R_fine = parallelSpMV(A_full_cached_csr, Az_full_vec) - rhs_full_cached;
-            dc_R_fine_norm = R_fine.norm();  // Save for line search (see Step 6)
-
-            // Step 2: Restrict to coarse space: R_c = P^T * R_fine = A_c * Az_c - b_c
-            Eigen::VectorXd R_coarse_defect = parallelSpMV(R_restriction_csr, R_fine);
-
-            // Step 3: Direct coarse solve: A_c * δx_c = -R_c
-            delta_A = applyPreconditioner(-R_coarse_defect);
+            // Defect correction: A_c^{-1} × R_FVM
+            //
+            // Previous approach computed R_coarse = R * (A_full * P * Az_c - b_full)
+            // (Galerkin restriction of the full-grid residual).
+            // Problem: A_full * P * Az_c includes inactive-cell interpolation errors
+            // that are permanent (cannot be reduced by coarse-space corrections).
+            // The fine-grid residual ||A_full * P * Az - b_full|| is dominated by
+            // these interpolation errors, so the line search's Armijo condition
+            // is never satisfied above α_min → residual stagnates.
+            //
+            // Fix: use the FVM coarsened residual directly (already computed above
+            // as residual_coarse = A_matrix * Az_vec - b_vec).
+            // A_c_galerkin^{-1} * R_FVM is a valid descent direction because
+            // A_c_galerkin ≈ A_FVM (both are consistent coarse representations of A_f).
+            // The line search Armijo condition is also evaluated with the FVM residual,
+            // ensuring full consistency and allowing α > α_min.
+            //
+            dc_R_fine_norm = residual_coarse_norm;  // FVM residual as Armijo baseline
+            delta_A = applyPreconditioner(-residual_coarse);  // A_c^{-1} * R_FVM
 
             if (nonlinear_config.precond_verbose) {
-                std::cout << "Defect correction: ||R_fine||=" << R_fine.norm()
-                          << ", ||R_c||=" << R_coarse_defect.norm() << std::endl;
+                std::cout << "Defect correction: ||R_FVM||=" << residual_coarse_norm << std::endl;
             }
 
         } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
@@ -589,10 +598,13 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
                 Az_trial_mat = Az;
 
-                // Full-grid trial residual with frozen A_f — O(nnz_full), no rebuild  (parallel SpMV)
-                Eigen::VectorXd Az_full_trial = parallelSpMV(P_prolongation_csr, Az_trial);
-                Eigen::VectorXd residual_full_trial = parallelSpMV(A_full_cached_csr, Az_full_trial) - rhs_full_cached;
-                residual_trial_norm = residual_full_trial.norm();
+                // FVM coarsened residual at trial point (frozen A_FVM, n_active × 1).
+                // Consistent with dc_R_fine_norm = residual_coarse_norm above.
+                // ~7× cheaper than A_full * P * Az_trial (335k vs 2.25M flops)
+                // and avoids inactive-cell interpolation errors that caused
+                // ||A_full * P * Az_trial − b_full|| to be permanently large.
+                Eigen::VectorXd residual_trial_coarse = A_matrix * Az_trial - b_vec;
+                residual_trial_norm = residual_trial_coarse.norm();
             } else {
                 // Non-defect-correction paths: update B/H/μ and rebuild matrix per trial
                 Az = Az_trial_mat;
