@@ -584,6 +584,34 @@
       "name": "Solver - OpenMP Thread Count",
       "trigger": "solver",
       "snippet": "omp_threads: 4"
+    },
+    "lib_file_template": {
+      "name": "Material Library Template",
+      "snippet": "material_presets:\n  my_soft_material:\n    B-H: \"mu0 * 1000 * $H\"\n  my_magnet:\n    mu_r: 1.05\n    magnetization:\n      Br: 1.27\n      pattern: parallel\n      angle: 0"
+    },
+    "lib_preset_mur_const": {
+      "name": "Preset - Constant μr",
+      "snippet": "mu_r: 1000"
+    },
+    "lib_preset_mur_formula": {
+      "name": "Preset - Variable μr (Formula)",
+      "snippet": "mu_r: \"5000 / (1 + ($H/500)^2)\""
+    },
+    "lib_preset_soft_table": {
+      "name": "Preset - Soft Magnet (B-H Table)",
+      "snippet": "B-H: [[0, 100, 500, 1000, 2000, 5000],\n      [0, 0.20, 0.80, 1.20, 1.50, 1.70]]"
+    },
+    "lib_preset_soft_formula": {
+      "name": "Preset - Soft Magnet (B-H Formula)",
+      "snippet": "B-H: \"1.8 * tanh($H / 200)\"\nbh_type: soft"
+    },
+    "lib_preset_magnet_parallel": {
+      "name": "Preset - Permanent Magnet (parallel)",
+      "snippet": "mu_r: 1.05\nmagnetization:\n  Br: 1.27\n  pattern: parallel\n  angle: 0"
+    },
+    "lib_preset_magnet_demag": {
+      "name": "Preset - Permanent Magnet (demagnetization curve)",
+      "snippet": "B-H: [[-960000, -700000, -400000, 0],\n      [0, 0.4, 0.9, 1.27]]\nbh_type: magnet\nmagnetization:\n  pattern: parallel\n  angle: 0"
     }
   },
   "templates": {

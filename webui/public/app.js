@@ -173,6 +173,14 @@ async function initializeConfigEditor() {
             const completions = [];
             const keywords = AppState.yamlSchema.keywords;
 
+            // Detect whether cursor is in a "value position" (after "key: ") vs a "key position".
+            // Value position example: "    type: d"  (lineKey="type", prefix="d")
+            // Key position example:   "    ty"       (isValuePosition=false)
+            const lineBeforeCursor = session.getLine(pos.row).substring(0, pos.column);
+            const valuePositionMatch = lineBeforeCursor.match(/^\s*([\w-]+):\s+\S*$/);
+            const isValuePosition = !!valuePositionMatch;
+            const lineKey = valuePositionMatch ? valuePositionMatch[1] : null;
+
             // Get parent context (nest recognition)
             const contextPath = getContextPath(editor, session, pos);
             const parentContext = contextPath.length > 0 ? contextPath[contextPath.length - 1] : null;
@@ -214,30 +222,44 @@ async function initializeConfigEditor() {
                 const info = keywords[keyword];
                 if (!info) continue;
 
-                const completion = {
-                    caption: keyword,
-                    value: keyword + ': ',
-                    meta: info.type || 'keyword',
-                    score: 1000,
-                    docHTML: `<b>${keyword}</b><br>${info.description}<br><code>${info.example || ''}</code>`
-                };
-                completions.push(completion);
+                if (!isValuePosition) {
+                    // At key position: show "keyword: " completion
+                    completions.push({
+                        caption: keyword,
+                        value: keyword + ': ',
+                        meta: info.type || 'keyword',
+                        score: 1000,
+                        docHTML: `<b>${keyword}</b><br>${info.description}<br><code>${info.example || ''}</code>`
+                    });
+                }
 
                 // Add value suggestions
                 if (info.values) {
                     info.values.forEach(val => {
-                        completions.push({
-                            caption: `${keyword}: ${val}`,
-                            value: `${keyword}: ${val}`,
-                            meta: 'value',
-                            score: 900
-                        });
+                        if (isValuePosition && lineKey === keyword) {
+                            // In value position for this keyword: suggest only the value (not "keyword: value")
+                            completions.push({
+                                caption: val,
+                                value: val,
+                                meta: 'value',
+                                score: 900,
+                                docHTML: `<b>${keyword}: ${val}</b><br>${info.description || ''}`
+                            });
+                        } else if (!isValuePosition) {
+                            // At key position: suggest full "keyword: value" pair
+                            completions.push({
+                                caption: `${keyword}: ${val}`,
+                                value: `${keyword}: ${val}`,
+                                meta: 'value',
+                                score: 900
+                            });
+                        }
                     });
                 }
             }
 
             // Add snippets based on context
-            addContextSnippets(completions, parentContext, grandparentContext);
+            addContextSnippets(completions, parentContext, grandparentContext, isValuePosition, lineKey);
 
             callback(null, completions);
         }
@@ -259,41 +281,50 @@ async function initializeConfigEditor() {
 }
 
 // Add context-aware snippets
-function addContextSnippets(completions, parentContext, grandparentContext) {
+// isValuePosition: true if cursor is after "key: " (in value position)
+// lineKey: the key name on the current line when isValuePosition is true
+function addContextSnippets(completions, parentContext, grandparentContext, isValuePosition = false, lineKey = null) {
     if (!AppState.yamlSchema || !AppState.yamlSchema.snippets) return;
 
     const snippets = AppState.yamlSchema.snippets;
 
-    // Add boundary condition snippets (for inner, outer, left, right, top, bottom)
-    const boundaryContexts = ['inner', 'outer', 'left', 'right', 'top', 'bottom'];
+    // Add boundary condition snippets (for inner, outer, left, right, top, bottom, theta_min, theta_max)
+    const boundaryContexts = ['inner', 'outer', 'left', 'right', 'top', 'bottom', 'theta_min', 'theta_max'];
     if (boundaryContexts.includes(parentContext)) {
-        // Add boundary type snippets
-        if (snippets.boundary_dirichlet) {
-            completions.push({
-                caption: '[Snippet] Dirichlet (value=0)',
-                value: snippets.boundary_dirichlet.snippet,
-                meta: 'snippet',
-                score: 1100,
-                docHTML: '<b>Snippet: Dirichlet Boundary</b><br>Creates type: dirichlet with value: 0.0'
-            });
-        }
-        if (snippets.boundary_neumann) {
-            completions.push({
-                caption: '[Snippet] Neumann (value=0)',
-                value: snippets.boundary_neumann.snippet,
-                meta: 'snippet',
-                score: 1100,
-                docHTML: '<b>Snippet: Neumann Boundary</b><br>Creates type: neumann with value: 0.0'
-            });
-        }
-        if (snippets.boundary_periodic) {
-            completions.push({
-                caption: '[Snippet] Periodic',
-                value: snippets.boundary_periodic.snippet,
-                meta: 'snippet',
-                score: 1100,
-                docHTML: '<b>Snippet: Periodic Boundary</b><br>Creates type: periodic with value: 0.0'
-            });
+        // Each boundary snippet has a "full" form (key position) and a "value-only" form (value position after "type:")
+        const boundarySnippets = [
+            { key: 'boundary_dirichlet',   caption: '[Snippet] Dirichlet',    valueOnly: 'dirichlet',
+              doc: '<b>Snippet: Dirichlet Boundary</b><br>type: dirichlet + value: 0.0' },
+            { key: 'boundary_neumann',     caption: '[Snippet] Neumann',      valueOnly: 'neumann',
+              doc: '<b>Snippet: Neumann Boundary</b><br>type: neumann + value: 0.0' },
+            { key: 'boundary_periodic',    caption: '[Snippet] Periodic',     valueOnly: 'periodic',
+              doc: '<b>Snippet: Periodic Boundary</b><br>type: periodic + value: 0.0' },
+            { key: 'boundary_antiperiodic',caption: '[Snippet] Anti-Periodic',valueOnly: 'periodic',
+              doc: '<b>Snippet: Anti-Periodic Boundary</b><br>type: periodic + value: -1.0' },
+            { key: 'boundary_robin',       caption: '[Snippet] Robin',        valueOnly: 'robin',
+              doc: '<b>Snippet: Robin Boundary</b><br>type: robin + alpha/beta/gamma' },
+        ];
+        for (const bs of boundarySnippets) {
+            if (!snippets[bs.key]) continue;
+            if (isValuePosition && lineKey === 'type') {
+                // User is typing the BC type value — suggest just the value word
+                completions.push({
+                    caption: bs.caption,
+                    value: bs.valueOnly,
+                    meta: 'value',
+                    score: 1100,
+                    docHTML: bs.doc
+                });
+            } else if (!isValuePosition) {
+                // User is at a key position — insert the full "type: ...\nvalue: ..." snippet
+                completions.push({
+                    caption: bs.caption,
+                    value: snippets[bs.key].snippet,
+                    meta: 'snippet',
+                    score: 1100,
+                    docHTML: bs.doc
+                });
+            }
         }
     }
 
@@ -319,6 +350,132 @@ function addContextSnippets(completions, parentContext, grandparentContext) {
                 meta: 'snippet',
                 score: 1100,
                 docHTML: '<b>Snippet: Transient Analysis</b><br>Creates full transient configuration'
+            });
+        }
+    }
+}
+
+// ---- Library editor completer ----
+// Creates a completer scoped to material library YAML files (material_presets structure).
+function createLibraryCompleter() {
+    return {
+        getCompletions: function(editor, session, pos, prefix, callback) {
+            if (!AppState.yamlSchema) { callback(null, []); return; }
+            const completions = [];
+            const keywords = AppState.yamlSchema.keywords;
+
+            // Value-position detection (same logic as main editor)
+            const lineBeforeCursor = session.getLine(pos.row).substring(0, pos.column);
+            const valuePositionMatch = lineBeforeCursor.match(/^\s*([\w-]+):\s+\S*$/);
+            const isValuePosition = !!valuePositionMatch;
+            const lineKey = valuePositionMatch ? valuePositionMatch[1] : null;
+
+            const contextPath = getContextPath(editor, session, pos);
+            const parentContext  = contextPath[contextPath.length - 1] || null;
+            const grandparentContext = contextPath[contextPath.length - 2] || null;
+
+            // Library YAML context rules:
+            //   top level                     → suggest material_presets
+            //   parent = material_presets      → user names presets freely (no key suggestions)
+            //   grandparent = material_presets → inside a preset → suggest preset properties
+            //   parent = magnetization         → inside magnetization block → suggest children
+            let availableKeywords = [];
+            if (!parentContext) {
+                availableKeywords = ['material_presets'];
+            } else if (grandparentContext === 'material_presets') {
+                const presetsInfo = keywords['material_presets'];
+                availableKeywords = presetsInfo && presetsInfo.childrenProperties
+                    ? presetsInfo.childrenProperties
+                    : ['mu_r', 'B-H', 'bh_type'];
+            } else if (parentContext === 'magnetization') {
+                const magInfo = keywords['magnetization'];
+                availableKeywords = magInfo && magInfo.children ? magInfo.children : [];
+            }
+            // parentContext === 'material_presets': user defines preset names → no key suggestions
+
+            for (const kw of availableKeywords) {
+                const info = keywords[kw];
+                if (!info) continue;
+
+                if (!isValuePosition) {
+                    completions.push({
+                        caption: kw,
+                        value: kw + ': ',
+                        meta: info.type || 'keyword',
+                        score: 1000,
+                        docHTML: `<b>${kw}</b><br>${info.description || ''}<br><code>${info.example || ''}</code>`
+                    });
+                }
+
+                if (info.values) {
+                    info.values.forEach(val => {
+                        if (isValuePosition && lineKey === kw) {
+                            completions.push({ caption: val, value: val, meta: 'value', score: 900,
+                                docHTML: `<b>${kw}: ${val}</b>` });
+                        } else if (!isValuePosition) {
+                            completions.push({ caption: `${kw}: ${val}`, value: `${kw}: ${val}`,
+                                meta: 'value', score: 900 });
+                        }
+                    });
+                }
+            }
+
+            addLibrarySnippets(completions, parentContext, grandparentContext, isValuePosition);
+            callback(null, completions);
+        }
+    };
+}
+
+// Snippets for the library editor (material preset templates, magnetization patterns)
+function addLibrarySnippets(completions, parentContext, grandparentContext, isValuePosition) {
+    if (!AppState.yamlSchema || !AppState.yamlSchema.snippets || isValuePosition) return;
+    const snippets = AppState.yamlSchema.snippets;
+
+    if (!parentContext) {
+        // Top level: offer a full library file template
+        if (snippets.lib_file_template) {
+            completions.push({
+                caption: '[Template] Material Library',
+                value: snippets.lib_file_template.snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: '<b>Material Library Template</b><br>Creates a starter library with soft and magnet presets'
+            });
+        }
+    } else if (grandparentContext === 'material_presets') {
+        // Inside a specific preset: show preset-type snippets
+        const presetSnippets = [
+            { key: 'lib_preset_mur_const',      doc: 'Constant relative permeability' },
+            { key: 'lib_preset_mur_formula',     doc: 'Variable μr as a formula of H (tinyexpr)' },
+            { key: 'lib_preset_soft_table',      doc: 'Nonlinear B-H curve (measured data table)' },
+            { key: 'lib_preset_soft_formula',    doc: 'Nonlinear B-H curve (continuous formula)' },
+            { key: 'lib_preset_magnet_parallel', doc: 'Permanent magnet with parallel magnetization + Br' },
+            { key: 'lib_preset_magnet_demag',    doc: 'Permanent magnet via B-H demagnetization curve' },
+        ];
+        for (const ps of presetSnippets) {
+            if (!snippets[ps.key]) continue;
+            completions.push({
+                caption: `[Preset] ${snippets[ps.key].name}`,
+                value: snippets[ps.key].snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: `<b>${snippets[ps.key].name}</b><br>${ps.doc}`
+            });
+        }
+    } else if (parentContext === 'magnetization') {
+        // Inside magnetization block
+        const magSnippets = [
+            'magnetization_parallel', 'magnetization_radial', 'magnetization_tangential',
+            'magnetization_halbach', 'magnetization_polar_anisotropy', 'magnetization_custom'
+        ];
+        for (const key of magSnippets) {
+            if (!snippets[key]) continue;
+            completions.push({
+                caption: `[Snippet] ${snippets[key].name}`,
+                value: snippets[key].snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: `<b>${snippets[key].name}</b>`
             });
         }
     }
@@ -7419,11 +7576,16 @@ async function openLibraryManager() {
         editor.setTheme('ace/theme/monokai');
         editor.session.setMode('ace/mode/yaml');
         editor.setOptions({
+            enableBasicAutocompletion: true,
+            enableLiveAutocompletion: true,
+            enableSnippets: false,
             fontSize: '13px',
             showPrintMargin: false,
             tabSize: 2,
             useSoftTabs: true
         });
+        ace.require('ace/ext/language_tools');
+        editor.completers = [createLibraryCompleter()];
         AppState.libraryAceEditor = editor;
     }
     await refreshLibraryList();
