@@ -7885,10 +7885,11 @@ function renderBHCurveForMaterial(name, props) {
         const treatAsSoft   = (bhType === 'soft');
 
         if (treatAsMagnet && !treatAsSoft) {
-            // Demagnetization formula: sample H ∈ [-1e5, -1] A/m, log-spaced in |H|
+            // Demagnetization formula: sample H ∈ [-5e6, -1] A/m, log-spaced in |H|
+            // Extended to 5 MA/m to cover strong demagnetizing fields
             const N = 200;
             const H_neg = Array.from({ length: N }, (_, i) =>
-                -Math.pow(10, i * 5 / (N - 1)));  // magnitude: 1 → 1e5
+                -Math.pow(10, i * Math.log10(5e6) / (N - 1)));  // magnitude: 1 → 5e6
             const pairs = H_neg.map(H => [H, evalB(H)]).filter(([, B]) => isFinite(B));
             if (isFinite(Br)) pairs.push([0, Br]);   // remanence point at H=0
             pairs.sort((a, b) => a[0] - b[0]);        // ascending H (most-negative first)
@@ -7980,8 +7981,10 @@ function renderBHCurveForMaterial(name, props) {
         const Br_val   = props.magnetization.Br;
         const mu_r_val = (typeof mur === 'number') ? mur : 1.05;  // default recoil μr for NdFeB
         const Hcb      = Br_val / (MU_0 * mu_r_val);
-        const N = 100;
-        H_arr   = Array.from({ length: N + 1 }, (_, i) => -Hcb + i * Hcb / N);  // -Hcb → 0
+        const H_max_demag = 5e6;  // extend to 5 MA/m to cover strong demagnetizing fields
+        const H_min = -Math.max(Hcb, H_max_demag);
+        const N = 200;
+        H_arr   = Array.from({ length: N + 1 }, (_, i) => H_min + i * (-H_min) / N);
         B_arr   = H_arr.map(H => Br_val + MU_0 * mu_r_val * H);
         mur_arr = null;
         isDemag = true;
@@ -8012,9 +8015,19 @@ function renderBHCurveForMaterial(name, props) {
     if (isDemag) {
         if (toolbar) toolbar.style.display = '';  // show log/linear checkbox
 
-        const useLogH   = logCb && logCb.checked;
-        const Br_demag  = B_arr[B_arr.length - 1];  // B at H closest to 0
-        const Hcb_demag = H_arr[0];                  // most negative H
+        const useLogH  = logCb && logCb.checked;
+        const Br_demag = B_arr[B_arr.length - 1];  // B at H=0 (remanence)
+
+        // Find Hcb: interpolate the H where B crosses zero.
+        // H_arr is sorted ascending (most-negative first); data may extend beyond Hcb.
+        let Hcb_demag = H_arr[0];  // fallback: leftmost H
+        for (let i = 0; i < B_arr.length - 1; i++) {
+            if (B_arr[i] <= 0 && B_arr[i + 1] > 0) {
+                const t = -B_arr[i] / (B_arr[i + 1] - B_arr[i]);
+                Hcb_demag = H_arr[i] + t * (H_arr[i + 1] - H_arr[i]);
+                break;
+            }
+        }
 
         let x_data, y_data, x_title, x_type;
         if (useLogH) {
@@ -8040,7 +8053,7 @@ function renderBHCurveForMaterial(name, props) {
               text: `Br ≈ ${Br_demag.toFixed(3)} T`,
               showarrow: true, arrowhead: 2, ax: -50, ay: -20,
               font: { color: '#e05252', size: 11 } },
-            { x: x_data[x_data.length - 1], y: y_data[y_data.length - 1],
+            { x: Math.abs(Hcb_demag), y: 0,
               xref: 'x', yref: 'y',
               text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
               showarrow: true, arrowhead: 2, ax: 30, ay: -25,
