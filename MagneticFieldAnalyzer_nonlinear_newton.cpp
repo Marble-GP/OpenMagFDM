@@ -576,35 +576,44 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Build matrix and compute residual at trial point
             double residual_trial_norm;
             if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-                // Defect correction: frozen-Jacobian line search using the FULL fine-grid matrix.
+                // Defect correction: TRUE nonlinear line search (update μ, rebuild A_FVM).
                 //
-                // Previous approach used the coarse frozen residual A_c*(Az_c + α*δ_c) - b_c,
-                // which is identically zero for α=1 (by construction of δ_c = A_c^{-1}*R_c),
-                // making the Armijo condition trivially satisfied and α always 1.
+                // The frozen-Jacobian approach evaluates A_matrix * Az_trial - b_vec
+                // where A_matrix uses the CURRENT (unfrozen) μ. Since delta_c is computed as
+                // A_c_galerkin^{-1} * R_FVM and A_c_galerkin ≈ A_FVM, the trial residual
+                // is approximately zero at α=1 — Armijo is trivially satisfied every iteration.
+                // After updating μ from Az_trial, the TRUE nonlinear residual can be much
+                // larger, causing period-2 oscillation (residual never converges).
                 //
-                // Fix: evaluate ||A_f * P * Az_trial - b_f|| with the CACHED full-grid matrix
-                // A_full_cached (no μ rebuild needed — O(nnz_full) per trial, frozen Jacobian).
-                // This detects overshoot and enables genuine backtracking.
+                // Fix: update B/H/μ from Az_trial, rebuild A_FVM with new μ, evaluate the
+                // TRUE nonlinear residual ||A_new(μ(Az_trial)) * Az_trial - b||. This matches
+                // the convention in the non-defect-correction path and prevents trivial acceptance.
+                // μ contamination from rejected trials doesn't matter because Step 1 of the next
+                // Newton iteration always recomputes μ from Az.
 
-                // Update Az matrix for inactive cell interpolation (needed for loop exit)
-                for (int idx = 0; idx < n_active_cells; idx++) {
-                    auto [ci, cj] = coarse_to_fine[idx];
-                    Az(cj, ci) = Az_trial(idx);
+                // Az is already updated to Az_trial_mat by lines above (active cells set,
+                // inactive cells interpolated). Now update μ from Az_trial.
+                Az = Az_trial_mat;
+                {
+                    Eigen::VectorXd Bx_active, By_active, H_active;
+                    calculateBFieldAtActiveCells(Az_trial, Bx_active, By_active);
+                    calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
+                    updateMuAtActiveCells(H_active);
+                    interpolateMuToFullGrid();
                 }
-                if (is_polar) {
-                    interpolateInactiveCellsPolar(Az_trial);
-                } else {
-                    interpolateInactiveCells(Az_trial);
+                // Rebuild coarsened FVM matrix with new μ and evaluate residual
+                {
+                    Eigen::SparseMatrix<double> A_nl_trial;
+                    Eigen::VectorXd b_nl_trial;
+                    if (is_polar) {
+                        buildMatrixPolarCoarsened(A_nl_trial, b_nl_trial);
+                    } else {
+                        buildMatrixCoarsened(A_nl_trial, b_nl_trial);
+                    }
+                    residual_trial_norm = (A_nl_trial * Az_trial - b_nl_trial).norm();
                 }
-                Az_trial_mat = Az;
-
-                // FVM coarsened residual at trial point (frozen A_FVM, n_active × 1).
-                // Consistent with dc_R_fine_norm = residual_coarse_norm above.
-                // ~7× cheaper than A_full * P * Az_trial (335k vs 2.25M flops)
-                // and avoids inactive-cell interpolation errors that caused
-                // ||A_full * P * Az_trial − b_full|| to be permanently large.
-                Eigen::VectorXd residual_trial_coarse = A_matrix * Az_trial - b_vec;
-                residual_trial_norm = residual_trial_coarse.norm();
+                // Invalidate full-matrix cache (μ has changed)
+                full_matrix_cache_valid = false;
             } else {
                 // Non-defect-correction paths: update B/H/μ and rebuild matrix per trial
                 Az = Az_trial_mat;
