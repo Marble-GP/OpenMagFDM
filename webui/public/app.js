@@ -7971,14 +7971,9 @@ function renderBHCurveForMaterial(name, props) {
             B_arr   = H_arr.map((H, i) => MU_0 * mur_arr[i] * H);
         }
 
-    // --- Case 4: mu_r: constant ---
-    } else if (typeof mur === 'number') {
-        H_arr   = [1, 1e5];
-        mur_arr = [mur, mur];
-        B_arr   = H_arr.map(H => MU_0 * mur * H);
-        isDashed = true;
-
-    // --- Case 5: magnetization.Br: constant (linear permanent magnet, no explicit B-H) ---
+    // --- Case 4: magnetization.Br: constant (linear permanent magnet, no explicit B-H) ---
+    // Must come before the "constant mu_r" case: NdFeB presets have both mu_r:1.05
+    // and magnetization.Br, so magnet detection must take priority.
     // Models the linear second-quadrant demagnetization line: B = Br + μ₀·μr·H
     // Hcb = Br / (μ₀·μr)   (coercive field where B = 0)
     } else if (props && props.magnetization && typeof props.magnetization.Br === 'number') {
@@ -7991,6 +7986,13 @@ function renderBHCurveForMaterial(name, props) {
         mur_arr = null;
         isDemag = true;
         isDashed = true;  // straight line → dashed style
+
+    // --- Case 5: mu_r: constant (non-magnet soft material) ---
+    } else if (typeof mur === 'number') {
+        H_arr   = [1, 1e5];
+        mur_arr = [mur, mur];
+        B_arr   = H_arr.map(H => MU_0 * mur * H);
+        isDashed = true;
     }
 
     if (!H_arr || !B_arr) {
