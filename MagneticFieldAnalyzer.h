@@ -377,6 +377,10 @@ private:
         int precond_update_frequency;     // How often to update preconditioner: 1=every Newton iter (default: 1)
         bool precond_verbose;             // Print preconditioner statistics (default: false)
 
+        // Fine finishing: full-grid Picard iterations after coarse convergence
+        int fine_finishing_iterations;    // Number of full-grid Picard steps after coarse solve (default: 0 = disabled)
+        double fine_finishing_tolerance;  // Convergence tolerance for fine finishing (default: -1 = use tolerance)
+
         NonlinearSolverConfig() :
             enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
             relaxation(0.7), anderson(), gmres_restart(30), line_search_c(1e-4),
@@ -384,7 +388,8 @@ private:
             line_search_max_trials(50), line_search_adaptive(true),
             verbose(false), export_convergence(false), use_galerkin_coarsening(false),
             use_matrix_free_jv(true),
-            use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false) {}
+            use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false),
+            fine_finishing_iterations(0), fine_finishing_tolerance(-1.0) {}
     };
 
     // Maxwell stress and force calculation

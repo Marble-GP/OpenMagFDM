@@ -282,9 +282,109 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 } else {
                     interpolateToFullGrid(Az_vec);
                 }
-                smoothInactiveCells(coarsen_smooth_iterations);
-                // Harmonically interpolate μ at inactive cells (IDW, series circuit model)
-                interpolateMuToFullGrid();
+
+                if (nonlinear_config.fine_finishing_iterations > 0) {
+                    // Fine finishing: replace smoothing with full-grid Picard steps.
+                    // The coarse solution provides a good initial guess; a few full-grid
+                    // iterations correct boundary-layer errors invisible to the coarse mesh.
+                    const double fine_tol = (nonlinear_config.fine_finishing_tolerance > 0.0)
+                        ? nonlinear_config.fine_finishing_tolerance
+                        : TOL;
+                    std::cout << "Fine finishing: up to " << nonlinear_config.fine_finishing_iterations
+                              << " full-grid Picard iter(s), tol=" << fine_tol << std::endl;
+
+                    for (int fi = 0; fi < nonlinear_config.fine_finishing_iterations; fi++) {
+                        // Step 1: Update μ from full-grid Az
+                        if (is_polar) {
+                            calculateMagneticFieldPolar();
+                        } else {
+                            calculateMagneticField();
+                        }
+                        calculateHField();
+                        updateMuDistribution();
+
+                        // Step 2: Build full-grid matrix
+                        Eigen::SparseMatrix<double> A_fine;
+                        Eigen::VectorXd b_fine;
+                        if (is_polar) {
+                            buildMatrixPolar(A_fine, b_fine);
+                        } else {
+                            buildMatrix(A_fine, b_fine);
+                        }
+
+                        // Step 3: Extract Az to vector and compute nonlinear residual
+                        int n_fine = is_polar ? (nr * ntheta) : (ny * nx);
+                        Eigen::VectorXd Az_fine_vec(n_fine);
+                        if (is_polar) {
+                            for (int i = 0; i < nr; i++) {
+                                for (int j = 0; j < ntheta; j++) {
+                                    double val = (r_orientation == "horizontal") ? Az(j, i) : Az(i, j);
+                                    Az_fine_vec(i * ntheta + j) = val;
+                                }
+                            }
+                        } else {
+                            for (int j = 0; j < ny; j++)
+                                for (int i = 0; i < nx; i++)
+                                    Az_fine_vec(j * nx + i) = Az(j, i);
+                        }
+
+                        double R_fine_norm = (A_fine * Az_fine_vec - b_fine).norm();
+                        double b_fine_norm = b_fine.norm();
+                        double fine_rel = R_fine_norm / (b_fine_norm + 1e-12);
+
+                        std::cout << "  Fine iter " << fi + 1 << "/" << nonlinear_config.fine_finishing_iterations
+                                  << ": ||R_fine||_rel = " << std::scientific << std::setprecision(2) << fine_rel;
+
+                        if (fine_rel < fine_tol) {
+                            std::cout << " [converged]" << std::endl;
+                            break;
+                        }
+                        std::cout << std::endl;
+
+                        // Step 4: Picard solve on full grid
+                        Eigen::SparseLU<Eigen::SparseMatrix<double>> fine_lu;
+                        fine_lu.compute(A_fine);
+                        if (fine_lu.info() != Eigen::Success) {
+                            std::cerr << "  [Fine LU failed, stopping fine finishing]" << std::endl;
+                            break;
+                        }
+                        Eigen::VectorXd Az_new_vec = fine_lu.solve(b_fine);
+                        if (fine_lu.info() != Eigen::Success) {
+                            std::cerr << "  [Fine solve failed, stopping fine finishing]" << std::endl;
+                            break;
+                        }
+
+                        // Step 5: Update Az matrix
+                        if (is_polar) {
+                            for (int i = 0; i < nr; i++) {
+                                for (int j = 0; j < ntheta; j++) {
+                                    if (r_orientation == "horizontal") {
+                                        Az(j, i) = Az_new_vec(i * ntheta + j);
+                                    } else {
+                                        Az(i, j) = Az_new_vec(i * ntheta + j);
+                                    }
+                                }
+                            }
+                        } else {
+                            for (int j = 0; j < ny; j++)
+                                for (int i = 0; i < nx; i++)
+                                    Az(j, i) = Az_new_vec(j * nx + i);
+                        }
+                    }
+
+                    // Final μ update so exported fields are consistent with the finished Az
+                    if (is_polar) {
+                        calculateMagneticFieldPolar();
+                    } else {
+                        calculateMagneticField();
+                    }
+                    calculateHField();
+                    updateMuDistribution();
+                } else {
+                    smoothInactiveCells(coarsen_smooth_iterations);
+                    // Harmonically interpolate μ at inactive cells (IDW, series circuit model)
+                    interpolateMuToFullGrid();
+                }
             }
 
             if (nonlinear_config.export_convergence) {

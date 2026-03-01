@@ -98,6 +98,10 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.use_phase6_precond_jfnk = nl_config["use_phase6_precond_jfnk"].as<bool>(true);
         nonlinear_config.precond_update_frequency = nl_config["precond_update_frequency"].as<int>(1);
         nonlinear_config.precond_verbose = nl_config["precond_verbose"].as<bool>(false);
+
+        // Fine finishing: full-grid Picard after coarse convergence
+        nonlinear_config.fine_finishing_iterations = nl_config["fine_finishing_iterations"].as<int>(0);
+        nonlinear_config.fine_finishing_tolerance = nl_config["fine_finishing_tolerance"].as<double>(-1.0);
     }
 
     // Parse global coarsening settings
