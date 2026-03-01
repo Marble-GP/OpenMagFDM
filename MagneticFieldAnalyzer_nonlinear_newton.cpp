@@ -547,13 +547,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
             const int m_phase6 = std::max(3, m_AA);
 
-            // Adaptive damping ω: starts at 0.5, halves on consecutive residual increases.
-            // Stored as static-like state via residual_history (already tracked).
-            // Detect consecutive increases from residual_history.
+            // Adaptive damping ω: applied to BOTH Picard and Anderson steps.
+            // Starts at 0.5, halves on 2+ consecutive residual increases,
+            // recovers (×1.5) on 3+ consecutive decreases.
             static double p6_omega = 0.5;
             if (iter == 0) p6_omega = 0.5;  // Reset at start of solve
 
             int n_consec_increase = 0;
+            int n_consec_decrease = 0;
             if (residual_history.size() >= 2) {
                 for (int rh = static_cast<int>(residual_history.size()) - 1; rh >= 1; rh--) {
                     if (residual_history[rh] >= residual_history[rh - 1] * 0.999) {
@@ -562,9 +563,18 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                         break;
                     }
                 }
+                if (n_consec_increase == 0) {
+                    for (int rh = static_cast<int>(residual_history.size()) - 1; rh >= 1; rh--) {
+                        if (residual_history[rh] < residual_history[rh - 1] * 0.999) {
+                            n_consec_decrease++;
+                        } else {
+                            break;
+                        }
+                    }
+                }
             }
 
-            // REACTIVE restart: 2+ consecutive increases → halve ω and clear history
+            // REACTIVE: 2+ consecutive increases → halve ω and clear history
             if (n_consec_increase >= 2) {
                 double old_omega = p6_omega;
                 p6_omega = std::max(0.05, p6_omega * 0.5);
@@ -575,6 +585,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 if (VERBOSE && old_omega != p6_omega) {
                     std::cout << " [P6: " << n_consec_increase
                               << " consec R↑ → ω=" << p6_omega << ", restart]";
+                }
+            }
+            // RECOVERY: 3+ consecutive decreases → increase ω (max 0.5)
+            else if (n_consec_decrease >= 3 && p6_omega < 0.5) {
+                double old_omega = p6_omega;
+                p6_omega = std::min(0.5, p6_omega * 1.5);
+                if (VERBOSE && old_omega != p6_omega) {
+                    std::cout << " [P6: " << n_consec_decrease
+                              << " consec R↓ → ω=" << p6_omega << "]";
                 }
             }
 
@@ -611,16 +630,22 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     const double beta_p6 = (beta_AA > 0.0 && beta_AA <= 1.0) ? beta_AA : 1.0;
                     Az_next = beta_p6 * G_anderson + (1.0 - beta_p6) * G_k;
 
-                    // Safety: cap Anderson step at 3× Picard step
+                    // Safety: cap Anderson step at 2× Picard step (before ω damping)
                     double picard_norm  = delta_A.norm();
-                    double anderson_norm = (Az_next - Az_vec_0).norm();
-                    if (picard_norm > 1e-30 && anderson_norm > 3.0 * picard_norm) {
-                        Az_next = Az_vec_0 + p6_omega * delta_A;  // Fall back to damped Picard
-                        if (VERBOSE) std::cout << " [P6: Anderson→Picard(safety) ω=" << p6_omega << "]";
-                    } else if (VERBOSE) {
-                        std::cout << " [P6: Anderson m=" << m_k
-                                  << " step=" << std::scientific << std::setprecision(2)
-                                  << anderson_norm << "]";
+                    Eigen::VectorXd anderson_full_step = Az_next - Az_vec_0;
+                    double anderson_norm = anderson_full_step.norm();
+                    if (picard_norm > 1e-30 && anderson_norm > 2.0 * picard_norm) {
+                        // Anderson step too large → fall back to damped Picard
+                        Az_next = Az_vec_0 + p6_omega * delta_A;
+                        if (VERBOSE) std::cout << " [P6: Anderson→Picard(cap) ω=" << p6_omega << "]";
+                    } else {
+                        // Apply ω damping to Anderson step (critical: prevents overshoot)
+                        Az_next = Az_vec_0 + p6_omega * anderson_full_step;
+                        if (VERBOSE) {
+                            std::cout << " [P6: Anderson m=" << m_k
+                                      << " step=" << std::scientific << std::setprecision(2)
+                                      << (p6_omega * anderson_norm) << " (ω=" << p6_omega << ")]";
+                        }
                     }
                 }
             }
