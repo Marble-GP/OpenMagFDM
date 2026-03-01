@@ -7749,13 +7749,16 @@ async function loadBHMaterialList() {
             const props = presets[name];
             const mur   = props && props.mu_r;
             const bh    = props && props['B-H'];
-            // Classify: B-H array / mu_r array / formula / constant
+            const mag   = props && props.magnetization;
+            // Classify: B-H array / mu_r array / formula / constant / magnet (Br)
             const isBH      = (Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]))
                            || (typeof bh === 'string' && bh.trim() !== '');
             const isArray   = !isBH && Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]);
-            const isFormula = !isBH && typeof mur === 'string' && mur.trim() !== '';
-            const isConst   = !isBH && typeof mur === 'number';
-            const hasPlot   = isBH || isArray || isFormula || isConst;
+            const isFormula = !isBH && !isArray && typeof mur === 'string' && mur.trim() !== '';
+            // isMagnet: has constant Br (no explicit B-H), treated as linear demagnetization curve
+            const isMagnet  = !isBH && mag && typeof mag.Br === 'number';
+            const isConst   = !isBH && !isMagnet && typeof mur === 'number';
+            const hasPlot   = isBH || isArray || isFormula || isConst || isMagnet;
 
             const item = document.createElement('div');
             item.className  = 'lib-file-item';
@@ -7765,6 +7768,7 @@ async function loadBHMaterialList() {
             item.title = isBH      ? 'B-H curve [[H],[B]]'
                        : isArray   ? 'Array μr(H)'
                        : isFormula ? 'Formula μr($H)'
+                       : isMagnet  ? `Permanent magnet  Br = ${mag.Br} T`
                        : isConst   ? `Constant μr = ${mur}`
                        :             'No B-H / μr data';
 
@@ -7774,11 +7778,13 @@ async function loadBHMaterialList() {
                                 + (isBH      ? 'background:#fff3cd; color:#856404;'
                                   : isArray   ? 'background:#d4edda; color:#155724;'
                                   : isFormula ? 'background:#cce5ff; color:#004085;'
+                                  : isMagnet  ? 'background:#fce4ec; color:#880e4f;'
                                   : isConst   ? 'background:#f8d7da; color:#721c24;'
                                   :             'background:#f0f0f0; color:#888;');
             badge.textContent = isBH      ? 'B-H'
                               : isArray   ? 'arr'
                               : isFormula ? 'fn'
+                              : isMagnet  ? 'Br'
                               : isConst   ? 'const'
                               :             '—';
             item.appendChild(badge);
@@ -7801,10 +7807,12 @@ async function loadBHMaterialList() {
             const p   = presets[name];
             const bh  = p && p['B-H'];
             const mur = p && p.mu_r;
+            const mg  = p && p.magnetization;
             if ((Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]))
                 || (typeof bh === 'string' && bh.trim() !== '')
                 || (Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]))
-                || typeof mur === 'string' || typeof mur === 'number') {
+                || typeof mur === 'string' || typeof mur === 'number'
+                || (mg && typeof mg.Br === 'number')) {
                 return { name, props: p };
             }
             return null;
@@ -7969,6 +7977,20 @@ function renderBHCurveForMaterial(name, props) {
         mur_arr = [mur, mur];
         B_arr   = H_arr.map(H => MU_0 * mur * H);
         isDashed = true;
+
+    // --- Case 5: magnetization.Br: constant (linear permanent magnet, no explicit B-H) ---
+    // Models the linear second-quadrant demagnetization line: B = Br + μ₀·μr·H
+    // Hcb = Br / (μ₀·μr)   (coercive field where B = 0)
+    } else if (props && props.magnetization && typeof props.magnetization.Br === 'number') {
+        const Br_val   = props.magnetization.Br;
+        const mu_r_val = (typeof mur === 'number') ? mur : 1.05;  // default recoil μr for NdFeB
+        const Hcb      = Br_val / (MU_0 * mu_r_val);
+        const N = 100;
+        H_arr   = Array.from({ length: N + 1 }, (_, i) => -Hcb + i * Hcb / N);  // -Hcb → 0
+        B_arr   = H_arr.map(H => Br_val + MU_0 * mu_r_val * H);
+        mur_arr = null;
+        isDemag = true;
+        isDashed = true;  // straight line → dashed style
     }
 
     if (!H_arr || !B_arr) {
@@ -8032,10 +8054,10 @@ function renderBHCurveForMaterial(name, props) {
 
         Plotly.newPlot(container, [{
             x: x_data, y: y_data,
-            mode: 'lines+markers',
+            mode: isDashed ? 'lines' : 'lines+markers',
             name: 'B [T]',
-            line:   { width: 2, color: '#e05252' },
-            marker: { size: 4, color: '#e05252' },
+            line:   { width: 2, color: '#e05252', ...(isDashed ? { dash: 'dash' } : {}) },
+            ...(isDashed ? {} : { marker: { size: 4, color: '#e05252' } }),
             hovertemplate: `${useLogH ? '|H|' : 'H'}=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>`
         }], {
             title:  { text: `<b>${name}</b>`, font: { size: 14 } },
