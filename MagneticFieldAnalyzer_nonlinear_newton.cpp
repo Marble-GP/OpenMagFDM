@@ -324,14 +324,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // This ensures P^T * R_fine = P^T * A_f * P * Az_c - P^T * b_f = A_c * Az_c - b_c
             // i.e., R_c_defect == residual_coarse, so the Newton direction is consistent
             // with the Armijo condition in the frozen-Jacobian line search.
-            buildProlongationMatrix();  // Ensure P and R are built
-            Eigen::VectorXd Az_full_vec = P_prolongation * Az_vec;
+            buildProlongationMatrix();  // Ensure P and R are built (also syncs CSR copies)
+            Eigen::VectorXd Az_full_vec = parallelSpMV(P_prolongation_csr, Az_vec);
 
-            Eigen::VectorXd R_fine = A_full_cached * Az_full_vec - rhs_full_cached;
+            Eigen::VectorXd R_fine = parallelSpMV(A_full_cached_csr, Az_full_vec) - rhs_full_cached;
             dc_R_fine_norm = R_fine.norm();  // Save for line search (see Step 6)
 
             // Step 2: Restrict to coarse space: R_c = P^T * R_fine = A_c * Az_c - b_c
-            Eigen::VectorXd R_coarse_defect = R_restriction * R_fine;
+            Eigen::VectorXd R_coarse_defect = parallelSpMV(R_restriction_csr, R_fine);
 
             // Step 3: Direct coarse solve: A_c * δx_c = -R_c
             delta_A = applyPreconditioner(-R_coarse_defect);
@@ -589,9 +589,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
                 Az_trial_mat = Az;
 
-                // Full-grid trial residual with frozen A_f — O(nnz_full), no rebuild
-                Eigen::VectorXd Az_full_trial = P_prolongation * Az_trial;
-                Eigen::VectorXd residual_full_trial = A_full_cached * Az_full_trial - rhs_full_cached;
+                // Full-grid trial residual with frozen A_f — O(nnz_full), no rebuild  (parallel SpMV)
+                Eigen::VectorXd Az_full_trial = parallelSpMV(P_prolongation_csr, Az_trial);
+                Eigen::VectorXd residual_full_trial = parallelSpMV(A_full_cached_csr, Az_full_trial) - rhs_full_cached;
                 residual_trial_norm = residual_full_trial.norm();
             } else {
                 // Non-defect-correction paths: update B/H/μ and rebuild matrix per trial

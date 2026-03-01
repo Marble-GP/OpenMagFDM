@@ -4007,6 +4007,31 @@ void MagneticFieldAnalyzer::updateFullMatrixCache() {
         buildMatrixPolar(A_full_cached, rhs_full_cached);
     }
     full_matrix_cache_valid = true;
+
+    // Sync CSR (row-major) copy for OpenMP-parallel SpMV.
+    // Eigen automatically converts CSC → CSR on assignment.
+    A_full_cached_csr = A_full_cached;
+}
+
+// ============================================================================
+// OpenMP-parallel SpMV: y = A * x  (A must be CSR / row-major)
+// ============================================================================
+Eigen::VectorXd MagneticFieldAnalyzer::parallelSpMV(
+    const Eigen::SparseMatrix<double, Eigen::RowMajor>& A,
+    const Eigen::VectorXd& x) const
+{
+    const int nrows = static_cast<int>(A.rows());
+    Eigen::VectorXd y(nrows);
+
+#pragma omp parallel for schedule(static)
+    for (int row = 0; row < nrows; ++row) {
+        double val = 0.0;
+        for (Eigen::SparseMatrix<double, Eigen::RowMajor>::InnerIterator it(A, row); it; ++it) {
+            val += it.value() * x[it.col()];
+        }
+        y[row] = val;
+    }
+    return y;
 }
 
 double MagneticFieldAnalyzer::computeFullGridResidual(double& out_b_norm) {
@@ -4045,8 +4070,8 @@ double MagneticFieldAnalyzer::computeFullGridResidual(double& out_b_norm) {
         }
     }
 
-    // Compute residual: r = A_f * Az_f - b_f
-    Eigen::VectorXd residual = A_full_cached * Az_full - rhs_full_cached;
+    // Compute residual: r = A_f * Az_f - b_f  (parallel SpMV)
+    Eigen::VectorXd residual = parallelSpMV(A_full_cached_csr, Az_full) - rhs_full_cached;
 
     out_b_norm = rhs_full_cached.norm();
     return residual.norm();
@@ -4405,6 +4430,11 @@ void MagneticFieldAnalyzer::buildProlongationMatrix() {
     // R = P^T (Galerkin restriction for symmetric A)
     R_restriction = P_prolongation.transpose();
 
+    // Sync CSR copies for OpenMP-parallel SpMV.
+    // Built once per coarsening geometry change.
+    P_prolongation_csr = P_prolongation;
+    R_restriction_csr  = R_restriction;
+
     multigrid_operators_built = true;
 
     std::cout << "Prolongation matrix built: " << n_full << " x " << n_active_cells
@@ -4736,10 +4766,10 @@ Eigen::VectorXd MagneticFieldAnalyzer::matrixFreeJv(
     double eps = std::sqrt(std::numeric_limits<double>::epsilon()) *
                  (1.0 + x_norm) / (v_norm + 1e-12);
 
-    // Prolongate x_c and (x_c + eps*v_c) to full grid
+    // Prolongate x_c and (x_c + eps*v_c) to full grid  (parallel SpMV)
     Eigen::VectorXd x_c_plus = x_c + eps * v_c;
-    Eigen::VectorXd Az_full = P_prolongation * x_c;
-    Eigen::VectorXd Az_full_eps = P_prolongation * x_c_plus;
+    Eigen::VectorXd Az_full     = parallelSpMV(P_prolongation_csr, x_c);
+    Eigen::VectorXd Az_full_eps = parallelSpMV(P_prolongation_csr, x_c_plus);
 
     // Compute B/H/μ for both states
     Eigen::MatrixXd mu_full, Bx_full, By_full, H_full;
@@ -4755,8 +4785,8 @@ Eigen::VectorXd MagneticFieldAnalyzer::matrixFreeJv(
     // Finite difference approximation of Jacobian action
     Eigen::VectorXd Jv_full = (F_full_eps - F_full) / eps;
 
-    // Restrict to coarse grid: J_c * v = R * (J_full * P * v) ≈ R * Jv_full
-    return R_restriction * Jv_full;
+    // Restrict to coarse grid: J_c * v = R * (J_full * P * v) ≈ R * Jv_full  (parallel SpMV)
+    return parallelSpMV(R_restriction_csr, Jv_full);
 }
 
 /**

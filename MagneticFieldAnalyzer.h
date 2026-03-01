@@ -556,6 +556,14 @@ private:
     Eigen::SparseMatrix<double> R_restriction;    // n_active x n_full (fine -> coarse, = P^T)
     bool multigrid_operators_built = false;       // Operators built flag
 
+    // CSR (row-major) copies for OpenMP-parallel SpMV (see parallelSpMV)
+    // Eigen's default CSC format does not support row-parallel matvec.
+    // These are kept in sync with their CSC counterparts and used in the
+    // hot path (defect correction residual + line search, ~5 SpMV/Newton iter).
+    Eigen::SparseMatrix<double, Eigen::RowMajor> A_full_cached_csr;
+    Eigen::SparseMatrix<double, Eigen::RowMajor> P_prolongation_csr;
+    Eigen::SparseMatrix<double, Eigen::RowMajor> R_restriction_csr;
+
     // Phase 7: Hermite interpolation gradients at active cells
     Eigen::MatrixXd dAz_dx_active;  // ∂Az/∂x at active cells (full grid size, zeros at inactive)
     Eigen::MatrixXd dAz_dy_active;  // ∂Az/∂y at active cells
@@ -705,6 +713,13 @@ private:
     // Phase 4: Full-grid residual evaluation for coarsened Newton-Krylov convergence
     void updateFullMatrixCache();  // Rebuild A_full_cached and rhs_full_cached
     double computeFullGridResidual(double& out_b_norm);  // Compute ||A_f * Az - b_f|| on full grid
+
+    // OpenMP-parallel sparse matrix-vector product y = A * x.
+    // Requires a row-major (CSR) matrix; iterates rows in parallel.
+    // Used in the defect-correction hot path and line search.
+    Eigen::VectorXd parallelSpMV(
+        const Eigen::SparseMatrix<double, Eigen::RowMajor>& A,
+        const Eigen::VectorXd& x) const;
 
     // Phase 4: Prolongation/Restriction operators for Galerkin projection
     void buildProlongationMatrix();  // Build P_prolongation (n_full x n_active) and R_restriction (P^T)
