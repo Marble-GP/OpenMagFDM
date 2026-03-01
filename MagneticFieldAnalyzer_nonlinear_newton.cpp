@@ -300,6 +300,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         Eigen::VectorXd delta_A;
 
+        // Full-grid frozen-Jacobian residual norm, set by defect correction for use in line search.
+        // Negative sentinel = not in defect correction mode (use coarse norm instead).
+        double dc_R_fine_norm = -1.0;
+
         // ===== Step 5: Compute Newton step δA =====
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
             // Phase 6: Nonlinear Defect Correction
@@ -324,6 +328,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             Eigen::VectorXd Az_full_vec = P_prolongation * Az_vec;
 
             Eigen::VectorXd R_fine = A_full_cached * Az_full_vec - rhs_full_cached;
+            dc_R_fine_norm = R_fine.norm();  // Save for line search (see Step 6)
 
             // Step 2: Restrict to coarse space: R_c = P^T * R_fine = A_c * Az_c - b_c
             Eigen::VectorXd R_coarse_defect = R_restriction * R_fine;
@@ -498,7 +503,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         const double alpha_min = nonlinear_config.line_search_alpha_min;
         const int max_line_search = nonlinear_config.line_search_max_trials;
 
-        double residual_0 = residual_norm;
+        // In defect correction mode, the frozen-coarse trial residual A_c*(Az_c + δ_c) - b_c
+        // is identically zero by construction (δ_c = A_c^{-1} * R_c), so the Armijo condition
+        // is trivially satisfied and α=1 is always accepted regardless of overshoot.
+        // Instead, use the full-grid frozen-Jacobian residual ||A_f * P * Az_trial - b_f||
+        // which is NOT zero and correctly detects divergence.
+        double residual_0 = (dc_R_fine_norm >= 0.0) ? dc_R_fine_norm : residual_norm;
         Eigen::VectorXd Az_vec_0 = Az_vec;
 
         for (int ls = 0; ls < max_line_search; ls++) {
@@ -557,10 +567,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Build matrix and compute residual at trial point
             double residual_trial_norm;
             if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-                // Defect correction: frozen-Jacobian line search.
-                // Use the FIXED A_matrix/b_vec from iteration start (standard Newton method).
-                // μ update happens at the top of next iteration (Step 1).
-                // This avoids expensive full-grid matrix rebuild + Galerkin projection per trial.
+                // Defect correction: frozen-Jacobian line search using the FULL fine-grid matrix.
+                //
+                // Previous approach used the coarse frozen residual A_c*(Az_c + α*δ_c) - b_c,
+                // which is identically zero for α=1 (by construction of δ_c = A_c^{-1}*R_c),
+                // making the Armijo condition trivially satisfied and α always 1.
+                //
+                // Fix: evaluate ||A_f * P * Az_trial - b_f|| with the CACHED full-grid matrix
+                // A_full_cached (no μ rebuild needed — O(nnz_full) per trial, frozen Jacobian).
+                // This detects overshoot and enables genuine backtracking.
 
                 // Update Az matrix for inactive cell interpolation (needed for loop exit)
                 for (int idx = 0; idx < n_active_cells; idx++) {
@@ -574,9 +589,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
                 Az_trial_mat = Az;
 
-                // Evaluate coarse residual with frozen matrix — O(nnz_coarse) only
-                Eigen::VectorXd residual_trial = A_matrix * Az_trial - b_vec;
-                residual_trial_norm = residual_trial.norm();
+                // Full-grid trial residual with frozen A_f — O(nnz_full), no rebuild
+                Eigen::VectorXd Az_full_trial = P_prolongation * Az_trial;
+                Eigen::VectorXd residual_full_trial = A_full_cached * Az_full_trial - rhs_full_cached;
+                residual_trial_norm = residual_full_trial.norm();
             } else {
                 // Non-defect-correction paths: update B/H/μ and rebuild matrix per trial
                 Az = Az_trial_mat;
