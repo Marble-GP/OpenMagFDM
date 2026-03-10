@@ -1,0 +1,81 @@
+# Newton-Picard Phase 6 test: Cartesian coordinates + Si_steel (nonlinear) + coarsening
+coordinate_system: cartesian
+
+mesh:
+  dx: 0.2e-3
+  dy: 0.2e-3
+
+boundary_conditions:
+  left:
+    type: periodic
+    value: 0.0
+  right:
+    type: periodic
+    value: 0.0
+  bottom:
+    type: dirichlet
+    value: 0.0
+  top:
+    type: dirichlet
+    value: 0.0
+
+materials:
+  air:
+    rgb: [255, 255, 255]
+    mu_r: 1.0
+    jz: 0.0
+    anti_aliasing: true
+
+  iron_stator:
+    rgb: [128, 128, 128]
+    preset: 35H300
+    jz: 0.0
+    anti_aliasing: true
+    coarsen: true
+    coarsen_ratio: 4
+
+  iron_rotor:
+    rgb: [100, 100, 100]
+    preset: 35H300
+    jz: 0.0
+    coarsen: true
+    coarsen_ratio: 4
+
+  rotor_field_positive:
+    rgb: [255, 255, 0]
+    mu_r: 1.0
+    jz: 2.0e9
+
+  rotor_field_positive1:
+    rgb: [255, 253, 0]
+    mu_r: 1.0
+    jz: 2.0e9
+
+  rotor_field_negative:
+    rgb: [128, 128, 0]
+    mu_r: 1.0
+    jz: -2.0e9
+
+  rotor_field_negative2:
+    rgb: [100, 100, 0]
+    mu_r: 1.0
+    jz: -2.0e9
+
+material_presets:
+  35H300:
+    mu_r: [[0, 10, 30, 50, 100, 200, 300, 400, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 30000, 50000, 100000],
+           [1591.55, 1591.55, 2122.07, 5570.42, 7480.28, 4973.59, 3554.46, 2745.42, 2244.08, 1177.75, 612.747, 421.761, 324.278, 264.197, 224.143, 195.533, 174.076, 157.387, 143.239, 52.5211, 31.831, 16.1542]]
+
+transient:
+  enabled: false
+
+nonlinear_solver:
+  verbose: true
+  max_iterations: 30
+  fine_finishing_iterations: 5
+  use_galerkin_coarsening: true
+  use_phase6_precond_jfnk: true
+
+coarsening:
+  boundary_shell: 1
+  smooth_iterations: 0

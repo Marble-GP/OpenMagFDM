@@ -108,6 +108,15 @@ materials:
     # jz: 1e6*cos(2*pi*$step/10)  # 数式表記（$step: ステップ番号）
     # jz: [0, 0.5e6, 1e6, 0.5e6, 0, -0.5e6, -1e6, -0.5e6, 0, 0]  # 配列表記
 
+# 適応粗大化設定（materials に coarsen: true を指定した場合のグローバルパラメータ）
+# 材料側で coarsen: true / coarsen_ratio: N を設定すると粗大化が有効になります。
+# coarsening セクションを省略した場合はすべてデフォルト値が使われます。
+# coarsening:
+#   boundary_shell: 1    # 材料境界を保護するための膨張半径 [pixels] (default: 1, 0=保護なし)
+#                        # 大きいほど境界付近のセルが多く残り精度向上 / 活性セル数増加
+#   smooth_iterations: 0 # 補間後のν重みGauss-Seidel平滑化回数 (default: 0 = 平滑化なし)
+#                        # 非線形材料でのファイン仕上げNewton使用時は 0 を推奨
+
 # 過渡解析設定（静的解析の場合は省略可）
 # enabled: true にすると、画像領域を循環シフトしながら解析を実行します
 transient:
