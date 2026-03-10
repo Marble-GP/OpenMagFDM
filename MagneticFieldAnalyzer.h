@@ -377,8 +377,8 @@ private:
         int precond_update_frequency;     // How often to update preconditioner: 1=every Newton iter (default: 1)
         bool precond_verbose;             // Print preconditioner statistics (default: false)
 
-        // Fine finishing: full-grid Picard iterations after coarse convergence
-        int fine_finishing_iterations;    // Number of full-grid Picard steps after coarse solve (default: 0 = disabled)
+        // Fine finishing: full-grid Newton iterations after coarse convergence
+        int fine_finishing_iterations;    // Number of full-grid Newton steps after coarse solve (default: 0 = disabled)
         double fine_finishing_tolerance;  // Convergence tolerance for fine finishing (default: -1 = use tolerance)
 
         NonlinearSolverConfig() :
