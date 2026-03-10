@@ -72,6 +72,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     std::vector<Eigen::VectorXd> Az_history;      // Az^(k) history
     std::vector<Eigen::VectorXd> g_history;       // g^(k) = Az^(k+1) - Az^(k) history
 
+    // Az at previous iteration's convergence check (for Az-stagnation detection)
+    Eigen::VectorXd Az_vec_at_prev_check;
+
     // Initial guess: solve linear problem with initial μ distribution
     if (VERBOSE) {
         std::cout << "Computing initial guess..." << std::endl;
@@ -194,40 +197,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_coarse_norm = residual_coarse.norm();
         double b_vec_coarse_norm = b_vec.norm();
 
-        // True Defect Correction (Phase 6): compute fine-grid residual
-        // R_fine = A_fine(μ) * x_fine - b_fine on the full 250k-DOF grid.
-        // μ is already filled at all cells via interpolateMuToFullGrid() in Step 1.
-        // This residual is physically correct and has a unique zero at the true solution,
-        // unlike R_FVM which can plateau at a non-zero value due to Picard oscillation.
-        Eigen::VectorXd R_fine_dc;
-        double R_fine_dc_norm = 0.0;
-        double b_fine_dc_norm = 0.0;
-        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            full_matrix_cache_valid = false;  // Force rebuild with current μ
-            updateFullMatrixCache();           // Builds A_fine (250k) from mu_map
-            int n_full = is_polar ? (nr * ntheta) : (ny * nx);
-            Eigen::VectorXd Az_fine_dc(n_full);
-            if (is_polar) {
-                for (int i = 0; i < nr; i++)
-                    for (int j = 0; j < ntheta; j++)
-                        Az_fine_dc(i * ntheta + j) = (r_orientation == "horizontal")
-                            ? Az(j, i) : Az(i, j);
-            } else {
-                for (int j = 0; j < ny; j++)
-                    for (int i = 0; i < nx; i++)
-                        Az_fine_dc(j * nx + i) = Az(j, i);
-            }
-            R_fine_dc = parallelSpMV(A_full_cached_csr, Az_fine_dc) - rhs_full_cached;
-            R_fine_dc_norm = R_fine_dc.norm();
-            b_fine_dc_norm = rhs_full_cached.norm();
-        }
+        // Phase 6 (Galerkin Picard) uses R_coarse directly — no fine-grid
+        // matrix rebuild needed here.
 
         // Convergence residual selection
         double residual_norm, b_vec_norm;
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // True DC: fine-grid residual is the physically correct convergence criterion.
-            residual_norm = R_fine_dc_norm;
-            b_vec_norm = b_fine_dc_norm;
+            // Phase 6 (Galerkin Picard): converge on coarse-grid residual.
+            // R_fine has a non-zero coarsening error floor; only R_coarse → 0 as
+            // the Galerkin solution converges.
+            residual_norm = residual_coarse_norm;
+            b_vec_norm = b_vec_coarse_norm;
         } else if (using_coarsening) {
             // Other coarsening modes: full-grid residual for accurate convergence
             residual_norm = computeFullGridResidual(b_vec_norm);
@@ -247,9 +227,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                       << ", ||Az|| = " << Az_vec.norm()
                       << ", ||b_coarse|| = " << b_vec_coarse_norm
                       << ", ||R_coarse||_abs = " << residual_coarse_norm;
-            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-                std::cout << ", ||R_fine||_abs = " << R_fine_dc_norm;
-            } else if (using_coarsening) {
+            if (using_coarsening && !nonlinear_config.use_phase6_precond_jfnk) {
                 std::cout << ", ||R_FVM||_abs = " << residual_norm;
             }
             std::cout << std::endl;
@@ -262,10 +240,6 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 // Show FVM coarsened residual alongside fine-grid for comparison
                 double residual_coarse_rel = residual_coarse_norm / (b_vec_coarse_norm + 1e-12);
                 std::cout << " (FVM: " << residual_coarse_rel << ")";
-            } else if (using_coarsening) {
-                // True DC: show coarse residual for reference
-                double residual_coarse_rel = residual_coarse_norm / (b_vec_coarse_norm + 1e-12);
-                std::cout << " (coarse: " << residual_coarse_rel << ")";
             }
             std::cout << std::flush;
         }
@@ -289,6 +263,48 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     converged = true;
                     if (VERBOSE) {
                         std::cout << " [Plateau detected: Δr=" << reduction_rate << "]";
+                    }
+                }
+            }
+
+            // Tertiary criterion for Phase 6: Az step size (handles oscillating residual).
+            // For non-monotone B-H materials, R_coarse can jump even when Az barely moves
+            // (crossing the μ_r peak). If the Newton/Anderson step size is very small,
+            // the iterate has effectively stabilized regardless of residual oscillation.
+            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk
+                && iter >= 4 && Az_vec_at_prev_check.size() == (size_t)n_active_cells) {
+                double az_step_rel = Az_vec.norm() > 1e-12
+                    ? (Az_vec - Az_vec_at_prev_check).norm() / Az_vec.norm()
+                    : 0.0;
+                if (az_step_rel < TOL * 0.1 && residual_rel < 1.0) {
+                    converged = true;
+                    if (VERBOSE) {
+                        std::cout << " [Az stagnation: ||δAz||/||Az||=" << std::scientific
+                                  << std::setprecision(2) << az_step_rel << "]";
+                    }
+                }
+            }
+
+            // Coarse-plateau criterion for Phase 6: detect coarsening error floor.
+            // With coarsen_ratio > 1, the coarse Galerkin solution has a residual floor
+            // that cannot be reduced below ~(coarsen error). When the last 5 residuals
+            // all lie within a 2x band (oscillating but not improving), the coarse phase
+            // has converged to its limit. Proceed to fine finishing for correction.
+            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk
+                && iter >= 5 && residual_rel < 1.0) {
+                const int plateau_window = 5;
+                double best_r  = residual_history[iter];
+                double worst_r = residual_history[iter];
+                for (int k = iter - plateau_window + 1; k <= iter; k++) {
+                    best_r  = std::min(best_r,  residual_history[k]);
+                    worst_r = std::max(worst_r, residual_history[k]);
+                }
+                if (worst_r < best_r * 2.0) {
+                    converged = true;
+                    if (VERBOSE) {
+                        std::cout << " [Coarse plateau: R∈["
+                                  << std::scientific << std::setprecision(2)
+                                  << best_r << ", " << worst_r << "]]";
                     }
                 }
             }
@@ -321,7 +337,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                         ? nonlinear_config.fine_finishing_tolerance
                         : TOL;
                     std::cout << "Fine finishing: up to " << nonlinear_config.fine_finishing_iterations
-                              << " full-grid Picard iter(s), tol=" << fine_tol << std::endl;
+                              << " full-grid Newton iter(s), tol=" << fine_tol << std::endl;
 
                     for (int fi = 0; fi < nonlinear_config.fine_finishing_iterations; fi++) {
                         // Step 1: Update μ from full-grid Az
@@ -371,18 +387,37 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                         }
                         std::cout << std::endl;
 
-                        // Step 4: Picard solve on full grid
+                        // Step 4: Newton step on full grid using A(μ_diff) tangent matrix.
+                        // Standard Picard [Az_new = A(μ_eff)^{-1} * b] diverges when
+                        // ρ_Picard = μ_eff/μ_diff > 1 (Si_steel near μ_r peak).
+                        // Newton [Az += A(μ_diff)^{-1} * (-(A(μ_eff)*Az - b))] converges:
+                        //   ρ_Newton ≈ |1 - μ_eff/μ_diff| < 1 in saturation region.
+                        Eigen::MatrixXd mu_map_eff_fine = mu_map;   // Save μ_eff
+
+                        updateMuDiffDistribution();                  // mu_map = μ_diff
+                        Eigen::SparseMatrix<double> A_newton_fine;
+                        Eigen::VectorXd b_newton_dummy;
+                        if (is_polar) {
+                            buildMatrixPolar(A_newton_fine, b_newton_dummy);
+                        } else {
+                            buildMatrix(A_newton_fine, b_newton_dummy);
+                        }
+                        mu_map = mu_map_eff_fine;                    // Restore μ_eff
+
                         Eigen::SparseLU<Eigen::SparseMatrix<double>> fine_lu;
-                        fine_lu.compute(A_fine);
+                        fine_lu.compute(A_newton_fine);
                         if (fine_lu.info() != Eigen::Success) {
-                            std::cerr << "  [Fine LU failed, stopping fine finishing]" << std::endl;
+                            std::cerr << "  [Fine Newton LU failed, stopping fine finishing]" << std::endl;
                             break;
                         }
-                        Eigen::VectorXd Az_new_vec = fine_lu.solve(b_fine);
+                        // Newton step: δAz = A(μ_diff)^{-1} * (-(A(μ_eff)*Az - b))
+                        Eigen::VectorXd R_fine_vec = A_fine * Az_fine_vec - b_fine;
+                        Eigen::VectorXd delta_fine = fine_lu.solve(-R_fine_vec);
                         if (fine_lu.info() != Eigen::Success) {
-                            std::cerr << "  [Fine solve failed, stopping fine finishing]" << std::endl;
+                            std::cerr << "  [Fine Newton solve failed, stopping fine finishing]" << std::endl;
                             break;
                         }
+                        Eigen::VectorXd Az_new_vec = Az_fine_vec + delta_fine;
 
                         // Step 5: Update Az matrix
                         if (is_polar) {
@@ -428,6 +463,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             return;
         }
 
+        // Save Az_vec at this convergence check point for stagnation detection next iter.
+        // Must be saved AFTER convergence check and BEFORE Phase 6 update.
+        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
+            Az_vec_at_prev_check = Az_vec;
+        }
+
         // ===== Step 5: Compute Newton step δA by solving J·δA = -R =====
         // Improved Jacobian: J ≈ L + D_r where D_r is r-weighted diagonal correction
         //
@@ -447,53 +488,59 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         // ===== Step 5: Compute Newton step δA =====
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // True Defect Correction (Phase 6 DC):
-            // δ_c = A_FVM^{-1} * (-P^T * R_fine)
+            // Newton-Picard (Phase 6):
+            // Solve A(μ_diff) * δAz = -R_coarse(μ_eff) using differential permeability.
             //
-            // R_fine = A_fine(μ) * x_fine - b_fine is computed on the full 250k-DOF grid.
-            // P^T (R_restriction) restricts it to the 67k-DOF coarse space.
-            // A_FVM (A_matrix) provides a fast coarse-grid preconditioner.
+            // Picard [A(μ_eff) * δ = -R] diverges when ρ = μ_eff/μ_diff >> 1 (Si_steel saturation).
+            // Newton [A(μ_diff) * δ = -R] has ρ_Newton ≈ |1 - 1/(μ_eff/μ_diff)| < 1 → converges.
             //
-            // Why this converges where Picard-on-coarse fails:
-            //   Picard-on-coarse drives R_FVM → 0, but for strongly nonlinear materials
-            //   the Picard spectral radius can exceed 1, causing oscillation at a non-zero
-            //   plateau. True DC drives R_fine → 0, which has a unique zero at the true
-            //   physical solution regardless of coarsening approximation quality.
+            // μ_diff = dB/dH / μ₀ (differential/tangent permeability, ≤ μ_eff in saturation).
             if (VERBOSE && iter == 0) {
-                std::cout << "Using True Defect Correction (Phase 6 DC)" << std::endl;
+                std::cout << "Using Newton-Picard (Phase 6): A(μ_diff) tangent matrix" << std::endl;
             }
 
-            dc_R_fine_norm = R_fine_dc_norm;  // Fine-grid residual as Armijo baseline
+            // 1. Save current μ_eff distribution
+            Eigen::MatrixXd mu_map_eff = mu_map;
 
-            // Restrict: r_c = P^T * R_fine  (fine → coarse)
-            if (!multigrid_operators_built) buildProlongationMatrix();
-            Eigen::VectorXd r_c_dc = parallelSpMV(R_restriction_csr, R_fine_dc);
+            // 2. Compute μ_diff at active cells (via central difference on B(H))
+            updateMuDiffAtActiveCells(H_active_saved);
+            // Propagate μ_diff to inactive cells (needed by buildMatrixGalerkin → A_f)
+            interpolateMuToFullGrid();
 
-            // Coarse solve: δ_c = A_FVM^{-1} * (-r_c)
-            Eigen::SparseLU<Eigen::SparseMatrix<double>> fvm_lu;
-            fvm_lu.compute(A_matrix);
-            if (fvm_lu.info() == Eigen::Success) {
-                delta_A = fvm_lu.solve(-r_c_dc);
-                if (fvm_lu.info() != Eigen::Success) {
-                    if (VERBOSE) std::cout << " [DC solve failed, Jacobi step]";
-                    delta_A.resize(n_active_cells);
-                    for (int k = 0; k < A_matrix.rows(); k++) {
-                        double diag = A_matrix.coeff(k, k);
-                        delta_A(k) = (std::abs(diag) > 1e-30) ? -r_c_dc(k) / diag : 0.0;
-                    }
+            // 3. Build Newton tangent matrix A(μ_diff) via Galerkin projection
+            Eigen::SparseMatrix<double> A_newton;
+            Eigen::VectorXd b_newton_dummy;
+            full_matrix_cache_valid = false;  // Force rebuild with μ_diff
+            buildMatrixGalerkin(A_newton, b_newton_dummy);
+
+            // 4. Restore μ_eff (invalidate cache: next iter must rebuild with μ_eff)
+            mu_map = mu_map_eff;
+            full_matrix_cache_valid = false;
+
+            // 5. Solve Newton step: δAz = A(μ_diff)^{-1} * (-R_coarse(μ_eff))
+            Eigen::SparseLU<Eigen::SparseMatrix<double>> newton_lu;
+            newton_lu.compute(A_newton);
+            if (newton_lu.info() == Eigen::Success) {
+                delta_A = newton_lu.solve(-residual_coarse);
+                if (newton_lu.info() != Eigen::Success) {
+                    if (VERBOSE) std::cout << " [Newton solve failed, Picard fallback]";
+                    // Fallback to Picard (A_eff)
+                    Eigen::SparseLU<Eigen::SparseMatrix<double>> picard_lu;
+                    picard_lu.compute(A_matrix);
+                    delta_A = picard_lu.solve(-residual_coarse);
                 }
             } else {
-                if (VERBOSE) std::cout << " [DC LU failed, Jacobi step]";
+                if (VERBOSE) std::cout << " [Newton LU failed, Jacobi step]";
                 delta_A.resize(n_active_cells);
-                for (int k = 0; k < A_matrix.rows(); k++) {
-                    double diag = A_matrix.coeff(k, k);
-                    delta_A(k) = (std::abs(diag) > 1e-30) ? -r_c_dc(k) / diag : 0.0;
+                for (int k = 0; k < A_newton.rows(); k++) {
+                    double diag = A_newton.coeff(k, k);
+                    delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
                 }
             }
 
             if (nonlinear_config.precond_verbose) {
-                std::cout << "True DC: ||R_fine||=" << R_fine_dc_norm
-                          << " ||r_c||=" << r_c_dc.norm() << std::endl;
+                std::cout << "Newton-Picard: ||R_coarse||=" << residual_coarse_norm
+                          << " ||delta_A||=" << delta_A.norm() << std::endl;
             }
 
         } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
@@ -688,13 +735,22 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // the μ update between iterations gradually resolve nonlinearity.
         bool phase6_anderson_done = false;
         if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            const int m_phase6 = std::max(3, m_AA);
+            // For Newton mode (Galerkin): enable Anderson with depth 2.
+            // The Newton tangent matrix A(μ_diff) can produce period-2 oscillation
+            // when μ_diff > μ_eff (near the B-H peak of non-monotone materials),
+            // giving iteration matrix M = 1 - μ_diff/μ_eff < 0.
+            // Anderson with m=2 detects this alternating pattern and extrapolates
+            // to the midpoint (the solution), breaking the limit cycle.
+            const int m_phase6 = nonlinear_config.use_galerkin_coarsening ? 2 : std::max(3, m_AA);
 
             // Adaptive damping ω: applied to BOTH Picard and Anderson steps.
-            // Starts at 0.5, halves on 2+ consecutive residual increases,
-            // recovers (×1.5) on 3+ consecutive decreases.
-            static double p6_omega = 0.5;
-            if (iter == 0) p6_omega = 0.5;  // Reset at start of solve
+            // For Galerkin mode: ρ_Galerkin < 1, so ω=1.0 (full Picard) is optimal.
+            //   ρ_eff(ω=1.0) = ρ ≈ 0.88 vs ρ_eff(ω=0.5) = 0.94 → significantly faster.
+            // For FVM mode: ρ_FVM may approach 1 → start with ω=0.5 for safety.
+            // Halves on 2+ consecutive residual increases; recovers (×1.5) on 3+ decreases.
+            static double p6_omega = 1.0;
+            const double p6_omega_max = nonlinear_config.use_galerkin_coarsening ? 1.0 : 0.5;
+            if (iter == 0) p6_omega = p6_omega_max;  // Reset at start of solve
 
             int n_consec_increase = 0;
             int n_consec_decrease = 0;
@@ -730,10 +786,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                               << " consec R↑ → ω=" << p6_omega << ", restart]";
                 }
             }
-            // RECOVERY: 3+ consecutive decreases → increase ω (max 0.5)
-            else if (n_consec_decrease >= 3 && p6_omega < 0.5) {
+            // RECOVERY: 3+ consecutive decreases → increase ω (max = p6_omega_max)
+            else if (n_consec_decrease >= 3 && p6_omega < p6_omega_max) {
                 double old_omega = p6_omega;
-                p6_omega = std::min(0.5, p6_omega * 1.5);
+                p6_omega = std::min(p6_omega_max, p6_omega * 1.5);
                 if (VERBOSE && old_omega != p6_omega) {
                     std::cout << " [P6: " << n_consec_decrease
                               << " consec R↓ → ω=" << p6_omega << "]";

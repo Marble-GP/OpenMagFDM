@@ -3875,6 +3875,129 @@ void MagneticFieldAnalyzer::updateMuAtActiveCells(
     }
 }
 
+void MagneticFieldAnalyzer::updateMuDiffAtActiveCells(const Eigen::VectorXd& H_active) {
+    // Update mu_map at active cells with differential permeability μ_diff = dB/dH / μ₀.
+    // For Newton correction in Phase 6: building A(μ_diff) instead of A(μ_eff)
+    // guarantees convergence even when Picard spectral radius ρ = μ_eff/μ_diff >> 1.
+    //
+    // μ_diff is computed as d(μ_0*μ_r*H)/dH / μ_0 via central differences,
+    // using the same PCHIP evaluateMu() for consistency with the residual evaluation.
+    // Linear (STATIC) materials are left unchanged (μ_diff = μ_eff for them).
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    bool is_polar = (coordinate_system == "polar");
+
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+        double H_mag = H_active(idx);
+
+        int img_i, img_j;
+        if (is_polar) {
+            polarToImageIndices(i, j, img_i, img_j);
+        } else {
+            img_i = i;
+            img_j = j;
+        }
+
+        if (img_j < 0 || img_j >= image_flipped.rows ||
+            img_i < 0 || img_i >= image_flipped.cols) continue;
+
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+
+        for (const auto& mat : config["materials"]) {
+            std::string name = mat.first.as<std::string>();
+            YAML::Node props = mat.second;
+            if (!props["rgb"]) continue;
+
+            cv::Scalar mat_rgb(
+                props["rgb"][0].as<int>(),
+                props["rgb"][1].as<int>(),
+                props["rgb"][2].as<int>()
+            );
+
+            if (rgb == mat_rgb) {
+                auto it = material_mu.find(name);
+                // Linear materials: μ_diff = μ_eff (already set), skip update
+                if (it == material_mu.end() || it->second.type == MuType::STATIC) break;
+                if (std::isnan(H_mag) || std::isinf(H_mag)) break;
+
+                // Central difference on B(H) = μ₀ · evaluateMu(H) · H
+                // to get dB/dH ≈ μ₀ · μ_diff
+                const double H_eps = std::max(1.0, H_mag * 1e-4);
+                double Hp = H_mag + H_eps;
+                double Hm = std::max(0.0, H_mag - H_eps);
+                double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
+                double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
+                double dH = Hp - Hm;
+                // μ_diff_r = (dB/dH) / μ₀; clamped to 1.0 (vacuum) as lower bound
+                double mu_diff_r = std::max(1.0, (Bp - Bm) / (dH * MU_0));
+
+                if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
+                    mu_map(j, i) = mu_diff_r * MU_0;
+                }
+                break;
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::updateMuDiffDistribution() {
+    // Full-grid version of updateMuDiffAtActiveCells, using H_map(j, i) for all pixels.
+    // Replaces mu_map with μ_diff = dB/dH / μ₀ (differential permeability).
+    // Used for Newton correction in fine finishing: Az += A(μ_diff)^{-1} * (-(A(μ_eff)*Az - b))
+    // This converges even when ρ_Picard = μ_eff/μ_diff > 1 (Si_steel saturation region).
+    // Linear (STATIC) materials are left unchanged (μ_diff = μ_eff for them).
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // y down -> y up, matches setupMaterialProperties()
+
+    for (int j = 0; j < image_to_use.rows; j++) {
+        for (int i = 0; i < image_to_use.cols; i++) {
+            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
+            cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
+
+            for (const auto& mat : config["materials"]) {
+                std::string name = mat.first.as<std::string>();
+                YAML::Node props = mat.second;
+                if (!props["rgb"]) continue;
+
+                cv::Scalar mat_rgb(
+                    props["rgb"][0].as<int>(),
+                    props["rgb"][1].as<int>(),
+                    props["rgb"][2].as<int>()
+                );
+
+                if (rgb == mat_rgb) {
+                    auto it = material_mu.find(name);
+                    // Linear materials: μ_diff = μ_eff (constant), skip update
+                    if (it == material_mu.end() || it->second.type == MuType::STATIC) break;
+
+                    double H_mag = H_map(j, i);
+                    if (std::isnan(H_mag) || std::isinf(H_mag)) break;
+
+                    // Central difference: dB/dH ≈ (B(H+ε) - B(H-ε)) / (2ε)
+                    const double H_eps = std::max(1.0, H_mag * 1e-4);
+                    double Hp = H_mag + H_eps;
+                    double Hm = std::max(0.0, H_mag - H_eps);
+                    double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
+                    double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
+                    double mu_diff_r = std::max(1.0, (Bp - Bm) / ((Hp - Hm) * MU_0));
+
+                    if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
+                        mu_map(j, i) = mu_diff_r * MU_0;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
 double MagneticFieldAnalyzer::calculateThetaInterpolationWeight(int j_theta, int j_prev, int j_next) const {
     // Calculate interpolation weight for theta direction (periodic boundary aware)
     bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");

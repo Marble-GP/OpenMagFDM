@@ -714,6 +714,12 @@ private:
                                        Eigen::VectorXd& H_active);
     // Updates mu_map at active cells only from H (inactive cells unchanged)
     void updateMuAtActiveCells(const Eigen::VectorXd& H_active);
+    // Updates mu_map at active cells with differential permeability μ_diff = dB/dH / μ₀
+    // Used for Newton correction in Phase 6: A(μ_diff) * δAz = -R(μ_eff)
+    void updateMuDiffAtActiveCells(const Eigen::VectorXd& H_active);
+    // Full-grid version: updates mu_map for ALL pixels using H_map(j,i).
+    // Used for Newton correction in fine finishing after coarse convergence.
+    void updateMuDiffDistribution();
 
     // Phase 4: Full-grid residual evaluation for coarsened Newton-Krylov convergence
     void updateFullMatrixCache();  // Rebuild A_full_cached and rhs_full_cached
