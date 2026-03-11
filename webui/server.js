@@ -623,25 +623,32 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
         const dominant = sorted.filter(c => c.ratio >  RARE_THRESHOLD);
         const rare     = sorted.filter(c => c.ratio <= RARE_THRESHOLD);
 
-        // Anti-aliasing detection: find rare colors that are linear blends of two dominant colors
+        // Anti-aliasing detection: a rare color is AA only if it is a linear blend
+        // of two colors that BOTH have higher coverage than the rare color itself.
+        // This prevents AA blends from being mistakenly used as AA bases.
         const antialiasBaseIdx = new Set(); // indices into dominant[]
         const aaBlends = [];               // detected blend records
 
         const rareUnique = [];  // rare colors that are NOT AA blends → treated as materials
         for (const rareColor of rare) {
             let found = false;
-            for (let i = 0; i < dominant.length && !found; i++) {
-                for (let j = i + 1; j < dominant.length && !found; j++) {
-                    const t = isLinearBlend(rareColor.rgb, dominant[i].rgb, dominant[j].rgb);
+            // Find all colors with higher coverage than this rare color
+            const higherCoverage = sorted.filter(c => c.ratio > rareColor.ratio);
+            for (let i = 0; i < higherCoverage.length && !found; i++) {
+                for (let j = i + 1; j < higherCoverage.length && !found; j++) {
+                    const t = isLinearBlend(rareColor.rgb, higherCoverage[i].rgb, higherCoverage[j].rgb);
                     if (t !== null) {
-                        antialiasBaseIdx.add(i);
-                        antialiasBaseIdx.add(j);
+                        // Record base indices in dominant[] for antialias:true flag
+                        const idxA = dominant.findIndex(d => d.rgb[0] === higherCoverage[i].rgb[0] && d.rgb[1] === higherCoverage[i].rgb[1] && d.rgb[2] === higherCoverage[i].rgb[2]);
+                        const idxB = dominant.findIndex(d => d.rgb[0] === higherCoverage[j].rgb[0] && d.rgb[1] === higherCoverage[j].rgb[1] && d.rgb[2] === higherCoverage[j].rgb[2]);
+                        if (idxA >= 0) antialiasBaseIdx.add(idxA);
+                        if (idxB >= 0) antialiasBaseIdx.add(idxB);
                         aaBlends.push({
                             rgb:   rareColor.rgb,
                             count: rareColor.count,
                             ratio: rareColor.ratio,
-                            baseA: dominant[i].rgb,
-                            baseB: dominant[j].rgb,
+                            baseA: higherCoverage[i].rgb,
+                            baseB: higherCoverage[j].rgb,
                             t:     Math.round(t * 1000) / 1000
                         });
                         found = true;
@@ -649,7 +656,7 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
                 }
             }
             if (!found) {
-                // This rare color cannot be explained as an AA blend of two dominant colors
+                // This rare color cannot be explained as an AA blend of two higher-coverage colors
                 // → it is a unique material color with small coverage
                 rareUnique.push(rareColor);
             }
@@ -681,7 +688,7 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             const hex = toHex([r, g, b]);
             lines.push(`  material_${hex}:`);
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
-            lines.push(`    mu_r: 1.0       # TODO: set permeability  (coverage: ${(ratio * 100).toFixed(1)}%)`);
+            lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${(ratio * 100).toFixed(1)}%)`);
             lines.push(`    jz: 0.0`);
             if (antialiasBaseIdx.has(i)) lines.push(`    antialias: true`);
         }
@@ -691,7 +698,7 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             const hex = toHex([r, g, b]);
             lines.push(`  material_${hex}:`);
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
-            lines.push(`    mu_r: 1.0       # TODO: set permeability  (coverage: ${(ru.ratio * 100).toFixed(2)}%)`);
+            lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${(ru.ratio * 100).toFixed(2)}%)`);
             lines.push(`    jz: 0.0`);
         }
         if (aaBlends.length > 0) {
