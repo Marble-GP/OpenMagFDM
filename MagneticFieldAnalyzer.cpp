@@ -889,7 +889,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 
         if (props["coarsen"]) {
             coarsen_cfg.enabled = props["coarsen"].as<bool>(false);
-            std::cout << "  DEBUG [" << name << "] coarsen parsed: " << (coarsen_cfg.enabled ? "true" : "false") << std::endl;
+            // std::cout << "  DEBUG [" << name << "] coarsen parsed: " << (coarsen_cfg.enabled ? "true" : "false") << std::endl;
         }
         if (props["coarsen_ratio"]) {
             coarsen_cfg.ratio = props["coarsen_ratio"].as<int>(2);
@@ -6193,11 +6193,8 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
     } else {
         // Incremental update: slide cached boundaries + recompute border regions
         std::cout << "Boundaries: Incremental update (slide + border recompute)" << std::endl;
-        std::cout << "[DEBUG] Starting incremental boundary detection..." << std::endl;
-
         boundaries = cached_boundaries.clone();
         int shift = transient_config.slide_pixels_per_step;
-        std::cout << "[DEBUG] shift = " << shift << std::endl;
 
         if (transient_config.slide_direction == "vertical") {
             // Vertical slide: shift rows (y direction)
@@ -6580,10 +6577,10 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     double theta_offset = 0.0;
 
     // DEBUG: Print all conditions
-    std::cout << "DEBUG calculateMaxwellStress: step=" << step
-              << ", coord_sys=" << coordinate_system
-              << ", transient.enabled=" << (transient_config.enabled ? "true" : "false")
-              << ", transient.enable_sliding=" << (transient_config.enable_sliding ? "true" : "false") << std::endl;
+    // std::cout << "DEBUG calculateMaxwellStress: step=" << step
+    //           << ", coord_sys=" << coordinate_system
+    //           << ", transient.enabled=" << (transient_config.enabled ? "true" : "false")
+    //           << ", transient.enable_sliding=" << (transient_config.enable_sliding ? "true" : "false") << std::endl;
 
     if (coordinate_system == "polar" && step >= 0 && transient_config.enabled && transient_config.enable_sliding) {
         theta_offset = step * transient_config.slide_pixels_per_step * dtheta;
@@ -11423,9 +11420,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         int slide_start = transient_config.slide_region_start;
                         int slide_end = transient_config.slide_region_end;
 
-                        std::cout << "[DEBUG] Applying partial-region circular shift:" << std::endl;
-                        std::cout << "  Shift: " << shift_pixels << " pixels (theta direction)" << std::endl;
-                        std::cout << "  Region: r index " << slide_start << " to " << slide_end << std::endl;
+                        // std::cout << "[DEBUG] Applying partial-region circular shift:" << std::endl;
+                        // std::cout << "  Shift: " << shift_pixels << " pixels (theta direction)" << std::endl;
+                        // std::cout << "  Region: r index " << slide_start << " to " << slide_end << std::endl;
 
                         // r_orientation=horizontal: image x-axis (horizontal) -> r direction
                         // Slide region defined by image x-coordinate -> r index (ir)
@@ -11448,7 +11445,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                             }
                         }
                     } else {
-                        std::cout << "[DEBUG] Circular shift disabled" << std::endl;
+                        // std::cout << "[DEBUG] Circular shift disabled" << std::endl;
                         x_shifted = previous_solution;
                     }
 
@@ -11461,9 +11458,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         double sigma = 8.0;  // Gaussian σ (pixels) - optimal value
                         int buffer = 10;  // Buffer beyond slide_end
 
-                        std::cout << "[DEBUG] Applying Gaussian smoothing (r-direction only):" << std::endl;
-                        std::cout << "  Region: r=[" << slide_start << ", " << (slide_end + buffer) << "]" << std::endl;
-                        std::cout << "  σ=" << sigma << " pixels" << std::endl;
+                        // std::cout << "[DEBUG] Applying Gaussian smoothing (r-direction only):" << std::endl;
+                        // std::cout << "  Region: r=[" << slide_start << ", " << (slide_end + buffer) << "]" << std::endl;
+                        // std::cout << "  σ=" << sigma << " pixels" << std::endl;
 
                         // Create Gaussian kernel (1D, r-direction)
                         int kernel_radius = static_cast<int>(3 * sigma);  // 3σ coverage
@@ -11567,8 +11564,8 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     double r0_norm = r0.norm();
                     double rel_r0 = (rhs_norm > 1e-12) ? (r0_norm / rhs_norm) : r0_norm;
 
-                    std::cout << "[DEBUG] Warm-start quality:" << std::endl;
-                    std::cout << "  ||r0|| / ||b'|| = " << rel_r0 << std::endl;
+                    // std::cout << "[DEBUG] Warm-start quality:" << std::endl;
+                    // std::cout << "  ||r0|| / ||b'|| = " << rel_r0 << std::endl;
 
                     // Additional diagnostic: Check residual distribution
                     if (transient_config.enable_sliding && coordinate_system == "polar") {
@@ -11712,7 +11709,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         std::cout << "\n[INFO] CG did not converge, falling back to direct solver" << std::endl;
 
                         // Fallback to direct solver
-                        std::cout << "[DEBUG] Using direct solver fallback..." << std::endl;
+                        // std::cout << "[DEBUG] Using direct solver fallback..." << std::endl;
                         auto fallback_start = std::chrono::high_resolution_clock::now();
                         if (A.nonZeros() != transient_matrix_nnz) {
                             transient_solver.compute(A);
@@ -11723,7 +11720,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         Az_flat = transient_solver.solve(rhs);
                         auto fallback_end = std::chrono::high_resolution_clock::now();
                         auto fallback_time = std::chrono::duration_cast<std::chrono::milliseconds>(fallback_end - fallback_start);
-                        std::cout << "[DEBUG] Direct solver fallback complete, time=" << fallback_time.count() << " ms" << std::endl;
+                        // std::cout << "[DEBUG] Direct solver fallback complete, time=" << fallback_time.count() << " ms" << std::endl;
                     }
 
                     // Print total iterative solver time (including all preprocessing)
