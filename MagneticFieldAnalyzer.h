@@ -15,6 +15,7 @@
 #include <yaml-cpp/yaml.h>
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <variant>
 #include <tinyexpr.h>
@@ -509,6 +510,12 @@ private:
     std::map<std::string, MaterialPixelInfo> material_pixel_info;  // Pixel count and area per material
     std::vector<AntialiasableMaterial> antialias_materials;  // Materials with antialias enabled
     std::map<std::string, YAML::Node> material_presets;  // Material presets (reusable B-H curves/properties)
+
+    // RGB→material lookup table for O(1) material matching in hot loops (OpenMP-safe)
+    struct MaterialLookupEntry {
+        std::string name;
+    };
+    std::unordered_map<int, MaterialLookupEntry> rgb_to_material;  // key: (R<<16)|(G<<8)|B
 
     // Adaptive mesh coarsening configuration
     struct CoarsenConfig {

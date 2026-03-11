@@ -1159,6 +1159,17 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         std::cout << "Anti-aliasing: " << antialias_count << " gradient pixels interpolated" << std::endl;
     }
 
+    // Build RGB→material lookup table for O(1) access in hot loops (OpenMP-safe)
+    rgb_to_material.clear();
+    for (const auto& mat : config["materials"]) {
+        std::string name = mat.first.as<std::string>();
+        YAML::Node props = mat.second;
+        if (!props["rgb"]) continue;
+        auto rgb = props["rgb"].as<std::vector<int>>();
+        int key = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+        rgb_to_material[key] = {name};
+    }
+
     // Compute magnetization grids if any material has magnetization defined
     if (!material_magnetization.empty()) {
         computeMagnetizationGrids();
@@ -3384,14 +3395,17 @@ void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
         n_cols = nx;
     }
 
-    for (int j = 0; j < n_rows; j++) {
-        for (int i = 0; i < n_cols; i++) {
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety.
+    // Active cells are read-only (writes only to inactive cells) → thread-safe.
+    // findNextActive*() scans active_cells matrix (read-only) → thread-safe.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < n_rows * n_cols; k++) {
+        int j = k / n_cols, i = k % n_cols;
             if (active_cells(j, i)) continue;  // Keep B-H computed μ
 
             // Get pixel from flipped image (same coordinate system as setupMaterialProperties)
             int img_i = i, img_j = j;
             if (is_polar) {
-                // polarToImageIndices expects (i_r, j_theta)
                 int i_r_img     = is_horizontal ? i : j;
                 int j_theta_img = is_horizontal ? j : i;
                 polarToImageIndices(i_r_img, j_theta_img, img_i, img_j);
@@ -3400,20 +3414,17 @@ void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
                 img_i < 0 || img_i >= image_flipped.cols) continue;
 
             cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+            // Note: image_flipped stores BGR, pixel[0]=B, pixel[1]=G, pixel[2]=R
+            int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-            // Find matching material and set μ
-            for (const auto& mat : config["materials"]) {
-                std::string name = mat.first.as<std::string>();
-                YAML::Node props = mat.second;
-                if (!props["rgb"]) continue;
+            auto lut_it = rgb_to_material.find(rgb_key);
+            if (lut_it != rgb_to_material.end()) {
+                const std::string& name = lut_it->second.name;
+                auto it = material_mu.find(name);
+                if (it != material_mu.end()) {
+                    const MuValue& mv = it->second;
 
-                auto rgb = props["rgb"].as<std::vector<int>>();
-                if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                    auto it = material_mu.find(name);
-                    if (it != material_mu.end()) {
-                        const MuValue& mv = it->second;
-
-                        if (mv.type != MuType::STATIC) {
+                    if (mv.type != MuType::STATIC) {
                             // Nonlinear material: find nearest active cell's μ so that
                             // A_fine reflects the actual operating point, not H=0.
                             double mu_nearest = 0.0;
@@ -3476,10 +3487,7 @@ void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
                             mu_map(j, i) = evaluateMu(mv, 0.0) * MU_0;
                         }
                     }
-                    break;
                 }
-            }
-        }
     }
 }
 
@@ -3747,6 +3755,8 @@ void MagneticFieldAnalyzer::calculateHFieldAtActiveCells(
 
     bool is_polar = (coordinate_system == "polar");
 
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
 
@@ -3771,34 +3781,23 @@ void MagneticFieldAnalyzer::calculateHFieldAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-        // Find material by RGB and compute H
+        // O(1) material lookup via LUT
         bool found = false;
-        for (const auto& mat : config["materials"]) {
-            std::string name = mat.first.as<std::string>();
-            YAML::Node props = mat.second;
-            if (!props["rgb"]) continue;
-
-            cv::Scalar mat_rgb(
-                props["rgb"][0].as<int>(),
-                props["rgb"][1].as<int>(),
-                props["rgb"][2].as<int>()
-            );
-
-            if (rgb == mat_rgb) {
-                auto bh_it = material_bh_tables.find(name);
-                if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
-                    // Nonlinear: inverse B-H interpolation
-                    H_active(idx) = interpolateH_from_B(bh_it->second, B_mag);
-                } else {
-                    // Linear: H = B/μ
-                    double mu = mu_map(j, i);
-                    H_active(idx) = (mu > 1e-20) ? B_mag / mu : 0.0;
-                }
-                found = true;
-                break;
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto bh_it = material_bh_tables.find(name);
+            if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                // Nonlinear: inverse B-H interpolation
+                H_active(idx) = interpolateH_from_B(bh_it->second, B_mag);
+            } else {
+                // Linear: H = B/μ
+                double mu = mu_map(j, i);
+                H_active(idx) = (mu > 1e-20) ? B_mag / mu : 0.0;
             }
+            found = true;
         }
 
         if (!found) {
@@ -3824,6 +3823,8 @@ void MagneticFieldAnalyzer::updateMuAtActiveCells(
 
     bool is_polar = (coordinate_system == "polar");
 
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
         double H_mag = H_active(idx);
@@ -3843,33 +3844,19 @@ void MagneticFieldAnalyzer::updateMuAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-        for (const auto& mat : config["materials"]) {
-            std::string name = mat.first.as<std::string>();
-            YAML::Node props = mat.second;
-            if (!props["rgb"]) continue;
-
-            cv::Scalar mat_rgb(
-                props["rgb"][0].as<int>(),
-                props["rgb"][1].as<int>(),
-                props["rgb"][2].as<int>()
-            );
-
-            if (rgb == mat_rgb) {
-                auto it = material_mu.find(name);
-                if (it != material_mu.end()) {
-                    // Skip STATIC (linear) materials — μ doesn't depend on H
-                    if (it->second.type == MuType::STATIC) break;
-
-                    // Guard: skip update if H is NaN (edge case from B computation)
-                    if (std::isnan(H_mag) || std::isinf(H_mag)) break;
-                    double mu_r = evaluateMu(it->second, H_mag);
-                    if (!std::isnan(mu_r) && !std::isinf(mu_r) && mu_r >= 1.0) {
-                        mu_map(j, i) = mu_r * MU_0;
-                    }
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto it = material_mu.find(name);
+            if (it != material_mu.end()) {
+                if (it->second.type == MuType::STATIC) continue;
+                if (std::isnan(H_mag) || std::isinf(H_mag)) continue;
+                double mu_r = evaluateMu(it->second, H_mag);
+                if (!std::isnan(mu_r) && !std::isinf(mu_r) && mu_r >= 1.0) {
+                    mu_map(j, i) = mu_r * MU_0;
                 }
-                break;
             }
         }
     }
@@ -3890,6 +3877,8 @@ void MagneticFieldAnalyzer::updateMuDiffAtActiveCells(const Eigen::VectorXd& H_a
 
     bool is_polar = (coordinate_system == "polar");
 
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
         double H_mag = H_active(idx);
@@ -3906,40 +3895,25 @@ void MagneticFieldAnalyzer::updateMuDiffAtActiveCells(const Eigen::VectorXd& H_a
             img_i < 0 || img_i >= image_flipped.cols) continue;
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-        for (const auto& mat : config["materials"]) {
-            std::string name = mat.first.as<std::string>();
-            YAML::Node props = mat.second;
-            if (!props["rgb"]) continue;
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto it = material_mu.find(name);
+            if (it == material_mu.end() || it->second.type == MuType::STATIC) continue;
+            if (std::isnan(H_mag) || std::isinf(H_mag)) continue;
 
-            cv::Scalar mat_rgb(
-                props["rgb"][0].as<int>(),
-                props["rgb"][1].as<int>(),
-                props["rgb"][2].as<int>()
-            );
+            const double H_eps = std::max(1.0, H_mag * 1e-4);
+            double Hp = H_mag + H_eps;
+            double Hm = std::max(0.0, H_mag - H_eps);
+            double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
+            double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
+            double dH = Hp - Hm;
+            double mu_diff_r = std::max(1.0, (Bp - Bm) / (dH * MU_0));
 
-            if (rgb == mat_rgb) {
-                auto it = material_mu.find(name);
-                // Linear materials: μ_diff = μ_eff (already set), skip update
-                if (it == material_mu.end() || it->second.type == MuType::STATIC) break;
-                if (std::isnan(H_mag) || std::isinf(H_mag)) break;
-
-                // Central difference on B(H) = μ₀ · evaluateMu(H) · H
-                // to get dB/dH ≈ μ₀ · μ_diff
-                const double H_eps = std::max(1.0, H_mag * 1e-4);
-                double Hp = H_mag + H_eps;
-                double Hm = std::max(0.0, H_mag - H_eps);
-                double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
-                double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
-                double dH = Hp - Hm;
-                // μ_diff_r = (dB/dH) / μ₀; clamped to 1.0 (vacuum) as lower bound
-                double mu_diff_r = std::max(1.0, (Bp - Bm) / (dH * MU_0));
-
-                if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
-                    mu_map(j, i) = mu_diff_r * MU_0;
-                }
-                break;
+            if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
+                mu_map(j, i) = mu_diff_r * MU_0;
             }
         }
     }
@@ -3956,43 +3930,35 @@ void MagneticFieldAnalyzer::updateMuDiffDistribution() {
     cv::Mat image_to_use;
     cv::flip(image, image_to_use, 0);  // y down -> y up, matches setupMaterialProperties()
 
-    for (int j = 0; j < image_to_use.rows; j++) {
-        for (int i = 0; i < image_to_use.cols; i++) {
-            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-            cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
+    int n_rows = image_to_use.rows;
+    int n_cols = image_to_use.cols;
 
-            for (const auto& mat : config["materials"]) {
-                std::string name = mat.first.as<std::string>();
-                YAML::Node props = mat.second;
-                if (!props["rgb"]) continue;
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < n_rows * n_cols; k++) {
+        int j = k / n_cols, i = k % n_cols;
+        cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-                cv::Scalar mat_rgb(
-                    props["rgb"][0].as<int>(),
-                    props["rgb"][1].as<int>(),
-                    props["rgb"][2].as<int>()
-                );
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto it = material_mu.find(name);
+            if (it == material_mu.end() || it->second.type == MuType::STATIC) continue;
 
-                if (rgb == mat_rgb) {
-                    auto it = material_mu.find(name);
-                    // Linear materials: μ_diff = μ_eff (constant), skip update
-                    if (it == material_mu.end() || it->second.type == MuType::STATIC) break;
+            double H_mag = H_map(j, i);
+            if (std::isnan(H_mag) || std::isinf(H_mag)) continue;
 
-                    double H_mag = H_map(j, i);
-                    if (std::isnan(H_mag) || std::isinf(H_mag)) break;
+            const double H_eps = std::max(1.0, H_mag * 1e-4);
+            double Hp = H_mag + H_eps;
+            double Hm = std::max(0.0, H_mag - H_eps);
+            double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
+            double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
+            double mu_diff_r = std::max(1.0, (Bp - Bm) / ((Hp - Hm) * MU_0));
 
-                    // Central difference: dB/dH ≈ (B(H+ε) - B(H-ε)) / (2ε)
-                    const double H_eps = std::max(1.0, H_mag * 1e-4);
-                    double Hp = H_mag + H_eps;
-                    double Hm = std::max(0.0, H_mag - H_eps);
-                    double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
-                    double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
-                    double mu_diff_r = std::max(1.0, (Bp - Bm) / ((Hp - Hm) * MU_0));
-
-                    if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
-                        mu_map(j, i) = mu_diff_r * MU_0;
-                    }
-                    break;
-                }
+            if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
+                mu_map(j, i) = mu_diff_r * MU_0;
             }
         }
     }
@@ -5989,8 +5955,10 @@ void MagneticFieldAnalyzer::calculateMagneticField() {
     bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
+    // flat k = j*nx+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
             // Bx = ∂Az/∂y
             if (j == 0) {
                 if (y_periodic) {
@@ -6034,10 +6002,7 @@ void MagneticFieldAnalyzer::calculateMagneticField() {
                 // Central difference
                 By(j, i) = -(Az(j, i+1) - Az(j, i-1)) / (2.0 * dx);
             }
-        }
     }
-
-    // std::cout << "Magnetic field calculated" << std::endl;
 }
 
 // ===== Helper methods for periodic boundary-aware filtering =====
@@ -10738,9 +10703,12 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
     bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
 
     // Calculate field components: Br = (1/r)∂Az/∂θ, Btheta = -∂Az/∂r
-    for (int i = 0; i < nr; i++) {
-        double r = r_coords[i];
-        for (int j = 0; j < ntheta; j++) {
+    // flat k = i*ntheta+j avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < nr * ntheta; k++) {
+        int i = k / ntheta, j = k % ntheta;
+        {
+            double r = r_coords[i];
             // Get Az values with proper indexing based on r_orientation
             auto getAz = [&](int r_idx, int theta_idx) -> double {
                 if (r_orientation == "horizontal") {
@@ -10828,7 +10796,7 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
         }
     }
 
-    // B magnitude diagnostics
+    // B magnitude diagnostics (sequential — uses reduction)
     double bmax = 0.0;
     for (int i=0;i<Br.rows();++i){
     for (int j=0;j<Br.cols();++j){

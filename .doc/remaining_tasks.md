@@ -1,59 +1,19 @@
 # OpenMagFDM 残タスク一覧
 
-最終更新: 2026-03-10（Phase 6 Newton 収束修正完了後）
+最終更新: 2026-03-10（High Priority 3件完了後）
 
 ---
 
-## 直近完了済み（参考）
+## 完了済み（参考）
 
 - [x] v1.3.0 Feature 1-5（Robin BC、Anti-aliasing、Flux Linkage、Material Presets、Adaptive Mesh）
 - [x] v1.3.0 Feature A-E（REST API 拡張、OpenMP、永久磁石、カラー検出、材料ライブラリ）
 - [x] Phase 6 Newton-Picard + Anderson m=2（周期2振動対策）
 - [x] Phase 6 台地検出（粗大化誤差フロア対応）
 - [x] ファイン仕上げ Newton（Picard 発散問題の解決）
-
----
-
-## High Priority（品質保証）
-
-### 1. Cartesian + coarsening の回帰テスト
-
-**理由：** 直近の全テストは polar 座標のみ。fine finishing Newton は `buildMatrix()` / `buildMatrixPolar()` を分岐しているが、Cartesian パスの実動作確認が未済。
-
-**方法：**
-```yaml
-coordinate_system: cartesian
-materials:
-  iron:
-    mu_r: 35H300
-    coarsen: true
-    coarsen_ratio: 4
-nonlinear_solver:
-  use_galerkin_coarsening: true
-  use_phase6_precond_jfnk: true
-  fine_finishing_iterations: 5
-```
-
----
-
-### 2. `smooth_iterations` デフォルト値の整合性確認
-
-**問題：** `MagneticFieldAnalyzer.h` のデフォルトは `coarsen_smooth_iterations = 0` だが、テスト設定では `smooth_iterations: 100` を使用。ドキュメント/サンプル設定との不整合。
-
-**確認事項：**
-- `smooth_iterations: 0` と `smooth_iterations: 100` で解の差を確認（Laplace 平滑化の影響評価）
-- `sample_config.yaml` に推奨値をコメントで追記
-
----
-
-### 3. RELEASE_NOTES_v1.3.0.md への Phase 6 修正追記
-
-**理由：** 非線形材料 + 粗大化の組み合わせで発生していた収束失敗（実用上重要なバグ）が解決されたが、現在のリリースノートに記載なし。
-
-**内容：**
-- Phase 6 Newton-Picard アルゴリズム変更
-- 台地検出・ファイン Newton の追加
-- 35H300 polar テスト結果（10+2 反復, R=8e-6）
+- [x] Cartesian + coarsening 回帰テスト（`test_newton_cartesian.yaml` 作成、動作確認）
+- [x] smooth_iterations デフォルト整合（テスト設定 0 に統一、sample_config にドキュメント追加）
+- [x] RELEASE_NOTES_v1.3.0.md への Phase 6 修正追記
 
 ---
 

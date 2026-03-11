@@ -870,61 +870,43 @@ void MagneticFieldAnalyzer::calculateHField() {
     cv::Mat image_to_use;
     cv::flip(image, image_to_use, 0);  // Flip vertically: y down -> y up
 
-    // Calculate H from B using proper inverse B-H relationship
-    for (int j = 0; j < H_map.rows(); j++) {
-        for (int i = 0; i < H_map.cols(); i++) {
-            double Bx_val, By_val;
+    int h_rows = H_map.rows();
+    int h_cols = H_map.cols();
+    bool is_cartesian = (coordinate_system == "cartesian");
 
-            if (coordinate_system == "cartesian") {
-                Bx_val = Bx(j, i);
-                By_val = By(j, i);
-            } else {  // polar
-                Bx_val = Br(j, i);     // Use Br, Btheta as proxy
-                By_val = Btheta(j, i);
-            }
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    // flat k = j*h_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < h_rows * h_cols; k++) {
+        int j = k / h_cols, i = k % h_cols;
+        double Bx_val, By_val;
 
-            double B_mag = std::sqrt(Bx_val * Bx_val + By_val * By_val);
+        if (is_cartesian) {
+            Bx_val = Bx(j, i);
+            By_val = By(j, i);
+        } else {
+            Bx_val = Br(j, i);
+            By_val = Btheta(j, i);
+        }
 
-            // For nonlinear materials, use inverse B-H interpolation
-            // For linear materials, use H = B/μ
-            // Use image_to_use (flipped) to match setupMaterialProperties()
-            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-            cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
+        double B_mag = std::sqrt(Bx_val * Bx_val + By_val * By_val);
 
-            // Find material for this pixel
-            std::string material_name = "";
-            for (const auto& mat : config["materials"]) {
-                std::string name = mat.first.as<std::string>();
-                YAML::Node props = mat.second;
-                if (!props["rgb"]) continue;
+        cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-                auto yaml_rgb = props["rgb"];
-                cv::Scalar mat_rgb(
-                    yaml_rgb[0].as<int>(),
-                    yaml_rgb[1].as<int>(),
-                    yaml_rgb[2].as<int>()
-                );
-
-                if (rgb == mat_rgb) {
-                    material_name = name;
-                    break;
-                }
-            }
-
-            // Check if this material has a B-H table (nonlinear)
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& material_name = lut_it->second.name;
             auto bh_it = material_bh_tables.find(material_name);
             if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
-                // Nonlinear material: use inverse B-H interpolation
                 H_map(j, i) = interpolateH_from_B(bh_it->second, B_mag);
             } else {
-                // Linear material: use H = B/μ
                 double mu = mu_map(j, i);
-                if (mu > 1e-20) {
-                    H_map(j, i) = B_mag / mu;
-                } else {
-                    H_map(j, i) = 0.0;
-                }
+                H_map(j, i) = (mu > 1e-20) ? B_mag / mu : 0.0;
             }
+        } else {
+            double mu = mu_map(j, i);
+            H_map(j, i) = (mu > 1e-20) ? B_mag / mu : 0.0;
         }
     }
 }
@@ -944,56 +926,35 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
     cv::Mat image_to_use;
     cv::flip(image, image_to_use, 0);  // Flip vertically: y down -> y up
 
-    // For each pixel, look up material and update mu
-    for (int j = 0; j < image_to_use.rows; j++) {
-        for (int i = 0; i < image_to_use.cols; i++) {
-            // Use image_to_use (flipped) to match setupMaterialProperties()
-            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-            cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);  // BGR to RGB
+    int n_rows = image_to_use.rows;
+    int n_cols = image_to_use.cols;
 
-            // Find matching material
-            for (const auto& mat : config["materials"]) {
-                std::string name = mat.first.as<std::string>();
-                YAML::Node props = mat.second;
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < n_rows * n_cols; k++) {
+        int j = k / n_cols, i = k % n_cols;
+        cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-                if (!props["rgb"]) continue;
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto it = material_mu.find(name);
 
-                auto yaml_rgb = props["rgb"];
-                cv::Scalar mat_rgb(
-                    yaml_rgb[0].as<int>(),
-                    yaml_rgb[1].as<int>(),
-                    yaml_rgb[2].as<int>()
-                );
-
-                if (rgb == mat_rgb) {
-                    // Found matching material
-                    auto it = material_mu.find(name);
-
-                    // Phase 6 optimization: Skip linear (STATIC) materials
-                    // Their μ is constant and doesn't depend on H, so no update needed.
-                    // This saves computation during nonlinear iteration.
-                    if (it != material_mu.end() && it->second.type == MuType::STATIC) {
-                        // Linear material: mu already set in setupMaterialProperties()
-                        break;
-                    }
-
-                    double H_mag = H_map(j, i);
-                    double mu_r = 1.0;  // Default to 1 (air)
-
-                    if (it != material_mu.end()) {
-                        // Nonlinear material: interpolate μ_eff(H) from YAML table
-                        // IMPORTANT: mu_r in YAML is effective permeability μ_eff = B/H
-                        mu_r = evaluateMu(it->second, H_mag);
-                    } else if (props["mu_r"]) {
-                        // Material not in material_mu but has mu_r - treat as linear
-                        // Already set in setupMaterialProperties(), skip update
-                        break;
-                    }
-
-                    mu_map(j, i) = mu_r * MU_0;
-                    break;
-                }
+            // Skip linear (STATIC) materials — μ is constant, already set
+            if (it != material_mu.end() && it->second.type == MuType::STATIC) {
+                continue;
             }
+
+            double H_mag = H_map(j, i);
+            double mu_r = 1.0;
+
+            if (it != material_mu.end()) {
+                mu_r = evaluateMu(it->second, H_mag);
+            }
+
+            mu_map(j, i) = mu_r * MU_0;
         }
     }
 }
