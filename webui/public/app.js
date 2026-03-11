@@ -66,6 +66,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     await refreshImageList();
     await refreshResultsList();
 
+    // Restore last active material library from cookie
+    const lastLibrary = getCookie('magfdm_last_library');
+    if (lastLibrary) {
+        try {
+            // Verify the library file still exists on server
+            const resp = await fetch(
+                `/api/material-libraries/${encodeURIComponent(lastLibrary)}?userId=${AppState.userId}`
+            );
+            if (resp.ok) {
+                AppState.selectedLibrary = lastLibrary;
+                document.getElementById('activeLibraryName').textContent = lastLibrary;
+                document.getElementById('activeLibraryBadge').style.display = 'inline-flex';
+                console.log('Restored material library from cookie:', lastLibrary);
+            } else {
+                // File no longer exists — clear stale cookie
+                setCookie('magfdm_last_library', '', -1);
+            }
+        } catch (e) {
+            console.warn('Failed to restore material library:', e);
+            setCookie('magfdm_last_library', '', -1);
+        }
+    }
+
     // Setup step slider event handler
     const stepSlider = document.getElementById('stepSlider');
     if (stepSlider) {
@@ -8261,10 +8284,14 @@ function setActiveLibrary() {
     AppState.selectedLibrary = filename;
     document.getElementById('activeLibraryName').textContent = filename;
     document.getElementById('activeLibraryBadge').style.display = 'inline-flex';
+    // Persist to cookie so it auto-loads on next visit
+    setCookie('magfdm_last_library', filename, 365);
     showStatus('configStatus', `Material library set: ${filename}`, 'success');
 }
 
 function clearActiveLibrary() {
     AppState.selectedLibrary = null;
     document.getElementById('activeLibraryBadge').style.display = 'none';
+    // Clear cookie
+    setCookie('magfdm_last_library', '', -1);
 }
