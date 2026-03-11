@@ -627,6 +627,7 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
         const antialiasBaseIdx = new Set(); // indices into dominant[]
         const aaBlends = [];               // detected blend records
 
+        const rareUnique = [];  // rare colors that are NOT AA blends → treated as materials
         for (const rareColor of rare) {
             let found = false;
             for (let i = 0; i < dominant.length && !found; i++) {
@@ -647,17 +648,26 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
                     }
                 }
             }
+            if (!found) {
+                // This rare color cannot be explained as an AA blend of two dominant colors
+                // → it is a unique material color with small coverage
+                rareUnique.push(rareColor);
+            }
         }
 
-        // Build YAML template (dominant colors only; AA bases get antialias:true)
+        // Build YAML template (dominant + rare-unique colors; AA bases get antialias:true)
         const toHex = ([r, g, b]) =>
             r.toString(16).padStart(2, '0') +
             g.toString(16).padStart(2, '0') +
             b.toString(16).padStart(2, '0');
 
+        const totalMaterials = dominant.length + rareUnique.length;
         const lines = [
             `# Auto-generated from ${req.file.originalname}`,
-            `# ${dominant.length} material color(s) detected` +
+            `# ${totalMaterials} material color(s) detected` +
+                (rareUnique.length > 0
+                    ? ` (${dominant.length} dominant + ${rareUnique.length} rare-unique)`
+                    : '') +
                 (aaBlends.length > 0
                     ? `, ${aaBlends.length} anti-aliasing blend(s) excluded`
                     : ''),
@@ -675,6 +685,15 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             lines.push(`    jz: 0.0`);
             if (antialiasBaseIdx.has(i)) lines.push(`    antialias: true`);
         }
+        // Rare-unique colors: small coverage but not AA blends → genuine materials
+        for (const ru of rareUnique) {
+            const [r, g, b] = ru.rgb;
+            const hex = toHex([r, g, b]);
+            lines.push(`  material_${hex}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # TODO: set permeability  (coverage: ${(ru.ratio * 100).toFixed(2)}%)`);
+            lines.push(`    jz: 0.0`);
+        }
         if (aaBlends.length > 0) {
             lines.push(``, `# Anti-aliasing blends detected (excluded from materials):`);
             for (const blend of aaBlends) {
@@ -686,15 +705,26 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
         // Clean up temp file
         await fs.unlink(tmpPath);
 
-        res.json({
-            success:      true,
-            colors:       dominant.map((c, i) => ({
+        // Combine dominant + rare-unique for the colors response
+        const allMaterialColors = [
+            ...dominant.map((c, i) => ({
                 rgb:       c.rgb,
                 ratio:     c.ratio,
                 antialias: antialiasBaseIdx.has(i)
             })),
+            ...rareUnique.map(c => ({
+                rgb:       c.rgb,
+                ratio:     c.ratio,
+                antialias: false
+            }))
+        ];
+
+        res.json({
+            success:      true,
+            colors:       allMaterialColors,
             allColors:    sorted.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
             aaBlends,
+            rareUnique:   rareUnique.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
             yamlTemplate: lines.join('\n')
         });
     } catch (error) {
