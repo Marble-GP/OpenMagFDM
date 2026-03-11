@@ -171,20 +171,20 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
         }
 
         // Parse OpenMP thread count (optional)
-        // YAML: solver: { omp_threads: 4 }
+        // YAML: omp: { threads: 4 }
         // Set to 0 or omit to use default (OMP_NUM_THREADS env var or all cores)
-        if (config["solver"] && config["solver"]["omp_threads"]) {
-            int omp_threads = config["solver"]["omp_threads"].as<int>(0);
+        if (config["omp"] && config["omp"]["threads"]) {
+            int omp_threads = config["omp"]["threads"].as<int>(0);
 #ifdef _OPENMP
             if (omp_threads > 0) {
                 omp_set_num_threads(omp_threads);
-                std::cout << "OpenMP: thread count set to " << omp_threads << " (via YAML solver.omp_threads)" << std::endl;
+                std::cout << "OpenMP: thread count set to " << omp_threads << " (via YAML omp.threads)" << std::endl;
             } else {
                 std::cout << "OpenMP: using default thread count (OMP_NUM_THREADS or all cores)" << std::endl;
             }
 #else
             if (omp_threads > 0) {
-                std::cout << "OpenMP: solver.omp_threads=" << omp_threads << " specified, but OpenMP is not enabled in this build." << std::endl;
+                std::cout << "OpenMP: omp.threads=" << omp_threads << " specified, but OpenMP is not enabled in this build." << std::endl;
             }
 #endif
         }

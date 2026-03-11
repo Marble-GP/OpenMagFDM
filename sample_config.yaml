@@ -1,5 +1,9 @@
 # 2次元磁場解析設定ファイル
 
+# OpenMP 並列化設定
+# omp:
+#   threads: 16  # 使用スレッド数（0 または省略で自動 = 全コア使用）
+
 # 座標系設定
 coordinate_system: polar  # cartesian (直交座標) or polar (極座標)
 
