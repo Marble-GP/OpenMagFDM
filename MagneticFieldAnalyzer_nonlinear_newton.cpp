@@ -417,24 +417,72 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                             std::cerr << "  [Fine Newton solve failed, stopping fine finishing]" << std::endl;
                             break;
                         }
-                        Eigen::VectorXd Az_new_vec = Az_fine_vec + delta_fine;
 
-                        // Step 5: Update Az matrix
-                        if (is_polar) {
-                            for (int i = 0; i < nr; i++) {
-                                for (int j = 0; j < ntheta; j++) {
-                                    if (r_orientation == "horizontal") {
-                                        Az(j, i) = Az_new_vec(i * ntheta + j);
-                                    } else {
-                                        Az(i, j) = Az_new_vec(i * ntheta + j);
+                        // Step 4b: True nonlinear backtracking line search.
+                        // At each trial α, update Az → recompute B/H/μ → rebuild A(μ) →
+                        // evaluate ||A(μ_new)*Az_new - b||.  No LU factorization needed
+                        // (just a sparse matvec), so each trial is much cheaper than
+                        // the Newton step itself.
+                        Eigen::MatrixXd Az_save = Az;
+                        Eigen::MatrixXd mu_save = mu_map;
+                        double alpha_fine = 1.0;
+                        bool step_accepted = false;
+
+                        for (int ls = 0; ls < 4; ls++) {
+                            Eigen::VectorXd Az_trial = Az_fine_vec + alpha_fine * delta_fine;
+
+                            // Write trial Az to matrix
+                            if (is_polar) {
+                                for (int ir = 0; ir < nr; ir++)
+                                    for (int jt = 0; jt < ntheta; jt++) {
+                                        if (r_orientation == "horizontal")
+                                            Az(jt, ir) = Az_trial(ir * ntheta + jt);
+                                        else
+                                            Az(ir, jt) = Az_trial(ir * ntheta + jt);
                                     }
-                                }
+                            } else {
+                                for (int jj = 0; jj < ny; jj++)
+                                    for (int ii = 0; ii < nx; ii++)
+                                        Az(jj, ii) = Az_trial(jj * nx + ii);
                             }
-                        } else {
-                            for (int j = 0; j < ny; j++)
-                                for (int i = 0; i < nx; i++)
-                                    Az(j, i) = Az_new_vec(j * nx + i);
+
+                            // Recompute μ at trial point
+                            if (is_polar) calculateMagneticFieldPolar();
+                            else          calculateMagneticField();
+                            calculateHField();
+                            updateMuDistribution();
+
+                            // Build matrix with trial μ and evaluate true residual
+                            Eigen::SparseMatrix<double> A_trial;
+                            Eigen::VectorXd b_trial;
+                            if (is_polar) buildMatrixPolar(A_trial, b_trial);
+                            else          buildMatrix(A_trial, b_trial);
+
+                            double R_trial_norm = (A_trial * Az_trial - b_trial).norm();
+                            double R_trial_rel = R_trial_norm / (b_trial.norm() + 1e-12);
+
+                            if (R_trial_rel < fine_rel) {
+                                // Accept: Az and mu_map are already updated
+                                step_accepted = true;
+                                if (alpha_fine < 1.0) {
+                                    std::cout << "  (α=" << std::fixed << std::setprecision(4) << alpha_fine
+                                              << ", R=" << std::scientific << std::setprecision(2) << R_trial_rel << ")" << std::endl;
+                                }
+                                break;
+                            }
+
+                            // Restore state for next trial
+                            Az = Az_save;
+                            mu_map = mu_save;
+                            alpha_fine *= 0.5;
                         }
+
+                        if (!step_accepted) {
+                            // No step size improved the residual → stop fine finishing
+                            std::cout << " [line search failed, stopping]" << std::endl;
+                            break;
+                        }
+                        // Az and mu_map are already at the accepted trial point
                     }
 
                     // Final μ update so exported fields are consistent with the finished Az
