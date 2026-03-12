@@ -2989,7 +2989,11 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
     #pragma omp parallel
     {
         std::vector<Eigen::Triplet<double>> local_triplets;
-        local_triplets.reserve(5 * n_active_cells / (1 + omp_get_num_threads()) + 16);
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(5 * n_active_cells / (1 + nth) + 16);
 
     #pragma omp for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
@@ -5549,7 +5553,11 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
     #pragma omp parallel
     {
         std::vector<Eigen::Triplet<double>> local_triplets;
-        local_triplets.reserve(5 * n / (1 + omp_get_num_threads()) + 16);
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(5 * n / (1 + nth) + 16);
 
     #pragma omp for schedule(static)
     for (int k = 0; k < ny * nx; k++) {
@@ -9815,7 +9823,11 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
     #pragma omp parallel
     {
         std::vector<Eigen::Triplet<double>> local_triplets;
-        local_triplets.reserve(7 * n / (1 + omp_get_num_threads()) + 16);
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(7 * n / (1 + nth) + 16);
 
     #pragma omp for schedule(static)
     for (int k = 0; k < nr * ntheta; k++) {  // Flat loop: radial × angular
@@ -10175,7 +10187,11 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
     #pragma omp parallel
     {
         std::vector<Eigen::Triplet<double>> local_triplets;
-        local_triplets.reserve(7 * n_active_cells / (1 + omp_get_num_threads()) + 16);
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(7 * n_active_cells / (1 + nth) + 16);
 
     #pragma omp for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
