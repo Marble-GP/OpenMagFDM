@@ -192,6 +192,67 @@ jobs:
         cd release
         Compress-Archive -Path OpenMagFDM-Windows -DestinationPath OpenMagFDM-Windows-x86_64.zip
 
+    - name: Smoke test (AMGCL activation check)
+      run: |
+        # Create a 200x200 test image: white background (air) + red square (coil)
+        # n = 200*200 = 40,000 > AMGCL_THRESHOLD (30,000) → AMGCL should activate
+        Add-Type -AssemblyName System.Drawing
+        $bmp = New-Object System.Drawing.Bitmap(200, 200)
+        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.Clear([System.Drawing.Color]::White)
+        $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255,255,0,0))
+        $g.FillRectangle($brush, 90, 90, 20, 20)
+        $g.Dispose(); $brush.Dispose()
+        $bmp.Save("${{github.workspace}}\release\OpenMagFDM-Windows\test_smoke.png")
+        $bmp.Dispose()
+
+        # Write config (cartesian 200x200, linear, Dirichlet BC)
+        @'
+coordinate_system: cartesian
+mesh:
+  dx: 1.0e-3
+  dy: 1.0e-3
+boundary_conditions:
+  left:
+    type: dirichlet
+    value: 0.0
+  right:
+    type: dirichlet
+    value: 0.0
+  bottom:
+    type: dirichlet
+    value: 0.0
+  top:
+    type: dirichlet
+    value: 0.0
+materials:
+  air:
+    rgb: [255, 255, 255]
+    mu_r: 1.0
+    jz: 0.0
+  coil:
+    rgb: [255, 0, 0]
+    mu_r: 1.0
+    jz: 1.0e6
+'@ | Out-File -FilePath "${{github.workspace}}\release\OpenMagFDM-Windows\test_smoke.yaml" -Encoding utf8
+
+        # Run solver
+        Set-Location "${{github.workspace}}\release\OpenMagFDM-Windows"
+        Write-Host "=== Running smoke test (n=40000, expect AMGCL) ==="
+        $output = & .\MagFDMsolver.exe test_smoke.yaml test_smoke.png 2>&1
+        $output | ForEach-Object { Write-Host $_ }
+        Write-Host "=== End of solver output ==="
+
+        # Verify AMGCL was activated
+        $amgclLines = $output | Where-Object { $_ -match "\[AMGCL\]|AMGCL AMG" }
+        if ($amgclLines) {
+          Write-Host "✓ AMGCL is working on Windows"
+          $amgclLines | ForEach-Object { Write-Host "  $_" }
+        } else {
+          Write-Host "✗ WARNING: AMGCL was NOT activated — solver fell back to SparseLU"
+          Write-Host "  This means large problems will be significantly slower on Windows."
+        }
+
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
