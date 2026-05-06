@@ -207,34 +207,19 @@ jobs:
         $bmp.Dispose()
 
         # Write config (cartesian 200x200, linear, Dirichlet BC)
-        @'
-coordinate_system: cartesian
-mesh:
-  dx: 1.0e-3
-  dy: 1.0e-3
-boundary_conditions:
-  left:
-    type: dirichlet
-    value: 0.0
-  right:
-    type: dirichlet
-    value: 0.0
-  bottom:
-    type: dirichlet
-    value: 0.0
-  top:
-    type: dirichlet
-    value: 0.0
-materials:
-  air:
-    rgb: [255, 255, 255]
-    mu_r: 1.0
-    jz: 0.0
-  coil:
-    rgb: [255, 0, 0]
-    mu_r: 1.0
-    jz: 1.0e6
-'@ | Out-File -FilePath "${{github.workspace}}\release\OpenMagFDM-Windows\test_smoke.yaml" -Encoding utf8
+        # Note: avoid PowerShell here-strings (@'...'@) here because their unindented
+        # content breaks YAML block scalar parsing in GitHub Actions workflow files.
+        $cfg  = "coordinate_system: cartesian`n"
+        $cfg += "mesh:`n  dx: 1.0e-3`n  dy: 1.0e-3`n"
+        $cfg += "boundary_conditions:`n"
+        $cfg += "  left:`n    type: dirichlet`n    value: 0.0`n"
+        $cfg += "  right:`n    type: dirichlet`n    value: 0.0`n"
+        $cfg += "  bottom:`n    type: dirichlet`n    value: 0.0`n"
+        $cfg += "  top:`n    type: dirichlet`n    value: 0.0`n"
+        $cfg += "materials:`n"
+        $cfg += "  air:`n    rgb: [255, 255, 255]`n    mu_r: 1.0`n    jz: 0.0`n"
+        $cfg += "  coil:`n    rgb: [255, 0, 0]`n    mu_r: 1.0`n    jz: 1.0e6`n"
+        $cfg | Out-File -FilePath "${{github.workspace}}\release\OpenMagFDM-Windows\test_smoke.yaml" -Encoding utf8
 
         # Run solver
         Set-Location "${{github.workspace}}\release\OpenMagFDM-Windows"
