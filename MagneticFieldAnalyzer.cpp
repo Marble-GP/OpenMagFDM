@@ -2851,20 +2851,8 @@ void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
         std::cout << "  Matrix is symmetric (relative error < 1e-8)" << std::endl;
     }
 
-    // Solve using SparseLU
     std::cout << "\n=== Solving coarsened linear system ===" << std::endl;
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-    solver.compute(A);
-
-    if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Coarsened matrix decomposition failed");
-    }
-
-    Eigen::VectorXd Az_coarse = solver.solve(rhs);
-
-    if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Coarsened linear system solving failed");
-    }
+    Eigen::VectorXd Az_coarse = solveLinearSystem(A, rhs);
 
     // Interpolate back to full grid
     std::cout << "Interpolating to full grid..." << std::endl;
@@ -4415,6 +4403,85 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
     A.makeCompressed();
 }
 
+Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
+    const Eigen::SparseMatrix<double>& A,
+    const Eigen::VectorXd& rhs,
+    const Eigen::VectorXd& initial_guess)
+{
+    int n = A.rows();
+
+    if (n > AMGCL_THRESHOLD) {
+        // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems
+        std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
+
+        typedef amgcl::make_solver<
+            amgcl::amg<
+                amgcl::backend::eigen<double>,
+                amgcl::coarsening::smoothed_aggregation,
+                amgcl::relaxation::spai0
+            >,
+            amgcl::solver::cg<amgcl::backend::eigen<double>>
+        > AMGSolver;
+
+        Eigen::SparseMatrix<double, Eigen::RowMajor> A_rm = A;
+
+        AMGSolver::params params;
+        params.solver.tol     = SOLVER_TOLERANCE;
+        params.solver.maxiter = SOLVER_MAX_ITERATIONS;
+
+        AMGSolver amg(A_rm, params);
+
+        // Warm-start: use previous solution as initial guess (especially useful in nonlinear iterations)
+        Eigen::VectorXd x = (initial_guess.size() == n) ? initial_guess
+                                                         : Eigen::VectorXd::Zero(n);
+        auto [iters, error] = amg(rhs, x);
+
+        std::cout << "  [AMGCL] " << iters << " iters, residual="
+                  << std::scientific << std::setprecision(2) << error
+                  << std::defaultfloat << std::endl;
+
+        if (error > SOLVER_TOLERANCE * 1000) {
+            std::cerr << "WARNING: AMGCL did not converge (error=" << error
+                      << "). Falling back to SparseLU." << std::endl;
+            Eigen::SparseLU<Eigen::SparseMatrix<double>> fallback;
+            fallback.compute(A);
+            if (fallback.info() != Eigen::Success)
+                throw std::runtime_error("SparseLU fallback factorization failed");
+            x = fallback.solve(rhs);
+            if (fallback.info() != Eigen::Success)
+                throw std::runtime_error("SparseLU fallback solve failed");
+        }
+
+        return x;
+
+    } else {
+        // SparseLU: symbolic factorization reused across nonlinear iterations
+        std::cout << "  [Solver] SparseLU (n=" << n << " <= " << AMGCL_THRESHOLD << ")" << std::endl;
+
+        if (!nl_solver_pattern_valid_ || n != nl_solver_last_n_) {
+            nl_solver_.analyzePattern(A);
+            nl_solver_pattern_valid_ = true;
+            nl_solver_last_n_ = n;
+        }
+
+        nl_solver_.factorize(A);
+
+        if (nl_solver_.info() != Eigen::Success) {
+            // Pattern may have changed; re-analyse and retry
+            nl_solver_.analyzePattern(A);
+            nl_solver_.factorize(A);
+            if (nl_solver_.info() != Eigen::Success)
+                throw std::runtime_error("SparseLU factorization failed");
+        }
+
+        Eigen::VectorXd x = nl_solver_.solve(rhs);
+        if (nl_solver_.info() != Eigen::Success)
+            throw std::runtime_error("SparseLU solve failed");
+
+        return x;
+    }
+}
+
 void MagneticFieldAnalyzer::buildAndSolveSystem() {
     std::cout << "\n=== Building FDM system of equations ===" << std::endl;
 
@@ -4442,20 +4509,15 @@ void MagneticFieldAnalyzer::buildAndSolveSystem() {
         std::cout << "  Matrix is symmetric (relative error < 1e-8)" << std::endl;
     }
 
-    // Solve using SparseLU
+    // Solve: AMGCL for large problems, SparseLU with pattern reuse for small problems
     std::cout << "\n=== Solving linear system ===" << std::endl;
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-    solver.compute(A);
 
-    if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Matrix decomposition failed");
+    // Warm-start from current Az if available (helps nonlinear iterations)
+    Eigen::VectorXd initial_guess;
+    if (static_cast<int>(Az.size()) == n) {
+        initial_guess = Eigen::Map<const Eigen::VectorXd>(Az.data(), n);
     }
-
-    Eigen::VectorXd Az_flat = solver.solve(rhs);
-
-    if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Linear system solving failed");
-    }
+    Eigen::VectorXd Az_flat = solveLinearSystem(A, rhs, initial_guess);
 
     // Reshape to 2D matrix
     Az.resize(ny, nx);
@@ -8720,16 +8782,24 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
         std::cerr << "This may indicate incorrect discretization or boundary conditions." << std::endl;
     }
 
-    // Solve linear system
+    // Solve: AMGCL for large problems, SparseLU with pattern reuse for small problems
     std::cout << "\n=== Solving linear system ===" << std::endl;
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-    solver.compute(A);
 
-    if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Matrix factorization failed!");
+    // Warm-start from current Az if available (helps nonlinear iterations)
+    Eigen::VectorXd initial_guess;
+    if (static_cast<int>(Az.size()) == n) {
+        initial_guess.resize(n);
+        if (r_orientation == "horizontal") {
+            for (int i = 0; i < nr; i++)
+                for (int j = 0; j < ntheta; j++)
+                    initial_guess(i * ntheta + j) = Az(j, i);
+        } else {
+            for (int i = 0; i < nr; i++)
+                for (int j = 0; j < ntheta; j++)
+                    initial_guess(i * ntheta + j) = Az(i, j);
+        }
     }
-
-    Eigen::VectorXd Az_flat = solver.solve(rhs);
+    Eigen::VectorXd Az_flat = solveLinearSystem(A, rhs, initial_guess);
 
     // Check residual (debug output only if verbose)
     if (nonlinear_config.verbose) {
@@ -8739,10 +8809,6 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
         std::cout << "[DBG] Residual norm ||A x - b|| = " << res_norm
                 << ", relative = " << (rhs_norm>0 ? res_norm / rhs_norm : res_norm) << std::endl;
     }
-
-        if (solver.info() != Eigen::Success) {
-            throw std::runtime_error("Linear system solve failed!");
-        }
 
     // Reshape solution to matrix form
     // Index mapping: idx = i * ntheta + j, where i is radial, j is angular
@@ -9029,18 +9095,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
 
     // Solve linear system
     std::cout << "\n=== Solving coarsened linear system ===" << std::endl;
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-    solver.compute(A);
-
-    if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Polar coarsened matrix decomposition failed!");
-    }
-
-    Eigen::VectorXd Az_coarse = solver.solve(rhs);
-
-    if (solver.info() != Eigen::Success) {
-        throw std::runtime_error("Polar coarsened solve failed!");
-    }
+    Eigen::VectorXd Az_coarse = solveLinearSystem(A, rhs);
 
     // Check residual
     if (nonlinear_config.verbose) {
@@ -9250,21 +9305,13 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
     A.setFromTriplets(triplets.begin(), triplets.end());
     A.makeCompressed();
 
-    // Solve using SparseLU
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-    solver.compute(A);
-
-    if (solver.info() != Eigen::Success) {
-        std::cerr << "Warning: Pseudo-Cartesian factorization failed, using zero initial guess" << std::endl;
-        Az = Eigen::MatrixXd::Zero(r_orientation == "horizontal" ? ntheta : nr,
-                                    r_orientation == "horizontal" ? nr : ntheta);
-        return;
-    }
-
-    Eigen::VectorXd Az_flat = solver.solve(rhs);
-
-    if (solver.info() != Eigen::Success) {
-        std::cerr << "Warning: Pseudo-Cartesian solve failed, using zero initial guess" << std::endl;
+    // Solve (soft failure: fall back to zero initial guess if solver throws)
+    Eigen::VectorXd Az_flat;
+    try {
+        Az_flat = solveLinearSystem(A, rhs);
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Pseudo-Cartesian solve failed (" << e.what()
+                  << "), using zero initial guess" << std::endl;
         Az = Eigen::MatrixXd::Zero(r_orientation == "horizontal" ? ntheta : nr,
                                     r_orientation == "horizontal" ? nr : ntheta);
         return;

@@ -568,6 +568,20 @@ private:
     Eigen::SparseMatrix<double> previous_matrix;  // Previous matrix for ΔA diagnostic
     bool use_iterative_solver;  // Use iterative solver with warm start (faster for step > 0)
 
+    // Persistent linear solver for nonlinear iteration pattern reuse (SparseLU path)
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> nl_solver_;
+    bool nl_solver_pattern_valid_ = false;
+    int nl_solver_last_n_ = 0;
+
+    // Threshold for switching from SparseLU to AMGCL (AMG-preconditioned CG)
+    // For 2D FDM Poisson, AMGCL is faster above ~170x170 grid (n > 30000)
+    static constexpr int AMGCL_THRESHOLD = 30000;
+
+    // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small
+    Eigen::VectorXd solveLinearSystem(const Eigen::SparseMatrix<double>& A,
+                                      const Eigen::VectorXd& rhs,
+                                      const Eigen::VectorXd& initial_guess = Eigen::VectorXd());
+
     // Private methods
     void loadConfig(const std::string& config_path);
     void loadImage(const std::string& image_path);
