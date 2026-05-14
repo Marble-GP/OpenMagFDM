@@ -9838,8 +9838,24 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // Start step timer
         auto step_start_time = std::chrono::high_resolution_clock::now();
 
+        // <<PROFILING_TIMER_BEGIN>>
+        long long prof_d_mat = 0, prof_d_build = 0, prof_d_warm = 0;
+        long long prof_d_amgb = 0, prof_d_amgs = 0, prof_d_resh = 0;
+        long long prof_d_force = 0, prof_d_energy = 0, prof_d_flux = 0;
+        long long prof_d_export = 0, prof_d_slide = 0;
+        long long prof_n = 0, prof_nnz = 0;
+        int prof_iters = 0;
+        double prof_resid = 0.0;
+        auto prof_t_mat = std::chrono::high_resolution_clock::now();
+        // <<PROFILING_TIMER_END>>
+
         // 1. Update material properties (Jz) for this step
         setupMaterialPropertiesForStep(step);
+
+        // <<PROFILING_TIMER_BEGIN>>
+        prof_d_mat = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - prof_t_mat).count();
+        // <<PROFILING_TIMER_END>>
 
         // 2. Solve FDM system
         auto solve_start = std::chrono::high_resolution_clock::now();
@@ -9883,6 +9899,10 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             Eigen::VectorXd rhs;
             int n;
 
+            // <<PROFILING_TIMER_BEGIN>>
+            auto prof_t_build = std::chrono::high_resolution_clock::now();
+            // <<PROFILING_TIMER_END>>
+
             // Build matrix based on coordinate system
             if (coordinate_system == "cartesian") {
                 n = nx * ny;
@@ -9891,6 +9911,14 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                 n = nr * ntheta;
                 buildMatrixPolar(A, rhs);
             }
+
+            // <<PROFILING_TIMER_BEGIN>>
+            prof_d_build = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - prof_t_build).count();
+            prof_n = static_cast<long long>(n);
+            prof_nnz = static_cast<long long>(A.nonZeros());
+            auto prof_t_warm = std::chrono::high_resolution_clock::now();
+            // <<PROFILING_TIMER_END>>
 
             Eigen::VectorXd Az_flat;
 
@@ -10273,6 +10301,11 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     amg_params.solver.tol = SOLVER_TOLERANCE;
                     amg_params.solver.maxiter =  SOLVER_MAX_ITERATIONS;
 
+                    // <<PROFILING_TIMER_BEGIN>>
+                    prof_d_warm = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::high_resolution_clock::now() - prof_t_warm).count();
+                    // <<PROFILING_TIMER_END>>
+
                     std::cout << "  Building AMG hierarchy..." << std::endl;
                     auto amg_build_start = std::chrono::high_resolution_clock::now();
                     AMGSolver amg_solve(A_rowmajor, amg_params);
@@ -10298,6 +10331,13 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     std::cout << "    Iterations: " << amg_iters << std::endl;
                     std::cout << "    Residual error: " << amg_error << std::endl;
                     std::cout << "    Status: " << (amg_error < SOLVER_TOLERANCE ? "SUCCESS" : "FAILED") << std::endl;
+
+                    // <<PROFILING_TIMER_BEGIN>>
+                    prof_d_amgb = amg_build_time.count();
+                    prof_d_amgs = amg_solve_time.count();
+                    prof_iters = amg_iters;
+                    prof_resid = amg_error;
+                    // <<PROFILING_TIMER_END>>
 
                     // Use AMGCL solution
                     Az_flat = amg_solution;
@@ -10411,6 +10451,10 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                 previous_matrix = A;
             }
 
+            // <<PROFILING_TIMER_BEGIN>>
+            auto prof_t_resh = std::chrono::high_resolution_clock::now();
+            // <<PROFILING_TIMER_END>>
+
             // Reshape to 2D matrix based on coordinate system
             if (coordinate_system == "cartesian") {
                 Az.resize(ny, nx);
@@ -10440,10 +10484,19 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     }
                 }
             }
+
+            // <<PROFILING_TIMER_BEGIN>>
+            prof_d_resh = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::high_resolution_clock::now() - prof_t_resh).count();
+            // <<PROFILING_TIMER_END>>
         } else {
             // Standard path (fallback - not used)
             solve();
         }
+
+        // <<PROFILING_TIMER_BEGIN>>
+        auto prof_t_force = std::chrono::high_resolution_clock::now();
+        // <<PROFILING_TIMER_END>>
 
         // 3. Calculate force using Distributed Amperian Force method (DEFAULT)
         // This method uses bound current from magnetization: J_b = ∇×M, F = ∫J_b × B dV
@@ -10451,16 +10504,39 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // This is the recommended and default force calculation method.
         calculateForceDistributedAmperian(step, 0.0);  // No smoothing (sigma = 0)
 
+        // <<PROFILING_TIMER_BEGIN>>
+        prof_d_force = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - prof_t_force).count();
+        auto prof_t_energy = std::chrono::high_resolution_clock::now();
+        // <<PROFILING_TIMER_END>>
+
         // 3.1. Calculate total magnetic energy (reuses calculated field from step)
         double total_energy = calculateTotalMagneticEnergy(step);
         std::cout << "Step " << step+1 << " Total Magnetic Energy: " << total_energy << " J/m" << std::endl;
 
+        // <<PROFILING_TIMER_BEGIN>>
+        prof_d_energy = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - prof_t_energy).count();
+        auto prof_t_flux = std::chrono::high_resolution_clock::now();
+        // <<PROFILING_TIMER_END>>
+
         // 3.2. Calculate flux linkage for all defined paths
         calculateAllFluxLinkages(step);
+
+        // <<PROFILING_TIMER_BEGIN>>
+        prof_d_flux = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - prof_t_flux).count();
+        auto prof_t_export = std::chrono::high_resolution_clock::now();
+        // <<PROFILING_TIMER_END>>
 
         // 4. Export results for this step
         exportResults(output_dir, step);
         exportActiveOnlyResults(output_dir, step);
+
+        // <<PROFILING_TIMER_BEGIN>>
+        prof_d_export = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - prof_t_export).count();
+        // <<PROFILING_TIMER_END>>
 
         // Calculate and display step elapsed time
         auto step_end_time = std::chrono::high_resolution_clock::now();
@@ -10470,11 +10546,38 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         std::cout << "Step " << step+1 << " elapsed time: " << step_duration.count() << " ms" << std::endl;
         std::cout << "Total elapsed time: " << total_elapsed.count() << " s" << std::endl;
 
+        // <<PROFILING_TIMER_BEGIN>>
+        auto prof_t_slide = std::chrono::high_resolution_clock::now();
+        // <<PROFILING_TIMER_END>>
+
         // 5. Slide image for next step (except for last step)
         if (step < transient_config.total_steps - 1 && transient_config.enable_sliding) {
             slideImageRegion();
             // Material properties (mu_map, jz_map) will be updated by setupMaterialPropertiesForStep() at next step
         }
+
+        // <<PROFILING_TIMER_BEGIN>>
+        prof_d_slide = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - prof_t_slide).count();
+        std::cout << "TIMING,step=" << (step+1)
+                  << ",n=" << prof_n
+                  << ",nnz=" << prof_nnz
+                  << ",iters=" << prof_iters
+                  << ",resid=" << prof_resid
+                  << ",mat=" << prof_d_mat
+                  << ",build=" << prof_d_build
+                  << ",warm=" << prof_d_warm
+                  << ",amgb=" << prof_d_amgb
+                  << ",amgs=" << prof_d_amgs
+                  << ",resh=" << prof_d_resh
+                  << ",force=" << prof_d_force
+                  << ",energy=" << prof_d_energy
+                  << ",flux=" << prof_d_flux
+                  << ",export=" << prof_d_export
+                  << ",slide=" << prof_d_slide
+                  << ",total=" << step_duration.count()
+                  << std::endl;
+        // <<PROFILING_TIMER_END>>
     }
 
     // Calculate total analysis time
