@@ -29,6 +29,20 @@ endif()
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 
+# MSVC-specific optimization flags
+# Background: MSVC Release defaults do NOT enable AVX2, while GCC -march=native does.
+# AMGCL's AMG smoother and CG inner-product loops are heavily SIMD-friendly, so
+# leaving AVX2 off makes the Windows binary ~30x slower than the Linux binary on
+# the same hardware. Profiling confirmed amgs alone accounts for 50% of step time
+# on Windows vs 30% on Linux.
+# Requires CPU with AVX2 (Intel Haswell 2013+, AMD Excavator 2015+, Zen 2017+).
+if(MSVC)
+    target_compile_options(MagFDMsolver PRIVATE
+        $<$<CONFIG:Release>:/O2;/arch:AVX2;/fp:fast>
+        $<$<CONFIG:RelWithDebInfo>:/O2;/arch:AVX2;/fp:fast>
+    )
+endif()
+
 # ライブラリを探す
 find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(OpenCV REQUIRED)
