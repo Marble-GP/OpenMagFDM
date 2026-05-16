@@ -10001,7 +10001,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                 std::cout << "Step " << step+1 << ": Using AMGCL (AMG-preconditioned CG)..." << std::endl;
                 std::cout << "  (Problem size n=" << n << " > 100k threshold)" << std::endl;
 
-                std::cout << "[AMGCL] Preparing warm-start initial guess..." << std::endl;
+                std::cout << "[AMGCL] Using zero initial guess (warm-start prep disabled)" << std::endl;
 
                 // Start timing
                 auto amgcl_total_start = std::chrono::high_resolution_clock::now();
@@ -10023,6 +10023,24 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                                   << "), using zero initial guess" << std::endl;
                         previous_solution = Eigen::VectorXd::Zero(n);
                     }
+
+                    // ============================================
+                    // Warm-start preparation (DISABLED — empirically counter-productive)
+                    // ============================================
+                    // The shift+smoothing+correction prep below was originally written
+                    // for use with Eigen's warm-start CG solver. When AMGCL was
+                    // integrated as a test (see disabled CG block ~line 10345), the
+                    // prep was left in place but its output (x0) is no longer used —
+                    // AMGCL starts from zero (`amg_solution = Zero(n)`).
+                    //
+                    // Profiling Windows transient analysis (Linux: 44s, Windows: 944s)
+                    // showed the prep costs ~1000 ms / step on Windows for no benefit,
+                    // and produces rel_r0 ~= 10 (worse than zero start = 1.0) anyway
+                    // due to material discontinuities at the slide region boundary.
+                    //
+                    // Re-enable when a strategy is found that produces rel_r0 < 1.0.
+                    constexpr bool warm_start_prep_enabled = false;
+                    if (warm_start_prep_enabled) {
 
                     // ============================================
                     // DIAGNOSTIC: Permutation verification & matrix change quantification
@@ -10277,6 +10295,8 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         std::cout << "    Boundary (±2): " << r0_boundary_norm << std::endl;
                         std::cout << "    Non-slide region: " << r0_nonslide_norm << std::endl;
                     }
+
+                    } // end if (warm_start_prep_enabled)
 
                     // ============================================
                     // AMGCL Test: AMG-preconditioned CG (zero initial guess)
