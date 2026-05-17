@@ -121,3 +121,8 @@ transient:
   slide_region_end: 390   # スライド領域の終了位置 [ピクセル]
   slide_pixels_per_step: 1  # 1ステップあたりの移動量 [ピクセル] (循環シフト量)
 
+  # 出力フィールド指定（省略時は全出力 = 互換動作）。
+  # 大規模問題でI/Oが遅い場合、必要な項目だけ列挙すると 大幅にステップ時間を短縮できる。
+  # 有効値: Az, Mu, H, Jz, InputImg, BoundaryImg, Forces, EnergyDensity
+  # 例: export_fields: [Az, Forces, EnergyDensity]
+

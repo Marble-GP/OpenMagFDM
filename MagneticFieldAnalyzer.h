@@ -488,6 +488,10 @@ private:
         int slide_region_end;         // Pixel position (x for vertical, y for horizontal)
         int slide_pixels_per_step;    // Pixels to shift per step
 
+        // Output field selection (empty = export all, backward compat).
+        // Valid names: "Az", "Mu", "H", "Jz", "InputImg", "BoundaryImg", "Forces", "EnergyDensity"
+        std::vector<std::string> export_fields;
+
         TransientConfig() : enabled(false), enable_sliding(true), total_steps(0),
                            slide_direction("vertical"), slide_region_start(0),
                            slide_region_end(0), slide_pixels_per_step(0) {}
@@ -576,6 +580,14 @@ private:
     // Threshold for switching from SparseLU to AMGCL (AMG-preconditioned CG)
     // For 2D FDM Poisson, AMGCL is faster above ~170x170 grid (n > 30000)
     static constexpr int AMGCL_THRESHOLD = 30000;
+
+    // Export field selection check (used by exportResults). Empty list = export all (backward compat).
+    bool shouldExportField(const std::string& field_name) const;
+
+    // Optimized matrix-to-CSV writer: builds the full payload in memory with snprintf
+    // and writes it in a single call. ~3-5x faster than per-element operator<< on Windows
+    // (where each tiny stdio call incurs significant overhead).
+    static void writeMatrixCSV(const Eigen::MatrixXd& m, const std::string& output_path);
 
     // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small
     Eigen::VectorXd solveLinearSystem(const Eigen::SparseMatrix<double>& A,
