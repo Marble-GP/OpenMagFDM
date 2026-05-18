@@ -13,6 +13,7 @@
 #include <Eigen/Sparse>
 #include <opencv2/opencv.hpp>
 #include <yaml-cpp/yaml.h>
+#include <memory>
 #include <string>
 #include <map>
 #include <vector>
@@ -567,7 +568,8 @@ private:
     int transient_matrix_nnz;  // Track non-zero count for pattern verification
 
     // Transient analysis optimization: warm start (iterative solver)
-    Eigen::VectorXd previous_solution;  // Previous step solution for warm start
+    Eigen::VectorXd previous_solution;  // x_{k-1}: previous step solution
+    Eigen::VectorXd previous_previous_solution;  // x_{k-2}: for AR(1) linear extrapolation
     Eigen::VectorXd previous_rhs;       // Previous RHS for Δb correction
     Eigen::SparseMatrix<double> previous_matrix;  // Previous matrix for ΔA diagnostic
     bool use_iterative_solver;  // Use iterative solver with warm start (faster for step > 0)

@@ -9836,8 +9836,10 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             // This ensures mu_map is updated based on actual H-field at each transient step
             solve();
 
-            // Update previous_solution for warm start in next step
+            // Update solution history for warm start in next step.
+            // Shift history k-1 → k-2 BEFORE overwriting k-1.
             int n = (coordinate_system == "cartesian") ? (nx * ny) : (nr * ntheta);
+            previous_previous_solution = previous_solution;
             previous_solution.resize(n);
 
             if (coordinate_system == "cartesian") {
@@ -9976,23 +9978,15 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                 // Start timing
                 auto amgcl_total_start = std::chrono::high_resolution_clock::now();
 
-                // Validate previous_solution size
-                if (previous_solution.size() != n) {
-                    std::cerr << "WARNING: previous_solution size mismatch ("
-                              << previous_solution.size() << " vs " << n
-                              << "), using zero initial guess" << std::endl;
-                    previous_solution = Eigen::VectorXd::Zero(n);
-                }
+                // Note: previous_solution and previous_previous_solution may
+                // be empty (size 0) at the first step or after a problem-size
+                // change. The AR(1) warm-start logic further below checks
+                // sizes and falls back to zero start gracefully, so we no
+                // longer pre-zero these vectors here (doing so used to
+                // pollute the AR(1) history with bogus zeros).
 
                 // Prepare warm-start initial guess with preprocessing
                 {
-                    // Validate previous_solution size before warm start
-                    if (previous_solution.size() != n) {
-                        std::cerr << "WARNING: previous_solution size mismatch ("
-                                  << previous_solution.size() << " vs " << n
-                                  << "), using zero initial guess" << std::endl;
-                        previous_solution = Eigen::VectorXd::Zero(n);
-                    }
 
                     // ============================================
                     // Warm-start preparation (DISABLED — empirically counter-productive)
@@ -10269,9 +10263,20 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     } // end if (warm_start_prep_enabled)
 
                     // ============================================
-                    // AMGCL Test: AMG-preconditioned CG (zero initial guess)
+                    // AMG-preconditioned CG (zero initial guess, fresh hierarchy each step)
                     // ============================================
-                    // std::cout << "\n[AMGCL TEST] AMG-preconditioned CG (zero initial guess):" << std::endl;
+                    // Note: an experimental "adaptive AMG hierarchy cache" was tried
+                    // (reuse the smoothed-aggregation hierarchy across steps, rebuild
+                    // when convergence degrades). It backfired badly on sliding-region
+                    // transient analysis: a hierarchy built from A_{k-1} took 3500+ CG
+                    // iterations on A_k (vs 17 for a fresh build), 200x slower per step.
+                    // The cause is that sliding moves mu values (1 ↔ 100 ↔ 500) across
+                    // cells each step, drastically changing the connection-strength
+                    // graph that smoothed_aggregation depends on. The cached hierarchy's
+                    // aggregates no longer match the new graph and the AMG smoother
+                    // becomes ineffective. See git log for details.
+                    // Building the hierarchy fresh each step (~85-100 ms on Windows
+                    // with AVX2) is currently the right trade-off.
 
                     // Convert matrix to RowMajor for AMGCL
                     Eigen::SparseMatrix<double, Eigen::RowMajor> A_rowmajor = A;
@@ -10304,8 +10309,38 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
                     std::cout << "  AMG hierarchy built in " << amg_build_time.count() << " ms" << std::endl;
 
-                    // Solve with AMGCL
-                    Eigen::VectorXd amg_solution = Eigen::VectorXd::Zero(n);
+                    // ============================================
+                    // Warm-start initial guess (AR(1) linear extrapolation)
+                    // ============================================
+                    // Empirically validated by sweeping iteration counts across
+                    // candidates (zero / x_prev / partial+shift / full+shift /
+                    // smoothed variants / AR(1) / AR(2)) at slide sizes 1, 5, 10,
+                    // 25 px. AR(1) (x_pred = 2*x_{k-1} - x_{k-2}) was best or
+                    // tied across all configurations:
+                    //
+                    //   slide_px | zero | x_prev | AR(1)  saving
+                    //   ---------|------|--------|------- -------
+                    //         1  |  17  |   14   |  13     -24%
+                    //         5  |  17  |   15   |  14-15  -12-18%
+                    //        10  |  17  |   16   |  15     -12%
+                    //        25  |  17  |   16   |  16      -6%
+                    //
+                    // Shifts (partial/full) and Gaussian smoothing did not beat
+                    // simply running AR(1) on the unshifted solutions, because
+                    // CG convergence cares about A-norm of the error, not the
+                    // residual L2 norm that shifts try to optimize.
+                    Eigen::VectorXd amg_solution;
+                    if (previous_previous_solution.size() == static_cast<Eigen::Index>(n)
+                        && previous_solution.size() == static_cast<Eigen::Index>(n)) {
+                        // AR(1): linear extrapolation in time
+                        amg_solution = 2.0 * previous_solution - previous_previous_solution;
+                    } else if (previous_solution.size() == static_cast<Eigen::Index>(n)) {
+                        // Only one history vector available — use it directly
+                        amg_solution = previous_solution;
+                    } else {
+                        // First step: no history
+                        amg_solution = Eigen::VectorXd::Zero(n);
+                    }
                     std::cout << "  Solving with AMG-CG..." << std::endl;
                     auto amg_solve_start = std::chrono::high_resolution_clock::now();
                     int amg_iters;
@@ -10406,7 +10441,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     */// End of warm-start CG code block
                 }
 
-                // Update previous solution, RHS, and matrix for next step
+                // Update solution history for AR(1) warm-start at next step.
+                // Order matters: shift k-1 → k-2 BEFORE overwriting k-1.
+                previous_previous_solution = previous_solution;
                 previous_solution = Az_flat;
                 previous_rhs = rhs;
                 previous_matrix = A;
@@ -10435,7 +10472,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     throw std::runtime_error("Linear system solving failed");
                 }
 
-                // Save solution, RHS, and matrix for potential future use
+                // Save solution, RHS, and matrix for potential future use.
+                // Shift history k-1 → k-2 BEFORE overwriting k-1.
+                previous_previous_solution = previous_solution;
                 previous_solution = Az_flat;
                 previous_rhs = rhs;
                 previous_matrix = A;
