@@ -21,12 +21,14 @@ const SOLVER_PATH = isPkg
 const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
 const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
 const OUTPUTS_DIR = path.join(BASE_DIR, 'outputs');
+const USER_LIBS_DIR = path.join(BASE_DIR, 'user-libs');
 
 // 基本ディレクトリを同期的に作成（Multerが使用する前に必要）
 try {
     if (!fsSync.existsSync(UPLOAD_DIR)) fsSync.mkdirSync(UPLOAD_DIR, { recursive: true });
     if (!fsSync.existsSync(USER_CONFIGS_DIR)) fsSync.mkdirSync(USER_CONFIGS_DIR, { recursive: true });
     if (!fsSync.existsSync(OUTPUTS_DIR)) fsSync.mkdirSync(OUTPUTS_DIR, { recursive: true });
+    if (!fsSync.existsSync(USER_LIBS_DIR)) fsSync.mkdirSync(USER_LIBS_DIR, { recursive: true });
 } catch (error) {
     console.error('Error creating base directories:', error);
 }
@@ -37,6 +39,7 @@ async function initializeDirectories() {
         await fs.mkdir(UPLOAD_DIR, { recursive: true });
         await fs.mkdir(USER_CONFIGS_DIR, { recursive: true });
         await fs.mkdir(OUTPUTS_DIR, { recursive: true });
+        await fs.mkdir(USER_LIBS_DIR, { recursive: true });
         console.log('Directories initialized successfully');
     } catch (error) {
         console.error('Error creating directories:', error);
@@ -49,6 +52,10 @@ const MAX_IMAGES_PER_USER = 20;
 
 // Running solver processes (userId -> process)
 const runningProcesses = new Map();
+
+// Async job queue (jobId -> job record)
+// job: { jobId, userId, status, progress, log, resultPath, process, created, finished }
+const jobs = new Map();
 
 /**
  * Generate timestamp-based output folder name
@@ -150,6 +157,33 @@ function getUserDir(userId) {
 function getUserUploadsDir(userId) {
     const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
     return path.join(UPLOAD_DIR, safeUserId);
+}
+
+// Helper: Get user material libraries directory
+function getUserLibsDir(userId) {
+    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
+    return path.join(USER_LIBS_DIR, safeUserId);
+}
+
+// Helper: Merge material library YAML into analysis config YAML
+// Library material_presets and library materials (without rgb) become presets
+// Analysis config overrides library presets if same key exists
+function mergeLibraryIntoConfig(analysisYamlStr, libraryYamlStr) {
+    const analysis = yaml.load(analysisYamlStr);
+    const library  = yaml.load(libraryYamlStr);
+    const merged   = Object.assign({}, analysis);
+
+    // Collect library presets: explicit material_presets + materials stripped of rgb
+    const libPresets = Object.assign({}, library.material_presets || {});
+    for (const [name, props] of Object.entries(library.materials || {})) {
+        const { rgb, ...rest } = props; // eslint-disable-line no-unused-vars
+        libPresets[name] = rest;
+    }
+
+    // Analysis material_presets override library presets with the same key
+    merged.material_presets = Object.assign({}, libPresets, analysis.material_presets || {});
+
+    return yaml.dump(merged, { lineWidth: -1 });
 }
 
 // Helper: Get user-specific config file path
@@ -399,6 +433,66 @@ app.post('/api/config', async (req, res) => {
     }
 });
 
+// Validate YAML configuration without saving
+app.post('/api/validate-config', async (req, res) => {
+    try {
+        const { config } = req.body;
+        if (!config || typeof config !== 'string') {
+            return res.status(400).json({ valid: false, errors: [{ field: 'config', message: 'config field is required' }] });
+        }
+
+        const errors = [];
+
+        // 1. YAML syntax check
+        let parsed;
+        try {
+            parsed = yaml.load(config);
+        } catch (yamlError) {
+            return res.json({ valid: false, errors: [{ field: 'yaml', message: `YAML syntax error: ${yamlError.message}` }] });
+        }
+
+        if (!parsed || typeof parsed !== 'object') {
+            return res.json({ valid: false, errors: [{ field: 'yaml', message: 'Config must be a YAML mapping' }] });
+        }
+
+        // 2. coordinate_system
+        const cs = parsed['coordinate_system'];
+        if (!cs) {
+            errors.push({ field: 'coordinate_system', message: 'coordinate_system is required (cartesian or polar)' });
+        } else if (!['cartesian', 'polar'].includes(cs)) {
+            errors.push({ field: 'coordinate_system', message: `Unknown coordinate_system: "${cs}". Must be cartesian or polar` });
+        }
+
+        // 3. materials
+        if (!parsed['materials'] || typeof parsed['materials'] !== 'object') {
+            errors.push({ field: 'materials', message: 'materials section is required' });
+        }
+
+        // 4. Coordinate-system specific checks
+        if (cs === 'cartesian') {
+            if (!parsed['boundary_conditions']) {
+                errors.push({ field: 'boundary_conditions', message: 'boundary_conditions is required for cartesian coordinate system' });
+            }
+            if (!parsed['mesh']) {
+                errors.push({ field: 'mesh', message: 'mesh section (dx, dy) is required for cartesian coordinate system' });
+            }
+        } else if (cs === 'polar') {
+            if (!parsed['polar_domain']) {
+                errors.push({ field: 'polar_domain', message: 'polar_domain is required for polar coordinate system' });
+            } else {
+                const pd = parsed['polar_domain'];
+                if (pd['r_start'] === undefined) errors.push({ field: 'polar_domain.r_start', message: 'polar_domain.r_start is required' });
+                if (pd['r_end'] === undefined) errors.push({ field: 'polar_domain.r_end', message: 'polar_domain.r_end is required' });
+                if (pd['theta_range'] === undefined) errors.push({ field: 'polar_domain.theta_range', message: 'polar_domain.theta_range is required' });
+            }
+        }
+
+        res.json({ valid: errors.length === 0, errors });
+    } catch (error) {
+        res.status(500).json({ valid: false, errors: [{ field: 'server', message: error.message }] });
+    }
+});
+
 // 画像ファイルのアップロード（ユーザーごとのディレクトリ）
 app.post('/api/upload-image', upload.single('image'), async (req, res) => {
     try {
@@ -446,6 +540,203 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
             success: false,
             error: error.message
         });
+    }
+});
+
+// Detect unique colors in an image and generate YAML material template.
+// Anti-aliasing detection: rare colors (≤ rareThreshold of total pixels) that can be
+// expressed as a linear blend of two dominant colors are identified as AA pixels.
+// Their base colors get antialias:true in the YAML template.
+app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
+    const tmpPath = req.file ? req.file.path : null;
+    try {
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No image file provided' });
+        }
+
+        // Configurable thresholds (query params override defaults)
+        const RARE_THRESHOLD  = parseFloat(req.query.rareThreshold  ?? '0.05'); // coverage ratio
+        const BLEND_TOLERANCE = parseFloat(req.query.blendTolerance  ?? '8');   // per-channel [0-255]
+        const MIN_COLOR_DIST  = parseFloat(req.query.minColorDist    ?? '30');  // Euclidean distance
+
+        // Returns t∈[0,1] if C ≈ t·A + (1-t)·B, otherwise null.
+        function isLinearBlend(C, A, B) {
+            // A and B must be sufficiently different to form a meaningful pair
+            const distSq = A.reduce((s, a, k) => s + (a - B[k]) ** 2, 0);
+            if (distSq < MIN_COLOR_DIST * MIN_COLOR_DIST) return null;
+
+            // Estimate t from non-degenerate channels (|A[ch]-B[ch]| > 10)
+            const tEsts = [];
+            for (let ch = 0; ch < 3; ch++) {
+                const denom = A[ch] - B[ch];
+                if (Math.abs(denom) > 10) {
+                    tEsts.push((C[ch] - B[ch]) / denom);
+                } else {
+                    // Degenerate channel: A≈B, so C must also ≈A
+                    if (Math.abs(C[ch] - A[ch]) > BLEND_TOLERANCE) return null;
+                }
+            }
+            if (tEsts.length === 0) return null; // A≈B in all channels
+
+            // All t estimates must be mutually consistent
+            const tMin = Math.min(...tEsts), tMax = Math.max(...tEsts);
+            if (tMax - tMin > 0.15) return null;
+
+            const t = tEsts.reduce((a, b) => a + b) / tEsts.length;
+            if (t < -0.05 || t > 1.05) return null; // outside blend range
+
+            // Final residual check across all channels
+            for (let ch = 0; ch < 3; ch++) {
+                const expected = t * A[ch] + (1 - t) * B[ch];
+                if (Math.abs(C[ch] - expected) > BLEND_TOLERANCE) return null;
+            }
+            return Math.max(0, Math.min(1, t));
+        }
+
+        const Jimp = require('jimp');
+        const image = await Jimp.read(tmpPath);
+        const totalPixels = image.bitmap.width * image.bitmap.height;
+
+        // Count occurrences of each unique RGB color (ignore fully transparent pixels)
+        const colorCounts = new Map();
+        image.scan(0, 0, image.bitmap.width, image.bitmap.height, (x, y, idx) => {
+            const r = image.bitmap.data[idx];
+            const g = image.bitmap.data[idx + 1];
+            const b = image.bitmap.data[idx + 2];
+            const a = image.bitmap.data[idx + 3];
+            if (a > 0) {
+                const key = `${r},${g},${b}`;
+                colorCounts.set(key, (colorCounts.get(key) || 0) + 1);
+            }
+        });
+
+        // Sort by count descending, compute coverage ratio
+        const sorted = Array.from(colorCounts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .map(([key, count]) => ({
+                rgb:   key.split(',').map(Number),
+                count,
+                ratio: count / totalPixels
+            }));
+
+        // Split: dominant = coverage > RARE_THRESHOLD, rare = candidates for AA detection
+        const dominant = sorted.filter(c => c.ratio >  RARE_THRESHOLD);
+        const rare     = sorted.filter(c => c.ratio <= RARE_THRESHOLD);
+
+        // Anti-aliasing detection: a rare color is AA only if it is a linear blend
+        // of two colors that BOTH have higher coverage than the rare color itself.
+        // This prevents AA blends from being mistakenly used as AA bases.
+        const antialiasBaseIdx = new Set(); // indices into dominant[]
+        const aaBlends = [];               // detected blend records
+
+        const rareUnique = [];  // rare colors that are NOT AA blends → treated as materials
+        for (const rareColor of rare) {
+            let found = false;
+            // Find all colors with higher coverage than this rare color
+            const higherCoverage = sorted.filter(c => c.ratio > rareColor.ratio);
+            for (let i = 0; i < higherCoverage.length && !found; i++) {
+                for (let j = i + 1; j < higherCoverage.length && !found; j++) {
+                    const t = isLinearBlend(rareColor.rgb, higherCoverage[i].rgb, higherCoverage[j].rgb);
+                    if (t !== null) {
+                        // Record base indices in dominant[] for antialias:true flag
+                        const idxA = dominant.findIndex(d => d.rgb[0] === higherCoverage[i].rgb[0] && d.rgb[1] === higherCoverage[i].rgb[1] && d.rgb[2] === higherCoverage[i].rgb[2]);
+                        const idxB = dominant.findIndex(d => d.rgb[0] === higherCoverage[j].rgb[0] && d.rgb[1] === higherCoverage[j].rgb[1] && d.rgb[2] === higherCoverage[j].rgb[2]);
+                        if (idxA >= 0) antialiasBaseIdx.add(idxA);
+                        if (idxB >= 0) antialiasBaseIdx.add(idxB);
+                        aaBlends.push({
+                            rgb:   rareColor.rgb,
+                            count: rareColor.count,
+                            ratio: rareColor.ratio,
+                            baseA: higherCoverage[i].rgb,
+                            baseB: higherCoverage[j].rgb,
+                            t:     Math.round(t * 1000) / 1000
+                        });
+                        found = true;
+                    }
+                }
+            }
+            if (!found) {
+                // This rare color cannot be explained as an AA blend of two higher-coverage colors
+                // → it is a unique material color with small coverage
+                rareUnique.push(rareColor);
+            }
+        }
+
+        // Build YAML template (dominant + rare-unique colors; AA bases get antialias:true)
+        const toHex = ([r, g, b]) =>
+            r.toString(16).padStart(2, '0') +
+            g.toString(16).padStart(2, '0') +
+            b.toString(16).padStart(2, '0');
+
+        const totalMaterials = dominant.length + rareUnique.length;
+        const lines = [
+            `# Auto-generated from ${req.file.originalname}`,
+            `# ${totalMaterials} material color(s) detected` +
+                (rareUnique.length > 0
+                    ? ` (${dominant.length} dominant + ${rareUnique.length} rare-unique)`
+                    : '') +
+                (aaBlends.length > 0
+                    ? `, ${aaBlends.length} anti-aliasing blend(s) excluded`
+                    : ''),
+            `# Fill in mu_r and jz for each material`,
+            `coordinate_system: cartesian`,
+            ``,
+            `materials:`
+        ];
+        for (let i = 0; i < dominant.length; i++) {
+            const { rgb: [r, g, b], ratio } = dominant[i];
+            const hex = toHex([r, g, b]);
+            lines.push(`  material_${hex}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${(ratio * 100).toFixed(1)}%)`);
+            lines.push(`    jz: 0.0`);
+            if (antialiasBaseIdx.has(i)) lines.push(`    antialias: true`);
+        }
+        // Rare-unique colors: small coverage but not AA blends → genuine materials
+        for (const ru of rareUnique) {
+            const [r, g, b] = ru.rgb;
+            const hex = toHex([r, g, b]);
+            lines.push(`  material_${hex}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${(ru.ratio * 100).toFixed(2)}%)`);
+            lines.push(`    jz: 0.0`);
+        }
+        if (aaBlends.length > 0) {
+            lines.push(``, `# Anti-aliasing blends detected (excluded from materials):`);
+            for (const blend of aaBlends) {
+                const pct = (blend.ratio * 100).toFixed(2);
+                lines.push(`#   [${blend.rgb}]  ${pct}%  =  t=${blend.t} · [${blend.baseA}]  +  (1-t) · [${blend.baseB}]`);
+            }
+        }
+
+        // Clean up temp file
+        await fs.unlink(tmpPath);
+
+        // Combine dominant + rare-unique for the colors response
+        const allMaterialColors = [
+            ...dominant.map((c, i) => ({
+                rgb:       c.rgb,
+                ratio:     c.ratio,
+                antialias: antialiasBaseIdx.has(i)
+            })),
+            ...rareUnique.map(c => ({
+                rgb:       c.rgb,
+                ratio:     c.ratio,
+                antialias: false
+            }))
+        ];
+
+        res.json({
+            success:      true,
+            colors:       allMaterialColors,
+            allColors:    sorted.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
+            aaBlends,
+            rareUnique:   rareUnique.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
+            yamlTemplate: lines.join('\n')
+        });
+    } catch (error) {
+        if (tmpPath) { try { await fs.unlink(tmpPath); } catch { /* ignore */ } }
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -607,7 +898,7 @@ app.post('/api/solve', async (req, res) => {
 // ソルバーの実行（プログレス付きSSEストリーミング）
 app.post('/api/solve-stream', async (req, res) => {
     try {
-        const { configFile, imageFile, userId } = req.body;
+        const { configFile, imageFile, userId, materialLibraryFile } = req.body;
 
         // パスの構築
         let configPath;
@@ -629,6 +920,24 @@ app.post('/api/solve-stream', async (req, res) => {
         await fs.access(imagePath);
         await fs.access(SOLVER_PATH);
 
+        // Merge material library if provided
+        const userIdKey = userId || 'default';
+        let effectiveConfigPath = configPath;
+        let mergedTempPath = null;
+        if (materialLibraryFile) {
+            const libDir  = getUserLibsDir(userIdKey);
+            const libPath = path.join(libDir, path.basename(materialLibraryFile));
+            if (!path.resolve(libPath).startsWith(path.resolve(libDir))) {
+                throw new Error('Invalid library path');
+            }
+            const configYaml = await fs.readFile(configPath, 'utf8');
+            const libYaml    = await fs.readFile(libPath, 'utf8');
+            const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
+            mergedTempPath   = path.join(getUserDir(userIdKey), `.merged_${Date.now()}.yaml`);
+            await fs.writeFile(mergedTempPath, mergedYaml);
+            effectiveConfigPath = mergedTempPath;
+        }
+
         // SSEヘッダーの設定
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -637,14 +946,12 @@ app.post('/api/solve-stream', async (req, res) => {
 
         console.log('Executing solver with streaming:', SOLVER_PATH);
 
-        const userIdKey = userId || 'default';
-
         // Prepare user-specific output directory
         const outputPath = await prepareUserOutputDirectory(userId);
         console.log(`Output directory for user ${userIdKey}: ${outputPath}`);
 
         // spawnを使用してリアルタイムで出力を取得（第3引数に出力パスを追加）
-        const solverProcess = spawn(SOLVER_PATH, [configPath, imagePath, outputPath], {
+        const solverProcess = spawn(SOLVER_PATH, [effectiveConfigPath, imagePath, outputPath], {
             cwd: BASE_DIR,
         });
 
@@ -727,6 +1034,12 @@ app.post('/api/solve-stream', async (req, res) => {
             // プロセスをマップから削除
             runningProcesses.delete(userIdKey);
             console.log(`Removed solver process for user: ${userIdKey}`);
+
+            // Clean up merged temp config if used
+            if (mergedTempPath) {
+                fs.unlink(mergedTempPath).catch(() => {});
+                mergedTempPath = null;
+            }
 
             // 最後のバッファを送信
             if (outputBuffer.trim()) {
@@ -933,6 +1246,79 @@ function formatBytes(bytes) {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
 }
 
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+    try {
+        const checks = {};
+
+        // Check solver binary
+        try {
+            await fs.access(SOLVER_PATH);
+            checks.solver = 'ok';
+        } catch {
+            checks.solver = 'missing';
+        }
+
+        // Check directories writable
+        for (const [name, dir] of [['uploads', UPLOAD_DIR], ['configs', USER_CONFIGS_DIR], ['outputs', OUTPUTS_DIR]]) {
+            try {
+                await fs.access(dir, fsSync.constants.W_OK);
+                checks[name] = 'ok';
+            } catch {
+                checks[name] = 'not_writable';
+            }
+        }
+
+        const allOk = Object.values(checks).every(v => v === 'ok');
+        res.status(allOk ? 200 : 503).json({
+            status: allOk ? 'ok' : 'degraded',
+            checks,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({ status: 'error', error: error.message });
+    }
+});
+
+// Solver info endpoint
+app.get('/api/solver/info', async (req, res) => {
+    try {
+        // Get version from solver binary
+        let version = 'unknown';
+        try {
+            await new Promise((resolve) => {
+                const proc = spawn(SOLVER_PATH, ['--version']);
+                let output = '';
+                proc.stdout.on('data', d => { output += d.toString(); });
+                proc.stderr.on('data', d => { output += d.toString(); });
+                proc.on('close', () => {
+                    const match = output.match(/[\d]+\.[\d]+\.[\d]+/);
+                    if (match) version = match[0];
+                    resolve();
+                });
+                proc.on('error', resolve);
+                setTimeout(() => { proc.kill(); resolve(); }, 3000);
+            });
+        } catch { /* ignore */ }
+
+        res.json({
+            version,
+            solverPath: SOLVER_PATH,
+            capabilities: {
+                coordinate_systems: ['cartesian', 'polar'],
+                nonlinear_solvers: ['picard', 'newton_krylov'],
+                features: ['coarsening', 'adaptive_mesh', 'transient', 'sliding_mesh', 'force_calculation']
+            },
+            build: {
+                nodeVersion: process.version,
+                platform: process.platform
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // Get list of user output folders with details
 app.get('/api/user-outputs', async (req, res) => {
     try {
@@ -1005,6 +1391,103 @@ app.get('/api/user-outputs', async (req, res) => {
 
     } catch (error) {
         console.error('Error listing user outputs:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// Delete multiple output folders (bulk delete)
+// NOTE: This route must be defined BEFORE /api/user-outputs/:folderName
+// to prevent Express from matching "bulk" as a :folderName parameter.
+app.delete('/api/user-outputs/bulk', async (req, res) => {
+    try {
+        const { userId, folderNames } = req.body;
+        const userIdKey = userId || 'default';
+
+        // Validate inputs
+        if (!Array.isArray(folderNames) || folderNames.length === 0) {
+            return res.status(400).json({
+                success: false,
+                error: 'folderNames must be a non-empty array'
+            });
+        }
+
+        if (folderNames.length > 100) {
+            return res.status(400).json({
+                success: false,
+                error: 'Cannot delete more than 100 folders at once'
+            });
+        }
+
+        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
+        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
+        const resolvedUserOutputDir = path.resolve(userOutputDir);
+
+        const results = [];
+
+        for (const folderName of folderNames) {
+            const result = { name: folderName };
+
+            try {
+                const safeFolderName = path.basename(folderName);
+                const folderPath = path.join(userOutputDir, safeFolderName);
+                const resolvedFolderPath = path.resolve(folderPath);
+
+                // Security check
+                if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
+                    result.success = false;
+                    result.error = 'Path traversal detected';
+                    results.push(result);
+                    continue;
+                }
+
+                // Check if exists
+                try {
+                    await fs.access(folderPath);
+                } catch {
+                    result.success = false;
+                    result.error = 'Folder not found';
+                    results.push(result);
+                    continue;
+                }
+
+                // Verify it's an analysis result
+                if (!await isAnalysisResult(folderPath)) {
+                    result.success = false;
+                    result.error = 'Not an analysis result folder';
+                    results.push(result);
+                    continue;
+                }
+
+                // Delete folder
+                await fs.rm(folderPath, { recursive: true, force: true });
+
+                console.log(`Bulk deleted: ${safeUserId}/${safeFolderName}`);
+
+                result.success = true;
+                results.push(result);
+
+            } catch (error) {
+                result.success = false;
+                result.error = error.message;
+                results.push(result);
+            }
+        }
+
+        // Check if any failed
+        const failedCount = results.filter(r => !r.success).length;
+        const successCount = results.filter(r => r.success).length;
+
+        res.json({
+            success: true,
+            message: `Deleted ${successCount} folder(s), ${failedCount} failed`,
+            results: results
+        });
+
+    } catch (error) {
+        console.error('Error in bulk delete:', error);
         res.status(500).json({
             success: false,
             error: error.message
@@ -1159,101 +1642,6 @@ app.put('/api/user-outputs/:folderName/rename', async (req, res) => {
     }
 });
 
-// Delete multiple output folders (bulk delete)
-app.delete('/api/user-outputs/bulk', async (req, res) => {
-    try {
-        const { userId, folderNames } = req.body;
-        const userIdKey = userId || 'default';
-
-        // Validate inputs
-        if (!Array.isArray(folderNames) || folderNames.length === 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'folderNames must be a non-empty array'
-            });
-        }
-
-        if (folderNames.length > 100) {
-            return res.status(400).json({
-                success: false,
-                error: 'Cannot delete more than 100 folders at once'
-            });
-        }
-
-        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
-        const resolvedUserOutputDir = path.resolve(userOutputDir);
-
-        const results = [];
-
-        for (const folderName of folderNames) {
-            const result = { name: folderName };
-
-            try {
-                const safeFolderName = path.basename(folderName);
-                const folderPath = path.join(userOutputDir, safeFolderName);
-                const resolvedFolderPath = path.resolve(folderPath);
-
-                // Security check
-                if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
-                    result.success = false;
-                    result.error = 'Path traversal detected';
-                    results.push(result);
-                    continue;
-                }
-
-                // Check if exists
-                try {
-                    await fs.access(folderPath);
-                } catch {
-                    result.success = false;
-                    result.error = 'Folder not found';
-                    results.push(result);
-                    continue;
-                }
-
-                // Verify it's an analysis result
-                if (!await isAnalysisResult(folderPath)) {
-                    result.success = false;
-                    result.error = 'Not an analysis result folder';
-                    results.push(result);
-                    continue;
-                }
-
-                // Delete folder
-                await fs.rm(folderPath, { recursive: true, force: true });
-
-                console.log(`Bulk deleted: ${safeUserId}/${safeFolderName}`);
-
-                result.success = true;
-                results.push(result);
-
-            } catch (error) {
-                result.success = false;
-                result.error = error.message;
-                results.push(result);
-            }
-        }
-
-        // Check if any failed
-        const failedCount = results.filter(r => !r.success).length;
-        const successCount = results.filter(r => r.success).length;
-
-        res.json({
-            success: true,
-            message: `Deleted ${successCount} folder(s), ${failedCount} failed`,
-            results: results
-        });
-
-    } catch (error) {
-        console.error('Error in bulk delete:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // Get description for an output folder
 app.get('/api/user-outputs/:folderName/description', async (req, res) => {
     try {
@@ -1398,6 +1786,448 @@ app.put('/api/user-outputs/:folderName/description', async (req, res) => {
             success: false,
             error: error.message
         });
+    }
+});
+
+// ============================================================
+// Field Query: Get field values at a physical coordinate
+// ============================================================
+
+// GET /api/results/:resultFolder/field-at-point
+// Query params:
+//   userId - user id
+//   x      - physical x [m] (Cartesian) or r [m] (Polar)
+//   y      - physical y [m] (Cartesian) or theta [rad] (Polar)
+//   step   - step number (0-based, default 0)
+app.get('/api/results/:resultFolder/field-at-point', async (req, res) => {
+    try {
+        const { resultFolder } = req.params;
+        const { userId, x, y, step } = req.query;
+
+        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const safeFolderName = path.basename(resultFolder);
+        const folderPath = path.join(OUTPUTS_DIR, userIdKey, safeFolderName);
+
+        // Security: verify path stays inside user's output dir
+        const resolvedFolder = path.resolve(folderPath);
+        const resolvedBase = path.resolve(path.join(OUTPUTS_DIR, userIdKey));
+        if (!resolvedFolder.startsWith(resolvedBase)) {
+            return res.status(403).json({ success: false, error: 'Access denied' });
+        }
+
+        // Load conditions
+        const conditionsPath = path.join(folderPath, 'conditions.json');
+        const conditions = JSON.parse(await fs.readFile(conditionsPath, 'utf8'));
+
+        const cs = conditions.coordinate_system || 'cartesian';
+        const xVal = parseFloat(x);
+        const yVal = parseFloat(y);
+        const stepNum = parseInt(step || '0');
+
+        if (isNaN(xVal) || isNaN(yVal)) {
+            return res.status(400).json({ success: false, error: 'x and y must be numeric' });
+        }
+
+        // Determine grid dimensions and convert to fractional indices
+        let nx, ny, dx, dy, i_float, j_float;
+        if (cs === 'polar') {
+            const rStart = conditions.polar?.r_start ?? 0;
+            dx = conditions.dr;
+            dy = conditions.dtheta;
+            nx = conditions.image_width;  // nr = columns
+            ny = conditions.image_height; // ntheta = rows
+            i_float = (xVal - rStart) / dx; // x = r
+            j_float = yVal / dy;            // y = theta
+        } else {
+            dx = conditions.dx;
+            dy = conditions.dy;
+            nx = conditions.image_width;
+            ny = conditions.image_height;
+            i_float = xVal / dx;
+            j_float = yVal / dy;
+        }
+
+        // Clamp to valid range
+        i_float = Math.max(0, Math.min(nx - 1, i_float));
+        j_float = Math.max(0, Math.min(ny - 1, j_float));
+
+        // Load Az CSV
+        const stepStr = String(stepNum).padStart(4, '0');
+        const csvPath = path.join(folderPath, 'Az', `step_${stepStr}.csv`);
+        const csvContent = await fs.readFile(csvPath, 'utf8');
+
+        // Parse CSV into 2D array (rows = j, cols = i)
+        const rows = csvContent.trim().split('\n').map(r => r.split(',').map(Number));
+        const getAz = (i, j) => {
+            const ri = Math.max(0, Math.min(ny - 1, j));
+            const ci = Math.max(0, Math.min(nx - 1, i));
+            return (rows[ri] && rows[ri][ci] !== undefined) ? rows[ri][ci] : 0;
+        };
+
+        // Bilinear interpolation for Az
+        const i0 = Math.floor(i_float), i1 = Math.min(i0 + 1, nx - 1);
+        const j0 = Math.floor(j_float), j1 = Math.min(j0 + 1, ny - 1);
+        const fi = i_float - i0, fj = j_float - j0;
+        const Az = getAz(i0, j0) * (1 - fi) * (1 - fj)
+                 + getAz(i1, j0) * fi * (1 - fj)
+                 + getAz(i0, j1) * (1 - fi) * fj
+                 + getAz(i1, j1) * fi * fj;
+
+        // Central difference for B = curl A (Cartesian: Bx=dAz/dy, By=-dAz/dx)
+        const Bx = (getAz(Math.round(i_float), Math.min(Math.round(j_float) + 1, ny - 1))
+                  - getAz(Math.round(i_float), Math.max(Math.round(j_float) - 1, 0))) / (2 * dy);
+        const By = -(getAz(Math.min(Math.round(i_float) + 1, nx - 1), Math.round(j_float))
+                   - getAz(Math.max(Math.round(i_float) - 1, 0), Math.round(j_float))) / (2 * dx);
+        const Babs = Math.sqrt(Bx * Bx + By * By);
+
+        res.json({
+            success: true,
+            coordinate_system: cs,
+            x: xVal, y: yVal,
+            step: stepNum,
+            Az, Bx, By, Babs
+        });
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return res.status(404).json({ success: false, error: 'Result folder or step not found' });
+        }
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ============================================================
+// Async Job Queue API
+// ============================================================
+
+// Submit async solve job (non-blocking, returns jobId immediately)
+app.post('/api/jobs', async (req, res) => {
+    try {
+        const { configFile, imageFile, userId, materialLibraryFile } = req.body;
+        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        if (!configFile || !imageFile) {
+            return res.status(400).json({ success: false, error: 'configFile and imageFile are required' });
+        }
+
+        // Build paths
+        const userDir = getUserDir(userIdKey);
+        const configPath = path.join(userDir, path.basename(configFile));
+        const userUploadDir = getUserUploadsDir(userIdKey);
+        const imagePath = path.join(userUploadDir, path.basename(imageFile));
+
+        // Validate files exist
+        await fs.access(configPath);
+        await fs.access(imagePath);
+        await fs.access(SOLVER_PATH);
+
+        // Merge material library if provided
+        let effectiveConfigPath = configPath;
+        let mergedTempPath = null;
+        if (materialLibraryFile) {
+            const libDir  = getUserLibsDir(userIdKey);
+            const libPath = path.join(libDir, path.basename(materialLibraryFile));
+            if (!path.resolve(libPath).startsWith(path.resolve(libDir))) {
+                throw new Error('Invalid library path');
+            }
+            const configYaml = await fs.readFile(configPath, 'utf8');
+            const libYaml    = await fs.readFile(libPath, 'utf8');
+            const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
+            mergedTempPath   = path.join(userDir, `.merged_${Date.now()}.yaml`);
+            await fs.writeFile(mergedTempPath, mergedYaml);
+            effectiveConfigPath = mergedTempPath;
+        }
+
+        const jobId = require('crypto').randomUUID();
+        const outputPath = await prepareUserOutputDirectory(userIdKey);
+
+        const job = {
+            jobId,
+            userId: userIdKey,
+            status: 'running',
+            progress: 0,
+            log: [],
+            resultPath: null,
+            process: null,
+            created: new Date().toISOString(),
+            finished: null
+        };
+        jobs.set(jobId, job);
+
+        // Spawn solver in background
+        const solverProcess = spawn(SOLVER_PATH, [effectiveConfigPath, imagePath, outputPath], { cwd: BASE_DIR });
+        job.process = solverProcess;
+
+        let outputBuffer = '';
+        solverProcess.stdout.on('data', (data) => {
+            outputBuffer += data.toString();
+            const lines = outputBuffer.split('\n');
+            outputBuffer = lines.pop() || '';
+            for (const line of lines) {
+                if (!line.trim()) continue;
+                job.log.push(line);
+                if (job.log.length > 500) job.log.shift(); // cap log
+
+                const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
+                if (stepMatch) {
+                    const current = parseInt(stepMatch[1]);
+                    const total = parseInt(stepMatch[2]);
+                    job.progress = Math.round(((current - 1) / total) * 100);
+                }
+                if (line.includes('completed successfully')) {
+                    job.progress = 100;
+                }
+            }
+        });
+        solverProcess.stderr.on('data', (data) => {
+            const text = data.toString();
+            for (const line of text.split('\n')) {
+                if (line.trim()) job.log.push(`[err] ${line}`);
+            }
+        });
+        solverProcess.on('close', (code) => {
+            job.status = code === 0 ? 'completed' : 'failed';
+            job.finished = new Date().toISOString();
+            job.process = null;
+            if (code === 0) {
+                job.resultPath = outputPath;
+                job.progress = 100;
+            }
+            if (mergedTempPath) {
+                fs.unlink(mergedTempPath).catch(() => {});
+                mergedTempPath = null;
+            }
+            console.log(`Job ${jobId} finished with code ${code}`);
+        });
+        solverProcess.on('error', (err) => {
+            job.status = 'failed';
+            job.finished = new Date().toISOString();
+            job.process = null;
+            job.log.push(`[error] ${err.message}`);
+            if (mergedTempPath) {
+                fs.unlink(mergedTempPath).catch(() => {});
+                mergedTempPath = null;
+            }
+        });
+
+        res.json({ success: true, jobId, status: 'running' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// List jobs for a user
+app.get('/api/jobs', (req, res) => {
+    try {
+        const { userId } = req.query;
+        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        const userJobs = Array.from(jobs.values())
+            .filter(j => j.userId === userIdKey)
+            .map(({ jobId, status, progress, resultPath, created, finished }) =>
+                ({ jobId, status, progress, resultPath, created, finished }))
+            .sort((a, b) => new Date(b.created) - new Date(a.created));
+
+        res.json({ success: true, jobs: userJobs });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get single job status and log tail
+app.get('/api/jobs/:jobId', (req, res) => {
+    try {
+        const job = jobs.get(req.params.jobId);
+        if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+
+        const logTail = job.log.slice(-50);
+        res.json({
+            success: true,
+            jobId: job.jobId,
+            status: job.status,
+            progress: job.progress,
+            resultPath: job.resultPath,
+            created: job.created,
+            finished: job.finished,
+            logTail
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Cancel a running job
+app.delete('/api/jobs/:jobId', async (req, res) => {
+    try {
+        const job = jobs.get(req.params.jobId);
+        if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
+
+        if (job.status !== 'running' || !job.process) {
+            return res.json({ success: true, message: `Job already ${job.status}` });
+        }
+
+        job.process.kill('SIGTERM');
+        const killTimer = setTimeout(() => {
+            if (job.process) job.process.kill('SIGKILL');
+        }, 5000);
+        job.process.once('close', () => clearTimeout(killTimer));
+
+        job.status = 'cancelled';
+        job.finished = new Date().toISOString();
+        job.process = null;
+
+        res.json({ success: true, message: 'Job cancelled' });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// =====================================================
+// Material Library API
+// =====================================================
+
+// List library files for a user
+app.get('/api/material-libraries', async (req, res) => {
+    try {
+        const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const libDir = getUserLibsDir(userId);
+        await fs.mkdir(libDir, { recursive: true });
+
+        const files = await fs.readdir(libDir);
+        const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
+
+        const entries = await Promise.all(yamlFiles.map(async (filename) => {
+            const fp = path.join(libDir, filename);
+            const stat = await fs.stat(fp);
+            return { filename, size: stat.size, modified: stat.mtime.toISOString() };
+        }));
+
+        res.json({ success: true, libraries: entries });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Upload a new library file (multipart)
+app.post('/api/material-libraries', upload.single('library'), async (req, res) => {
+    try {
+        const userId = (req.body.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+
+        if (!req.file) {
+            return res.status(400).json({ success: false, error: 'No file uploaded' });
+        }
+
+        const filename = path.basename(req.file.originalname).replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+        if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) {
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.status(400).json({ success: false, error: 'Only .yaml/.yml files are allowed' });
+        }
+
+        const libDir = getUserLibsDir(userId);
+        await fs.mkdir(libDir, { recursive: true });
+
+        const destPath = path.join(libDir, filename);
+        if (!path.resolve(destPath).startsWith(path.resolve(libDir))) {
+            await fs.unlink(req.file.path).catch(() => {});
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        const content = await fs.readFile(req.file.path, 'utf8');
+        await fs.unlink(req.file.path).catch(() => {});
+
+        // Validate YAML syntax
+        try {
+            yaml.load(content);
+        } catch (yamlErr) {
+            return res.status(400).json({ success: false, error: `YAML parse error: ${yamlErr.message}` });
+        }
+
+        await fs.writeFile(destPath, content, 'utf8');
+        res.json({ success: true, filename });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Get library file content
+app.get('/api/material-libraries/:filename', async (req, res) => {
+    try {
+        const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const filename = path.basename(req.params.filename);
+        const libDir = getUserLibsDir(userId);
+        const filePath = path.join(libDir, filename);
+
+        if (!path.resolve(filePath).startsWith(path.resolve(libDir))) {
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        const content = await fs.readFile(filePath, 'utf8');
+        res.type('text/plain').send(content);
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            res.status(404).json({ success: false, error: 'Library file not found' });
+        } else {
+            res.status(500).json({ success: false, error: error.message });
+        }
+    }
+});
+
+// Save (create or update) library file content via JSON body
+app.put('/api/material-libraries/:filename', async (req, res) => {
+    try {
+        const userId = (req.body.userId || req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const filename = path.basename(req.params.filename).replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+
+        if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) {
+            return res.status(400).json({ success: false, error: 'Only .yaml/.yml files are allowed' });
+        }
+
+        const content = req.body.content;
+        if (typeof content !== 'string') {
+            return res.status(400).json({ success: false, error: 'content field (string) is required' });
+        }
+
+        // Validate YAML syntax
+        try {
+            yaml.load(content);
+        } catch (yamlErr) {
+            return res.status(400).json({ success: false, error: `YAML parse error: ${yamlErr.message}` });
+        }
+
+        const libDir = getUserLibsDir(userId);
+        await fs.mkdir(libDir, { recursive: true });
+
+        const filePath = path.join(libDir, filename);
+        if (!path.resolve(filePath).startsWith(path.resolve(libDir))) {
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        await fs.writeFile(filePath, content, 'utf8');
+        res.json({ success: true, filename });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Delete a library file
+app.delete('/api/material-libraries/:filename', async (req, res) => {
+    try {
+        const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const filename = path.basename(req.params.filename);
+        const libDir = getUserLibsDir(userId);
+        const filePath = path.join(libDir, filename);
+
+        if (!path.resolve(filePath).startsWith(path.resolve(libDir))) {
+            return res.status(400).json({ success: false, error: 'Invalid filename' });
+        }
+
+        await fs.unlink(filePath);
+        res.json({ success: true, message: `Deleted ${filename}` });
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            res.status(404).json({ success: false, error: 'Library file not found' });
+        } else {
+            res.status(500).json({ success: false, error: error.message });
+        }
     }
 });
 

@@ -30,7 +30,14 @@ const AppState = {
     // Plotly mode bar visibility
     showPlotlyModeBar: false,  // Show/hide Plotly mode bar for all plots
     // Plot configuration (ranges, colorscales, etc.)
-    plotConfigs: {}  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
+    plotConfigs: {},  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
+    // Detect Colors result cache
+    lastDetectResult: null,  // Last result from /api/materials/detect
+    // Material Library
+    selectedLibrary: null,       // Active library filename (null = none)
+    libraryAceEditor: null,      // Ace Editor instance inside Library modal
+    currentLibraryFile: null,    // Currently selected filename in Library modal
+    currentBHMaterial: null      // Last rendered BH material {name, props} for axis toggle
 };
 
 // ===== Utility Functions =====
@@ -58,6 +65,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadConfig();
     await refreshImageList();
     await refreshResultsList();
+
+    // Restore last active material library from cookie
+    const lastLibrary = getCookie('magfdm_last_library');
+    if (lastLibrary) {
+        try {
+            // Verify the library file still exists on server
+            const resp = await fetch(
+                `/api/material-libraries/${encodeURIComponent(lastLibrary)}?userId=${AppState.userId}`
+            );
+            if (resp.ok) {
+                AppState.selectedLibrary = lastLibrary;
+                document.getElementById('activeLibraryName').textContent = lastLibrary;
+                document.getElementById('activeLibraryBadge').style.display = 'inline-flex';
+                console.log('Restored material library from cookie:', lastLibrary);
+            } else {
+                // File no longer exists — clear stale cookie
+                setCookie('magfdm_last_library', '', -1);
+            }
+        } catch (e) {
+            console.warn('Failed to restore material library:', e);
+            setCookie('magfdm_last_library', '', -1);
+        }
+    }
 
     // Setup step slider event handler
     const stepSlider = document.getElementById('stepSlider');
@@ -166,6 +196,14 @@ async function initializeConfigEditor() {
             const completions = [];
             const keywords = AppState.yamlSchema.keywords;
 
+            // Detect whether cursor is in a "value position" (after "key: ") vs a "key position".
+            // Value position example: "    type: d"  (lineKey="type", prefix="d")
+            // Key position example:   "    ty"       (isValuePosition=false)
+            const lineBeforeCursor = session.getLine(pos.row).substring(0, pos.column);
+            const valuePositionMatch = lineBeforeCursor.match(/^\s*([\w-]+):\s+\S*$/);
+            const isValuePosition = !!valuePositionMatch;
+            const lineKey = valuePositionMatch ? valuePositionMatch[1] : null;
+
             // Get parent context (nest recognition)
             const contextPath = getContextPath(editor, session, pos);
             const parentContext = contextPath.length > 0 ? contextPath[contextPath.length - 1] : null;
@@ -207,30 +245,44 @@ async function initializeConfigEditor() {
                 const info = keywords[keyword];
                 if (!info) continue;
 
-                const completion = {
-                    caption: keyword,
-                    value: keyword + ': ',
-                    meta: info.type || 'keyword',
-                    score: 1000,
-                    docHTML: `<b>${keyword}</b><br>${info.description}<br><code>${info.example || ''}</code>`
-                };
-                completions.push(completion);
+                if (!isValuePosition) {
+                    // At key position: show "keyword: " completion
+                    completions.push({
+                        caption: keyword,
+                        value: keyword + ': ',
+                        meta: info.type || 'keyword',
+                        score: 1000,
+                        docHTML: `<b>${keyword}</b><br>${info.description}<br><code>${info.example || ''}</code>`
+                    });
+                }
 
                 // Add value suggestions
                 if (info.values) {
                     info.values.forEach(val => {
-                        completions.push({
-                            caption: `${keyword}: ${val}`,
-                            value: `${keyword}: ${val}`,
-                            meta: 'value',
-                            score: 900
-                        });
+                        if (isValuePosition && lineKey === keyword) {
+                            // In value position for this keyword: suggest only the value (not "keyword: value")
+                            completions.push({
+                                caption: val,
+                                value: val,
+                                meta: 'value',
+                                score: 900,
+                                docHTML: `<b>${keyword}: ${val}</b><br>${info.description || ''}`
+                            });
+                        } else if (!isValuePosition) {
+                            // At key position: suggest full "keyword: value" pair
+                            completions.push({
+                                caption: `${keyword}: ${val}`,
+                                value: `${keyword}: ${val}`,
+                                meta: 'value',
+                                score: 900
+                            });
+                        }
                     });
                 }
             }
 
             // Add snippets based on context
-            addContextSnippets(completions, parentContext, grandparentContext);
+            addContextSnippets(completions, parentContext, grandparentContext, isValuePosition, lineKey);
 
             callback(null, completions);
         }
@@ -252,41 +304,50 @@ async function initializeConfigEditor() {
 }
 
 // Add context-aware snippets
-function addContextSnippets(completions, parentContext, grandparentContext) {
+// isValuePosition: true if cursor is after "key: " (in value position)
+// lineKey: the key name on the current line when isValuePosition is true
+function addContextSnippets(completions, parentContext, grandparentContext, isValuePosition = false, lineKey = null) {
     if (!AppState.yamlSchema || !AppState.yamlSchema.snippets) return;
 
     const snippets = AppState.yamlSchema.snippets;
 
-    // Add boundary condition snippets (for inner, outer, left, right, top, bottom)
-    const boundaryContexts = ['inner', 'outer', 'left', 'right', 'top', 'bottom'];
+    // Add boundary condition snippets (for inner, outer, left, right, top, bottom, theta_min, theta_max)
+    const boundaryContexts = ['inner', 'outer', 'left', 'right', 'top', 'bottom', 'theta_min', 'theta_max'];
     if (boundaryContexts.includes(parentContext)) {
-        // Add boundary type snippets
-        if (snippets.boundary_dirichlet) {
-            completions.push({
-                caption: '[Snippet] Dirichlet (value=0)',
-                value: snippets.boundary_dirichlet.snippet,
-                meta: 'snippet',
-                score: 1100,
-                docHTML: '<b>Snippet: Dirichlet Boundary</b><br>Creates type: dirichlet with value: 0.0'
-            });
-        }
-        if (snippets.boundary_neumann) {
-            completions.push({
-                caption: '[Snippet] Neumann (value=0)',
-                value: snippets.boundary_neumann.snippet,
-                meta: 'snippet',
-                score: 1100,
-                docHTML: '<b>Snippet: Neumann Boundary</b><br>Creates type: neumann with value: 0.0'
-            });
-        }
-        if (snippets.boundary_periodic) {
-            completions.push({
-                caption: '[Snippet] Periodic',
-                value: snippets.boundary_periodic.snippet,
-                meta: 'snippet',
-                score: 1100,
-                docHTML: '<b>Snippet: Periodic Boundary</b><br>Creates type: periodic with value: 0.0'
-            });
+        // Each boundary snippet has a "full" form (key position) and a "value-only" form (value position after "type:")
+        const boundarySnippets = [
+            { key: 'boundary_dirichlet',   caption: '[Snippet] Dirichlet',    valueOnly: 'dirichlet',
+              doc: '<b>Snippet: Dirichlet Boundary</b><br>type: dirichlet + value: 0.0' },
+            { key: 'boundary_neumann',     caption: '[Snippet] Neumann',      valueOnly: 'neumann',
+              doc: '<b>Snippet: Neumann Boundary</b><br>type: neumann + value: 0.0' },
+            { key: 'boundary_periodic',    caption: '[Snippet] Periodic',     valueOnly: 'periodic',
+              doc: '<b>Snippet: Periodic Boundary</b><br>type: periodic + value: 0.0' },
+            { key: 'boundary_antiperiodic',caption: '[Snippet] Anti-Periodic',valueOnly: 'periodic',
+              doc: '<b>Snippet: Anti-Periodic Boundary</b><br>type: periodic + value: -1.0' },
+            { key: 'boundary_robin',       caption: '[Snippet] Robin',        valueOnly: 'robin',
+              doc: '<b>Snippet: Robin Boundary</b><br>type: robin + alpha/beta/gamma' },
+        ];
+        for (const bs of boundarySnippets) {
+            if (!snippets[bs.key]) continue;
+            if (isValuePosition && lineKey === 'type') {
+                // User is typing the BC type value — suggest just the value word
+                completions.push({
+                    caption: bs.caption,
+                    value: bs.valueOnly,
+                    meta: 'value',
+                    score: 1100,
+                    docHTML: bs.doc
+                });
+            } else if (!isValuePosition) {
+                // User is at a key position — insert the full "type: ...\nvalue: ..." snippet
+                completions.push({
+                    caption: bs.caption,
+                    value: snippets[bs.key].snippet,
+                    meta: 'snippet',
+                    score: 1100,
+                    docHTML: bs.doc
+                });
+            }
         }
     }
 
@@ -312,6 +373,132 @@ function addContextSnippets(completions, parentContext, grandparentContext) {
                 meta: 'snippet',
                 score: 1100,
                 docHTML: '<b>Snippet: Transient Analysis</b><br>Creates full transient configuration'
+            });
+        }
+    }
+}
+
+// ---- Library editor completer ----
+// Creates a completer scoped to material library YAML files (material_presets structure).
+function createLibraryCompleter() {
+    return {
+        getCompletions: function(editor, session, pos, prefix, callback) {
+            if (!AppState.yamlSchema) { callback(null, []); return; }
+            const completions = [];
+            const keywords = AppState.yamlSchema.keywords;
+
+            // Value-position detection (same logic as main editor)
+            const lineBeforeCursor = session.getLine(pos.row).substring(0, pos.column);
+            const valuePositionMatch = lineBeforeCursor.match(/^\s*([\w-]+):\s+\S*$/);
+            const isValuePosition = !!valuePositionMatch;
+            const lineKey = valuePositionMatch ? valuePositionMatch[1] : null;
+
+            const contextPath = getContextPath(editor, session, pos);
+            const parentContext  = contextPath[contextPath.length - 1] || null;
+            const grandparentContext = contextPath[contextPath.length - 2] || null;
+
+            // Library YAML context rules:
+            //   top level                     → suggest material_presets
+            //   parent = material_presets      → user names presets freely (no key suggestions)
+            //   grandparent = material_presets → inside a preset → suggest preset properties
+            //   parent = magnetization         → inside magnetization block → suggest children
+            let availableKeywords = [];
+            if (!parentContext) {
+                availableKeywords = ['material_presets'];
+            } else if (grandparentContext === 'material_presets') {
+                const presetsInfo = keywords['material_presets'];
+                availableKeywords = presetsInfo && presetsInfo.childrenProperties
+                    ? presetsInfo.childrenProperties
+                    : ['mu_r', 'B-H', 'bh_type'];
+            } else if (parentContext === 'magnetization') {
+                const magInfo = keywords['magnetization'];
+                availableKeywords = magInfo && magInfo.children ? magInfo.children : [];
+            }
+            // parentContext === 'material_presets': user defines preset names → no key suggestions
+
+            for (const kw of availableKeywords) {
+                const info = keywords[kw];
+                if (!info) continue;
+
+                if (!isValuePosition) {
+                    completions.push({
+                        caption: kw,
+                        value: kw + ': ',
+                        meta: info.type || 'keyword',
+                        score: 1000,
+                        docHTML: `<b>${kw}</b><br>${info.description || ''}<br><code>${info.example || ''}</code>`
+                    });
+                }
+
+                if (info.values) {
+                    info.values.forEach(val => {
+                        if (isValuePosition && lineKey === kw) {
+                            completions.push({ caption: val, value: val, meta: 'value', score: 900,
+                                docHTML: `<b>${kw}: ${val}</b>` });
+                        } else if (!isValuePosition) {
+                            completions.push({ caption: `${kw}: ${val}`, value: `${kw}: ${val}`,
+                                meta: 'value', score: 900 });
+                        }
+                    });
+                }
+            }
+
+            addLibrarySnippets(completions, parentContext, grandparentContext, isValuePosition);
+            callback(null, completions);
+        }
+    };
+}
+
+// Snippets for the library editor (material preset templates, magnetization patterns)
+function addLibrarySnippets(completions, parentContext, grandparentContext, isValuePosition) {
+    if (!AppState.yamlSchema || !AppState.yamlSchema.snippets || isValuePosition) return;
+    const snippets = AppState.yamlSchema.snippets;
+
+    if (!parentContext) {
+        // Top level: offer a full library file template
+        if (snippets.lib_file_template) {
+            completions.push({
+                caption: '[Template] Material Library',
+                value: snippets.lib_file_template.snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: '<b>Material Library Template</b><br>Creates a starter library with soft and magnet presets'
+            });
+        }
+    } else if (grandparentContext === 'material_presets') {
+        // Inside a specific preset: show preset-type snippets
+        const presetSnippets = [
+            { key: 'lib_preset_mur_const',      doc: 'Constant relative permeability' },
+            { key: 'lib_preset_mur_formula',     doc: 'Variable μr as a formula of H (tinyexpr)' },
+            { key: 'lib_preset_soft_table',      doc: 'Nonlinear B-H curve (measured data table)' },
+            { key: 'lib_preset_soft_formula',    doc: 'Nonlinear B-H curve (continuous formula)' },
+            { key: 'lib_preset_magnet_parallel', doc: 'Permanent magnet with parallel magnetization + Br' },
+            { key: 'lib_preset_magnet_demag',    doc: 'Permanent magnet via B-H demagnetization curve' },
+        ];
+        for (const ps of presetSnippets) {
+            if (!snippets[ps.key]) continue;
+            completions.push({
+                caption: `[Preset] ${snippets[ps.key].name}`,
+                value: snippets[ps.key].snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: `<b>${snippets[ps.key].name}</b><br>${ps.doc}`
+            });
+        }
+    } else if (parentContext === 'magnetization') {
+        // Inside magnetization block
+        const magSnippets = [
+            'magnetization_parallel', 'magnetization_radial', 'magnetization_tangential',
+            'magnetization_halbach', 'magnetization_polar_anisotropy', 'magnetization_custom'
+        ];
+        for (const key of magSnippets) {
+            if (!snippets[key]) continue;
+            completions.push({
+                caption: `[Snippet] ${snippets[key].name}`,
+                value: snippets[key].snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: `<b>${snippets[key].name}</b>`
             });
         }
     }
@@ -666,6 +853,7 @@ async function handleImageUpload(event) {
         const result = await response.json();
         AppState.uploadedImageFilename = result.filename;
         showStatus('solverStatus', `Image uploaded: ${result.filename}`, 'success');
+        document.getElementById('detectColorsBtn').style.display = 'block';
 
         // Refresh image list
         await refreshImageList();
@@ -711,6 +899,7 @@ function loadSelectedImage() {
     const img = document.getElementById('uploadedImage');
     img.src = `/uploads/${AppState.userId}/${filename}`;
     img.classList.remove('hidden');
+    document.getElementById('detectColorsBtn').style.display = 'block';
     showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
 }
 
@@ -738,9 +927,172 @@ async function deleteSelectedImage() {
         if (AppState.uploadedImageFilename === filename) {
             AppState.uploadedImageFilename = null;
             document.getElementById('uploadedImage').classList.add('hidden');
+            document.getElementById('detectColorsBtn').style.display = 'none';
         }
     } catch (error) {
         showStatus('solverStatus', `Delete error: ${error.message}`, 'error');
+    }
+}
+
+// =====================================================
+// Detect Colors Feature
+// =====================================================
+
+async function detectColors() {
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'Please upload or select an image first', 'error');
+        return;
+    }
+
+    const rareThreshold = parseFloat(document.getElementById('detectRareThreshold').value || '5') / 100;
+    const blendTolerance = parseInt(document.getElementById('detectBlendTolerance').value || '8', 10);
+
+    try {
+        // Fetch the image file as a blob
+        const imgResponse = await fetch(`/uploads/${AppState.userId}/${AppState.uploadedImageFilename}`);
+        if (!imgResponse.ok) throw new Error('Failed to fetch image');
+        const blob = await imgResponse.blob();
+
+        // Post to detect endpoint
+        const formData = new FormData();
+        formData.append('image', blob, AppState.uploadedImageFilename);
+        formData.append('userId', AppState.userId);
+
+        const params = new URLSearchParams({
+            rareThreshold: rareThreshold.toString(),
+            blendTolerance: blendTolerance.toString()
+        });
+
+        const response = await fetch(`/api/materials/detect?${params}`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!response.ok) {
+            const err = await response.json();
+            throw new Error(err.error || 'Detection failed');
+        }
+
+        const result = await response.json();
+        AppState.lastDetectResult = result;
+        renderDetectModal(result);
+        document.getElementById('detectColorsModal').style.display = 'flex';
+
+    } catch (error) {
+        showStatus('solverStatus', `Detect error: ${error.message}`, 'error');
+    }
+}
+
+function renderDetectModal(result) {
+    // Render dominant color grid
+    const grid = document.getElementById('detectColorGrid');
+    grid.innerHTML = '';
+    (result.colors || []).forEach(c => {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const isAA = c.antialias === true;
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex; align-items:center; gap:6px; background:#f8f9fa; border-radius:4px; padding:5px 8px; font-size:0.8rem;';
+        item.innerHTML = `
+            <div style="width:20px; height:20px; background:${hex}; border:1px solid #ccc; border-radius:2px; flex-shrink:0;"></div>
+            <span style="font-family:monospace;">${hex}</span>
+            <span style="color:#6c757d;">${(c.ratio * 100).toFixed(1)}%</span>
+            ${isAA ? '<span style="background:#fff3cd; color:#856404; border-radius:10px; padding:1px 6px; font-size:0.75rem;">AA base</span>' : ''}
+        `;
+        grid.appendChild(item);
+    });
+
+    // Render AA blends section
+    const aaSection = document.getElementById('detectAASection');
+    const aaList = document.getElementById('detectAAList');
+    aaList.innerHTML = '';
+    const blends = result.aaBlends || [];
+    if (blends.length > 0) {
+        blends.forEach(b => {
+            const hexC = `#${b.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            const hexA = `#${b.baseA.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            const hexB = `#${b.baseB.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            const row = document.createElement('div');
+            row.style.cssText = 'display:flex; align-items:center; gap:8px; font-size:0.8rem; margin-bottom:5px;';
+            row.innerHTML = `
+                <div style="width:18px; height:18px; background:${hexC}; border:1px solid #ccc; border-radius:2px;"></div>
+                <span style="font-family:monospace;">${hexC}</span>
+                <span style="color:#6c757d;">(${(b.ratio * 100).toFixed(1)}%)</span>
+                <span style="color:#aaa;">≈</span>
+                <div style="width:14px; height:14px; background:${hexA}; border:1px solid #ccc; border-radius:2px;"></div>
+                <span style="font-family:monospace; color:#6c757d;">${hexA}</span>
+                <span style="color:#aaa;">×${(1 - b.t).toFixed(2)} + </span>
+                <div style="width:14px; height:14px; background:${hexB}; border:1px solid #ccc; border-radius:2px;"></div>
+                <span style="font-family:monospace; color:#6c757d;">${hexB}</span>
+                <span style="color:#aaa;">×${b.t.toFixed(2)}</span>
+            `;
+            aaList.appendChild(row);
+        });
+        aaSection.style.display = 'block';
+    } else {
+        aaSection.style.display = 'none';
+    }
+
+    // Render YAML template
+    document.getElementById('detectYamlPreview').textContent = result.yamlTemplate || '';
+}
+
+async function rerunDetect() {
+    await detectColors();
+}
+
+function closeDetectColorsModal() {
+    document.getElementById('detectColorsModal').style.display = 'none';
+}
+
+async function copyDetectedYaml() {
+    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
+        return;
+    }
+    try {
+        await navigator.clipboard.writeText(AppState.lastDetectResult.yamlTemplate);
+        showStatus('solverStatus', 'YAML template copied to clipboard', 'success');
+    } catch (e) {
+        showStatus('solverStatus', 'Clipboard write failed', 'error');
+    }
+}
+
+function insertMaterialsSection() {
+    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
+        return;
+    }
+    if (!AppState.aceEditor) {
+        showStatus('solverStatus', 'Config editor not initialized', 'error');
+        return;
+    }
+
+    try {
+        // Parse detected materials
+        const detectedDoc = jsyaml.load(AppState.lastDetectResult.yamlTemplate);
+        if (!detectedDoc || !detectedDoc.materials) {
+            showStatus('solverStatus', 'No materials found in detected template', 'error');
+            return;
+        }
+
+        // Parse current editor content
+        const currentYaml = AppState.aceEditor.getValue();
+        let currentDoc = {};
+        try {
+            currentDoc = jsyaml.load(currentYaml) || {};
+        } catch (e) {
+            currentDoc = {};
+        }
+
+        // Replace only the materials section
+        currentDoc.materials = detectedDoc.materials;
+
+        const merged = jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 });
+        AppState.aceEditor.setValue(merged, -1);
+
+        closeDetectColorsModal();
+        switchTab('config');
+        showStatus('configStatus', 'materials: section updated from detected colors', 'success');
+    } catch (e) {
+        showStatus('solverStatus', `Insert failed: ${e.message}`, 'error');
     }
 }
 
@@ -1200,61 +1552,108 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             }
         };
 
-        for (let jt = 0; jt < ntheta; jt++) {
-            for (let ir = 0; ir < nr; ir++) {
-                const r = r_coords[ir];
-                const safe_r = Math.max(r, 1e-15);
+        // Helper: check if cell (ir, jt) is active (true when no coarsening mask)
+        const getActivePolar = (ir, jt) => {
+            if (!activeMask) return true;
+            return r_orientation === 'horizontal' ? activeMask[jt][ir] : activeMask[ir][jt];
+        };
 
-                // Br = (1/r) * ∂Az/∂θ
-                let jt_next, jt_prev;
-                let Az_next, Az_prev;
+        if (activeMask) {
+            // Full-grid step=1 stencil at active cells.
+            // C++ exports interpolated Az at ALL cells (active + inactive via interpolateToFullGrid),
+            // so immediate ±1 neighbors are always valid. This matches the non-coarsened solver
+            // behavior exactly at material boundaries, eliminating surface concentration artifacts.
+            // Inactive cells remain 0; _fillInactiveScalar() fills them after Bx/By conversion.
+            for (let jt = 0; jt < ntheta; jt++) {
+                for (let ir = 0; ir < nr; ir++) {
+                    if (!getActivePolar(ir, jt)) continue;
 
-                if (thetaPeriodic) {
-                    // Periodic or anti-periodic boundary
-                    jt_next = (jt + 1) % ntheta;
-                    jt_prev = (jt - 1 + ntheta) % ntheta;
-                    Az_next = getAz(ir, jt_next);
-                    Az_prev = getAz(ir, jt_prev);
+                    const r = r_coords[ir];
+                    const safe_r = Math.max(r, 1e-15);
 
-                    // Apply sign flip for anti-periodic BC
-                    if (thetaAntiperiodic) {
-                        if (jt === ntheta - 1) Az_next = -Az_next;  // next crosses boundary
-                        if (jt === 0) Az_prev = -Az_prev;          // prev crosses boundary
+                    // Br = (1/r) * ∂Az/∂θ — full-grid step=1 stencil.
+                    // C++ exports interpolated Az at ALL cells (active + inactive),
+                    // so use immediate ±1 neighbors to match non-coarsened behavior exactly.
+                    let jt_prev = jt - 1, jt_next = jt + 1;
+                    if (jt_prev < 0) jt_prev = thetaPeriodic ? ntheta - 1 : -1;
+                    if (jt_next >= ntheta) jt_next = thetaPeriodic ? 0 : -1;
+
+                    let Br_val = 0;
+                    if (jt_prev >= 0 && jt_next >= 0) {
+                        let Az_next = getAz(ir, jt_next), Az_prev = getAz(ir, jt_prev);
+                        if (thetaAntiperiodic) {
+                            if (jt_next < jt) Az_next = -Az_next;
+                            if (jt_prev > jt) Az_prev = -Az_prev;
+                        }
+                        Br_val = (Az_next - Az_prev) / (2 * dtheta) / safe_r;
+                    } else if (jt_next >= 0) {
+                        Br_val = (getAz(ir, jt_next) - getAz(ir, jt)) / dtheta / safe_r;
+                    } else if (jt_prev >= 0) {
+                        Br_val = (getAz(ir, jt) - getAz(ir, jt_prev)) / dtheta / safe_r;
                     }
-                } else {
-                    // Non-periodic (Dirichlet/Neumann) - use one-sided difference at boundaries
-                    if (jt === 0) {
-                        jt_next = 1;
-                        jt_prev = 0;
+                    setField(Br, ir, jt, Br_val);
+
+                    // Bθ = -∂Az/∂r — full-grid step=1 stencil (same rationale as Br).
+                    const ir_prev = ir > 0 ? ir - 1 : -1;
+                    const ir_next = ir < nr - 1 ? ir + 1 : -1;
+
+                    let Btheta_val = 0;
+                    if (ir_prev >= 0 && ir_next >= 0) {
+                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir_prev, jt)) / (2 * dr);
+                    } else if (ir_next >= 0) {
+                        Btheta_val = -(getAz(ir_next, jt) - getAz(ir, jt)) / dr;
+                    } else if (ir_prev >= 0) {
+                        Btheta_val = -(getAz(ir, jt) - getAz(ir_prev, jt)) / dr;
+                    }
+                    setField(Btheta, ir, jt, Btheta_val);
+                }
+            }
+        } else {
+            // Uniform grid (no coarsening)
+            for (let jt = 0; jt < ntheta; jt++) {
+                for (let ir = 0; ir < nr; ir++) {
+                    const r = r_coords[ir];
+                    const safe_r = Math.max(r, 1e-15);
+
+                    // Br = (1/r) * ∂Az/∂θ
+                    let jt_next, jt_prev;
+                    let Az_next, Az_prev;
+
+                    if (thetaPeriodic) {
+                        jt_next = (jt + 1) % ntheta;
+                        jt_prev = (jt - 1 + ntheta) % ntheta;
                         Az_next = getAz(ir, jt_next);
                         Az_prev = getAz(ir, jt_prev);
-                    } else if (jt === ntheta - 1) {
-                        jt_next = ntheta - 1;
-                        jt_prev = ntheta - 2;
-                        Az_next = getAz(ir, jt_next);
-                        Az_prev = getAz(ir, jt_prev);
+                        if (thetaAntiperiodic) {
+                            if (jt === ntheta - 1) Az_next = -Az_next;
+                            if (jt === 0) Az_prev = -Az_prev;
+                        }
                     } else {
-                        jt_next = jt + 1;
-                        jt_prev = jt - 1;
+                        if (jt === 0) {
+                            jt_next = 1; jt_prev = 0;
+                        } else if (jt === ntheta - 1) {
+                            jt_next = ntheta - 1; jt_prev = ntheta - 2;
+                        } else {
+                            jt_next = jt + 1; jt_prev = jt - 1;
+                        }
                         Az_next = getAz(ir, jt_next);
                         Az_prev = getAz(ir, jt_prev);
                     }
-                }
 
-                const denom = (jt === 0 || jt === ntheta - 1) && !thetaPeriodic ? dtheta : (2 * dtheta);
-                const dAz_dtheta = (Az_next - Az_prev) / denom;
-                setField(Br, ir, jt, dAz_dtheta / safe_r);
+                    const denom = (jt === 0 || jt === ntheta - 1) && !thetaPeriodic ? dtheta : (2 * dtheta);
+                    setField(Br, ir, jt, (Az_next - Az_prev) / denom / safe_r);
 
-                // Bθ = -∂Az/∂r
-                let dAz_dr = 0;
-                if (ir === 0) {
-                    dAz_dr = (getAz(1, jt) - getAz(0, jt)) / dr;
-                } else if (ir === nr - 1) {
-                    dAz_dr = (getAz(nr-1, jt) - getAz(nr-2, jt)) / dr;
-                } else {
-                    dAz_dr = (getAz(ir+1, jt) - getAz(ir-1, jt)) / (2 * dr);
+                    // Bθ = -∂Az/∂r
+                    let dAz_dr = 0;
+                    if (ir === 0) {
+                        dAz_dr = (getAz(1, jt) - getAz(0, jt)) / dr;
+                    } else if (ir === nr - 1) {
+                        dAz_dr = (getAz(nr-1, jt) - getAz(nr-2, jt)) / dr;
+                    } else {
+                        dAz_dr = (getAz(ir+1, jt) - getAz(ir-1, jt)) / (2 * dr);
+                    }
+                    setField(Btheta, ir, jt, -dAz_dr);
                 }
-                setField(Btheta, ir, jt, -dAz_dr);
             }
         }
 
@@ -1282,81 +1681,43 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
             }
         }
     } else if (activeMask) {
-        // Cartesian with coarsening-aware differentiation
-        // Step 1: Compute B at active cells using nearest active neighbors
-        // Step 2: Bilinear interpolate B at inactive cells from enclosing active cells
+        // Cartesian with coarsening: full-grid step=1 stencil.
+        // C++ exports interpolated Az at ALL cells (active + inactive via interpolateToFullGrid),
+        // so use immediate ±1 neighbors to match non-coarsened behavior at material boundaries.
         const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
         const x_periodic = bc && bc.left && bc.right &&
                           bc.left.type === 'periodic' && bc.right.type === 'periodic';
         const y_periodic = bc && bc.bottom && bc.top &&
                           bc.bottom.type === 'periodic' && bc.top.type === 'periodic';
 
-        // Step 1: B at active cells only (non-uniform central difference)
         for (let j = 0; j < rows; j++) {
             for (let i = 0; i < cols; i++) {
                 if (!activeMask[j][i]) continue;
 
-                // Bx = ∂Az/∂y: find nearest active neighbors in j direction (same column)
-                let j_prev = -1, j_next = -1;
-                for (let jj = j - 1; jj >= 0; jj--) {
-                    if (activeMask[jj][i]) { j_prev = jj; break; }
-                }
-                for (let jj = j + 1; jj < rows; jj++) {
-                    if (activeMask[jj][i]) { j_next = jj; break; }
-                }
-                // Periodic wrap
-                if (j_prev < 0 && y_periodic) {
-                    for (let jj = rows - 1; jj > j; jj--) {
-                        if (activeMask[jj][i]) { j_prev = jj; break; }
-                    }
-                }
-                if (j_next < 0 && y_periodic) {
-                    for (let jj = 0; jj < j; jj++) {
-                        if (activeMask[jj][i]) { j_next = jj; break; }
-                    }
-                }
+                // Bx = ∂Az/∂y — full-grid step=1 stencil
+                let j_prev = j - 1, j_next = j + 1;
+                if (j_prev < 0) j_prev = y_periodic ? rows - 1 : -1;
+                if (j_next >= rows) j_next = y_periodic ? 0 : -1;
 
                 if (j_prev >= 0 && j_next >= 0) {
-                    const h_back = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
-                    const h_fwd = j_next < j ? (j_next + rows - j) : (j_next - j);
-                    Bx[j][i] = (Az[j_next][i] - Az[j_prev][i]) / ((h_back + h_fwd) * dy);
+                    Bx[j][i] = (Az[j_next][i] - Az[j_prev][i]) / (2 * dy);
                 } else if (j_next >= 0) {
-                    const h = j_next < j ? (j_next + rows - j) : (j_next - j);
-                    Bx[j][i] = (Az[j_next][i] - Az[j][i]) / (h * dy);
+                    Bx[j][i] = (Az[j_next][i] - Az[j][i]) / dy;
                 } else if (j_prev >= 0) {
-                    const h = j_prev > j ? (j + rows - j_prev) : (j - j_prev);
-                    Bx[j][i] = (Az[j][i] - Az[j_prev][i]) / (h * dy);
+                    Bx[j][i] = (Az[j][i] - Az[j_prev][i]) / dy;
                 }
 
-                // By = -∂Az/∂x: find nearest active neighbors in i direction (same row)
-                let i_prev = -1, i_next = -1;
-                for (let ii = i - 1; ii >= 0; ii--) {
-                    if (activeMask[j][ii]) { i_prev = ii; break; }
-                }
-                for (let ii = i + 1; ii < cols; ii++) {
-                    if (activeMask[j][ii]) { i_next = ii; break; }
-                }
-                if (i_prev < 0 && x_periodic) {
-                    for (let ii = cols - 1; ii > i; ii--) {
-                        if (activeMask[j][ii]) { i_prev = ii; break; }
-                    }
-                }
-                if (i_next < 0 && x_periodic) {
-                    for (let ii = 0; ii < i; ii++) {
-                        if (activeMask[j][ii]) { i_next = ii; break; }
-                    }
-                }
+                // By = -∂Az/∂x — full-grid step=1 stencil
+                let i_prev = i - 1, i_next = i + 1;
+                if (i_prev < 0) i_prev = x_periodic ? cols - 1 : -1;
+                if (i_next >= cols) i_next = x_periodic ? 0 : -1;
 
                 if (i_prev >= 0 && i_next >= 0) {
-                    const h_back = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
-                    const h_fwd = i_next < i ? (i_next + cols - i) : (i_next - i);
-                    By[j][i] = -(Az[j][i_next] - Az[j][i_prev]) / ((h_back + h_fwd) * dx);
+                    By[j][i] = -(Az[j][i_next] - Az[j][i_prev]) / (2 * dx);
                 } else if (i_next >= 0) {
-                    const h = i_next < i ? (i_next + cols - i) : (i_next - i);
-                    By[j][i] = -(Az[j][i_next] - Az[j][i]) / (h * dx);
+                    By[j][i] = -(Az[j][i_next] - Az[j][i]) / dx;
                 } else if (i_prev >= 0) {
-                    const h = i_prev > i ? (i + cols - i_prev) : (i - i_prev);
-                    By[j][i] = -(Az[j][i] - Az[j][i_prev]) / (h * dx);
+                    By[j][i] = -(Az[j][i] - Az[j][i_prev]) / dx;
                 }
             }
         }
@@ -1624,7 +1985,8 @@ async function runSolver() {
             body: JSON.stringify({
                 configFile: configFile,
                 imageFile: AppState.uploadedImageFilename,
-                userId: AppState.userId
+                userId: AppState.userId,
+                materialLibraryFile: AppState.selectedLibrary || null
             })
         });
 
@@ -7136,4 +7498,800 @@ function refreshAllPlots() {
             }
         });
     }
+}
+
+// =====================================================
+// Material Library Manager
+// =====================================================
+
+const LIB_TEMPLATE = `# OpenMagFDM Material Library
+# Reference presets in analysis configs via:
+#   materials:
+#     iron_core:
+#       rgb: [128, 128, 128]
+#       preset: pure_iron_model
+#
+# -----------------------------------------------------------------------
+# Key formats:
+#   mu_r: table    mu_r: [[H1,H2,...],[mur1,mur2,...]]  (PCHIP interpolated)
+#   mu_r: formula  mu_r: "5000 / (1 + ($H/200)^2)"
+#   B-H:  table    B-H:  [[H1,H2,...],[B1,B2,...]]      (PCHIP interpolated)
+#   B-H:  formula  B-H:  "expression with $H"
+#
+# Permanent magnets: specify Br [T] + magnetization block.
+# Formula constants available: mu0 (4pi*1e-7 H/m), pi, exp, sin, cos, ...
+# -----------------------------------------------------------------------
+
+material_presets:
+
+  # =========================================================================
+  # Soft magnetic materials
+  # =========================================================================
+
+  # Silicon steel M19 — example using mu_r point table
+  silicon_steel_m19:
+    mu_r:
+      - [0,    200,  500,  1000, 2000, 5000, 10000]  # H [A/m]
+      - [5000, 4500, 3000, 2000, 1000,  500,   200]  # mu_r
+
+  # Pure Iron — continuous function model (~2.1 T saturation)
+  pure_iron_model:
+    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))
+
+  # Permendur (Fe-Co 49/49) — highest saturation of common soft magnetics (~2.4 T)
+  permendur_model:
+    B-H: ($H/(14.5 + 0.45*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 25))))
+
+  # Structural steel (SS400 equivalent) — moderate permeability
+  structural_steel_model:
+    B-H: ($H/(97.0 + 0.625*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 20))))
+
+  # =========================================================================
+  # Permanent magnets — IEC 60404-8-1 / JIS C 2502 typical values
+  #   Br: residual flux density [T]  mu_r: reversible permeability (~1.05 for NdFeB)
+  #   angle: 0 = +X direction  (90 = +Y, 180 = -X, 270 = -Y)
+  # =========================================================================
+
+  # NdFeB sintered N35  Br=1.19T  Hcb>=764kA/m  Hcj>=955kA/m  BHmax~35MGOe
+  NdFeB_N35:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.19
+      pattern: parallel
+      angle: 0
+
+  # NdFeB sintered N40  Br=1.27T  Hcb>=836kA/m  Hcj>=955kA/m  BHmax~40MGOe
+  NdFeB_N40:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.27
+      pattern: parallel
+      angle: 0
+
+  # NdFeB sintered N45  Br=1.34T  Hcb>=836kA/m  Hcj>=876kA/m  BHmax~45MGOe
+  NdFeB_N45:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.34
+      pattern: parallel
+      angle: 0
+
+  # NdFeB sintered N50  Br=1.42T  Hcb>=796kA/m  Hcj>=876kA/m  BHmax~50MGOe
+  NdFeB_N50:
+    mu_r: 1.05
+    magnetization:
+      Br: 1.42
+      pattern: parallel
+      angle: 0
+
+  # Ferrite sintered high-Br (FB9B equivalent)  Br=0.44T  Hcb>=255kA/m  Hcj>=280kA/m
+  ferrite_high_B:
+    mu_r: 1.05
+    magnetization:
+      Br: 0.44
+      pattern: parallel
+      angle: 0
+`;
+
+async function openLibraryManager() {
+    if (!AppState.libraryAceEditor) {
+        const editor = ace.edit('libraryAceEditor');
+        editor.setTheme('ace/theme/monokai');
+        editor.session.setMode('ace/mode/yaml');
+        editor.setOptions({
+            enableBasicAutocompletion: true,
+            enableLiveAutocompletion: true,
+            enableSnippets: false,
+            fontSize: '13px',
+            showPrintMargin: false,
+            tabSize: 2,
+            useSoftTabs: true
+        });
+        ace.require('ace/ext/language_tools');
+        editor.completers = [createLibraryCompleter()];
+        AppState.libraryAceEditor = editor;
+    }
+    await refreshLibraryList();
+    document.getElementById('libraryManagerModal').style.display = 'flex';
+    // Ace editor needs an explicit resize after the modal becomes visible,
+    // otherwise it renders as only a few lines tall (container had 0 height while hidden).
+    requestAnimationFrame(() => {
+        if (AppState.libraryAceEditor) AppState.libraryAceEditor.resize();
+    });
+}
+
+function closeLibraryManager() {
+    document.getElementById('libraryManagerModal').style.display = 'none';
+}
+
+async function refreshLibraryList() {
+    const listEl = document.getElementById('libraryFileList');
+    const statusEl = document.getElementById('libraryListStatus');
+    listEl.innerHTML = '';
+    statusEl.textContent = 'Loading...';
+    try {
+        const response = await fetch(`/api/material-libraries?userId=${AppState.userId}`);
+        if (!response.ok) throw new Error('Failed to load library list');
+        const result = await response.json();
+
+        statusEl.textContent = '';
+        if (result.libraries.length === 0) {
+            listEl.innerHTML = '<div style="color:#aaa; font-size:0.8rem; padding:5px;">No files yet</div>';
+            return;
+        }
+
+        result.libraries.forEach(lib => {
+            const item = document.createElement('div');
+            item.className = 'lib-file-item' + (AppState.currentLibraryFile === lib.filename ? ' active' : '');
+            item.textContent = lib.filename;
+            item.title = `${(lib.size / 1024).toFixed(1)} KB  ${new Date(lib.modified).toLocaleString()}`;
+            item.onclick = () => selectLibraryFile(lib.filename);
+            listEl.appendChild(item);
+        });
+    } catch (e) {
+        statusEl.textContent = `Error: ${e.message}`;
+    }
+}
+
+async function selectLibraryFile(filename) {
+    try {
+        const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}?userId=${AppState.userId}`);
+        if (!response.ok) throw new Error('Failed to load file');
+        const content = await response.text();
+
+        AppState.currentLibraryFile = filename;
+        if (AppState.libraryAceEditor) {
+            AppState.libraryAceEditor.setValue(content, -1);
+        }
+        document.getElementById('libEditFilename').textContent = filename;
+        document.getElementById('libDeleteBtn').style.display = 'inline-block';
+        document.getElementById('libSaveBtn').style.display = 'inline-block';
+        document.getElementById('libUseBtn').style.display = 'inline-block';
+
+        document.querySelectorAll('.lib-file-item').forEach(el => {
+            el.classList.toggle('active', el.textContent === filename);
+        });
+
+        // B-H Curves tab sources from the active library, not the editor — no update needed here
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Error: ${e.message}`;
+    }
+}
+
+function switchLibTab(tab) {
+    const editPane  = document.getElementById('libPaneEdit');
+    const bhPane    = document.getElementById('libPaneBH');
+    const leftPanel = document.getElementById('libLeftPanel');
+    const editBtn   = document.getElementById('libTabEdit');
+    const bhBtn     = document.getElementById('libTabBH');
+
+    if (tab === 'edit') {
+        editPane.style.display  = 'flex';
+        bhPane.style.display    = 'none';
+        leftPanel.style.display = 'flex';
+        editBtn.classList.add('lib-tab-active');
+        bhBtn.classList.remove('lib-tab-active');
+        if (AppState.libraryAceEditor) AppState.libraryAceEditor.resize();
+    } else {
+        editPane.style.display  = 'none';
+        bhPane.style.display    = 'flex';
+        leftPanel.style.display = 'none';
+        editBtn.classList.remove('lib-tab-active');
+        bhBtn.classList.add('lib-tab-active');
+        // Defer so the pane is fully laid out before Plotly measures the container
+        requestAnimationFrame(() => loadBHMaterialList());
+    }
+}
+
+// Evaluate a tinyexpr-style mu_r formula string at a given H value.
+// Replaces $H with the numeric value and maps tinyexpr names to JS Math.
+function evaluateMuFormula(formula, H) {
+    const expr = formula
+        .replace(/\$H/g, `(${H})`)
+        .replace(/\bmu0\b/g, '(4*Math.PI*1e-7)')  // vacuum permeability
+        .replace(/\bpi\b/g, 'Math.PI')
+        .replace(/\bexp\s*\(/g, 'Math.exp(')
+        .replace(/\bsin\s*\(/g, 'Math.sin(')
+        .replace(/\bcos\s*\(/g, 'Math.cos(')
+        .replace(/\bsqrt\s*\(/g, 'Math.sqrt(')
+        .replace(/\babs\s*\(/g, 'Math.abs(')
+        .replace(/\bln\s*\(/g, 'Math.log(')      // ln = natural log
+        .replace(/\blog\s*\(/g, 'Math.log10(')   // tinyexpr log = log10
+        .replace(/\bpow\s*\(/g, 'Math.pow(')
+        .replace(/\^/g, '**');                    // tinyexpr power operator
+    try {
+        // eslint-disable-next-line no-new-func
+        const v = Function(`'use strict'; return (${expr})`)();
+        return (isFinite(v) && v > 0) ? v : NaN;
+    } catch (_) {
+        return NaN;
+    }
+}
+
+// Load the active library (AppState.selectedLibrary) and populate the
+// material list in the B-H Curves pane left column.
+async function loadBHMaterialList() {
+    const listEl    = document.getElementById('libBHMaterialList');
+    const plotEl    = document.getElementById('libBHPlotContainer');
+    listEl.innerHTML = '';
+    plotEl.innerHTML = '';
+
+    if (!AppState.selectedLibrary) {
+        listEl.innerHTML = `<div style="color:#888; font-size:0.82rem; padding:8px; line-height:1.5;">
+            No active library.<br>
+            Open a library file,<br>click <em>Use This Library</em>,<br>then return here.</div>`;
+        return;
+    }
+
+    try {
+        const response = await fetch(
+            `/api/material-libraries/${encodeURIComponent(AppState.selectedLibrary)}?userId=${AppState.userId}`
+        );
+        if (!response.ok) throw new Error('Failed to load library');
+        const content = await response.text();
+
+        const doc = jsyaml.load(content) || {};
+        // Combine material_presets and materials sections
+        const presets = Object.assign({}, doc.material_presets || {}, doc.materials || {});
+        const names   = Object.keys(presets);
+
+        if (names.length === 0) {
+            listEl.innerHTML = '<div style="color:#888; font-size:0.82rem; padding:8px;">No materials in library.</div>';
+            return;
+        }
+
+        // Header showing which library is active
+        const hdr = document.createElement('div');
+        hdr.style.cssText = 'font-weight:600; font-size:0.8rem; margin-bottom:8px; color:#495057; word-break:break-all;';
+        hdr.textContent   = AppState.selectedLibrary;
+        listEl.appendChild(hdr);
+
+        // Build clickable material list
+        let firstItem = null;
+        for (const name of names) {
+            const props = presets[name];
+            const mur   = props && props.mu_r;
+            const bh    = props && props['B-H'];
+            const mag   = props && props.magnetization;
+            // Classify: B-H array / mu_r array / formula / constant / magnet (Br)
+            const isBH      = (Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]))
+                           || (typeof bh === 'string' && bh.trim() !== '');
+            const isArray   = !isBH && Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]);
+            const isFormula = !isBH && !isArray && typeof mur === 'string' && mur.trim() !== '';
+            // isMagnet: has constant Br (no explicit B-H), treated as linear demagnetization curve
+            const isMagnet  = !isBH && mag && typeof mag.Br === 'number';
+            const isConst   = !isBH && !isMagnet && typeof mur === 'number';
+            const hasPlot   = isBH || isArray || isFormula || isConst || isMagnet;
+
+            const item = document.createElement('div');
+            item.className  = 'lib-file-item';
+            item.dataset.matname = name;
+            item.style.cssText = 'padding:5px 8px; cursor:pointer; border-radius:3px;'
+                               + ' font-size:0.82rem; word-break:break-all; line-height:1.4;';
+            item.title = isBH      ? 'B-H curve [[H],[B]]'
+                       : isArray   ? 'Array μr(H)'
+                       : isFormula ? 'Formula μr($H)'
+                       : isMagnet  ? `Permanent magnet  Br = ${mag.Br} T`
+                       : isConst   ? `Constant μr = ${mur}`
+                       :             'No B-H / μr data';
+
+            // Badge
+            const badge = document.createElement('span');
+            badge.style.cssText = 'float:right; font-size:0.68rem; border-radius:8px; padding:1px 5px; margin-left:4px;'
+                                + (isBH      ? 'background:#fff3cd; color:#856404;'
+                                  : isArray   ? 'background:#d4edda; color:#155724;'
+                                  : isFormula ? 'background:#cce5ff; color:#004085;'
+                                  : isMagnet  ? 'background:#fce4ec; color:#880e4f;'
+                                  : isConst   ? 'background:#f8d7da; color:#721c24;'
+                                  :             'background:#f0f0f0; color:#888;');
+            badge.textContent = isBH      ? 'B-H'
+                              : isArray   ? 'arr'
+                              : isFormula ? 'fn'
+                              : isMagnet  ? 'Br'
+                              : isConst   ? 'const'
+                              :             '—';
+            item.appendChild(badge);
+            item.appendChild(document.createTextNode(name));
+
+            item.onclick = () => {
+                listEl.querySelectorAll('.lib-file-item[data-matname]').forEach(el => el.classList.remove('active'));
+                item.classList.add('active');
+                if (hasPlot) renderBHCurveForMaterial(name, props);
+                else plotEl.innerHTML = '<div style="color:#888; text-align:center; padding:30px;">No B-H / μr data for this material.</div>';
+            };
+
+            listEl.appendChild(item);
+            if (!firstItem) firstItem = { item, name, props, hasPlot };
+        }
+
+        // Auto-select the first material with plottable data (or just first)
+        const autoSelect = names.reduce((found, name) => {
+            if (found) return found;
+            const p   = presets[name];
+            const bh  = p && p['B-H'];
+            const mur = p && p.mu_r;
+            const mg  = p && p.magnetization;
+            if ((Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]))
+                || (typeof bh === 'string' && bh.trim() !== '')
+                || (Array.isArray(mur) && mur.length === 2 && Array.isArray(mur[0]))
+                || typeof mur === 'string' || typeof mur === 'number'
+                || (mg && typeof mg.Br === 'number')) {
+                return { name, props: p };
+            }
+            return null;
+        }, null) || (names.length > 0 ? { name: names[0], props: presets[names[0]] } : null);
+
+        if (autoSelect) {
+            const target = listEl.querySelector(`[data-matname="${CSS.escape(autoSelect.name)}"]`);
+            if (target) target.classList.add('active');
+            renderBHCurveForMaterial(autoSelect.name, autoSelect.props);
+        }
+
+    } catch (e) {
+        listEl.innerHTML = `<div style="color:#c62828; font-size:0.82rem; padding:8px;">Error: ${e.message}</div>`;
+    }
+}
+
+// Render dual-axis B-H / μr-H Plotly chart for a single material.
+// Handles three data sources:
+//   1. B-H: [[H,...],[B,...]]   — B values are direct; μr derived from B/μ₀H
+//   2. mu_r: [[H,...],[μr,...]] — μr direct; B = μ₀·μr·H
+//   3. mu_r: formula / constant
+function renderBHCurveForMaterial(name, props) {
+    const container = document.getElementById('libBHPlotContainer');
+    const toolbar   = document.getElementById('libBHToolbar');
+    container.innerHTML = '';
+
+    AppState.currentBHMaterial = { name, props };
+
+    const MU_0   = 4 * Math.PI * 1e-7;
+    const bh     = props && props['B-H'];
+    const mur    = props && props.mu_r;
+    const bhType = (props && props['bh_type']) || 'auto';
+
+    // Determine X-axis type from checkbox (default: log)
+    const logCb = document.getElementById('libBHLogX');
+    const xtype = (logCb && !logCb.checked) ? 'linear' : 'log';
+
+    // Log-spaced H axis for formula / constant evaluation (1 to 1e5 A/m)
+    const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, i * 5 / 199));
+
+    let H_arr = null, B_arr = null, mur_arr = null;
+    let isDashed = false;
+    let isDemag = false;  // demagnetization curve (H < 0)
+
+    // --- Case 1a: B-H: formula string "expr($H)" ---
+    if (typeof bh === 'string' && bh.trim() !== '') {
+        // Evaluate over H range 1e-3..1e5 A/m (real materials saturate well below 1e5)
+        const H_log = Array.from({ length: 200 }, (_, i) => Math.pow(10, -3 + i * 8 / 199));
+        const bhFormula = bh.trim();
+        const evalB = (H) => {
+            const expr = bhFormula
+                .replace(/\$H/g, `(${H})`)
+                .replace(/\bmu0\b/g, '(4*Math.PI*1e-7)')  // vacuum permeability
+                .replace(/\bpi\b/g, 'Math.PI')
+                .replace(/\bexp\s*\(/g, 'Math.exp(')
+                .replace(/\bsin\s*\(/g, 'Math.sin(')
+                .replace(/\bcos\s*\(/g, 'Math.cos(')
+                .replace(/\btanh\s*\(/g, 'Math.tanh(')
+                .replace(/\bsqrt\s*\(/g, 'Math.sqrt(')
+                .replace(/\babs\s*\(/g, 'Math.abs(')
+                .replace(/\bln\s*\(/g, 'Math.log(')
+                .replace(/\blog\s*\(/g, 'Math.log10(')
+                .replace(/\bpow\s*\(/g, 'Math.pow(')
+                .replace(/\^/g, '**');
+            try { return Function(`'use strict'; return (${expr})`)(); }
+            catch (_) { return NaN; }
+        };
+        const Br            = evalB(0);
+        const treatAsMagnet = (bhType === 'magnet') || (bhType === 'auto' && isFinite(Br) && Math.abs(Br) > 1e-9);
+        const treatAsSoft   = (bhType === 'soft');
+
+        if (treatAsMagnet && !treatAsSoft) {
+            // Demagnetization formula: sample H ∈ [-1e6, -1] A/m, log-spaced in |H|
+            // Extended to 5 MA/m to cover strong demagnetizing fields
+            const N = 200;
+            const H_neg = Array.from({ length: N }, (_, i) =>
+                -Math.pow(10, i * Math.log10(1e6) / (N - 1)));  // magnitude: 1 → 1e6
+            const pairs = H_neg.map(H => [H, evalB(H)]).filter(([, B]) => isFinite(B));
+            if (isFinite(Br)) pairs.push([0, Br]);   // remanence point at H=0
+            pairs.sort((a, b) => a[0] - b[0]);        // ascending H (most-negative first)
+            if (pairs.length > 1) {
+                H_arr   = pairs.map(p => p[0]);
+                B_arr   = pairs.map(p => p[1]);
+                mur_arr = null;
+                isDemag = true;
+            }
+        } else {
+            // Soft magnet or no remanence: sample H ∈ [1e-3, 1e5] A/m
+            const useBr = treatAsSoft ? 0 : (isFinite(Br) ? Br : 0);
+            const H_ok  = H_log.filter(H => isFinite(evalB(H)));
+            if (H_ok.length > 1) {
+                H_arr   = H_ok;
+                B_arr   = H_arr.map(H => evalB(H));
+                mur_arr = H_arr.map((H, i) => Math.max(1, (B_arr[i] - useBr) / (MU_0 * H)));
+            }
+        }
+
+    // --- Case 1b: B-H: [[H],[B]] ---
+    } else if (Array.isArray(bh) && bh.length === 2 &&
+        Array.isArray(bh[0]) && Array.isArray(bh[1]) &&
+        bh[0].length === bh[1].length && bh[0].length >= 2) {
+
+        if (bh[0].some(h => h < -1e-12)) {
+            // --- Demagnetization curve (H < 0, second quadrant) ---
+            // Sort by H ascending (most negative first → H≈0 at end)
+            const pairs = bh[0].map((h, i) => [h, bh[1][i]]).sort((a, b) => a[0] - b[0]);
+            H_arr   = pairs.map(p => p[0]);
+            B_arr   = pairs.map(p => p[1]);
+            mur_arr = null;
+            isDemag = true;
+
+        } else {
+            // --- Normal magnetization curve (H >= 0) ---
+            const H_raw = [...bh[0]];
+            const B_raw = [...bh[1]];
+
+            // Detect remanence: if H[0]=0 and B[0]≠0
+            const Br = (Math.abs(H_raw[0]) < 1e-12 && Math.abs(B_raw[0]) > 1e-12) ? B_raw[0] : 0;
+
+            // Prepend implicit (0,0) if first H > 0
+            if (H_raw[0] > 1e-12) { H_raw.unshift(0); B_raw.unshift(0); }
+
+            B_arr = B_raw;
+
+            // Compute μr: μr(H=0) from initial slope; μr(H>0) = (B-Br)/(μ₀H)
+            mur_arr = [];
+            if (H_raw.length >= 2 && H_raw[1] > 0) {
+                const mu0_val = (B_raw[1] - Br) / (MU_0 * H_raw[1]);
+                mur_arr.push(Math.max(1, mu0_val));
+            } else {
+                mur_arr.push(1);
+            }
+            for (let i = 1; i < H_raw.length; i++) {
+                if (H_raw[i] <= 1e-15) continue;
+                mur_arr.push(Math.max(1, (B_raw[i] - Br) / (MU_0 * H_raw[i])));
+            }
+
+            H_arr = H_raw;
+        }
+
+    // --- Case 2: mu_r: [[H],[μr]] ---
+    } else if (Array.isArray(mur) && mur.length === 2 &&
+               Array.isArray(mur[0]) && Array.isArray(mur[1]) &&
+               mur[0].length === mur[1].length && mur[0].length > 0) {
+        H_arr   = mur[0];
+        mur_arr = mur[1];
+        B_arr   = H_arr.map((H, i) => MU_0 * mur_arr[i] * H);
+
+    // --- Case 3: mu_r: formula string ---
+    } else if (typeof mur === 'string' && mur.trim() !== '') {
+        const pts = H_log
+            .map(H => ({ H, mu: evaluateMuFormula(mur, H) }))
+            .filter(p => !isNaN(p.mu) && p.mu > 0);
+        if (pts.length > 0) {
+            H_arr   = pts.map(p => p.H);
+            mur_arr = pts.map(p => p.mu);
+            B_arr   = H_arr.map((H, i) => MU_0 * mur_arr[i] * H);
+        }
+
+    // --- Case 4: magnetization.Br: constant (linear permanent magnet, no explicit B-H) ---
+    // Must come before the "constant mu_r" case: NdFeB presets have both mu_r:1.05
+    // and magnetization.Br, so magnet detection must take priority.
+    // Models the linear second-quadrant demagnetization line: B = Br + μ₀·μr·H
+    // Hcb = Br / (μ₀·μr)   (coercive field where B = 0)
+    } else if (props && props.magnetization && typeof props.magnetization.Br === 'number') {
+        const Br_val   = props.magnetization.Br;
+        const mu_r_val = (typeof mur === 'number') ? mur : 1.05;  // default recoil μr for NdFeB
+        const Hcb      = Br_val / (MU_0 * mu_r_val);
+        const H_max_demag = 1e6;  // extend to 1 MA/m to cover strong demagnetizing fields
+        const H_min = -Math.max(Hcb, H_max_demag);
+        const N = 200;
+        H_arr   = Array.from({ length: N + 1 }, (_, i) => H_min + i * (-H_min) / N);
+        B_arr   = H_arr.map(H => Br_val + MU_0 * mu_r_val * H);
+        mur_arr = null;
+        isDemag = true;
+        isDashed = true;  // straight line → dashed style
+
+    // --- Case 5: mu_r: constant (non-magnet soft material) ---
+    } else if (typeof mur === 'number') {
+        H_arr   = [1, 1e5];
+        mur_arr = [mur, mur];
+        B_arr   = H_arr.map(H => MU_0 * mur * H);
+        isDashed = true;
+    }
+
+    if (!H_arr || !B_arr) {
+        container.innerHTML = '<div style="color:#888; text-align:center; padding:40px; font-size:0.9rem;">'
+                            + 'No plottable B-H / μr data for this material.</div>';
+        if (toolbar) toolbar.style.display = 'none';
+        return;
+    }
+
+    const plotH = Math.max(350, container.offsetHeight || 0);
+
+    // Keep checkbox label in sync: "Log |H| axis" for demagnetization, "Log X axis" otherwise
+    const logLabelNode = logCb && logCb.nextSibling;
+    if (logLabelNode) logLabelNode.textContent = isDemag ? ' Log |H| axis' : ' Log X axis';
+
+    // ---- Demagnetization curve (H < 0): single B trace ----
+    if (isDemag) {
+        if (toolbar) toolbar.style.display = '';  // show log/linear checkbox
+
+        const useLogH  = logCb && logCb.checked;
+        const Br_demag = B_arr[B_arr.length - 1];  // B at H=0 (remanence)
+
+        // Find Hcb: interpolate the H where B crosses zero.
+        // H_arr is sorted ascending (most-negative first); data may extend beyond Hcb.
+        let Hcb_demag = H_arr[0];  // fallback: leftmost H
+        for (let i = 0; i < B_arr.length - 1; i++) {
+            if (B_arr[i] <= 0 && B_arr[i + 1] > 0) {
+                const t = -B_arr[i] / (B_arr[i + 1] - B_arr[i]);
+                Hcb_demag = H_arr[i] + t * (H_arr[i + 1] - H_arr[i]);
+                break;
+            }
+        }
+
+        let x_data, y_data, x_title, x_type;
+        if (useLogH) {
+            // Show |H| on log scale (exclude H=0)
+            const filtered = H_arr.map((h, i) => [Math.abs(h), B_arr[i]])
+                                   .filter(([h]) => h > 1e-12)
+                                   .sort((a, b) => a[0] - b[0]);  // ascending |H|
+            x_data  = filtered.map(p => p[0]);
+            y_data  = filtered.map(p => p[1]);
+            x_title = '|H| [A/m]';
+            x_type  = 'log';
+        } else {
+            x_data  = H_arr;
+            y_data  = B_arr;
+            x_title = 'H [A/m]';
+            x_type  = 'linear';
+        }
+
+        // log|H| mode: axis is reversed (Hcb on left, Br on right).
+        // ax offsets are flipped vs the non-reversed case so text stays inside the plot.
+        const annotations = useLogH ? [
+            { x: x_data[0], y: y_data[0], xref: 'x', yref: 'y',
+              text: `Br ≈ ${Br_demag.toFixed(3)} T`,
+              showarrow: true, arrowhead: 2, ax: -50, ay: -20,
+              font: { color: '#e05252', size: 11 } },
+            { x: Math.abs(Hcb_demag), y: 0,
+              xref: 'x', yref: 'y',
+              text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
+              showarrow: true, arrowhead: 2, ax: 30, ay: -25,
+              font: { color: '#555', size: 11 } }
+        ] : [
+            { x: 0, y: Br_demag, xref: 'x', yref: 'y',
+              text: `Br = ${Br_demag.toFixed(3)} T`,
+              showarrow: true, arrowhead: 2, ax: 40, ay: -20,
+              font: { color: '#e05252', size: 11 } },
+            { x: Hcb_demag, y: 0, xref: 'x', yref: 'y',
+              text: `Hcb = ${(Math.abs(Hcb_demag) / 1000).toFixed(0)} kA/m`,
+              showarrow: true, arrowhead: 2, ax: 30, ay: -25,
+              font: { color: '#555', size: 11 } }
+        ];
+
+        Plotly.newPlot(container, [{
+            x: x_data, y: y_data,
+            mode: isDashed ? 'lines' : 'lines+markers',
+            name: 'B [T]',
+            line:   { width: 2, color: '#e05252', ...(isDashed ? { dash: 'dash' } : {}) },
+            ...(isDashed ? {} : { marker: { size: 4, color: '#e05252' } }),
+            hovertemplate: `${useLogH ? '|H|' : 'H'}=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>`
+        }], {
+            title:  { text: `<b>${name}</b>`, font: { size: 14 } },
+            xaxis:  { title: x_title, type: x_type, exponentformat: 'power',
+                      ...(useLogH ? { autorange: 'reversed' } : {}) },
+            yaxis:  { title: 'B [T]', rangemode: 'tozero', exponentformat: 'power',
+                      titlefont: { color: '#e05252' }, tickfont: { color: '#e05252' } },
+            shapes: useLogH ? [
+                { type: 'line', x0: 0, x1: 1, y0: 0, y1: 0,
+                  xref: 'paper', yref: 'y',
+                  line: { color: '#bbb', dash: 'dot', width: 1 } }
+            ] : [
+                { type: 'line', x0: 0, x1: 0, y0: 0, y1: 1,
+                  xref: 'x', yref: 'paper',
+                  line: { color: '#bbb', dash: 'dot', width: 1 } },
+                { type: 'line', x0: 0, x1: 1, y0: 0, y1: 0,
+                  xref: 'paper', yref: 'y',
+                  line: { color: '#bbb', dash: 'dot', width: 1 } }
+            ],
+            annotations,
+            margin:     { t: 45, l: 65, r: 30, b: 55 },
+            height:     plotH,
+            showlegend: false
+        }, { responsive: true, displayModeBar: false });
+        return;
+    }
+
+    // ---- Normal B-H / μr curve ----
+    const markerSize = (Array.isArray(bh) || Array.isArray(mur)) ? 4 : 0;
+    const mode = isDashed ? 'lines' : (markerSize > 0 ? 'lines+markers' : 'lines');
+
+    // B on left axis (y1), μr on right axis (y2)
+    // For log X axis: skip H=0 point (Plotly handles gracefully but avoids log(0))
+    const useLog = xtype === 'log';
+    const hFilter = (_, i) => !useLog || H_arr[i] > 0;
+
+    const H_plot    = H_arr.filter(hFilter);
+    const B_plot    = B_arr.filter((_, i) => hFilter(null, i));
+    const mur_plot  = mur_arr.filter((_, i) => hFilter(null, i));
+
+    const traceB = {
+        x: H_plot, y: B_plot,
+        mode, name: 'B [T]', yaxis: 'y1',
+        line: { width: 2, color: '#e05252', dash: isDashed ? 'dash' : 'solid' },
+        ...(markerSize > 0 ? { marker: { size: markerSize, color: '#e05252' } } : {}),
+        hovertemplate: 'H=%{x:.4g} A/m<br>B=%{y:.4g} T<extra></extra>'
+    };
+
+    const traceMur = {
+        x: H_plot, y: mur_plot,
+        mode, name: 'μr', yaxis: 'y2',
+        line: { width: 2, color: '#667eea', dash: isDashed ? 'dash' : 'solid' },
+        ...(markerSize > 0 ? { marker: { size: markerSize, color: '#667eea' } } : {}),
+        hovertemplate: 'H=%{x:.4g} A/m<br>μr=%{y:.4g}<extra></extra>'
+    };
+
+    Plotly.newPlot(container, [traceB, traceMur], {
+        title:  { text: `<b>${name}</b>`, font: { size: 14 } },
+        xaxis:  { title: 'H [A/m]', type: xtype, exponentformat: 'power' },
+        yaxis:  { title: 'B [T]', exponentformat: 'power',
+                  titlefont: { color: '#e05252' }, tickfont: { color: '#e05252' } },
+        yaxis2: { title: 'μr', overlaying: 'y', side: 'right', exponentformat: 'power',
+                  titlefont: { color: '#667eea' }, tickfont: { color: '#667eea' } },
+        margin:     { t: 45, l: 65, r: 70, b: 55 },
+        height:     plotH,
+        legend:     { x: 0.02, y: 0.98, bgcolor: 'rgba(255,255,255,0.8)', bordercolor: '#ccc', borderwidth: 1 },
+        showlegend: true
+    }, { responsive: true, displayModeBar: false });
+
+    if (toolbar) toolbar.style.display = '';
+}
+
+// Called when the log/linear checkbox changes.
+function onLibBHAxisChange() {
+    if (AppState.currentBHMaterial) {
+        renderBHCurveForMaterial(AppState.currentBHMaterial.name, AppState.currentBHMaterial.props);
+    }
+}
+
+function uploadLibrary() {
+    document.getElementById('libraryUpload').click();
+}
+
+async function newLibrary() {
+    const name = prompt('New library filename (must end with .yaml):');
+    if (!name) return;
+    const filename = (name.endsWith('.yaml') || name.endsWith('.yml')) ? name : name + '.yaml';
+
+    AppState.currentLibraryFile = filename;
+    if (AppState.libraryAceEditor) {
+        AppState.libraryAceEditor.setValue(LIB_TEMPLATE, -1);
+    }
+    document.getElementById('libEditFilename').textContent = filename + '  (unsaved)';
+    document.getElementById('libDeleteBtn').style.display = 'none';
+    document.getElementById('libSaveBtn').style.display = 'inline-block';
+    document.getElementById('libUseBtn').style.display = 'none';
+}
+
+async function handleLibraryUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    event.target.value = '';
+
+    const formData = new FormData();
+    formData.append('library', file);
+    formData.append('userId', AppState.userId);
+
+    try {
+        const response = await fetch('/api/material-libraries', {
+            method: 'POST',
+            body: formData
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        await refreshLibraryList();
+        await selectLibraryFile(result.filename);
+        document.getElementById('libraryListStatus').textContent = 'Uploaded successfully';
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Upload error: ${e.message}`;
+    }
+}
+
+async function saveLibrary() {
+    if (!AppState.libraryAceEditor) return;
+
+    let filename = AppState.currentLibraryFile;
+    if (!filename) {
+        filename = prompt('Save as (must end with .yaml):');
+        if (!filename) return;
+        if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) filename += '.yaml';
+        AppState.currentLibraryFile = filename;
+    }
+
+    const content = AppState.libraryAceEditor.getValue();
+    try {
+        const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content, userId: AppState.userId })
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+        document.getElementById('libEditFilename').textContent = filename;
+        document.getElementById('libDeleteBtn').style.display = 'inline-block';
+        document.getElementById('libUseBtn').style.display = 'inline-block';
+        document.getElementById('libraryListStatus').textContent = 'Saved';
+        await refreshLibraryList();
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Save error: ${e.message}`;
+    }
+}
+
+async function deleteLibrary() {
+    const filename = AppState.currentLibraryFile;
+    if (!filename) return;
+    if (!confirm(`Delete "${filename}"?`)) return;
+
+    try {
+        const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}?userId=${AppState.userId}`, {
+            method: 'DELETE'
+        });
+        const result = await response.json();
+        if (!result.success) throw new Error(result.error);
+
+        AppState.currentLibraryFile = null;
+        if (AppState.libraryAceEditor) AppState.libraryAceEditor.setValue('', -1);
+        document.getElementById('libEditFilename').textContent = 'No file selected';
+        document.getElementById('libDeleteBtn').style.display = 'none';
+        document.getElementById('libSaveBtn').style.display = 'none';
+        document.getElementById('libUseBtn').style.display = 'none';
+
+        if (AppState.selectedLibrary === filename) {
+            clearActiveLibrary();
+        }
+        await refreshLibraryList();
+    } catch (e) {
+        document.getElementById('libraryListStatus').textContent = `Delete error: ${e.message}`;
+    }
+}
+
+function setActiveLibrary() {
+    const filename = AppState.currentLibraryFile;
+    if (!filename) return;
+    AppState.selectedLibrary = filename;
+    document.getElementById('activeLibraryName').textContent = filename;
+    document.getElementById('activeLibraryBadge').style.display = 'inline-flex';
+    // Persist to cookie so it auto-loads on next visit
+    setCookie('magfdm_last_library', filename, 365);
+    showStatus('configStatus', `Material library set: ${filename}`, 'success');
+}
+
+function clearActiveLibrary() {
+    AppState.selectedLibrary = null;
+    document.getElementById('activeLibraryBadge').style.display = 'none';
+    // Clear cookie
+    setCookie('magfdm_last_library', '', -1);
 }

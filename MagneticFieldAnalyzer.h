@@ -16,6 +16,7 @@
 #include <memory>
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <variant>
 #include <tinyexpr.h>
@@ -378,14 +379,19 @@ private:
         int precond_update_frequency;     // How often to update preconditioner: 1=every Newton iter (default: 1)
         bool precond_verbose;             // Print preconditioner statistics (default: false)
 
+        // Fine finishing: full-grid Newton iterations after coarse convergence
+        int fine_finishing_iterations;    // Number of full-grid Newton steps after coarse solve (default: 0 = disabled)
+        double fine_finishing_tolerance;  // Convergence tolerance for fine finishing (default: -1 = use tolerance)
+
         NonlinearSolverConfig() :
             enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
             relaxation(0.7), anderson(), gmres_restart(30), line_search_c(1e-4),
             line_search_alpha_init(1.0), line_search_alpha_min(1e-3), line_search_rho(0.65),
             line_search_max_trials(50), line_search_adaptive(true),
-            verbose(false), export_convergence(false), use_galerkin_coarsening(true),
+            verbose(false), export_convergence(false), use_galerkin_coarsening(false),
             use_matrix_free_jv(true),
-            use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false) {}
+            use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false),
+            fine_finishing_iterations(0), fine_finishing_tolerance(-1.0) {}
     };
 
     // Maxwell stress and force calculation
@@ -510,19 +516,43 @@ private:
     std::vector<AntialiasableMaterial> antialias_materials;  // Materials with antialias enabled
     std::map<std::string, YAML::Node> material_presets;  // Material presets (reusable B-H curves/properties)
 
+    // RGB→material lookup table for O(1) material matching in hot loops (OpenMP-safe)
+    struct MaterialLookupEntry {
+        std::string name;
+    };
+    std::unordered_map<int, MaterialLookupEntry> rgb_to_material;  // key: (R<<16)|(G<<8)|B
+
     // Adaptive mesh coarsening configuration
     struct CoarsenConfig {
         bool enabled;       // Enable coarsening for this material
         int ratio;          // Coarsening ratio (area reduction factor)
-        int skip_x;         // Actual skip ratio in x/r direction (auto-calculated)
-        int skip_y;         // Actual skip ratio in y/theta direction (auto-calculated)
+        int skip_x;         // Max skip ratio in x/r direction (auto-calculated, power of 2)
+        int skip_y;         // Max skip ratio in y/theta direction (auto-calculated, power of 2)
+        int max_skip_iso;   // min(skip_x, skip_y) for gradient coarsening levels
 
-        CoarsenConfig() : enabled(false), ratio(1), skip_x(1), skip_y(1) {}
+        CoarsenConfig() : enabled(false), ratio(1), skip_x(1), skip_y(1), max_skip_iso(1) {}
     };
     std::map<std::string, CoarsenConfig> material_coarsen;  // Coarsening config per material
 
+    // Permanent magnet magnetization model
+    struct MagnetizationConfig {
+        bool enabled = false;
+        double Hc = 0.0;          // Effective magnetization magnitude [A/m] (resolved from Br or Hc in YAML)
+        std::string pattern;       // "parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "custom"
+        double angle_deg = 0.0;    // Magnetization angle [deg] (parallel)
+        int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy)
+        double cx = 0.0, cy = 0.0; // Rotation center [m]
+        double R_pc = 0.0;         // Pitch circle radius [m] (polar_anisotropy)
+        std::string Mx_expr, My_expr;  // tinyexpr expressions for Mx, My (parallel/halbach/custom)
+    };
+    std::map<std::string, MagnetizationConfig> material_magnetization;
+    Eigen::MatrixXd Mx_map;      // (ny, nx) or (ntheta, nr) — magnetization x-component
+    Eigen::MatrixXd My_map;      // same shape — magnetization y-component
+    Eigen::MatrixXd Jz_mag_map;  // equivalent magnetization current (curl of M)
+
     // Adaptive mesh coarsening data
     Eigen::Matrix<bool, Eigen::Dynamic, Eigen::Dynamic> active_cells;  // True if cell is active (not coarsened)
+    Eigen::Matrix<int, Eigen::Dynamic, Eigen::Dynamic> cell_skip_level;  // Per-cell skip level (1,2,4,8...)
     Eigen::MatrixXd local_dx, local_dy;  // Local mesh spacing at each active cell
     std::vector<std::pair<int, int>> coarse_to_fine;  // coarse_idx -> (i, j) in full grid
     std::map<std::pair<int, int>, int> fine_to_coarse;  // (i, j) -> coarse_idx
@@ -530,6 +560,8 @@ private:
     bool coarsening_enabled;  // Global flag: true if any material has coarsening enabled
     std::vector<bool> active_row_flags;  // True if row has interior active cells (for interpolation)
     int max_coarsen_skip = 1;  // Maximum skip across all coarsened materials (for locality check)
+    int coarsen_boundary_shell = 1;      // Edge dilation radius [pixels] for boundary protection (YAML: coarsening.boundary_shell)
+    int coarsen_smooth_iterations = 0;   // Post-interpolation Laplacian smoothing iterations (YAML: coarsening.smooth_iterations)
 
     // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
     Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix
@@ -540,6 +572,14 @@ private:
     Eigen::SparseMatrix<double> P_prolongation;   // n_full x n_active (coarse -> fine)
     Eigen::SparseMatrix<double> R_restriction;    // n_active x n_full (fine -> coarse, = P^T)
     bool multigrid_operators_built = false;       // Operators built flag
+
+    // CSR (row-major) copies for OpenMP-parallel SpMV (see parallelSpMV)
+    // Eigen's default CSC format does not support row-parallel matvec.
+    // These are kept in sync with their CSC counterparts and used in the
+    // hot path (defect correction residual + line search, ~5 SpMV/Newton iter).
+    Eigen::SparseMatrix<double, Eigen::RowMajor> A_full_cached_csr;
+    Eigen::SparseMatrix<double, Eigen::RowMajor> P_prolongation_csr;
+    Eigen::SparseMatrix<double, Eigen::RowMajor> R_restriction_csr;
 
     // Phase 7: Hermite interpolation gradients at active cells
     Eigen::MatrixXd dAz_dx_active;  // ∂Az/∂x at active cells (full grid size, zeros at inactive)
@@ -625,6 +665,11 @@ private:
     void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
     void updateMuDistribution();  // Update mu_map based on current H_map
 
+    // Permanent magnet magnetization model
+    void computeMagnetizationGrids();        // Build Mx_map, My_map from material_magnetization configs
+    void computeMagnetizationCurl();         // Cartesian: Jz_mag = ∂My/∂x - ∂Mx/∂y
+    void computeMagnetizationCurlPolar();    // Polar: Jz_mag = (1/r)∂(r·Mθ)/∂r - (1/r)∂Mr/∂θ
+
     // Anti-aliasing interpolation methods
     double calculateRGBDistance(const cv::Vec3b& a, const cv::Vec3b& b) const;
     bool isPointOnLineSegment(const cv::Vec3b& pixel, const cv::Vec3b& a, const cv::Vec3b& b, double tolerance = 15.0) const;
@@ -641,8 +686,8 @@ private:
     cv::Mat detectMaterialBoundaries();  // Detect material boundaries using edge detection
     void calculateOptimalSkipRatios();   // Calculate skip_x, skip_y from aspect ratio
     void generateCoarseningMask();       // Generate mask of active/inactive cells
-    void generateCoarseningMaskCartesian(const cv::Mat& boundaries);  // Cartesian mask generation
-    void generateCoarseningMaskPolar(const cv::Mat& boundaries);      // Polar mask generation
+    void generateCoarseningMaskCartesian(const cv::Mat& boundaries, const cv::Mat& dist_map);  // Cartesian mask generation
+    void generateCoarseningMaskPolar(const cv::Mat& boundaries, const cv::Mat& dist_map);      // Polar mask generation
     void polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const;  // Polar->Image coordinate transform
     void buildCoarseIndexMaps();         // Build coarse <-> fine index mappings
     void calculateLocalMeshSpacing();    // Calculate h_minus/h_plus for each active cell
@@ -652,6 +697,7 @@ private:
     int findNextActiveTheta(int i_r, int j_theta, int direction) const;   // Find next active cell in theta
     std::pair<int, int> findActiveNeighbor(int i, int j, int di, int dj) const;  // Find active neighbor
     double bilinearInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // Interpolate inactive cell
+    double bilinearInterpolateFromCoarsePolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const;  // Polar 4-corner bilinear
     double hermiteInterpolateFromCoarse(int i, int j, const Eigen::VectorXd& Az_coarse) const;  // C^1 Hermite interpolation
     void computeAzGradientsAtActiveCells(const Eigen::VectorXd& Az_coarse);  // Compute ∂Az/∂x, ∂Az/∂y at active cells
     double interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const;  // Polar coarse grid interpolation
@@ -686,6 +732,7 @@ private:
     void buildAndSolveSystemPolarCoarsened();
     void interpolateToFullGrid(const Eigen::VectorXd& Az_coarse);
     void interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse);
+    void smoothInactiveCells(int iterations);  // Post-interpolation Laplacian smoothing at inactive cells
     void interpolateMuToFullGrid();  // IDW harmonic mean μ interpolation at inactive cells
     void interpolateInactiveCells(const Eigen::VectorXd& Az_coarse);  // Update only inactive cells (for nonlinear iteration)
     void interpolateInactiveCellsPolar(const Eigen::VectorXd& Az_coarse);  // Polar version
@@ -702,15 +749,30 @@ private:
                                        Eigen::VectorXd& H_active);
     // Updates mu_map at active cells only from H (inactive cells unchanged)
     void updateMuAtActiveCells(const Eigen::VectorXd& H_active);
+    // Updates mu_map at active cells with differential permeability μ_diff = dB/dH / μ₀
+    // Used for Newton correction in Phase 6: A(μ_diff) * δAz = -R(μ_eff)
+    void updateMuDiffAtActiveCells(const Eigen::VectorXd& H_active);
+    // Full-grid version: updates mu_map for ALL pixels using H_map(j,i).
+    // Used for Newton correction in fine finishing after coarse convergence.
+    void updateMuDiffDistribution();
 
     // Phase 4: Full-grid residual evaluation for coarsened Newton-Krylov convergence
     void updateFullMatrixCache();  // Rebuild A_full_cached and rhs_full_cached
     double computeFullGridResidual(double& out_b_norm);  // Compute ||A_f * Az - b_f|| on full grid
 
+    // OpenMP-parallel sparse matrix-vector product y = A * x.
+    // Requires a row-major (CSR) matrix; iterates rows in parallel.
+    // Used in the defect-correction hot path and line search.
+    Eigen::VectorXd parallelSpMV(
+        const Eigen::SparseMatrix<double, Eigen::RowMajor>& A,
+        const Eigen::VectorXd& x) const;
+
     // Phase 4: Prolongation/Restriction operators for Galerkin projection
     void buildProlongationMatrix();  // Build P_prolongation (n_full x n_active) and R_restriction (P^T)
     void buildInterpolationWeights(int i, int j, int fine_idx,
         std::vector<Eigen::Triplet<double>>& triplets);  // Helper: Cartesian interpolation weights
+    void buildInterpolationWeightsPolar(int i_r, int j_theta, int fine_idx,
+        std::vector<Eigen::Triplet<double>>& triplets);  // Helper: Polar interpolation weights
     void buildProlongationMatrixPolar(std::vector<Eigen::Triplet<double>>& triplets);  // Polar version
 
     // Phase 4: Galerkin coarse matrix (A_c = R * A_f * P)

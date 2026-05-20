@@ -1,0 +1,130 @@
+# 2次元磁場解析設定ファイル
+
+# OpenMP 並列化設定
+# omp:
+#   threads: 16  # 0 または省略で自動（全コア使用）
+
+# 座標系設定
+coordinate_system: polar # cartesian (直交座標) or polar (極座標)
+
+# メッシュ設定（直交座標の場合）
+mesh:
+  dx: 0.2e-3  # X方向メッシュサイズ [m]
+  dy: 0.2e-3  # Y方向メッシュサイズ [m]
+
+# 極座標ドメイン設定（coordinate_system: polar の場合）
+polar_domain:
+  r_start: 0.2  # 内半径 [m] (0 < r_start < r_end)
+  r_end: 0.3    # 外半径 [m]
+  r_orientation: horizontal # r方向: horizontal (列方向) or vertical (行方向)
+  theta_range: pi/6  # θ方向の範囲 [rad] (2*pi for full periodic domain)
+  # 数式対応: pi/2, pi/3, 2*pi/3, 3*pi/4, pi*3/4, 3/4*pi など任意の M*pi/N 形式が使用可能
+  # θ方向は r_orientation と垂直な方向で 0 ~ theta_range
+
+# 極座標境界条件
+polar_boundary_conditions:
+  inner:  # 内側 (r = r_start)
+    type: dirichlet
+    value: 0.0
+  outer:  # 外側 (r = r_end)
+    type: dirichlet
+    value: 0.0
+  theta_min: 
+    type: periodic
+    value: 0.0
+  theta_max: 
+    type: periodic
+    value: 0.0
+  
+  # 未指定の場合は自動的にディリクレｋ境界条件 (A=0) が適用されます
+
+# 直交座標の境界条件（4辺それぞれに設定）
+# type: dirichlet, neumann, periodic
+# 注意: 周期境界条件は対向する辺のペアで設定する必要があります
+boundary_conditions:
+  left:
+    type: dirichlet
+    value: 0.0
+  right:
+    type: dirichlet
+    value: 0.0
+  bottom:
+    type: periodic
+    value: 0.0
+  top:
+    type: periodic
+    value: 0.0
+   # 未指定の場合は自動的にディリクレｋ境界条件 (A=0) が適用されます
+
+# 材料設定（RGB値と物性値の対応）
+materials:
+  air:
+    rgb: [255, 255, 255]  # 白
+    mu_r: 1.0 # 比透磁率
+    jz: 0.0  # 電流密度 [A/m²]
+    calc_force: false
+    anti_aliasing: true
+  
+  iron_stator:
+    rgb: [128, 128, 128]  # グレー（実際の画像の色）
+    preset: Si_steel_array
+    # mu_r: 100
+    calc_force: true  # マクスウェル応力による電磁力を計算
+    anti_aliasing: true
+    coarsen: true
+    coarsen_ratio: 8
+  
+  side_air:
+    rgb: [0, 255, 0]  # green
+    mu_r: 1.0
+    anti_aliasing: true
+    coarsen: true
+    coarsen_ratio: 8
+  
+  rotor_field_positive_r:
+    rgb: [255, 0, 0]  # red
+    mu_r: 1.0
+    jz: 150e6  # 負の電流
+    
+  rotor_field_negative_b:
+    rgb: [0, 0, 255]  # blue
+    mu_r: 1.0
+    jz: -150e6  # 負の電流
+
+    # 過渡解析時の動的電流密度の例:
+    # jz: 1e6*cos(2*pi*$step/10)  # 数式表記（$step: ステップ番号）
+    # jz: [0, 0.5e6, 1e6, 0.5e6, 0, -0.5e6, -1e6, -0.5e6, 0, 0]  # 配列表記
+
+# 過渡解析設定（静的解析の場合は省略可）
+# enabled: true にすると、画像領域を循環シフトしながら解析を実行します
+transient:
+  enabled: true # 過渡解析の有効/無効
+  enable_sliding: true # 画像スライドの有効/無効（falseの場合はJzのみ変化）
+  total_steps: 50 # 解析ステップ数
+  slide_direction: vertical  # スライド方向
+  # vertical: slide_region_start <= x <= slide_region_end の縦帯領域をy方向にスライド
+  # horizontal: slide_region_start <= y <= slide_region_end の横帯領域をx方向にスライド
+  slide_region_start: 95  # スライド領域の開始位置 [ピクセル] (左上が原点[0,0])
+  slide_region_end: 405   # スライド領域の終了位置 [ピクセル]
+  slide_pixels_per_step: 10  # 1ステップあたりの移動量 [ピクセル] (循環シフト量)
+
+
+nonlinear_solver: 
+  # solver_type: picard
+  # anderson: 
+  #   enabled: true
+  #   beta: 0.2
+    
+  verbose: true
+  max_iterations: 50
+  fine_finishing_iterations: 5
+  # tolerance: 1e-3
+  
+  use_galerkin_coarsening: true  # Phase 4: Galerkin projection A_c = R * A_f * P
+  use_phase6_precond_jfnk: true
+  precond_update_frequency: 1
+  precond_verbose: true
+
+coarsening:
+  boundary_shell: 0      # 膨張半径 [pixels] (default: 1, 0=膨張なし)
+  smooth_iterations: 100   # Laplacian平滑化反復回数 (default: 0)

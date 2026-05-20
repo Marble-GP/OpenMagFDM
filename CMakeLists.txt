@@ -48,6 +48,14 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+# OpenMP (optional: single-threaded build if not available)
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    message(STATUS "OpenMP found: ${OpenMP_CXX_VERSION} — parallel build enabled")
+else()
+    message(STATUS "OpenMP not found — single-threaded build")
+endif()
+
 # AMGCL (header-only library)
 include_directories(${CMAKE_SOURCE_DIR}/amgcl)
 add_definitions(-DAMGCL_NO_BOOST)
@@ -67,4 +75,5 @@ target_link_libraries(MagFDMsolver
     Eigen3::Eigen
     ${OpenCV_LIBS}
     yaml-cpp::yaml-cpp
+    $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )

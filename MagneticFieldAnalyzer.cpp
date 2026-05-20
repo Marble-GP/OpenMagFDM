@@ -1,4 +1,5 @@
 #include "MagneticFieldAnalyzer.h"
+#include "tinyexpr/tinyexpr.h"
 #include <iostream>
 #include <fstream>
 #include <iomanip>
@@ -8,6 +9,9 @@
 #include <set>
 #include <cstdio>
 #include <algorithm>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _WIN32
 #include <direct.h>
@@ -83,7 +87,10 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
 
         // Phase 4: Galerkin coarsening option (for coarsened Newton-Krylov)
-        nonlinear_config.use_galerkin_coarsening = nl_config["use_galerkin_coarsening"].as<bool>(true);
+        // Default false: FVM (buildMatrixPolarCoarsened/buildMatrixCoarsened) is used for
+        // Picard steps. FVM's fixed point is the true physical solution, while Galerkin
+        // (P^T*A_f*P) converges to a projection fixed point that may not satisfy the PDE.
+        nonlinear_config.use_galerkin_coarsening = nl_config["use_galerkin_coarsening"].as<bool>(false);
 
         // Phase 5: Matrix-free Jv option (solves oscillation issue with coarsening + nonlinear)
         nonlinear_config.use_matrix_free_jv = nl_config["use_matrix_free_jv"].as<bool>(true);
@@ -92,6 +99,17 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.use_phase6_precond_jfnk = nl_config["use_phase6_precond_jfnk"].as<bool>(true);
         nonlinear_config.precond_update_frequency = nl_config["precond_update_frequency"].as<int>(1);
         nonlinear_config.precond_verbose = nl_config["precond_verbose"].as<bool>(false);
+
+        // Fine finishing: full-grid Picard after coarse convergence
+        nonlinear_config.fine_finishing_iterations = nl_config["fine_finishing_iterations"].as<int>(0);
+        nonlinear_config.fine_finishing_tolerance = nl_config["fine_finishing_tolerance"].as<double>(-1.0);
+    }
+
+    // Parse global coarsening settings
+    if (config["coarsening"]) {
+        auto cs_cfg = config["coarsening"];
+        coarsen_boundary_shell = cs_cfg["boundary_shell"].as<int>(1);
+        coarsen_smooth_iterations = cs_cfg["smooth_iterations"].as<int>(0);
     }
 
     // Determine coordinate system
@@ -158,6 +176,25 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                 std::cout << "  Loaded preset: " << preset_name << std::endl;
             }
             std::cout << "Loaded " << material_presets.size() << " material preset(s)" << std::endl;
+        }
+
+        // Parse OpenMP thread count (optional)
+        // YAML: omp: { threads: 4 }
+        // Set to 0 or omit to use default (OMP_NUM_THREADS env var or all cores)
+        if (config["omp"] && config["omp"]["threads"]) {
+            int omp_threads = config["omp"]["threads"].as<int>(0);
+#ifdef _OPENMP
+            if (omp_threads > 0) {
+                omp_set_num_threads(omp_threads);
+                std::cout << "OpenMP: thread count set to " << omp_threads << " (via YAML omp.threads)" << std::endl;
+            } else {
+                std::cout << "OpenMP: using default thread count (OMP_NUM_THREADS or all cores)" << std::endl;
+            }
+#else
+            if (omp_threads > 0) {
+                std::cout << "OpenMP: omp.threads=" << omp_threads << " specified, but OpenMP is not enabled in this build." << std::endl;
+            }
+#endif
         }
 
         // Parse flux linkage paths
@@ -381,7 +418,8 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         "dx", "dy",        // Cartesian cell size
         "dr", "dtheta",    // Polar cell size
         "N", "A",          // Jz: material pixel count and area
-        "pi", "e"          // tinyexpr built-in constants
+        "pi", "e",         // tinyexpr built-in constants
+        "mu0"              // Predefined physical constant: vacuum permeability (4π×10⁻⁷ H/m)
     };
 
     if (!config["variables"]) {
@@ -396,7 +434,7 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         // Check for reserved variable names
         if (reserved_vars.count(var_name) > 0) {
             throw std::runtime_error("Variable '" + var_name + "' is a reserved variable name. "
-                                     "Reserved variables: step, H, dx, dy, dr, dtheta, N, A, pi, e");
+                                     "Reserved variables: step, H, dx, dy, dr, dtheta, N, A, pi, e, mu0");
         }
 
         // Get the value (can be number or formula string)
@@ -425,7 +463,12 @@ void MagneticFieldAnalyzer::parseUserVariables() {
             }
 
             // Try to evaluate as formula using tinyexpr
+            // Inject mu0 so users can write e.g. "mu0 * 1000" in variable definitions
             te_parser parser;
+            {
+                te_variable mu0_var; mu0_var.m_name = "mu0"; mu0_var.m_value = MU_0;
+                parser.set_variables_and_functions({mu0_var});
+            }
             var_value = parser.evaluate(val_str);
 
             if (!parser.success()) {
@@ -543,8 +586,255 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
 
-        // Parse mu_r value (static, formula, or table) - Nonlinear support
-        MuValue mu_value = parseMuValue(props["mu_r"]);
+        // Parse permeability: B-H: [[H,...],[B,...]] or mu_r: (scalar/formula/table)
+        // B-H takes precedence; mu_r is ignored with a warning if both are present.
+        double bh_remanence_Br = 0.0;   // Br [T] from B-H first point (0 if none)
+        bool   bh_has_remanence = false; // true if B(H=0) != 0
+
+        // Optional classification flag for B-H curves.
+        // Controls whether a non-zero B at H=0 is treated as:
+        //   "magnet" (demagnetization curve, Br+recoil μr extracted)
+        //   "soft"   (magnetization curve with a bias, TABLE built for H>=0)
+        //   "auto"   (default: infer from B(0) — magnet if B(0)!=0, soft otherwise)
+        std::string bh_type = "auto";
+        if (props["bh_type"]) {
+            bh_type = props["bh_type"].as<std::string>("auto");
+            if (bh_type == "demagnetization" || bh_type == "demag") bh_type = "magnet";
+            if (bh_type == "magnetization"   || bh_type == "symmetric") bh_type = "soft";
+            if (bh_type != "magnet" && bh_type != "soft") bh_type = "auto";
+        }
+
+        MuValue mu_value;
+
+        if (props["B-H"]) {
+            if (props["mu_r"]) {
+                std::cout << "[WARNING] Material '" << name << "': both 'B-H' and 'mu_r' defined. Using 'B-H'." << std::endl;
+            }
+            const YAML::Node& bh_node = props["B-H"];
+
+            // Helper: build mu_r TABLE from parallel H_data / B_data vectors (Br already extracted)
+            auto buildBHTable = [&](std::vector<double> H_data, std::vector<double> B_data, double Br) {
+                mu_value.type = MuType::TABLE;
+                // H=0: initial differential permeability
+                {
+                    double dB = B_data[1] - Br;
+                    double dH = H_data[1];
+                    double mu_r0 = (dH > 1e-15) ? std::max(1.0, dB / (MU_0 * dH)) : 1.0;
+                    mu_value.H_table.push_back(0.0);
+                    mu_value.mu_table.push_back(mu_r0);
+                }
+                for (size_t k = 1; k < H_data.size(); k++) {
+                    if (H_data[k] < 1e-15) continue;
+                    double mu_r_k = (B_data[k] - Br) / (MU_0 * H_data[k]);
+                    mu_value.H_table.push_back(H_data[k]);
+                    mu_value.mu_table.push_back(std::max(1.0, mu_r_k));
+                }
+                std::cout << "  [" << name << "] B-H: "
+                          << (H_data.size() - 1) << " points, "
+                          << "mu_r range [" << mu_value.mu_table.front() << ", "
+                          << *std::max_element(mu_value.mu_table.begin(), mu_value.mu_table.end()) << "]" << std::endl;
+            };
+
+            if (bh_node.IsSequence() && bh_node.size() == 2
+                && bh_node[0].IsSequence() && bh_node[1].IsSequence()) {
+                // ---- Array format: B-H: [[H,...],[B,...]] ----
+                std::vector<double> H_data = bh_node[0].as<std::vector<double>>();
+                std::vector<double> B_data = bh_node[1].as<std::vector<double>>();
+                if (H_data.size() != B_data.size() || H_data.size() < 2) {
+                    throw std::runtime_error("B-H for material '" + name + "': H and B arrays must have equal length >= 2");
+                }
+
+                // Detect demagnetization curve (any H < 0 → second quadrant)
+                bool is_demag = std::any_of(H_data.begin(), H_data.end(),
+                                            [](double h){ return h < -1e-12; });
+
+                if (is_demag) {
+                    // --- Demagnetization curve ---
+                    // Sort pairs by H ascending (most negative first, H=0 at end)
+                    std::vector<std::pair<double,double>> pts;
+                    pts.reserve(H_data.size());
+                    for (size_t k = 0; k < H_data.size(); k++)
+                        pts.push_back({H_data[k], B_data[k]});
+                    std::sort(pts.begin(), pts.end(),
+                              [](const auto& a, const auto& b){ return a.first < b.first; });
+                    size_t n = pts.size();
+
+                    // Check monotonicity: sorted ascending in H → B must be non-decreasing
+                    // (B increases from ~0 at H=-Hcb to Br at H=0, i.e. curve is monotonically decreasing in |H|)
+                    bool demag_monotone = true;
+                    for (size_t k = 0; k + 1 < n; k++) {
+                        if (pts[k+1].second < pts[k].second - 1e-9) {
+                            demag_monotone = false;
+                            break;
+                        }
+                    }
+                    if (!demag_monotone) {
+                        std::cerr << "\n**************************************************\n"
+                                  << "WARNING: Material '" << name << "'\n"
+                                  << "  Demagnetization B-H curve is NOT monotonically decreasing!\n"
+                                  << "  (B must increase from 0 at H=-Hcb to Br at H=0)\n"
+                                  << "  This may cause inaccurate Br/Hcb extraction.\n"
+                                  << "**************************************************\n" << std::endl;
+                    }
+
+                    // Br: B at H=0 (interpolate/extrapolate from the two rightmost points)
+                    double Br = 0.0;
+                    if (std::abs(pts[n-1].first) < 1e-12) {
+                        Br = pts[n-1].second;
+                    } else {
+                        // Extrapolate last segment to H=0
+                        double dH = pts[n-1].first - pts[n-2].first;
+                        double dB = pts[n-1].second - pts[n-2].second;
+                        Br = pts[n-1].second + (std::abs(dH) > 1e-12 ? dB / dH : 0.0)
+                             * (0.0 - pts[n-1].first);
+                    }
+
+                    // mu_r from slope of last two points (linear region closest to H=0)
+                    double mu_r_lin = 1.05;
+                    {
+                        double dH = pts[n-1].first - pts[n-2].first;  // > 0 (ascending)
+                        double dB = pts[n-1].second - pts[n-2].second; // > 0
+                        if (std::abs(dH) > 1e-12)
+                            mu_r_lin = std::max(1.0, dB / (MU_0 * dH));
+                    }
+
+                    // Hcb: H value where B = 0 (B-coercivity)
+                    double Hcb = 0.0;
+                    for (size_t k = 0; k + 1 < n; k++) {
+                        if (pts[k].second <= 1e-9 && pts[k+1].second >= 0) {
+                            double dB = pts[k+1].second - pts[k].second;
+                            double frac = (dB > 1e-12) ? pts[k].second / dB : 0.0;
+                            Hcb = std::abs(pts[k].first + frac * (pts[k+1].first - pts[k].first));
+                            break;
+                        }
+                    }
+
+                    // Use linear μr model (solver doesn't iterate in 2nd quadrant)
+                    mu_value.type         = MuType::STATIC;
+                    mu_value.static_value = mu_r_lin;
+                    bh_remanence_Br  = Br;
+                    bh_has_remanence = true;
+
+                    std::cout << "  [" << name << "] Demagnetization curve:"
+                              << " Br=" << Br << " T"
+                              << ", Hcb=" << Hcb * 1e-3 << " kA/m"
+                              << ", mu_r=" << mu_r_lin
+                              << (demag_monotone ? " [Monotonic: OK]" : " [Monotonic: FAILED]")
+                              << std::endl;
+
+                } else {
+                    // ---- Normal magnetization curve: H >= 0 ----
+                    double Br = 0.0;
+                    if (H_data[0] > 1e-12) {
+                        // Prepend implicit (0, 0)
+                        H_data.insert(H_data.begin(), 0.0);
+                        B_data.insert(B_data.begin(), 0.0);
+                    } else if (std::abs(B_data[0]) > 1e-9) {
+                        Br = B_data[0];
+                        bh_remanence_Br  = Br;
+                        bh_has_remanence = true;
+                        std::cout << "  [" << name << "] B-H: residual magnetization Br=" << Br << " T" << std::endl;
+                    }
+                    buildBHTable(H_data, B_data, Br);
+                } // end if (is_demag)
+
+            } else if (bh_node.IsScalar()) {
+                // ---- Formula format: B-H: "expression with $H" ----
+                std::string B_formula_raw = bh_node.as<std::string>();
+                // Build tinyexpr expression: replace $varname (longest first), then $H
+                std::string te_expr = B_formula_raw;
+                {
+                    std::vector<std::pair<std::string, std::string>> subs;
+                    for (const auto& [vn, _] : user_variables)
+                        subs.push_back({"$" + vn, vn});
+                    std::sort(subs.begin(), subs.end(),
+                              [](const auto& a, const auto& b){ return a.first.size() > b.first.size(); });
+                    for (const auto& [from, to] : subs) {
+                        size_t pos = 0;
+                        while ((pos = te_expr.find(from, pos)) != std::string::npos) {
+                            te_expr.replace(pos, from.size(), to);
+                            pos += to.size();
+                        }
+                    }
+                    size_t pos = 0;
+                    while ((pos = te_expr.find("$H", pos)) != std::string::npos) {
+                        te_expr.replace(pos, 2, "H"); pos += 1;
+                    }
+                }
+                std::cout << "  [" << name << "] B-H formula: " << B_formula_raw << std::endl;
+
+                // tinyexpr evaluator for B(H)
+                auto evalB = [&](double H_val) -> double {
+                    te_parser parser;
+                    std::set<te_variable> vars;
+                    te_variable H_var; H_var.m_name = "H"; H_var.m_value = H_val;
+                    vars.insert(H_var);
+                    for (const auto& [vn, vv] : user_variables) {
+                        te_variable uv; uv.m_name = vn.c_str(); uv.m_value = vv;
+                        vars.insert(uv);
+                    }
+                    // Predefined physical constant: mu0 (vacuum permeability = 4π×10⁻⁷ H/m)
+                    te_variable mu0_var; mu0_var.m_name = "mu0"; mu0_var.m_value = MU_0;
+                    vars.insert(mu0_var);
+                    parser.set_variables_and_functions(vars);
+                    double val = parser.evaluate(te_expr);
+                    if (!parser.success())
+                        throw std::runtime_error("Failed to evaluate B-H formula '" + B_formula_raw + "'");
+                    return val;
+                };
+
+                // Detect remanence from B(0)
+                double Br = evalB(0.0);
+
+                // Decide interpretation based on bh_type flag + auto-detection
+                bool treat_as_magnet = (bh_type == "magnet")
+                    || (bh_type == "auto" && std::abs(Br) > 1e-9);
+                bool treat_as_soft = (bh_type == "soft");
+
+                if (treat_as_magnet && !treat_as_soft) {
+                    // --- Demagnetization curve (permanent magnet) ---
+                    // Use recoil μr from formula derivative at H→0⁻
+                    // μr = ΔB / (μ₀ · |ΔH|) with ΔH = -1 A/m
+                    const double dH_neg = -1.0;
+                    double mu_r_recoil = 1.05;  // safe default
+                    double B_step = evalB(dH_neg);
+                    if (std::isfinite(B_step)) {
+                        // (Br - B(-1)) / (μ₀ · 1) — both numerator and Δ|H| positive
+                        mu_r_recoil = std::max(1.0, (Br - B_step) / (MU_0 * std::abs(dH_neg)));
+                    }
+                    mu_value.type         = MuType::STATIC;
+                    mu_value.static_value = mu_r_recoil;
+                    bh_remanence_Br  = Br;
+                    bh_has_remanence = true;
+                    std::cout << "  [" << name << "] B-H formula (demagnetization):"
+                              << " Br=" << Br << " T, recoil mu_r=" << mu_r_recoil << std::endl;
+                } else {
+                    // --- Magnetization curve (soft magnet, H >= 0) ---
+                    // bh_type=="soft" → ignore any non-zero B(0) as a bias, build TABLE
+                    double table_Br = treat_as_soft ? 0.0 : Br;
+                    if (treat_as_soft && std::abs(Br) > 1e-9) {
+                        std::cout << "  [" << name << "] B-H formula: bh_type=soft, "
+                                  << "bias B(0)=" << Br << " T ignored (treated as soft magnet)" << std::endl;
+                    }
+                    // Sample into a log-spaced table: H ∈ [1e-3, 1e6] A/m (500 points)
+                    const int N_PTS = 500;
+                    const double LOG_MIN = -3.0, LOG_MAX = 6.0;
+                    std::vector<double> H_data, B_data;
+                    H_data.push_back(0.0); B_data.push_back(table_Br);
+                    for (int k = 0; k < N_PTS; k++) {
+                        double H = std::pow(10.0, LOG_MIN + k * (LOG_MAX - LOG_MIN) / (N_PTS - 1));
+                        double B = evalB(H);
+                        if (std::isfinite(B)) { H_data.push_back(H); B_data.push_back(B); }
+                    }
+                    buildBHTable(H_data, B_data, table_Br);
+                }
+
+            } else {
+                throw std::runtime_error("B-H for material '" + name + "' must be [[H,...],[B,...]] or a formula string");
+            }
+        } else {
+            mu_value = parseMuValue(props["mu_r"]);
+        }
 
         // Parse dmu_r_extrapolation if specified (for TABLE type only)
         if (props["dmu_r_extrapolation"]) {
@@ -607,7 +897,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 
         if (props["coarsen"]) {
             coarsen_cfg.enabled = props["coarsen"].as<bool>(false);
-            std::cout << "  DEBUG [" << name << "] coarsen parsed: " << (coarsen_cfg.enabled ? "true" : "false") << std::endl;
+            // std::cout << "  DEBUG [" << name << "] coarsen parsed: " << (coarsen_cfg.enabled ? "true" : "false") << std::endl;
         }
         if (props["coarsen_ratio"]) {
             coarsen_cfg.ratio = props["coarsen_ratio"].as<int>(2);
@@ -661,6 +951,124 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                     }
                 }
             }
+        }
+
+        // Parse permanent magnet magnetization block
+        if (props["magnetization"]) {
+            const YAML::Node& mag = props["magnetization"];
+            MagnetizationConfig mc;
+            mc.enabled = true;
+
+            // Accept Br [T], Hc [A/m], or derive from B-H remanence (fallback).
+            // Internally, M0 = Br/mu0 is stored in mc.Hc [A/m].
+            if (mag["Br"]) {
+                double Br = mag["Br"].as<double>(0.0);
+                mc.Hc = Br / MU_0;
+                std::cout << "  [" << name << "] magnetization: Br=" << Br << " T → M0=" << mc.Hc << " A/m" << std::endl;
+            } else if (mag["Hc"]) {
+                mc.Hc = mag["Hc"].as<double>(0.0);
+            } else if (bh_has_remanence) {
+                // No explicit Hc/Br in magnetization block — derive from B-H remanence
+                mc.Hc = bh_remanence_Br / MU_0;
+                std::cout << "  [" << name << "] magnetization: Hc derived from B-H Br="
+                          << bh_remanence_Br << " T → M0=" << mc.Hc << " A/m" << std::endl;
+            } else {
+                mc.Hc = 0.0;
+            }
+
+            mc.pattern = mag["pattern"].as<std::string>("parallel");
+
+            if (mc.pattern == "parallel") {
+                mc.angle_deg = mag["angle"].as<double>(0.0);
+                double angle_rad = mc.angle_deg * M_PI / 180.0;
+                // Pre-compute constant expressions (no per-cell variables needed)
+                std::ostringstream sx, sy;
+                sx << std::setprecision(17) << mc.Hc * std::cos(angle_rad);
+                sy << std::setprecision(17) << mc.Hc * std::sin(angle_rad);
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: parallel angle=" << mc.angle_deg << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "halbach_continuous") {
+                mc.p = mag["p"].as<int>(1);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                // Build tinyexpr formulas with numeric p, cx, cy substituted
+                std::ostringstream sx, sy;
+                // Mx = Hc * cos(p * atan2(y - cy, x - cx))
+                sx << std::setprecision(17) << mc.Hc << "*cos(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*sin(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: halbach_continuous p=" << mc.p << ", Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "radial") {
+                // Radial magnetization: M points outward along r̂ from (cx, cy)
+                // Mx = Hc * cos(theta),  My = Hc * sin(theta)
+                // where theta = atan2(y - cy, x - cx)
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                std::ostringstream sx, sy;
+                sx << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: radial (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "tangential") {
+                // Tangential magnetization: M points counter-clockwise along θ̂ from (cx, cy)
+                // Mx = -Hc * sin(theta),  My = Hc * cos(theta)
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                std::ostringstream sx, sy;
+                sx << std::setprecision(17) << (-mc.Hc) << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                mc.Mx_expr = sx.str();
+                mc.My_expr = sy.str();
+                std::cout << "  [" << name << "] magnetization: tangential (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "polar_anisotropy") {
+                mc.p = mag["p"].as<int>(1);
+                mc.R_pc = mag["R_pc"].as<double>(0.05);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                // polar_anisotropy uses dedicated C++ loop (not tinyexpr)
+                mc.Mx_expr = "";
+                mc.My_expr = "";
+                std::cout << "  [" << name << "] magnetization: polar_anisotropy p=" << mc.p << ", R_pc=" << mc.R_pc << " m, Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "custom") {
+                mc.Mx_expr = mag["Mx"].as<std::string>("");
+                mc.My_expr = mag["My"].as<std::string>("");
+                // Replace Hc token with numeric value
+                std::ostringstream hc_str;
+                hc_str << std::setprecision(17) << mc.Hc;
+                auto replaceAll = [](std::string& s, const std::string& from, const std::string& to) {
+                    size_t pos = 0;
+                    while ((pos = s.find(from, pos)) != std::string::npos) {
+                        s.replace(pos, from.length(), to);
+                        pos += to.length();
+                    }
+                };
+                replaceAll(mc.Mx_expr, "Hc", hc_str.str());
+                replaceAll(mc.My_expr, "Hc", hc_str.str());
+                std::cout << "  [" << name << "] magnetization: custom Mx=\"" << mag["Mx"].as<std::string>("") << "\", Hc=" << mc.Hc << " A/m" << std::endl;
+            } else {
+                throw std::runtime_error("Unknown magnetization pattern '" + mc.pattern + "' for material '" + name + "'");
+            }
+            material_magnetization[name] = mc;
+        } else if (bh_has_remanence) {
+            // B-H has remanence but no magnetization: block — warn and default to parallel angle=0
+            std::cout << "[WARNING] Material '" << name << "': B-H remanence (Br="
+                      << bh_remanence_Br << " T) detected but no 'magnetization:' block defined.\n"
+                      << "  Defaulting to pattern:parallel, angle:0. "
+                      << "Add a 'magnetization:' block to specify orientation." << std::endl;
+            MagnetizationConfig mc;
+            mc.enabled   = true;
+            mc.Hc        = bh_remanence_Br / MU_0;
+            mc.pattern   = "parallel";
+            mc.angle_deg = 0.0;
+            std::ostringstream sx, sy;
+            sx << std::setprecision(17) << mc.Hc;  // cos(0) = 1
+            sy << "0.0";                            // sin(0) = 0
+            mc.Mx_expr = sx.str();
+            mc.My_expr = sy.str();
+            material_magnetization[name] = mc;
         }
 
         // Get pixel info for display
@@ -757,6 +1165,289 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         }
 
         std::cout << "Anti-aliasing: " << antialias_count << " gradient pixels interpolated" << std::endl;
+    }
+
+    // Build RGB→material lookup table for O(1) access in hot loops (OpenMP-safe)
+    rgb_to_material.clear();
+    for (const auto& mat : config["materials"]) {
+        std::string name = mat.first.as<std::string>();
+        YAML::Node props = mat.second;
+        if (!props["rgb"]) continue;
+        auto rgb = props["rgb"].as<std::vector<int>>();
+        int key = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+        rgb_to_material[key] = {name};
+    }
+
+    // Compute magnetization grids if any material has magnetization defined
+    if (!material_magnetization.empty()) {
+        computeMagnetizationGrids();
+    } else {
+        // Ensure maps are zero-initialized when no magnetization is defined
+        if (coordinate_system == "polar") {
+            int rows = (r_orientation == "horizontal") ? ntheta : nr;
+            int cols = (r_orientation == "horizontal") ? nr : ntheta;
+            Jz_mag_map = Eigen::MatrixXd::Zero(rows, cols);
+        } else {
+            Jz_mag_map = Eigen::MatrixXd::Zero(ny, nx);
+        }
+    }
+}
+
+// ============================================================================
+// Permanent magnet magnetization model
+// ============================================================================
+
+void MagneticFieldAnalyzer::computeMagnetizationGrids() {
+    // Builds Mx_map, My_map from per-material MagnetizationConfig, then calls curl.
+    //
+    // For parallel/halbach_continuous/custom patterns: uses tinyexpr compile-once/
+    // eval-many with variables x, y, r, theta bound to pointers.
+    //
+    // For polar_anisotropy: uses 2p wire-current superposition model where
+    // wires at radius R_pc create a p-pole field whose direction defines the
+    // easy axis of magnetization.
+
+    bool is_polar = (coordinate_system == "polar");
+
+    if (is_polar) {
+        int rows = (r_orientation == "horizontal") ? ntheta : nr;
+        int cols = (r_orientation == "horizontal") ? nr : ntheta;
+        Mx_map = Eigen::MatrixXd::Zero(rows, cols);
+        My_map = Eigen::MatrixXd::Zero(rows, cols);
+    } else {
+        Mx_map = Eigen::MatrixXd::Zero(ny, nx);
+        My_map = Eigen::MatrixXd::Zero(ny, nx);
+    }
+
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    for (const auto& [mat_name, mc] : material_magnetization) {
+        if (!mc.enabled || mc.Hc == 0.0) continue;
+
+        // Get material RGB for pixel matching
+        std::vector<int> rgb_vec = {255, 255, 255};
+        for (const auto& mat : config["materials"]) {
+            if (mat.first.as<std::string>() == mat_name) {
+                rgb_vec = mat.second["rgb"].as<std::vector<int>>(rgb_vec);
+                break;
+            }
+        }
+        cv::Vec3b rgb(rgb_vec[0], rgb_vec[1], rgb_vec[2]);
+
+        if (mc.pattern == "polar_anisotropy") {
+            // 2p concentrated wire currents on pitch circle → superposed B direction
+            int grid_rows = is_polar ? (int)Mx_map.rows() : ny;
+            int grid_cols = is_polar ? (int)Mx_map.cols() : nx;
+
+            for (int j = 0; j < grid_rows; j++) {
+                for (int i = 0; i < grid_cols; i++) {
+                    // Check pixel match
+                    int img_i, img_j;
+                    if (is_polar) {
+                        if (r_orientation == "horizontal") { img_i = i; img_j = j; }
+                        else { img_i = j; img_j = i; }
+                    } else {
+                        img_i = i; img_j = j;
+                    }
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+                    if (pixel != rgb) continue;
+
+                    // Physical coordinates of this cell
+                    double x_phys, y_phys;
+                    if (is_polar) {
+                        int i_r   = (r_orientation == "horizontal") ? i : j;
+                        int j_theta = (r_orientation == "horizontal") ? j : i;
+                        double r_phys = r_start + i_r * dr;
+                        double theta_phys = j_theta * dtheta;
+                        x_phys = r_phys * std::cos(theta_phys);
+                        y_phys = r_phys * std::sin(theta_phys);
+                    } else {
+                        x_phys = i * dx;
+                        y_phys = j * dy;
+                    }
+
+                    // Superpose field of 2p wire currents at R_pc
+                    double Bx_sum = 0.0, By_sum = 0.0;
+                    for (int k = 0; k < 2 * mc.p; k++) {
+                        double theta_k = M_PI * k / mc.p;
+                        double sign = (k % 2 == 0) ? 1.0 : -1.0;
+                        double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
+                        double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
+                        double r2 = dx_w * dx_w + dy_w * dy_w;
+                        if (r2 < 1e-20) continue;
+                        // μ₀I/2π factor omitted — only direction matters
+                        Bx_sum += sign * (-dy_w) / r2;
+                        By_sum += sign * ( dx_w) / r2;
+                    }
+                    double B_norm = std::sqrt(Bx_sum * Bx_sum + By_sum * By_sum);
+                    Mx_map(j, i) = mc.Hc * Bx_sum / (B_norm + 1e-20);
+                    My_map(j, i) = mc.Hc * By_sum / (B_norm + 1e-20);
+                }
+            }
+        } else {
+            // tinyexpr compile-once/eval-many for parallel / halbach / custom
+            double x_val = 0.0, y_val = 0.0, r_val = 0.0, theta_val = 0.0;
+            const double mu0_phys = MU_0;  // Predefined constant for magnetization expressions
+
+            te_parser px, py;
+            px.add_variable_or_function({"x",     &x_val});
+            px.add_variable_or_function({"y",     &y_val});
+            px.add_variable_or_function({"r",     &r_val});
+            px.add_variable_or_function({"theta", &theta_val});
+            px.add_variable_or_function({"mu0",   &mu0_phys});
+            py.add_variable_or_function({"x",     &x_val});
+            py.add_variable_or_function({"y",     &y_val});
+            py.add_variable_or_function({"r",     &r_val});
+            py.add_variable_or_function({"theta", &theta_val});
+            py.add_variable_or_function({"mu0",   &mu0_phys});
+
+            if (!px.compile(mc.Mx_expr)) {
+                throw std::runtime_error("Failed to compile Mx_expr for material '" + mat_name + "': " + mc.Mx_expr);
+            }
+            if (!py.compile(mc.My_expr)) {
+                throw std::runtime_error("Failed to compile My_expr for material '" + mat_name + "': " + mc.My_expr);
+            }
+
+            int grid_rows = is_polar ? (int)Mx_map.rows() : ny;
+            int grid_cols = is_polar ? (int)Mx_map.cols() : nx;
+
+            for (int j = 0; j < grid_rows; j++) {
+                for (int i = 0; i < grid_cols; i++) {
+                    int img_i, img_j;
+                    if (is_polar) {
+                        if (r_orientation == "horizontal") { img_i = i; img_j = j; }
+                        else { img_i = j; img_j = i; }
+                    } else {
+                        img_i = i; img_j = j;
+                    }
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+                    if (pixel != rgb) continue;
+
+                    // Physical coordinates
+                    if (is_polar) {
+                        int i_r   = (r_orientation == "horizontal") ? i : j;
+                        int j_th  = (r_orientation == "horizontal") ? j : i;
+                        r_val     = r_start + i_r * dr;
+                        theta_val = j_th * dtheta;
+                        x_val     = r_val * std::cos(theta_val);
+                        y_val     = r_val * std::sin(theta_val);
+                    } else {
+                        x_val     = i * dx;
+                        y_val     = j * dy;
+                        r_val     = std::sqrt(x_val * x_val + y_val * y_val);
+                        theta_val = std::atan2(y_val, x_val);
+                    }
+
+                    Mx_map(j, i) = px.evaluate();
+                    My_map(j, i) = py.evaluate();
+                }
+            }
+        }
+
+        std::cout << "Magnetization computed for '" << mat_name << "' (" << mc.pattern << ")" << std::endl;
+    }
+
+    // Compute equivalent magnetization current Jz_mag = curl(M)
+    if (is_polar) {
+        computeMagnetizationCurlPolar();
+    } else {
+        computeMagnetizationCurl();
+    }
+}
+
+void MagneticFieldAnalyzer::computeMagnetizationCurl() {
+    // Cartesian: Jz_mag = ∂My/∂x - ∂Mx/∂y
+    // Uses central differences in interior, one-sided at boundaries.
+    Jz_mag_map = Eigen::MatrixXd::Zero(ny, nx);
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            // dMy/dx
+            double dMy_dx;
+            if (i > 0 && i < nx - 1) {
+                dMy_dx = (My_map(j, i+1) - My_map(j, i-1)) / (2.0 * dx);
+            } else if (i == 0) {
+                dMy_dx = (My_map(j, 1) - My_map(j, 0)) / dx;
+            } else {
+                dMy_dx = (My_map(j, nx-1) - My_map(j, nx-2)) / dx;
+            }
+
+            // dMx/dy
+            double dMx_dy;
+            if (j > 0 && j < ny - 1) {
+                dMx_dy = (Mx_map(j+1, i) - Mx_map(j-1, i)) / (2.0 * dy);
+            } else if (j == 0) {
+                dMx_dy = (Mx_map(1, i) - Mx_map(0, i)) / dy;
+            } else {
+                dMx_dy = (Mx_map(ny-1, i) - Mx_map(ny-2, i)) / dy;
+            }
+
+            Jz_mag_map(j, i) = dMy_dx - dMx_dy;
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::computeMagnetizationCurlPolar() {
+    // Polar: Jz_mag = (1/r)·∂(r·Mθ)/∂r − (1/r)·∂Mr/∂θ
+    // Mr  = Mx·cos(θ) + My·sin(θ)
+    // Mθ  = −Mx·sin(θ) + My·cos(θ)
+    //
+    // Map indexing mirrors mu_map / jz_map:
+    //   horizontal: (ntheta, nr) → (j, i) = (theta_idx, r_idx)
+    //   vertical:   (nr, ntheta) → (j, i) = (r_idx, theta_idx)
+    int rows = (int)Mx_map.rows();
+    int cols = (int)Mx_map.cols();
+    Jz_mag_map = Eigen::MatrixXd::Zero(rows, cols);
+
+    bool horiz = (r_orientation == "horizontal");
+
+    for (int j = 0; j < rows; j++) {
+        for (int i = 0; i < cols; i++) {
+            int i_r   = horiz ? i : j;
+            int j_th  = horiz ? j : i;
+            double r     = r_start + i_r * dr;
+            double theta = j_th * dtheta;
+
+            // Convert Mx/My to radial/tangential
+            double cos_t = std::cos(theta), sin_t = std::sin(theta);
+            auto getMr = [&](int ir, int jt) -> double {
+                int row = horiz ? jt : ir, col = horiz ? ir : jt;
+                return Mx_map(row, col) * cos_t + My_map(row, col) * sin_t;
+            };
+            auto getMth = [&](int ir, int jt) -> double {
+                int row = horiz ? jt : ir, col = horiz ? ir : jt;
+                return -Mx_map(row, col) * sin_t + My_map(row, col) * cos_t;
+            };
+
+            // d(r·Mθ)/dr using adjacent r-cells
+            int ir_m = std::max(i_r - 1, 0);
+            int ir_p = std::min(i_r + 1, nr - 1);
+            double r_m = r_start + ir_m * dr;
+            double r_p = r_start + ir_p * dr;
+            double denom_r = (ir_p - ir_m) * dr;
+
+            double d_rMth_dr = 0.0;
+            if (denom_r > 1e-15 && r > 1e-10) {
+                double val_p = r_p * getMth(ir_p, j_th);
+                double val_m = r_m * getMth(ir_m, j_th);
+                d_rMth_dr = (val_p - val_m) / denom_r;
+            }
+
+            // dMr/dθ using adjacent theta-cells
+            int jt_m = std::max(j_th - 1, 0);
+            int jt_p = std::min(j_th + 1, ntheta - 1);
+            double denom_th = (jt_p - jt_m) * dtheta;
+
+            double dMr_dth = 0.0;
+            if (denom_th > 1e-15 && r > 1e-10) {
+                dMr_dth = (getMr(i_r, jt_p) - getMr(i_r, jt_m)) / denom_th;
+            }
+
+            if (r > 1e-10) {
+                Jz_mag_map(j, i) = d_rMth_dr / r - dMr_dth / r;
+            }
+        }
     }
 }
 
@@ -1114,21 +1805,45 @@ void MagneticFieldAnalyzer::exportFluxLinkageCSV(const std::string& output_dir) 
 // ============================================================================
 
 cv::Mat MagneticFieldAnalyzer::detectMaterialBoundaries() {
-    // Detect material boundaries using Canny edge detection
-    // Returns a binary mask where boundaries are marked as white (255)
+    // Detect material boundaries using per-channel Sobel gradient.
+    // Previous approach (grayscale Canny) failed when different materials
+    // had similar brightness but different colors (e.g., green vs gray:
+    // grayscale 150 vs 128, difference=22 < Canny threshold 50).
+    //
+    // Per-channel approach: compute Sobel gradient on each BGR channel
+    // independently, take the maximum across channels, then threshold.
+    // This detects ANY color boundary regardless of grayscale similarity.
 
-    cv::Mat gray, edges;
+    cv::Mat channels[3];
+    cv::split(image, channels);
 
-    // Convert to grayscale for edge detection
-    cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
+    cv::Mat max_grad = cv::Mat::zeros(image.rows, image.cols, CV_32F);
 
-    // Apply Canny edge detection
-    cv::Canny(gray, edges, 50, 150);
+    for (int c = 0; c < 3; c++) {
+        cv::Mat grad_x, grad_y, grad_mag;
+        cv::Sobel(channels[c], grad_x, CV_32F, 1, 0);
+        cv::Sobel(channels[c], grad_y, CV_32F, 0, 1);
+        cv::magnitude(grad_x, grad_y, grad_mag);
+        max_grad = cv::max(max_grad, grad_mag);
+    }
 
-    // Dilate edges to create a protection zone around boundaries
-    // This ensures cells near boundaries are not coarsened
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
-    cv::dilate(edges, edges, kernel);
+    // Threshold to binary edge mask.
+    // Sobel-3 kernel on a sharp step of height h gives ~4*h response.
+    // Minimum detectable single-channel step: threshold/4 ≈ 8 gray levels.
+    cv::Mat edges;
+    cv::threshold(max_grad, edges, 30, 255, cv::THRESH_BINARY);
+    edges.convertTo(edges, CV_8U);
+
+    // Dilate edges to create a protection zone around boundaries.
+    // Radius is configurable via YAML coarsening.boundary_shell (default: 1).
+    // The gradient coarsening levels already provide a gradual transition,
+    // so a thin shell (1-2px) is typically sufficient.
+    int shell = coarsen_boundary_shell;
+    if (shell > 0) {
+        int ksize = 2 * shell + 1;  // radius -> diameter
+        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(ksize, ksize));
+        cv::dilate(edges, edges, kernel);
+    }
 
     // Flip to match analysis coordinate system (y up)
     cv::Mat edges_flipped;
@@ -1143,7 +1858,7 @@ void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
 
     for (auto& [mat_name, cfg] : material_coarsen) {
         if (!cfg.enabled || cfg.ratio <= 1) {
-            cfg.skip_x = cfg.skip_y = 1;
+            cfg.skip_x = cfg.skip_y = cfg.max_skip_iso = 1;
             continue;
         }
 
@@ -1171,12 +1886,14 @@ void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
         // Round to nearest integer
         cfg.skip_x = std::max(1, (int)std::round(skip_x_float));
         cfg.skip_y = std::max(1, (int)std::round(skip_y_float));
+        cfg.max_skip_iso = std::min(cfg.skip_x, cfg.skip_y);
 
         // Log actual reduction ratio
         int actual_ratio = cfg.skip_x * cfg.skip_y;
         std::cout << "Material '" << mat_name << "': coarsen_ratio=" << cfg.ratio
                   << " -> skip_x=" << cfg.skip_x << ", skip_y=" << cfg.skip_y
-                  << " (actual ratio=" << actual_ratio << ")" << std::endl;
+                  << " (actual ratio=" << actual_ratio
+                  << ", gradient max_skip=" << cfg.max_skip_iso << ")" << std::endl;
     }
 }
 
@@ -1197,147 +1914,327 @@ void MagneticFieldAnalyzer::generateCoarseningMask() {
         return;
     }
 
-    std::cout << "Generating coarsening mask..." << std::endl;
+    std::cout << "Generating gradient coarsening mask..." << std::endl;
 
-    // Calculate optimal skip ratios based on aspect ratio
+    // Calculate optimal skip ratios based on aspect ratio (power-of-2)
     calculateOptimalSkipRatios();
 
     // Detect material boundaries
     cv::Mat boundaries = detectMaterialBoundaries();
 
+    // Compute distance transform from boundaries for gradient coarsening
+    cv::Mat boundary_inv;
+    cv::bitwise_not(boundaries, boundary_inv);
+    cv::Mat dist_map;
+    cv::distanceTransform(boundary_inv, dist_map, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+
     // Generate mask based on coordinate system
     if (coordinate_system == "polar") {
         active_cells.resize(ntheta, nr);
         active_cells.setConstant(true);
-        generateCoarseningMaskPolar(boundaries);
+        cell_skip_level.resize(ntheta, nr);
+        cell_skip_level.setConstant(1);
+        generateCoarseningMaskPolar(boundaries, dist_map);
     } else {
         active_cells.resize(ny, nx);
         active_cells.setConstant(true);
-        generateCoarseningMaskCartesian(boundaries);
+        cell_skip_level.resize(ny, nx);
+        cell_skip_level.setConstant(1);
+        generateCoarseningMaskCartesian(boundaries, dist_map);
     }
 
     // Build index mappings
     buildCoarseIndexMaps();
 }
 
-void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(const cv::Mat& boundaries) {
-    // Generate coarsening mask for Cartesian coordinates
-    // Uses skip_x and skip_y calculated from aspect ratio
+void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(
+    const cv::Mat& boundaries, const cv::Mat& dist_map)
+{
+    // Generate gradient coarsening mask for Cartesian coordinates
+    // Uses distance from boundaries to assign progressive skip levels
+    // Divisor chain: each level divides the next (nesting property)
+    // This guarantees i%s_large==0 → i%s_small==0 for all levels
+
+    // Pre-compute gradient levels for each unique max_skip value
+    // Built by repeatedly dividing max_skip by its smallest prime factor
+    // e.g. max_skip=10 → [1, 5, 10]     (10/2=5, 5/5=1)
+    // e.g. max_skip=8  → [1, 2, 4, 8]   (8/2=4, 4/2=2, 2/2=1)
+    // e.g. max_skip=12 → [1, 3, 6, 12]  (12/2=6, 6/2=3, 3/3=1)
+    std::map<int, std::vector<int>> gradient_levels_cache;
+    auto getGradientLevels = [&](int max_skip) -> const std::vector<int>& {
+        auto it = gradient_levels_cache.find(max_skip);
+        if (it != gradient_levels_cache.end()) return it->second;
+
+        std::vector<int> levels;
+        if (max_skip <= 1) {
+            levels = {1};
+        } else {
+            // Build chain from max_skip down to 1 by dividing by smallest prime factor
+            std::vector<int> descending;
+            int n = max_skip;
+            descending.push_back(n);
+            while (n > 1) {
+                // Find smallest prime factor of n
+                int p = 2;
+                while (p * p <= n && n % p != 0) p++;
+                if (p * p > n) p = n;  // n itself is prime
+                n /= p;
+                descending.push_back(n);
+            }
+            // Reverse to ascending order: {1, ..., max_skip}
+            levels.assign(descending.rbegin(), descending.rend());
+        }
+
+        // Log the divisor chain
+        std::cout << "  Gradient divisor chain for max_skip=" << max_skip << ": [";
+        for (size_t k = 0; k < levels.size(); k++) {
+            if (k > 0) std::cout << ", ";
+            std::cout << levels[k];
+        }
+        std::cout << "]" << std::endl;
+
+        gradient_levels_cache[max_skip] = levels;
+        return gradient_levels_cache[max_skip];
+    };
+
+    // Look up skip level from distance: band width for level k = levels[k+1]
+    // (minimum pixels needed for proper transition to next coarser level).
+    // This is much tighter than the old formula (each band = max_skip pixels).
+    // Example: levels={1,5,10} → skip=1 zone is 5px wide (was 10), skip=5 is 10px.
+    auto computeGradientSkipLevel = [&](float dist, int max_skip) -> int {
+        const auto& levels = getGradientLevels(max_skip);
+        float cumulative = 0;
+        for (size_t k = 0; k < levels.size() - 1; k++) {
+            cumulative += levels[k + 1];  // band width = next level's skip value
+            if (dist < cumulative) return levels[k];
+        }
+        return levels.back();
+    };
 
     // Flip image for coordinate matching
     cv::Mat image_flipped;
     cv::flip(image, image_flipped, 0);
 
+    // Pre-compute pixel RGB → max_skip mapping to avoid YAML lookups in the parallel section.
+    // This also pre-populates gradient_levels_cache so the parallel section only reads it.
+    std::vector<std::pair<cv::Vec3b, int>> rgb_to_maxskip;
+    for (const auto& mat_pair : material_coarsen) {
+        const auto& cfg = mat_pair.second;
+        if (!cfg.enabled || cfg.max_skip_iso <= 1) continue;
+        for (const auto& material : config["materials"]) {
+            if (material.first.as<std::string>() != mat_pair.first) continue;
+            auto rgb = material.second["rgb"].as<std::vector<int>>();
+            rgb_to_maxskip.push_back({cv::Vec3b(rgb[0], rgb[1], rgb[2]), cfg.max_skip_iso});
+        }
+    }
+    // Pre-populate gradient_levels_cache for all unique max_skip values (triggers logging once).
+    // After this, all parallel calls to getGradientLevels are cache-hits (read-only).
+    for (const auto& [rgb, ms] : rgb_to_maxskip) {
+        getGradientLevels(ms);
+    }
+
     int coarsened_count = 0;
 
-    // Mark cells for coarsening based on material settings
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            // Skip boundary cells - always keep them active
-            if (boundaries.at<uchar>(j, i) > 0) {
-                continue;
-            }
+    // Mark cells for coarsening based on distance and material settings.
+    // flat k = j*nx+i for MSVC OpenMP 2.0 compatibility; cell_skip_level / active_cells
+    // writes are unique per (j,i). gradient_levels_cache is read-only (pre-populated above).
+    #pragma omp parallel for schedule(static) reduction(+:coarsened_count)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
 
-            // Skip cells on domain boundary
-            if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1) {
-                continue;
-            }
+        // Canny boundary cells - always full resolution
+        if (boundaries.at<uchar>(j, i) > 0) {
+            cell_skip_level(j, i) = 1;
+            continue;
+        }
 
-            // Find which material this cell belongs to
-            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+        // Domain boundary cells - always full resolution
+        if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1) {
+            cell_skip_level(j, i) = 1;
+            continue;
+        }
 
-            // Look up material coarsening settings
-            for (const auto& mat_pair : material_coarsen) {
-                const auto& cfg = mat_pair.second;
-                if (!cfg.enabled) continue;
-                if (cfg.skip_x <= 1 && cfg.skip_y <= 1) continue;
+        // Find which material this cell belongs to
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
 
-                // Check if this material matches by looking up its RGB
-                for (const auto& material : config["materials"]) {
-                    std::string mat_name = material.first.as<std::string>();
-                    if (mat_name != mat_pair.first) continue;
+        // Look up max_skip from pre-computed map (no YAML access in parallel section)
+        int max_skip = 1;
+        for (const auto& [rgb, ms] : rgb_to_maxskip) {
+            if (pixel == rgb) { max_skip = ms; break; }
+        }
 
-                    auto rgb = material.second["rgb"].as<std::vector<int>>();
-                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                        // This cell belongs to a coarsen-enabled material
-                        // Keep only cells at coarsening grid positions
-                        bool coarsen_x = (cfg.skip_x > 1 && i % cfg.skip_x != 0);
-                        bool coarsen_y = (cfg.skip_y > 1 && j % cfg.skip_y != 0);
-                        if (coarsen_x || coarsen_y) {
-                            active_cells(j, i) = false;
-                            coarsened_count++;
-                        }
-                    }
-                }
-            }
+        if (max_skip <= 1) {
+            cell_skip_level(j, i) = 1;
+            continue;
+        }
+
+        // Compute gradient skip level from distance to boundary
+        float dist = dist_map.at<float>(j, i);
+        int local_skip = computeGradientSkipLevel(dist, max_skip);
+        cell_skip_level(j, i) = local_skip;
+
+        // Apply modulo test: mark inactive if not aligned to local skip grid
+        if (local_skip > 1 && (i % local_skip != 0 || j % local_skip != 0)) {
+            active_cells(j, i) = false;
+            coarsened_count++;
         }
     }
 
-    std::cout << "Cartesian coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+    // Log gradient level statistics
+    std::map<int, int> level_counts;
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            level_counts[cell_skip_level(j, i)]++;
+        }
+    }
+    std::cout << "Cartesian gradient coarsening levels:" << std::endl;
+    for (const auto& [level, count] : level_counts) {
+        std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
+    }
+    std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
 }
 
-void MagneticFieldAnalyzer::generateCoarseningMaskPolar(const cv::Mat& boundaries) {
-    // Generate coarsening mask for Polar coordinates
-    // Uses skip_x (r-direction) and skip_y (theta-direction) calculated from aspect ratio
-    //
-    // IMPORTANT: boundaries is already flipped (from detectMaterialBoundaries) to match
-    // analysis coordinates (y-up). We must also flip image to ensure coordinate consistency.
+void MagneticFieldAnalyzer::generateCoarseningMaskPolar(
+    const cv::Mat& boundaries, const cv::Mat& dist_map)
+{
+    // Generate gradient coarsening mask for Polar coordinates
+    // Uses distance from boundaries to assign progressive skip levels
+    // Divisor chain: each level divides the next (nesting property)
+
+    // Pre-compute gradient levels (same divisor chain logic as Cartesian)
+    std::map<int, std::vector<int>> gradient_levels_cache;
+    auto getGradientLevels = [&](int max_skip) -> const std::vector<int>& {
+        auto it = gradient_levels_cache.find(max_skip);
+        if (it != gradient_levels_cache.end()) return it->second;
+
+        std::vector<int> levels;
+        if (max_skip <= 1) {
+            levels = {1};
+        } else {
+            std::vector<int> descending;
+            int n = max_skip;
+            descending.push_back(n);
+            while (n > 1) {
+                int p = 2;
+                while (p * p <= n && n % p != 0) p++;
+                if (p * p > n) p = n;
+                n /= p;
+                descending.push_back(n);
+            }
+            levels.assign(descending.rbegin(), descending.rend());
+        }
+
+        std::cout << "  Gradient divisor chain for max_skip=" << max_skip << ": [";
+        for (size_t k = 0; k < levels.size(); k++) {
+            if (k > 0) std::cout << ", ";
+            std::cout << levels[k];
+        }
+        std::cout << "]" << std::endl;
+
+        gradient_levels_cache[max_skip] = levels;
+        return gradient_levels_cache[max_skip];
+    };
+
+    auto computeGradientSkipLevel = [&](float dist, int max_skip) -> int {
+        const auto& levels = getGradientLevels(max_skip);
+        float cumulative = 0;
+        for (size_t k = 0; k < levels.size() - 1; k++) {
+            cumulative += levels[k + 1];
+            if (dist < cumulative) return levels[k];
+        }
+        return levels.back();
+    };
 
     // Flip image to match analysis coordinates (same as boundaries)
     cv::Mat image_flipped;
     cv::flip(image, image_flipped, 0);
 
     bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    // Pre-compute pixel RGB → max_skip mapping and pre-populate gradient_levels_cache.
+    std::vector<std::pair<cv::Vec3b, int>> rgb_to_maxskip;
+    for (const auto& mat_pair : material_coarsen) {
+        const auto& cfg = mat_pair.second;
+        if (!cfg.enabled || cfg.max_skip_iso <= 1) continue;
+        for (const auto& material : config["materials"]) {
+            if (material.first.as<std::string>() != mat_pair.first) continue;
+            auto rgb = material.second["rgb"].as<std::vector<int>>();
+            rgb_to_maxskip.push_back({cv::Vec3b(rgb[0], rgb[1], rgb[2]), cfg.max_skip_iso});
+        }
+    }
+    for (const auto& [rgb, ms] : rgb_to_maxskip) {
+        getGradientLevels(ms);
+    }
+
     int coarsened_count = 0;
 
-    for (int i_r = 0; i_r < nr; i_r++) {
-        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
-            // Convert polar indices to flipped image coordinates
-            // Both boundaries and image_flipped are now in analysis coordinates (y-up)
-            int img_i, img_j;
-            polarToImageIndices(i_r, j_theta, img_i, img_j);
+    // flat k = i_r*ntheta+j_theta for MSVC OpenMP 2.0 compatibility.
+    // cell_skip_level / active_cells writes are unique per (j_theta,i_r).
+    // polarToImageIndices() is a pure function — safe to call from multiple threads.
+    #pragma omp parallel for schedule(static) reduction(+:coarsened_count)
+    for (int k = 0; k < nr * ntheta; k++) {
+        int i_r = k / ntheta, j_theta = k % ntheta;
 
-            // Skip boundary cells - always keep them active
-            if (boundaries.at<uchar>(img_j, img_i) > 0) continue;
+        // Convert polar indices to flipped image coordinates
+        int img_i, img_j;
+        polarToImageIndices(i_r, j_theta, img_i, img_j);
 
-            // Skip r-direction boundaries
-            if (i_r == 0 || i_r == nr - 1) continue;
+        // Canny boundary cells - always full resolution
+        if (boundaries.at<uchar>(img_j, img_i) > 0) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
 
-            // Skip theta-direction boundaries (if not periodic)
-            if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) continue;
+        // R-direction boundaries - always full resolution
+        if (i_r == 0 || i_r == nr - 1) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
 
-            // Find which material this cell belongs to
-            // Use flipped image to match boundaries coordinate system
-            cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+        // Theta-direction boundaries (if not periodic) - always full resolution
+        if (!is_periodic && (j_theta == 0 || j_theta == ntheta - 1)) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
 
-            // Look up material coarsening settings
-            for (const auto& mat_pair : material_coarsen) {
-                const auto& cfg = mat_pair.second;
-                if (!cfg.enabled) continue;
-                if (cfg.skip_x <= 1 && cfg.skip_y <= 1) continue;
+        // Find which material this cell belongs to
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
 
-                // Check if this material matches by looking up its RGB
-                for (const auto& material : config["materials"]) {
-                    std::string mat_name = material.first.as<std::string>();
-                    if (mat_name != mat_pair.first) continue;
+        // Look up max_skip from pre-computed map (no YAML access in parallel section)
+        int max_skip = 1;
+        for (const auto& [rgb, ms] : rgb_to_maxskip) {
+            if (pixel == rgb) { max_skip = ms; break; }
+        }
 
-                    auto rgb = material.second["rgb"].as<std::vector<int>>();
-                    if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                        // This cell belongs to a coarsen-enabled material
-                        // r-direction: skip_x, theta-direction: skip_y
-                        bool coarsen_r = (cfg.skip_x > 1 && i_r % cfg.skip_x != 0);
-                        bool coarsen_theta = (cfg.skip_y > 1 && j_theta % cfg.skip_y != 0);
-                        if (coarsen_r || coarsen_theta) {
-                            active_cells(j_theta, i_r) = false;  // Note: (theta, r) order
-                            coarsened_count++;
-                        }
-                    }
-                }
-            }
+        if (max_skip <= 1) {
+            cell_skip_level(j_theta, i_r) = 1;
+            continue;
+        }
+
+        // Compute gradient skip level from distance to boundary
+        float dist = dist_map.at<float>(img_j, img_i);
+        int local_skip = computeGradientSkipLevel(dist, max_skip);
+        cell_skip_level(j_theta, i_r) = local_skip;
+
+        // Apply modulo test: mark inactive if not aligned to local skip grid
+        if (local_skip > 1 && (i_r % local_skip != 0 || j_theta % local_skip != 0)) {
+            active_cells(j_theta, i_r) = false;
+            coarsened_count++;
         }
     }
 
-    std::cout << "Polar coarsening: " << coarsened_count << " cells marked as inactive" << std::endl;
+    // Log gradient level statistics
+    std::map<int, int> level_counts;
+    for (int j = 0; j < ntheta; j++) {
+        for (int i = 0; i < nr; i++) {
+            level_counts[cell_skip_level(j, i)]++;
+        }
+    }
+    std::cout << "Polar gradient coarsening levels:" << std::endl;
+    for (const auto& [level, count] : level_counts) {
+        std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
+    }
+    std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
 }
 
 void MagneticFieldAnalyzer::polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const {
@@ -1719,6 +2616,121 @@ double MagneticFieldAnalyzer::bilinearInterpolateFromCoarse(int i, int j, const 
     return 0.0;
 }
 
+double MagneticFieldAnalyzer::bilinearInterpolateFromCoarsePolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const {
+    // 4-corner bilinear interpolation for polar grid inactive cells.
+    // Row direction = theta (j_theta, 0..ntheta-1), column direction = r (i_r, 0..nr-1).
+    // active_row_flags[j_theta] = true if theta-row j_theta has local active cells.
+    // fine_to_coarse key = {i_r, j_theta} matching coarse_to_fine ordering.
+    // This must match buildInterpolationWeightsPolar exactly for Galerkin consistency.
+
+    bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    int locality_radius = max_coarsen_skip + 1;
+    auto hasLocalActive = [&](int row, int col) -> bool {
+        int lo = std::max(0, col - locality_radius);
+        int hi = std::min(nr - 1, col + locality_radius);
+        for (int ii = lo; ii <= hi; ii++) {
+            if (active_cells(row, ii)) return true;
+        }
+        return false;
+    };
+
+    // Step 1: Find enclosing theta-rows (j_bot at or below j_theta, j_top above j_theta)
+    int j_bot = -1, j_top = -1;
+    for (int jj = j_theta; jj >= 0; jj--) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+    }
+    if (j_bot < 0 && theta_periodic) {
+        for (int jj = ntheta - 1; jj > j_theta; jj--) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+        }
+    }
+    for (int jj = j_theta + 1; jj < ntheta; jj++) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+    }
+    if (j_top < 0 && theta_periodic) {
+        for (int jj = 0; jj < j_theta; jj++) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+        }
+    }
+    if (j_top < 0 && j_bot >= 0) j_top = j_bot;
+    if (j_bot < 0) return 0.0;
+
+    // Compute fy (theta fraction, periodic-aware)
+    double fy = 0.0;
+    if (j_top != j_bot) {
+        if (j_bot <= j_theta && j_top > j_theta) {
+            fy = double(j_theta - j_bot) / double(j_top - j_bot);
+        } else if (theta_periodic && j_bot > j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = (ntheta - j_bot) + j_theta;
+            fy = double(dist_from_bot) / double(dist_total);
+        } else if (theta_periodic && j_top < j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = j_theta - j_bot;
+            fy = double(dist_from_bot) / double(dist_total);
+        }
+    }
+
+    // Step 2: Find r-columns active on BOTH j_bot and j_top rows
+    int il = -1, ir_col = -1;
+    for (int ii = i_r; ii >= 0; ii--) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            il = ii; break;
+        }
+    }
+    for (int ii = i_r + 1; ii < nr; ii++) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            ir_col = ii; break;
+        }
+    }
+
+    // Compute fx (r fraction)
+    double fx = 0.0;
+    if (il >= 0 && ir_col >= 0 && il != ir_col && il <= i_r && ir_col > i_r) {
+        fx = double(i_r - il) / double(ir_col - il);
+    }
+
+    // Step 3: 4-corner bilinear interpolation
+    if (il >= 0 && ir_col >= 0 && j_bot >= 0 && j_top >= 0) {
+        auto it_bl = fine_to_coarse.find({il,     j_bot});
+        auto it_br = fine_to_coarse.find({ir_col, j_bot});
+        auto it_tl = fine_to_coarse.find({il,     j_top});
+        auto it_tr = fine_to_coarse.find({ir_col, j_top});
+
+        if (it_bl != fine_to_coarse.end() && it_br != fine_to_coarse.end() &&
+            it_tl != fine_to_coarse.end() && it_tr != fine_to_coarse.end()) {
+            return (1-fx)*(1-fy)*Az_coarse(it_bl->second)
+                 + fx   *(1-fy)*Az_coarse(it_br->second)
+                 + (1-fx)*fy   *Az_coarse(it_tl->second)
+                 + fx   *fy   *Az_coarse(it_tr->second);
+        }
+    }
+
+    // Fallback: 1D theta interpolation if only one r-column found
+    if (il >= 0 && j_bot >= 0 && j_top >= 0 && j_top != j_bot) {
+        auto it_b = fine_to_coarse.find({il, j_bot});
+        auto it_t = fine_to_coarse.find({il, j_top});
+        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+            return (1-fy)*Az_coarse(it_b->second) + fy*Az_coarse(it_t->second);
+        }
+    }
+
+    // Last fallback: nearest active neighbor (theta-periodic-aware)
+    for (int dj = -1; dj <= 1; dj++) {
+        for (int di = -1; di <= 1; di++) {
+            int ni = i_r + di;
+            int nj = j_theta + dj;
+            if (theta_periodic) { nj = ((nj % ntheta) + ntheta) % ntheta; }
+            if (ni >= 0 && ni < nr && nj >= 0 && nj < ntheta && active_cells(nj, ni)) {
+                auto it = fine_to_coarse.find({ni, nj});
+                if (it != fine_to_coarse.end()) return Az_coarse(it->second);
+            }
+        }
+    }
+    return 0.0;
+}
+
 // ============================================================================
 // Phase 7: Cubic Hermite interpolation for smooth Az
 // ============================================================================
@@ -1979,7 +2991,19 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
     bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    // Build equation for each active cell
+    // Build equation for each active cell.
+    // Thread-local triplets merged via critical section; rhs(idx) writes unique per idx.
+    // findNextActive* / fine_to_coarse / mu_map are all read-only → thread-safe.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(5 * n_active_cells / (1 + nth) + 16);
+
+    #pragma omp for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
 
@@ -1990,19 +3014,19 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
 
         // Dirichlet boundary conditions
         if (is_left && bc_left.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_left.value;
             continue;
         } else if (is_right && bc_right.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_right.value;
             continue;
         } else if (is_bottom && bc_bottom.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_bottom.value;
             continue;
         } else if (is_top && bc_top.type == "dirichlet") {
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
             rhs(idx) = bc_top.value;
             continue;
         }
@@ -2015,10 +3039,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             // Find next active cell in +x direction for the derivative term
             int i_east = findNextActiveX(i, j, +1);
             double h_east = (i_east - i) * dx;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_east));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_east));
             auto it_east = fine_to_coarse.find({i_east, j});
             if (it_east != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, -b/h_east));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, -b/h_east));
             }
             rhs(idx) = g;
             continue;
@@ -2028,10 +3052,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double g = bc_right.gamma;
             int i_west = findNextActiveX(i, j, -1);
             double h_west = (i - i_west) * dx;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_west));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_west));
             auto it_west = fine_to_coarse.find({i_west, j});
             if (it_west != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, -b/h_west));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, -b/h_west));
             }
             rhs(idx) = g;
             continue;
@@ -2041,10 +3065,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double g = bc_bottom.gamma;
             int j_north = findNextActiveY(i, j, +1);
             double h_north = (j_north - j) * dy;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_north));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_north));
             auto it_north = fine_to_coarse.find({i, j_north});
             if (it_north != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, -b/h_north));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, -b/h_north));
             }
             rhs(idx) = g;
             continue;
@@ -2054,10 +3078,10 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             double g = bc_top.gamma;
             int j_south = findNextActiveY(i, j, -1);
             double h_south = (j - j_south) * dy;
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_south));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/h_south));
             auto it_south = fine_to_coarse.find({i, j_south});
             if (it_south != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, -b/h_south));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, -b/h_south));
             }
             rhs(idx) = g;
             continue;
@@ -2127,7 +3151,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool west_is_dirichlet = (i_west == 0) && (bc_left.type == "dirichlet");
 
             if (!west_is_dirichlet && it_west != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, coeff_west));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_west->second, coeff_west));
             } else if (west_is_dirichlet) {
                 rhs(idx) -= coeff_west * bc_left.value;
             }
@@ -2145,7 +3169,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool east_is_dirichlet = (i_east == nx - 1) && (bc_right.type == "dirichlet");
 
             if (!east_is_dirichlet && it_east != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, coeff_east));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_east->second, coeff_east));
             } else if (east_is_dirichlet) {
                 rhs(idx) -= coeff_east * bc_right.value;
             }
@@ -2165,7 +3189,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool south_is_dirichlet = (j_south == 0) && (bc_bottom.type == "dirichlet");
 
             if (!south_is_dirichlet && it_south != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, coeff_south));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_south->second, coeff_south));
             } else if (south_is_dirichlet) {
                 rhs(idx) -= coeff_south * bc_bottom.value;
             }
@@ -2183,7 +3207,7 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
             bool north_is_dirichlet = (j_north == ny - 1) && (bc_top.type == "dirichlet");
 
             if (!north_is_dirichlet && it_north != fine_to_coarse.end()) {
-                triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, coeff_north));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, it_north->second, coeff_north));
             } else if (north_is_dirichlet) {
                 rhs(idx) -= coeff_north * bc_top.value;
             }
@@ -2191,12 +3215,19 @@ void MagneticFieldAnalyzer::buildMatrixCoarsened(Eigen::SparseMatrix<double>& A,
         }
 
         // Center coefficient
-        triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+        local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
         // Right-hand side: source term (no area scaling for FDM)
+        // Include permanent magnet magnetization equivalent current Jz_mag = dMy/dx - dMx/dy
         // Use += to preserve any accumulated Dirichlet boundary contributions
-        rhs(idx) += -jz_map(j, i);
-    }
+        rhs(idx) += -(jz_map(j, i) + Jz_mag_map(j, i));
+    }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
+        }
+    }  // end omp parallel
 
     A.setFromTriplets(triplets.begin(), triplets.end());
     A.makeCompressed();
@@ -2216,80 +3247,259 @@ void MagneticFieldAnalyzer::interpolateToFullGrid(const Eigen::VectorXd& Az_coar
     Az.setZero();
 
     // Step 1: Set active cells directly from solver output
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (active_cells(j, i)) {
-                auto it = fine_to_coarse.find({i, j});
-                if (it != fine_to_coarse.end()) {
-                    Az(j, i) = Az_coarse(it->second);
-                }
+    // Active cells get exact Az_coarse values; reads fine_to_coarse (read-only map).
+    // flat k = j*nx+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        if (active_cells(j, i)) {
+            auto it = fine_to_coarse.find({i, j});
+            if (it != fine_to_coarse.end()) {
+                Az(j, i) = Az_coarse(it->second);
             }
         }
     }
 
     // Step 2: Interpolate inactive cells with bilinear
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (!active_cells(j, i)) {
-                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
-            }
+    // Reads Az_coarse only (not Az), so no race with Step 1.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        if (!active_cells(j, i)) {
+            Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
         }
     }
 }
 
+void MagneticFieldAnalyzer::smoothInactiveCells(int iterations) {
+    // ν-weighted Gauss-Seidel smoothing at inactive cells.
+    //
+    // Solves the discrete form of ∇·(ν∇Az) = 0  (ν = 1/μ) at inactive cells,
+    // using active cells as fixed Dirichlet constraints. This is the physically
+    // correct interpolation that respects the magnetic reluctance distribution.
+    //
+    // At each inactive cell:
+    //   Az_c = Σ(ν_face · Az_neighbor / h²) / Σ(ν_face / h²)
+    //
+    // where ν_face = 2·ν_i·ν_j/(ν_i+ν_j) is the harmonic mean face reluctivity
+    // (series magnetic circuit model at material interfaces).
+    //
+    // Properties:
+    // - Uniform μ region: reduces to simple Laplacian averaging (mean value property)
+    // - μ interface: correctly models reluctance discontinuity
+    // - Active cells (material boundaries) act as Dirichlet constraints
+    //   → no cross-material contamination
+    // - Gauss-Seidel (in-place) for ~2-3x faster convergence vs Jacobi
+
+    if (iterations <= 0 || !coarsening_enabled) return;
+
+    int n_rows, n_cols;
+    double h_x, h_y;
+    if (coordinate_system == "polar") {
+        n_rows = (r_orientation == "horizontal") ? ntheta : nr;
+        n_cols = (r_orientation == "horizontal") ? nr : ntheta;
+        // For polar: h_x is along columns (i), h_y is along rows (j)
+        // horizontal: i→r, j→θ  →  h_x=dr, h_y=dtheta
+        // vertical:   i→θ, j→r  →  h_x=dtheta, h_y=dr
+        h_x = (r_orientation == "horizontal") ? dr : dtheta;
+        h_y = (r_orientation == "horizontal") ? dtheta : dr;
+    } else {
+        n_rows = ny;
+        n_cols = nx;
+        h_x = dx;
+        h_y = dy;
+    }
+
+    bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
+    bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
+    if (coordinate_system == "polar") {
+        x_periodic = false;
+        y_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    }
+
+    double inv_hx2 = 1.0 / (h_x * h_x);
+    double inv_hy2 = 1.0 / (h_y * h_y);
+
+    // Harmonic mean face reluctivity: ν_face = 2·ν_a·ν_b / (ν_a + ν_b)
+    auto face_nu = [](double mu_a, double mu_b) -> double {
+        // ν = 1/μ, harmonic mean of ν = 2/(μ_a + μ_b) * (μ_a·μ_b)/(μ_a·μ_b) ... simplify:
+        // = 2 * (1/μ_a) * (1/μ_b) / (1/μ_a + 1/μ_b) = 2 / (μ_a + μ_b)
+        return 2.0 / (mu_a + mu_b);
+    };
+
+    double max_change = 0.0;
+    for (int iter = 0; iter < iterations; iter++) {
+        max_change = 0.0;
+        for (int j = 0; j < n_rows; j++) {
+            for (int i = 0; i < n_cols; i++) {
+                if (active_cells(j, i)) continue;  // Keep solver values
+
+                double mu_c = mu_map(j, i);
+                double sum = 0.0, wsum = 0.0;
+
+                // West neighbor
+                int jn, in_;
+                jn = j; in_ = (i > 0) ? i - 1 : (x_periodic ? n_cols - 1 : -1);
+                if (in_ >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hx2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+                // East neighbor
+                jn = j; in_ = (i < n_cols - 1) ? i + 1 : (x_periodic ? 0 : -1);
+                if (in_ >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hx2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+                // South neighbor
+                in_ = i; jn = (j > 0) ? j - 1 : (y_periodic ? n_rows - 1 : -1);
+                if (jn >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hy2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+                // North neighbor
+                in_ = i; jn = (j < n_rows - 1) ? j + 1 : (y_periodic ? 0 : -1);
+                if (jn >= 0) {
+                    double w = face_nu(mu_c, mu_map(jn, in_)) * inv_hy2;
+                    sum += w * Az(jn, in_);
+                    wsum += w;
+                }
+
+                if (wsum > 0) {
+                    double new_val = sum / wsum;
+                    double change = std::abs(new_val - Az(j, i));
+                    if (change > max_change) max_change = change;
+                    Az(j, i) = new_val;  // Gauss-Seidel: in-place update
+                }
+            }
+        }
+    }
+    std::cout << "nu-weighted smoothing: " << iterations << " iters, max_change="
+              << std::scientific << std::setprecision(2) << max_change << std::endl;
+}
+
 void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
-    // Rebuild mu_map for inactive cells directly from the input image.
-    // Active cells keep their B-H curve computed μ (from updateMuAtActiveCells).
-    // Inactive cells get the material-based μ from image pixel lookup (ground truth).
-    // This avoids cross-material contamination from harmonic mean interpolation.
+    // Rebuild mu_map for inactive cells:
+    // - Active cells: keep B-H computed μ (from updateMuAtActiveCells)
+    // - Inactive cells:
+    //   * Linear (STATIC) materials: evaluateMu(H=0) is exact (μ independent of H)
+    //   * Nonlinear (TABLE/FORMULA) materials: use nearest active cell's μ from mu_map
+    //     Rationale: evaluateMu(H=0) gives μ_r≈5000 for silicon steel, but saturated
+    //     iron may have μ_r≈100-200. Using μ(H=0) corrupts A_fine and thus A_G=P^T*A_fine*P,
+    //     causing Galerkin Picard to stagnate at a wrong fixed point.
 
     if (!coarsening_enabled || n_active_cells == 0) return;
 
     const double MU_0 = 4.0 * M_PI * 1e-7;
+    bool is_polar = (coordinate_system == "polar");
+    bool is_horizontal = is_polar && (r_orientation == "horizontal");
     cv::Mat image_flipped;
     cv::flip(image, image_flipped, 0);
 
     int n_rows, n_cols;
-    if (coordinate_system == "polar") {
-        n_rows = (r_orientation == "horizontal") ? ntheta : nr;
-        n_cols = (r_orientation == "horizontal") ? nr : ntheta;
+    if (is_polar) {
+        n_rows = is_horizontal ? ntheta : nr;
+        n_cols = is_horizontal ? nr : ntheta;
     } else {
         n_rows = ny;
         n_cols = nx;
     }
 
-    for (int j = 0; j < n_rows; j++) {
-        for (int i = 0; i < n_cols; i++) {
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety.
+    // Active cells are read-only (writes only to inactive cells) → thread-safe.
+    // findNextActive*() scans active_cells matrix (read-only) → thread-safe.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < n_rows * n_cols; k++) {
+        int j = k / n_cols, i = k % n_cols;
             if (active_cells(j, i)) continue;  // Keep B-H computed μ
 
             // Get pixel from flipped image (same coordinate system as setupMaterialProperties)
             int img_i = i, img_j = j;
-            if (coordinate_system == "polar") {
-                polarToImageIndices(i, j, img_i, img_j);
+            if (is_polar) {
+                int i_r_img     = is_horizontal ? i : j;
+                int j_theta_img = is_horizontal ? j : i;
+                polarToImageIndices(i_r_img, j_theta_img, img_i, img_j);
             }
             if (img_j < 0 || img_j >= image_flipped.rows ||
                 img_i < 0 || img_i >= image_flipped.cols) continue;
 
             cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+            // Note: image_flipped stores BGR, pixel[0]=B, pixel[1]=G, pixel[2]=R
+            int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-            // Find matching material and set μ
-            for (const auto& mat : config["materials"]) {
-                std::string name = mat.first.as<std::string>();
-                YAML::Node props = mat.second;
-                if (!props["rgb"]) continue;
+            auto lut_it = rgb_to_material.find(rgb_key);
+            if (lut_it != rgb_to_material.end()) {
+                const std::string& name = lut_it->second.name;
+                auto it = material_mu.find(name);
+                if (it != material_mu.end()) {
+                    const MuValue& mv = it->second;
 
-                auto rgb = props["rgb"].as<std::vector<int>>();
-                if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
-                    auto it = material_mu.find(name);
-                    if (it != material_mu.end()) {
-                        // Use current H=0 for inactive cells (initial/base μ)
-                        double mu_r = evaluateMu(it->second, 0.0);
-                        mu_map(j, i) = mu_r * MU_0;
+                    if (mv.type != MuType::STATIC) {
+                            // Nonlinear material: find nearest active cell's μ so that
+                            // A_fine reflects the actual operating point, not H=0.
+                            double mu_nearest = 0.0;
+
+                            if (!is_polar) {
+                                // Cartesian: scan ±x and ±y
+                                int i_east  = findNextActiveX(i, j, +1);
+                                int i_west  = findNextActiveX(i, j, -1);
+                                int j_north = findNextActiveY(i, j, +1);
+                                int j_south = findNextActiveY(i, j, -1);
+                                int d_east  = std::abs(i_east  - i);
+                                int d_west  = std::abs(i_west  - i);
+                                int d_north = std::abs(j_north - j);
+                                int d_south = std::abs(j_south - j);
+                                int d_min = std::min({d_east, d_west, d_north, d_south});
+                                if      (d_min == d_east)  mu_nearest = mu_map(j,       i_east);
+                                else if (d_min == d_west)  mu_nearest = mu_map(j,       i_west);
+                                else if (d_min == d_north) mu_nearest = mu_map(j_north, i);
+                                else                       mu_nearest = mu_map(j_south, i);
+                            } else {
+                                // Polar: scan ±radial and ±theta
+                                // is_horizontal: j=j_theta, i=i_r; else j=i_r, i=j_theta
+                                int i_r     = is_horizontal ? i : j;
+                                int j_theta = is_horizontal ? j : i;
+                                int i_next = findNextActiveRadial(i_r, j_theta, +1);
+                                int i_prev = findNextActiveRadial(i_r, j_theta, -1);
+                                int j_next = findNextActiveTheta(i_r, j_theta, +1);
+                                int j_prev = findNextActiveTheta(i_r, j_theta, -1);
+                                int d_rn = std::abs(i_next - i_r);
+                                int d_rp = std::abs(i_prev - i_r);
+                                int d_tn = std::abs(j_next - j_theta);
+                                int d_tp = std::abs(j_prev - j_theta);
+                                int d_min = std::min({d_rn, d_rp, d_tn, d_tp});
+                                // Map active neighbor (i_r', j_theta') back to (row, col)
+                                // horizontal: row=j_theta, col=i_r  → mu_map(j_theta', i_r')
+                                // vertical:   row=i_r,    col=j_theta → mu_map(i_r', j_theta')
+                                if (d_min == d_rn) {
+                                    // radial +: i_r→i_next, j_theta unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j, i_next) : mu_map(i_next, i);
+                                } else if (d_min == d_rp) {
+                                    // radial -: i_r→i_prev, j_theta unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j, i_prev) : mu_map(i_prev, i);
+                                } else if (d_min == d_tn) {
+                                    // theta +: j_theta→j_next, i_r unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j_next, i) : mu_map(j, j_next);
+                                } else {
+                                    // theta -: j_theta→j_prev, i_r unchanged
+                                    mu_nearest = is_horizontal ? mu_map(j_prev, i) : mu_map(j, j_prev);
+                                }
+                            }
+
+                            // Use nearest active cell's μ if valid; fall back to H=0 μ
+                            if (mu_nearest > 0.0) {
+                                mu_map(j, i) = mu_nearest;
+                            } else {
+                                mu_map(j, i) = evaluateMu(mv, 0.0) * MU_0;
+                            }
+                        } else {
+                            // Linear material: μ is constant, H=0 is exact
+                            mu_map(j, i) = evaluateMu(mv, 0.0) * MU_0;
+                        }
                     }
-                    break;
                 }
-            }
-        }
     }
 }
 
@@ -2314,6 +3524,10 @@ void MagneticFieldAnalyzer::calculateBFieldAtActiveCells(
     bool x_periodic = (!is_polar) && (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (!is_polar) && (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
+    // Bx_active(idx) / By_active(idx) writes are unique per idx.
+    // All reads (Az_coarse, coarse_to_fine, fine_to_coarse, active_cells) are read-only.
+    // findNextActive* helpers are pure reads → thread-safe.
+    #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
 
@@ -2553,6 +3767,8 @@ void MagneticFieldAnalyzer::calculateHFieldAtActiveCells(
 
     bool is_polar = (coordinate_system == "polar");
 
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
 
@@ -2577,34 +3793,23 @@ void MagneticFieldAnalyzer::calculateHFieldAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-        // Find material by RGB and compute H
+        // O(1) material lookup via LUT
         bool found = false;
-        for (const auto& mat : config["materials"]) {
-            std::string name = mat.first.as<std::string>();
-            YAML::Node props = mat.second;
-            if (!props["rgb"]) continue;
-
-            cv::Scalar mat_rgb(
-                props["rgb"][0].as<int>(),
-                props["rgb"][1].as<int>(),
-                props["rgb"][2].as<int>()
-            );
-
-            if (rgb == mat_rgb) {
-                auto bh_it = material_bh_tables.find(name);
-                if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
-                    // Nonlinear: inverse B-H interpolation
-                    H_active(idx) = interpolateH_from_B(bh_it->second, B_mag);
-                } else {
-                    // Linear: H = B/μ
-                    double mu = mu_map(j, i);
-                    H_active(idx) = (mu > 1e-20) ? B_mag / mu : 0.0;
-                }
-                found = true;
-                break;
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto bh_it = material_bh_tables.find(name);
+            if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                // Nonlinear: inverse B-H interpolation
+                H_active(idx) = interpolateH_from_B(bh_it->second, B_mag);
+            } else {
+                // Linear: H = B/μ
+                double mu = mu_map(j, i);
+                H_active(idx) = (mu > 1e-20) ? B_mag / mu : 0.0;
             }
+            found = true;
         }
 
         if (!found) {
@@ -2630,6 +3835,8 @@ void MagneticFieldAnalyzer::updateMuAtActiveCells(
 
     bool is_polar = (coordinate_system == "polar");
 
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    #pragma omp parallel for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i, j] = coarse_to_fine[idx];
         double H_mag = H_active(idx);
@@ -2649,33 +3856,121 @@ void MagneticFieldAnalyzer::updateMuAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-        for (const auto& mat : config["materials"]) {
-            std::string name = mat.first.as<std::string>();
-            YAML::Node props = mat.second;
-            if (!props["rgb"]) continue;
-
-            cv::Scalar mat_rgb(
-                props["rgb"][0].as<int>(),
-                props["rgb"][1].as<int>(),
-                props["rgb"][2].as<int>()
-            );
-
-            if (rgb == mat_rgb) {
-                auto it = material_mu.find(name);
-                if (it != material_mu.end()) {
-                    // Skip STATIC (linear) materials — μ doesn't depend on H
-                    if (it->second.type == MuType::STATIC) break;
-
-                    // Guard: skip update if H is NaN (edge case from B computation)
-                    if (std::isnan(H_mag) || std::isinf(H_mag)) break;
-                    double mu_r = evaluateMu(it->second, H_mag);
-                    if (!std::isnan(mu_r) && !std::isinf(mu_r) && mu_r >= 1.0) {
-                        mu_map(j, i) = mu_r * MU_0;
-                    }
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto it = material_mu.find(name);
+            if (it != material_mu.end()) {
+                if (it->second.type == MuType::STATIC) continue;
+                if (std::isnan(H_mag) || std::isinf(H_mag)) continue;
+                double mu_r = evaluateMu(it->second, H_mag);
+                if (!std::isnan(mu_r) && !std::isinf(mu_r) && mu_r >= 1.0) {
+                    mu_map(j, i) = mu_r * MU_0;
                 }
-                break;
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::updateMuDiffAtActiveCells(const Eigen::VectorXd& H_active) {
+    // Update mu_map at active cells with differential permeability μ_diff = dB/dH / μ₀.
+    // For Newton correction in Phase 6: building A(μ_diff) instead of A(μ_eff)
+    // guarantees convergence even when Picard spectral radius ρ = μ_eff/μ_diff >> 1.
+    //
+    // μ_diff is computed as d(μ_0*μ_r*H)/dH / μ_0 via central differences,
+    // using the same PCHIP evaluateMu() for consistency with the residual evaluation.
+    // Linear (STATIC) materials are left unchanged (μ_diff = μ_eff for them).
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
+
+    bool is_polar = (coordinate_system == "polar");
+
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        auto [i, j] = coarse_to_fine[idx];
+        double H_mag = H_active(idx);
+
+        int img_i, img_j;
+        if (is_polar) {
+            polarToImageIndices(i, j, img_i, img_j);
+        } else {
+            img_i = i;
+            img_j = j;
+        }
+
+        if (img_j < 0 || img_j >= image_flipped.rows ||
+            img_i < 0 || img_i >= image_flipped.cols) continue;
+
+        cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto it = material_mu.find(name);
+            if (it == material_mu.end() || it->second.type == MuType::STATIC) continue;
+            if (std::isnan(H_mag) || std::isinf(H_mag)) continue;
+
+            const double H_eps = std::max(1.0, H_mag * 1e-4);
+            double Hp = H_mag + H_eps;
+            double Hm = std::max(0.0, H_mag - H_eps);
+            double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
+            double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
+            double dH = Hp - Hm;
+            double mu_diff_r = std::max(1.0, (Bp - Bm) / (dH * MU_0));
+
+            if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
+                mu_map(j, i) = mu_diff_r * MU_0;
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::updateMuDiffDistribution() {
+    // Full-grid version of updateMuDiffAtActiveCells, using H_map(j, i) for all pixels.
+    // Replaces mu_map with μ_diff = dB/dH / μ₀ (differential permeability).
+    // Used for Newton correction in fine finishing: Az += A(μ_diff)^{-1} * (-(A(μ_eff)*Az - b))
+    // This converges even when ρ_Picard = μ_eff/μ_diff > 1 (Si_steel saturation region).
+    // Linear (STATIC) materials are left unchanged (μ_diff = μ_eff for them).
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // y down -> y up, matches setupMaterialProperties()
+
+    int n_rows = image_to_use.rows;
+    int n_cols = image_to_use.cols;
+
+    // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
+    // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < n_rows * n_cols; k++) {
+        int j = k / n_cols, i = k % n_cols;
+        cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
+        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+
+        auto lut_it = rgb_to_material.find(rgb_key);
+        if (lut_it != rgb_to_material.end()) {
+            const std::string& name = lut_it->second.name;
+            auto it = material_mu.find(name);
+            if (it == material_mu.end() || it->second.type == MuType::STATIC) continue;
+
+            double H_mag = H_map(j, i);
+            if (std::isnan(H_mag) || std::isinf(H_mag)) continue;
+
+            const double H_eps = std::max(1.0, H_mag * 1e-4);
+            double Hp = H_mag + H_eps;
+            double Hm = std::max(0.0, H_mag - H_eps);
+            double Bp = evaluateMu(it->second, Hp) * Hp * MU_0;
+            double Bm = evaluateMu(it->second, Hm) * Hm * MU_0;
+            double mu_diff_r = std::max(1.0, (Bp - Bm) / ((Hp - Hm) * MU_0));
+
+            if (!std::isnan(mu_diff_r) && !std::isinf(mu_diff_r)) {
+                mu_map(j, i) = mu_diff_r * MU_0;
             }
         }
     }
@@ -2700,67 +3995,10 @@ double MagneticFieldAnalyzer::calculateThetaInterpolationWeight(int j_theta, int
 }
 
 double MagneticFieldAnalyzer::interpolateFromCoarseGridPolar(int i_r, int j_theta, const Eigen::VectorXd& Az_coarse) const {
-    // Bilinear interpolation for inactive cells in polar coordinates
-    // Interpolate in both r and theta directions
-
-    // Find surrounding active cells in r direction
-    int i_prev = i_r, i_next = i_r;
-    while (i_prev > 0 && !active_cells(j_theta, i_prev)) i_prev--;
-    while (i_next < nr - 1 && !active_cells(j_theta, i_next)) i_next++;
-
-    // Find surrounding active cells in theta direction (periodic boundary aware)
-    bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
-    int j_prev = j_theta, j_next = j_theta;
-
-    // Search for j_prev
-    int search = j_theta - 1;
-    for (int k = 0; k < ntheta; k++) {
-        int j_check = is_periodic ? (search + ntheta) % ntheta : std::max(0, search);
-        if (!is_periodic && search < 0) break;
-        if (active_cells(j_check, i_r)) {
-            j_prev = j_check;
-            break;
-        }
-        search--;
-    }
-
-    // Search for j_next
-    search = j_theta + 1;
-    for (int k = 0; k < ntheta; k++) {
-        int j_check = is_periodic ? search % ntheta : std::min(ntheta - 1, search);
-        if (!is_periodic && search >= ntheta) break;
-        if (active_cells(j_check, i_r)) {
-            j_next = j_check;
-            break;
-        }
-        search++;
-    }
-
-    // Get coarse indices for 4 surrounding points
-    auto it_sw = fine_to_coarse.find({i_prev, j_prev});  // (r_low, theta_low)
-    auto it_se = fine_to_coarse.find({i_next, j_prev});  // (r_high, theta_low)
-    auto it_nw = fine_to_coarse.find({i_prev, j_next});  // (r_low, theta_high)
-    auto it_ne = fine_to_coarse.find({i_next, j_next});  // (r_high, theta_high)
-
-    // Calculate interpolation weights
-    double wr = (i_next != i_prev) ? double(i_r - i_prev) / double(i_next - i_prev) : 0.5;
-    double wt = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-
-    // Get values at 4 points
-    double v_sw = (it_sw != fine_to_coarse.end()) ? Az_coarse(it_sw->second) : 0.0;
-    double v_se = (it_se != fine_to_coarse.end()) ? Az_coarse(it_se->second) : 0.0;
-    double v_nw = (it_nw != fine_to_coarse.end()) ? Az_coarse(it_nw->second) : 0.0;
-    double v_ne = (it_ne != fine_to_coarse.end()) ? Az_coarse(it_ne->second) : 0.0;
-
-    // Fallback: if no points found, return 0
-    int found_count = (it_sw != fine_to_coarse.end()) + (it_se != fine_to_coarse.end()) +
-                      (it_nw != fine_to_coarse.end()) + (it_ne != fine_to_coarse.end());
-    if (found_count == 0) return 0.0;
-
-    // Bilinear interpolation
-    double v_low = (1.0 - wr) * v_sw + wr * v_se;
-    double v_high = (1.0 - wr) * v_nw + wr * v_ne;
-    return (1.0 - wt) * v_low + wt * v_high;
+    // Delegate to bilinearInterpolateFromCoarsePolar, which uses 4-corner bilinear interpolation.
+    // This exactly matches buildInterpolationWeightsPolar (used in buildProlongationMatrixPolar),
+    // ensuring P * Az_c == Az_full exactly (required for Galerkin consistency).
+    return bilinearInterpolateFromCoarsePolar(i_r, j_theta, Az_coarse);
 }
 
 void MagneticFieldAnalyzer::interpolateToFullGridPolar(const Eigen::VectorXd& Az_coarse) {
@@ -2803,11 +4041,13 @@ void MagneticFieldAnalyzer::interpolateInactiveCells(const Eigen::VectorXd& Az_c
     // Uses bilinear (not Hermite) to preserve solver convergence behavior.
     // Hermite is only used in interpolateToFullGrid() for final output quality.
 
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            if (!active_cells(j, i)) {
-                Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
-            }
+    // flat k = j*nx+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility.
+    // active_cells / fine_to_coarse / Az_coarse are read-only; Az(j,i) writes are unique.
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        if (!active_cells(j, i)) {
+            Az(j, i) = bilinearInterpolateFromCoarse(i, j, Az_coarse);
         }
     }
 }
@@ -2816,24 +4056,26 @@ void MagneticFieldAnalyzer::interpolateInactiveCellsPolar(const Eigen::VectorXd&
     // Update ONLY inactive cells by interpolation from active cells (Polar version)
     // Active cells in Az are assumed to already have correct values
 
-    for (int i_r = 0; i_r < nr; i_r++) {
-        for (int j_theta = 0; j_theta < ntheta; j_theta++) {
-            if (!active_cells(j_theta, i_r)) {  // Note: active_cells is (theta, r)
-                // Inactive cell - interpolate from surrounding active cells
-                double interpolated_value = interpolateFromCoarseGridPolar(i_r, j_theta, Az_coarse);
-                if (r_orientation == "horizontal") {
-                    Az(j_theta, i_r) = interpolated_value;
-                } else {
-                    Az(i_r, j_theta) = interpolated_value;
-                }
+    // flat k = i_r*ntheta+j_theta for MSVC OpenMP 2.0 compatibility.
+    // active_cells / fine_to_coarse / Az_coarse are read-only; Az writes are unique per (i_r,j_theta).
+    bool is_horizontal = (r_orientation == "horizontal");
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < nr * ntheta; k++) {
+        int i_r = k / ntheta, j_theta = k % ntheta;
+        if (!active_cells(j_theta, i_r)) {  // Note: active_cells is (theta, r)
+            double interpolated_value = interpolateFromCoarseGridPolar(i_r, j_theta, Az_coarse);
+            if (is_horizontal) {
+                Az(j_theta, i_r) = interpolated_value;
+            } else {
+                Az(i_r, j_theta) = interpolated_value;
             }
-            // Active cells: keep existing values (already updated from Az_coarse)
         }
+        // Active cells: keep existing values (already updated from Az_coarse)
     }
 }
 
 void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
-    std::cout << "\n=== Building coarsened FDM system ===" << std::endl;
+    std::cout << "\n=== Building coarsened system (Galerkin: A_c = P^T * A_f * P) ===" << std::endl;
     std::cout << "Active cells: " << n_active_cells << " / " << (nx * ny)
               << " (reduction: " << std::fixed << std::setprecision(1)
               << (100.0 * (1.0 - double(n_active_cells) / (nx * ny))) << "%)" << std::endl;
@@ -2841,20 +4083,23 @@ void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     Eigen::SparseMatrix<double> A(n_active_cells, n_active_cells);
     Eigen::VectorXd rhs(n_active_cells);
 
-    // Build coarsened matrix
-    buildMatrixCoarsened(A, rhs);
+    // Use Galerkin projection instead of geometric coarsened matrix.
+    // The geometric stencil 2/(mu*h*(h_w+h_e)) is asymmetric at skip transitions
+    // because (h_w+h_e) differs per cell. Galerkin A_c = P^T * A_f * P is
+    // automatically symmetric since A_f (uniform fine grid) is symmetric.
+    buildMatrixGalerkin(A, rhs);
 
-    // Check matrix symmetry
+    // Verify matrix symmetry (should always pass with Galerkin)
     Eigen::SparseMatrix<double> A_T = A.transpose();
     double symmetry_error = (A - A_T).norm();
     double A_norm = A.norm();
     double relative_symmetry_error = (A_norm > 1e-12) ? (symmetry_error / A_norm) : symmetry_error;
-    std::cout << "Coarsened matrix symmetry check:" << std::endl;
+    std::cout << "Galerkin matrix symmetry check:" << std::endl;
     std::cout << "  ||A - A^T|| = " << symmetry_error << std::endl;
     std::cout << "  ||A|| = " << A_norm << std::endl;
     std::cout << "  Relative error = " << relative_symmetry_error << std::endl;
     if (relative_symmetry_error > 1e-8) {
-        std::cerr << "WARNING: Coarsened matrix is not symmetric! Relative error = "
+        std::cerr << "WARNING: Galerkin matrix is not symmetric! Relative error = "
                   << relative_symmetry_error << std::endl;
     } else {
         std::cout << "  Matrix is symmetric (relative error < 1e-8)" << std::endl;
@@ -2866,6 +4111,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     // Interpolate back to full grid
     std::cout << "Interpolating to full grid..." << std::endl;
     interpolateToFullGrid(Az_coarse);
+    smoothInactiveCells(coarsen_smooth_iterations);
     interpolateMuToFullGrid();
 
     std::cout << "Coarsened solution complete!" << std::endl;
@@ -2876,13 +4122,20 @@ void MagneticFieldAnalyzer::exportCoarseningMask(const std::string& output_dir, 
         return;  // No coarsening, nothing to export
     }
 
-    // Create binary mask image: same size as input image, single channel
-    // Active cells = 255 (white), Inactive/coarsened cells = 0 (black)
+    // Create gradient mask image: same size as input image, single channel
+    // Active cells = 255 (white)
+    // Inactive cells = 255/skip_level (encodes gradient coarsening level)
+    //   skip=2 → 127, skip=4 → 63, skip=8 → 31 (all < 128 for frontend compatibility)
     cv::Mat mask_image(ny, nx, CV_8UC1);
 
     for (int j = 0; j < ny; j++) {
         for (int i = 0; i < nx; i++) {
-            mask_image.at<uchar>(j, i) = active_cells(j, i) ? 255 : 0;
+            if (active_cells(j, i)) {
+                mask_image.at<uchar>(j, i) = 255;
+            } else {
+                int skip = cell_skip_level(j, i);
+                mask_image.at<uchar>(j, i) = (uchar)std::max(1, 255 / skip);
+            }
         }
     }
 
@@ -2920,6 +4173,31 @@ void MagneticFieldAnalyzer::updateFullMatrixCache() {
         buildMatrixPolar(A_full_cached, rhs_full_cached);
     }
     full_matrix_cache_valid = true;
+
+    // Sync CSR (row-major) copy for OpenMP-parallel SpMV.
+    // Eigen automatically converts CSC → CSR on assignment.
+    A_full_cached_csr = A_full_cached;
+}
+
+// ============================================================================
+// OpenMP-parallel SpMV: y = A * x  (A must be CSR / row-major)
+// ============================================================================
+Eigen::VectorXd MagneticFieldAnalyzer::parallelSpMV(
+    const Eigen::SparseMatrix<double, Eigen::RowMajor>& A,
+    const Eigen::VectorXd& x) const
+{
+    const int nrows = static_cast<int>(A.rows());
+    Eigen::VectorXd y(nrows);
+
+#pragma omp parallel for schedule(static)
+    for (int row = 0; row < nrows; ++row) {
+        double val = 0.0;
+        for (Eigen::SparseMatrix<double, Eigen::RowMajor>::InnerIterator it(A, row); it; ++it) {
+            val += it.value() * x[it.col()];
+        }
+        y[row] = val;
+    }
+    return y;
 }
 
 double MagneticFieldAnalyzer::computeFullGridResidual(double& out_b_norm) {
@@ -2958,8 +4236,8 @@ double MagneticFieldAnalyzer::computeFullGridResidual(double& out_b_norm) {
         }
     }
 
-    // Compute residual: r = A_f * Az_f - b_f
-    Eigen::VectorXd residual = A_full_cached * Az_full - rhs_full_cached;
+    // Compute residual: r = A_f * Az_f - b_f  (parallel SpMV)
+    Eigen::VectorXd residual = parallelSpMV(A_full_cached_csr, Az_full) - rhs_full_cached;
 
     out_b_norm = rhs_full_cached.norm();
     return residual.norm();
@@ -3122,6 +4400,139 @@ void MagneticFieldAnalyzer::buildInterpolationWeights(
     }
 }
 
+void MagneticFieldAnalyzer::buildInterpolationWeightsPolar(
+    int i_r, int j_theta, int fine_idx,
+    std::vector<Eigen::Triplet<double>>& triplets)
+{
+    // Polar version of buildInterpolationWeights, matching bilinearInterpolateFromCoarsePolar.
+    // Row = theta direction (j_theta), column = r direction (i_r).
+    // fine_idx must be set by caller (polar: i_r * ntheta + j_theta).
+
+    bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    int locality_radius = max_coarsen_skip + 1;
+    auto hasLocalActive = [&](int row, int col) -> bool {
+        int lo = std::max(0, col - locality_radius);
+        int hi = std::min(nr - 1, col + locality_radius);
+        for (int ii = lo; ii <= hi; ii++) {
+            if (active_cells(row, ii)) return true;
+        }
+        return false;
+    };
+
+    // Step 1: Find enclosing theta-rows
+    int j_bot = -1, j_top = -1;
+    for (int jj = j_theta; jj >= 0; jj--) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+    }
+    if (j_bot < 0 && theta_periodic) {
+        for (int jj = ntheta - 1; jj > j_theta; jj--) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_bot = jj; break; }
+        }
+    }
+    for (int jj = j_theta + 1; jj < ntheta; jj++) {
+        if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+    }
+    if (j_top < 0 && theta_periodic) {
+        for (int jj = 0; jj < j_theta; jj++) {
+            if (active_row_flags[jj] && hasLocalActive(jj, i_r)) { j_top = jj; break; }
+        }
+    }
+    if (j_top < 0 && j_bot >= 0) j_top = j_bot;
+    if (j_bot < 0) return;
+
+    // Compute fy
+    double fy = 0.0;
+    if (j_top != j_bot) {
+        if (j_bot <= j_theta && j_top > j_theta) {
+            fy = double(j_theta - j_bot) / double(j_top - j_bot);
+        } else if (theta_periodic && j_bot > j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = (ntheta - j_bot) + j_theta;
+            fy = double(dist_from_bot) / double(dist_total);
+        } else if (theta_periodic && j_top < j_theta) {
+            int dist_total = (ntheta - j_bot) + j_top;
+            int dist_from_bot = j_theta - j_bot;
+            fy = double(dist_from_bot) / double(dist_total);
+        }
+    }
+
+    // Step 2: Find r-columns active on BOTH rows
+    int il = -1, ir_col = -1;
+    for (int ii = i_r; ii >= 0; ii--) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            il = ii; break;
+        }
+    }
+    for (int ii = i_r + 1; ii < nr; ii++) {
+        if (active_cells(j_bot, ii) && (j_top == j_bot || active_cells(j_top, ii))) {
+            ir_col = ii; break;
+        }
+    }
+
+    // Compute fx
+    double fx = 0.0;
+    if (il >= 0 && ir_col >= 0 && il != ir_col && il <= i_r && ir_col > i_r) {
+        fx = double(i_r - il) / double(ir_col - il);
+    }
+
+    // Step 3: 4-corner bilinear weights
+    if (il >= 0 && ir_col >= 0 && j_bot >= 0 && j_top >= 0) {
+        auto it_bl = fine_to_coarse.find({il,     j_bot});
+        auto it_br = fine_to_coarse.find({ir_col, j_bot});
+        auto it_tl = fine_to_coarse.find({il,     j_top});
+        auto it_tr = fine_to_coarse.find({ir_col, j_top});
+
+        if (it_bl != fine_to_coarse.end() && it_br != fine_to_coarse.end() &&
+            it_tl != fine_to_coarse.end() && it_tr != fine_to_coarse.end()) {
+            double w_bl = (1.0 - fx) * (1.0 - fy);
+            double w_br = fx * (1.0 - fy);
+            double w_tl = (1.0 - fx) * fy;
+            double w_tr = fx * fy;
+            if (w_bl > 1e-15) triplets.push_back({fine_idx, it_bl->second, w_bl});
+            if (w_br > 1e-15) triplets.push_back({fine_idx, it_br->second, w_br});
+            if (w_tl > 1e-15) triplets.push_back({fine_idx, it_tl->second, w_tl});
+            if (w_tr > 1e-15) triplets.push_back({fine_idx, it_tr->second, w_tr});
+            return;
+        }
+    }
+
+    // Fallback: 1D theta interpolation if only one r-column found
+    if (il >= 0 && j_bot >= 0 && j_top >= 0 && j_top != j_bot) {
+        auto it_b = fine_to_coarse.find({il, j_bot});
+        auto it_t = fine_to_coarse.find({il, j_top});
+        if (it_b != fine_to_coarse.end() && it_t != fine_to_coarse.end()) {
+            triplets.push_back({fine_idx, it_b->second, 1.0 - fy});
+            triplets.push_back({fine_idx, it_t->second, fy});
+            return;
+        }
+    }
+
+    // Last fallback: nearest active neighbor (theta-periodic-aware)
+    double min_dist = std::numeric_limits<double>::max();
+    int nearest_coarse_idx = -1;
+    for (int dj = -1; dj <= 1; dj++) {
+        for (int di = -1; di <= 1; di++) {
+            int ni = i_r + di;
+            int nj = j_theta + dj;
+            if (theta_periodic) { nj = ((nj % ntheta) + ntheta) % ntheta; }
+            if (ni >= 0 && ni < nr && nj >= 0 && nj < ntheta && active_cells(nj, ni)) {
+                double dist = std::sqrt(double(di * di + dj * dj));
+                if (dist < min_dist) {
+                    auto it = fine_to_coarse.find({ni, nj});
+                    if (it != fine_to_coarse.end()) {
+                        min_dist = dist;
+                        nearest_coarse_idx = it->second;
+                    }
+                }
+            }
+        }
+    }
+    if (nearest_coarse_idx >= 0) {
+        triplets.push_back({fine_idx, nearest_coarse_idx, 1.0});
+    }
+}
+
 void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
     std::vector<Eigen::Triplet<double>>& triplets)
 {
@@ -3132,13 +4543,8 @@ void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
         for (int j_theta = 0; j_theta < ntheta; j_theta++) {
             int fine_idx = i_r * ntheta + j_theta;
 
-            // Check active_cells with orientation-aware indexing
-            bool is_active;
-            if (r_orientation == "horizontal") {
-                is_active = active_cells(j_theta, i_r);
-            } else {
-                is_active = active_cells(i_r, j_theta);
-            }
+            // active_cells is ALWAYS (ntheta, nr) = (j_theta, i_r) regardless of r_orientation
+            bool is_active = active_cells(j_theta, i_r);
 
             if (is_active) {
                 // Active cell: injection (weight = 1.0)
@@ -3147,70 +4553,8 @@ void MagneticFieldAnalyzer::buildProlongationMatrixPolar(
                     triplets.push_back({fine_idx, it->second, 1.0});
                 }
             } else {
-                // Inactive cell: interpolation from surrounding active cells
-                // Find neighbors in r and theta directions
-                int i_inner = findNextActiveRadial(i_r, j_theta, -1);
-                int i_outer = findNextActiveRadial(i_r, j_theta, +1);
-                int j_prev = findNextActiveTheta(i_r, j_theta, -1);
-                int j_next = findNextActiveTheta(i_r, j_theta, +1);
-
-                auto it_inner = fine_to_coarse.find({i_inner, j_theta});
-                auto it_outer = fine_to_coarse.find({i_outer, j_theta});
-                auto it_prev = fine_to_coarse.find({i_r, j_prev});
-                auto it_next = fine_to_coarse.find({i_r, j_next});
-
-                bool have_r = (it_inner != fine_to_coarse.end() && it_outer != fine_to_coarse.end() &&
-                               i_inner != i_outer);
-                bool have_theta = (it_prev != fine_to_coarse.end() && it_next != fine_to_coarse.end() &&
-                                   j_prev != j_next);
-
-                if (have_r && have_theta) {
-                    // Bilinear in r-theta
-                    double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
-                    double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-
-                    triplets.push_back({fine_idx, it_inner->second, 0.5 * (1.0 - fr)});
-                    triplets.push_back({fine_idx, it_outer->second, 0.5 * fr});
-                    triplets.push_back({fine_idx, it_prev->second, 0.5 * (1.0 - ft)});
-                    triplets.push_back({fine_idx, it_next->second, 0.5 * ft});
-                } else if (have_r) {
-                    double fr = (i_outer > i_inner) ? double(i_r - i_inner) / double(i_outer - i_inner) : 0.5;
-                    triplets.push_back({fine_idx, it_inner->second, 1.0 - fr});
-                    triplets.push_back({fine_idx, it_outer->second, fr});
-                } else if (have_theta) {
-                    double ft = calculateThetaInterpolationWeight(j_theta, j_prev, j_next);
-                    triplets.push_back({fine_idx, it_prev->second, 1.0 - ft});
-                    triplets.push_back({fine_idx, it_next->second, ft});
-                } else {
-                    // Fallback: nearest active neighbor
-                    double min_dist = std::numeric_limits<double>::max();
-                    int nearest_coarse_idx = -1;
-
-                    for (int di = -2; di <= 2; di++) {
-                        for (int dj = -2; dj <= 2; dj++) {
-                            int ni = i_r + di;
-                            int nj = (j_theta + dj + ntheta) % ntheta;
-                            if (ni >= 0 && ni < nr) {
-                                bool neighbor_active = (r_orientation == "horizontal") ?
-                                    active_cells(nj, ni) : active_cells(ni, nj);
-                                if (neighbor_active) {
-                                    double dist = std::sqrt(di * di + dj * dj);
-                                    if (dist < min_dist) {
-                                        auto it = fine_to_coarse.find({ni, nj});
-                                        if (it != fine_to_coarse.end()) {
-                                            min_dist = dist;
-                                            nearest_coarse_idx = it->second;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (nearest_coarse_idx >= 0) {
-                        triplets.push_back({fine_idx, nearest_coarse_idx, 1.0});
-                    }
-                }
+                // Inactive cell: 4-corner bilinear weights (matching bilinearInterpolateFromCoarsePolar)
+                buildInterpolationWeightsPolar(i_r, j_theta, fine_idx, triplets);
             }
         }
     }
@@ -3251,6 +4595,11 @@ void MagneticFieldAnalyzer::buildProlongationMatrix() {
 
     // R = P^T (Galerkin restriction for symmetric A)
     R_restriction = P_prolongation.transpose();
+
+    // Sync CSR copies for OpenMP-parallel SpMV.
+    // Built once per coarsening geometry change.
+    P_prolongation_csr = P_prolongation;
+    R_restriction_csr  = R_restriction;
 
     multigrid_operators_built = true;
 
@@ -3583,10 +4932,10 @@ Eigen::VectorXd MagneticFieldAnalyzer::matrixFreeJv(
     double eps = std::sqrt(std::numeric_limits<double>::epsilon()) *
                  (1.0 + x_norm) / (v_norm + 1e-12);
 
-    // Prolongate x_c and (x_c + eps*v_c) to full grid
+    // Prolongate x_c and (x_c + eps*v_c) to full grid  (parallel SpMV)
     Eigen::VectorXd x_c_plus = x_c + eps * v_c;
-    Eigen::VectorXd Az_full = P_prolongation * x_c;
-    Eigen::VectorXd Az_full_eps = P_prolongation * x_c_plus;
+    Eigen::VectorXd Az_full     = parallelSpMV(P_prolongation_csr, x_c);
+    Eigen::VectorXd Az_full_eps = parallelSpMV(P_prolongation_csr, x_c_plus);
 
     // Compute B/H/μ for both states
     Eigen::MatrixXd mu_full, Bx_full, By_full, H_full;
@@ -3602,8 +4951,8 @@ Eigen::VectorXd MagneticFieldAnalyzer::matrixFreeJv(
     // Finite difference approximation of Jacobian action
     Eigen::VectorXd Jv_full = (F_full_eps - F_full) / eps;
 
-    // Restrict to coarse grid: J_c * v = R * (J_full * P * v) ≈ R * Jv_full
-    return R_restriction * Jv_full;
+    // Restrict to coarse grid: J_c * v = R * (J_full * P * v) ≈ R * Jv_full  (parallel SpMV)
+    return parallelSpMV(R_restriction_csr, Jv_full);
 }
 
 /**
@@ -4194,18 +5543,22 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
     bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    // Periodic boundary detection messages (commented out to reduce log verbosity)
-    // if (x_periodic) {
-    //     std::cout << "Periodic boundary detected in X direction (left-right)" << std::endl;
-    // }
-    // if (y_periodic) {
-    //     std::cout << "Periodic boundary detected in Y direction (bottom-top)" << std::endl;
-    // }
+    // Build equation for each grid point.
+    // Thread-local triplets are merged after the loop; rhs(idx) writes are unique per idx.
+    // flat k = j*nx+i for MSVC OpenMP 2.0 compatibility.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(5 * n / (1 + nth) + 16);
 
-    // Build equation for each grid point
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
-            int idx = j * nx + i;
+    #pragma omp for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
+        int idx = k;
 
             bool is_left = (i == 0);
             bool is_right = (i == nx - 1);
@@ -4214,19 +5567,19 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
             // Dirichlet boundary conditions (skip if periodic)
             if (is_left && bc_left.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_left.value;
                 continue;
             } else if (is_right && bc_right.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_right.value;
                 continue;
             } else if (is_bottom && bc_bottom.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_bottom.value;
                 continue;
             } else if (is_top && bc_top.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_top.value;
                 continue;
             }
@@ -4239,8 +5592,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_left.alpha;
                 double b = bc_left.beta;
                 double g = bc_left.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx + 1, -b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx + 1, -b/dx));
                 rhs(idx) = g;
                 continue;
             }
@@ -4251,8 +5604,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_right.alpha;
                 double b = bc_right.beta;
                 double g = bc_right.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx - 1, -b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dx));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx - 1, -b/dx));
                 rhs(idx) = g;
                 continue;
             }
@@ -4263,8 +5616,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_bottom.alpha;
                 double b = bc_bottom.beta;
                 double g = bc_bottom.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx + nx, -b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx + nx, -b/dy));
                 rhs(idx) = g;
                 continue;
             }
@@ -4275,8 +5628,8 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
                 double a = bc_top.alpha;
                 double b = bc_top.beta;
                 double g = bc_top.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
-                triplets.push_back(Eigen::Triplet<double>(idx, idx - nx, -b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dy));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx - nx, -b/dy));
                 rhs(idx) = g;
                 continue;
             }
@@ -4310,7 +5663,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!left_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_west, coeff_west));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_west, coeff_west));
                 } else {
                     // Left neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_west * bc_left.value;
@@ -4333,7 +5686,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!right_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_east, coeff_east));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_east, coeff_east));
                 } else {
                     // Right neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_east * bc_right.value;
@@ -4367,7 +5720,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!bottom_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_south, coeff_south));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_south, coeff_south));
                 } else {
                     // Bottom neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_south * bc_bottom.value;
@@ -4390,7 +5743,7 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 
                 if (!top_neighbor_is_dirichlet) {
                     // Normal interior-interior or periodic coupling
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx_north, coeff_north));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx_north, coeff_north));
                 } else {
                     // Top neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= coeff_north * bc_top.value;
@@ -4399,13 +5752,19 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
             }
 
             // Center coefficient
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
-            // Right-hand side (current density)
+            // Right-hand side (current density + magnetization equivalent current)
+            // Jz_mag_map = dMy/dx - dMx/dy (equivalent current from magnetization)
             // Use += to preserve any accumulated Dirichlet boundary contributions
-            rhs(idx) += -jz_map(j, i);
+            rhs(idx) += -(jz_map(j, i) + Jz_mag_map(j, i));
+        }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
         }
-    }
+    }  // end omp parallel
 
     // Construct sparse matrix
     A.setFromTriplets(triplets.begin(), triplets.end());
@@ -4640,8 +5999,10 @@ void MagneticFieldAnalyzer::calculateMagneticField() {
     bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
     bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
 
-    for (int j = 0; j < ny; j++) {
-        for (int i = 0; i < nx; i++) {
+    // flat k = j*nx+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < ny * nx; k++) {
+        int j = k / nx, i = k % nx;
             // Bx = ∂Az/∂y
             if (j == 0) {
                 if (y_periodic) {
@@ -4685,10 +6046,7 @@ void MagneticFieldAnalyzer::calculateMagneticField() {
                 // Central difference
                 By(j, i) = -(Az(j, i+1) - Az(j, i-1)) / (2.0 * dx);
             }
-        }
     }
-
-    // std::cout << "Magnetic field calculated" << std::endl;
 }
 
 // ===== Helper methods for periodic boundary-aware filtering =====
@@ -4879,11 +6237,8 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
     } else {
         // Incremental update: slide cached boundaries + recompute border regions
         std::cout << "Boundaries: Incremental update (slide + border recompute)" << std::endl;
-        std::cout << "[DEBUG] Starting incremental boundary detection..." << std::endl;
-
         boundaries = cached_boundaries.clone();
         int shift = transient_config.slide_pixels_per_step;
-        std::cout << "[DEBUG] shift = " << shift << std::endl;
 
         if (transient_config.slide_direction == "vertical") {
             // Vertical slide: shift rows (y direction)
@@ -5266,10 +6621,10 @@ void MagneticFieldAnalyzer::calculateMaxwellStress(int step) {
     double theta_offset = 0.0;
 
     // DEBUG: Print all conditions
-    std::cout << "DEBUG calculateMaxwellStress: step=" << step
-              << ", coord_sys=" << coordinate_system
-              << ", transient.enabled=" << (transient_config.enabled ? "true" : "false")
-              << ", transient.enable_sliding=" << (transient_config.enable_sliding ? "true" : "false") << std::endl;
+    // std::cout << "DEBUG calculateMaxwellStress: step=" << step
+    //           << ", coord_sys=" << coordinate_system
+    //           << ", transient.enabled=" << (transient_config.enabled ? "true" : "false")
+    //           << ", transient.enable_sliding=" << (transient_config.enable_sliding ? "true" : "false") << std::endl;
 
     if (coordinate_system == "polar" && step >= 0 && transient_config.enabled && transient_config.enable_sliding) {
         theta_offset = step * transient_config.slide_pixels_per_step * dtheta;
@@ -8493,23 +9848,35 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
     bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
     double periodic_sign = is_antiperiodic ? -1.0 : 1.0;  // Sign for coupling across theta boundary
 
-    // Build equation for each grid point
-    for (int i = 0; i < nr; i++) {  // Radial direction
-        for (int j = 0; j < ntheta; j++) {  // Angular direction
-            int idx = i * ntheta + j;
+    // Build equation for each grid point.
+    // Thread-local triplets merged via critical section; rhs(idx) writes unique per idx.
+    // flat k = i*ntheta+j for MSVC OpenMP 2.0 compatibility.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(7 * n / (1 + nth) + 16);
+
+    #pragma omp for schedule(static)
+    for (int k = 0; k < nr * ntheta; k++) {  // Flat loop: radial × angular
+        int i = k / ntheta, j = k % ntheta;
+        int idx = k;
             double r = r_coords[i];
 
             // Angular boundary conditions (only for non-periodic boundaries)
             if (!is_periodic) {
                 // Handle theta_min boundary (j == 0)
                 if (j == 0 && bc_theta_min.type == "dirichlet") {
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                     rhs(idx) = bc_theta_min.value;
                     continue;
                 }
                 // Handle theta_max boundary (j == ntheta - 1)
                 if (j == ntheta - 1 && bc_theta_max.type == "dirichlet") {
-                    triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                     rhs(idx) = bc_theta_max.value;
                     continue;
                 }
@@ -8518,13 +9885,13 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             // Radial boundary conditions (Dirichlet only handled here)
             // Neumann boundaries use ghost-elimination in interior stencil below
             if (i == 0 && bc_inner.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_inner.value;
                 continue;
             }
 
             if (i == nr - 1 && bc_outer.type == "dirichlet") {
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
                 rhs(idx) = bc_outer.value;
                 continue;
             }
@@ -8537,8 +9904,8 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 double a = bc_inner.alpha;
                 double b = bc_inner.beta;
                 double g = bc_inner.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
                 rhs(idx) = g;
                 continue;
             }
@@ -8550,8 +9917,8 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 double a = bc_outer.alpha;
                 double b = bc_outer.beta;
                 double g = bc_outer.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
                 rhs(idx) = g;
                 continue;
             }
@@ -8597,17 +9964,17 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                     std::cerr << "Warning: r_imh <= 0 at inner Neumann BC (r=" << r << "), using mirror approximation" << std::endl;
                     double r_imh_eff = r_iph;  // Mirror approximation
                     double a_im_eff = r_imh_eff / (mu_inner * dr * dr);
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im_eff + a_ip));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im_eff + a_ip));
                     coeff_center -= (a_im_eff + a_ip);
                 } else {
                     // Standard ghost elimination
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im + a_ip));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im + a_ip));
                     coeff_center -= (a_im + a_ip);
                 }
             } else if (i == nr - 1 && bc_outer.type == "neumann") {
                 // Ghost elimination: Az_{nr} = Az_{nr-2}
                 // Stencil: a_im·Az_{nr-2} + a_ip·Az_{nr} → (a_im + a_ip)·Az_{nr-2}
-                triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im + a_ip));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im + a_ip));
                 coeff_center -= (a_im + a_ip);
             } else {
                 // Standard interior stencil
@@ -8616,14 +9983,14 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 bool outer_neighbor_is_dirichlet = (i == nr - 2) && (bc_outer.type == "dirichlet");
 
                 if (!inner_neighbor_is_dirichlet) {
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
                 } else {
                     // Inner neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= a_im * bc_inner.value;
                 }
 
                 if (!outer_neighbor_is_dirichlet) {
-                    triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
+                    local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
                 } else {
                     // Outer neighbor is Dirichlet: move bc value to RHS
                     rhs(idx) -= a_ip * bc_outer.value;
@@ -8674,7 +10041,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             if (!theta_prev_is_dirichlet) {
                 double sign = prev_crosses_boundary ? periodic_sign : 1.0;
-                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, sign * coeff_theta_prev));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, sign * coeff_theta_prev));
             } else {
                 // Theta_min neighbor is Dirichlet: move bc value to RHS
                 rhs(idx) -= coeff_theta_prev * bc_theta_min.value;
@@ -8682,7 +10049,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             if (!theta_next_is_dirichlet) {
                 double sign = next_crosses_boundary ? periodic_sign : 1.0;
-                triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, sign * coeff_theta_next));
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, sign * coeff_theta_next));
             } else {
                 // Theta_max neighbor is Dirichlet: move bc value to RHS
                 rhs(idx) -= coeff_theta_next * bc_theta_max.value;
@@ -8691,14 +10058,20 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             coeff_center -= (coeff_theta_prev + coeff_theta_next);
 
             // Center coefficient
-            triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
+            local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
-            // Right-hand side (current density)
-            // After r-weighting: RHS becomes -r·Jz
+            // Right-hand side (current density + magnetization equivalent current)
+            // After r-weighting: RHS becomes -r·(Jz + Jz_mag)
+            // Jz_mag_map = polar curl of M (1/r·d(r·Mθ)/dr - 1/r·dMr/dθ)
             // Use += to preserve any accumulated Dirichlet boundary contributions
-            rhs(idx) += -getJzPolar(jz_map, i, j, r_orientation) * r;
+            rhs(idx) += -(getJzPolar(jz_map, i, j, r_orientation) + getJzPolar(Jz_mag_map, i, j, r_orientation)) * r;
+        }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
         }
-    }
+    }  // end omp parallel
 
     // Check for potential singularity (all-Neumann + periodic case)
     // In this case, the solution is only defined up to a constant
@@ -8844,7 +10217,18 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
     bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
     double periodic_sign = is_antiperiodic ? -1.0 : 1.0;
 
-    // Build equation for each active cell
+    // Build equation for each active cell.
+    // Thread-local triplets merged via critical section; rhs(idx) writes unique per idx.
+    #pragma omp parallel
+    {
+        std::vector<Eigen::Triplet<double>> local_triplets;
+        int nth = 1;
+        #ifdef _OPENMP
+        nth = omp_get_num_threads();
+        #endif
+        local_triplets.reserve(7 * n_active_cells / (1 + nth) + 16);
+
+    #pragma omp for schedule(static)
     for (int idx = 0; idx < n_active_cells; idx++) {
         auto [i_r, j_theta] = coarse_to_fine[idx];  // {r, theta} order
         double r = r_coords[i_r];
@@ -8852,12 +10236,12 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         // Angular boundary conditions (non-periodic only)
         if (!is_periodic) {
             if (j_theta == 0 && bc_theta_min.type == "dirichlet") {
-                triplets.push_back({idx, idx, 1.0});
+                local_triplets.push_back({idx, idx, 1.0});
                 rhs(idx) = bc_theta_min.value;
                 continue;
             }
             if (j_theta == ntheta - 1 && bc_theta_max.type == "dirichlet") {
-                triplets.push_back({idx, idx, 1.0});
+                local_triplets.push_back({idx, idx, 1.0});
                 rhs(idx) = bc_theta_max.value;
                 continue;
             }
@@ -8865,12 +10249,12 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
 
         // Radial boundary conditions (Dirichlet)
         if (i_r == 0 && bc_inner.type == "dirichlet") {
-            triplets.push_back({idx, idx, 1.0});
+            local_triplets.push_back({idx, idx, 1.0});
             rhs(idx) = bc_inner.value;
             continue;
         }
         if (i_r == nr - 1 && bc_outer.type == "dirichlet") {
-            triplets.push_back({idx, idx, 1.0});
+            local_triplets.push_back({idx, idx, 1.0});
             rhs(idx) = bc_outer.value;
             continue;
         }
@@ -8886,8 +10270,8 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             auto it_next = fine_to_coarse.find({i_next, j_theta});
             if (it_next != fine_to_coarse.end()) {
                 double h_plus = (i_next - i_r) * dr;
-                triplets.push_back({idx, idx, a + b/h_plus});
-                triplets.push_back({idx, it_next->second, -b/h_plus});
+                local_triplets.push_back({idx, idx, a + b/h_plus});
+                local_triplets.push_back({idx, it_next->second, -b/h_plus});
             }
             rhs(idx) = g;
             continue;
@@ -8902,8 +10286,8 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             auto it_prev = fine_to_coarse.find({i_prev, j_theta});
             if (it_prev != fine_to_coarse.end()) {
                 double h_minus = (i_r - i_prev) * dr;
-                triplets.push_back({idx, idx, a + b/h_minus});
-                triplets.push_back({idx, it_prev->second, -b/h_minus});
+                local_triplets.push_back({idx, idx, a + b/h_minus});
+                local_triplets.push_back({idx, it_prev->second, -b/h_minus});
             }
             rhs(idx) = g;
             continue;
@@ -8942,9 +10326,17 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         double r_imh = r - h_minus / 2.0;  // r_{i-1/2}
         double r_iph = r + h_plus / 2.0;   // r_{i+1/2}
 
-        // Interface permeabilities
-        double mu_inner_r = getMuAtInterfacePolar(i_r - 0.5, j_theta, "r");
-        double mu_outer_r = getMuAtInterfacePolar(i_r + 0.5, j_theta, "r");
+        // Interface permeabilities (harmonic mean of ACTIVE cells only)
+        // getMuAtInterfacePolar(i_r ± 0.5) uses fine-grid neighbors (i_r ± 1) which
+        // are INACTIVE cells with μ reset to H=0 value (e.g. μ_r=5000) by
+        // interpolateMuToFullGrid(). This causes wrong FVM coefficients and prevents
+        // convergence. Use harmonic mean between the two ACTIVE cells instead,
+        // consistent with how the theta-direction interfaces are computed.
+        double mu_center_r = getMuPolar(mu_map, i_r,    j_theta, r_orientation);
+        double mu_prev_r   = getMuPolar(mu_map, i_prev,  j_theta, r_orientation);
+        double mu_next_r   = getMuPolar(mu_map, i_next,  j_theta, r_orientation);
+        double mu_inner_r = 2.0 / (1.0/mu_center_r + 1.0/mu_prev_r);
+        double mu_outer_r = 2.0 / (1.0/mu_center_r + 1.0/mu_next_r);
 
         // Non-uniform FDM radial coefficients: 2 * r_face / (μ · h_r · (h_minus + h_plus))
         double a_im = 2.0 * r_imh / (mu_inner_r * h_minus * (h_minus + h_plus));
@@ -8958,20 +10350,20 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
                 double a_im_eff = 2.0 * r_imh_eff / (mu_inner_r * h_plus * (h_minus + h_plus));
                 auto it_next = fine_to_coarse.find({i_next, j_theta});
                 if (it_next != fine_to_coarse.end()) {
-                    triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
+                    local_triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
                 }
                 coeff_center -= (a_im_eff + a_ip);
             } else {
                 auto it_next = fine_to_coarse.find({i_next, j_theta});
                 if (it_next != fine_to_coarse.end()) {
-                    triplets.push_back({idx, it_next->second, a_im + a_ip});
+                    local_triplets.push_back({idx, it_next->second, a_im + a_ip});
                 }
                 coeff_center -= (a_im + a_ip);
             }
         } else if (i_r == nr - 1 && bc_outer.type == "neumann") {
             auto it_prev = fine_to_coarse.find({i_prev, j_theta});
             if (it_prev != fine_to_coarse.end()) {
-                triplets.push_back({idx, it_prev->second, a_im + a_ip});
+                local_triplets.push_back({idx, it_prev->second, a_im + a_ip});
             }
             coeff_center -= (a_im + a_ip);
         } else {
@@ -8983,13 +10375,13 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             auto it_next = fine_to_coarse.find({i_next, j_theta});
 
             if (!inner_neighbor_is_dirichlet && it_prev != fine_to_coarse.end()) {
-                triplets.push_back({idx, it_prev->second, a_im});
+                local_triplets.push_back({idx, it_prev->second, a_im});
             } else if (inner_neighbor_is_dirichlet) {
                 rhs(idx) -= a_im * bc_inner.value;
             }
 
             if (!outer_neighbor_is_dirichlet && it_next != fine_to_coarse.end()) {
-                triplets.push_back({idx, it_next->second, a_ip});
+                local_triplets.push_back({idx, it_next->second, a_ip});
             } else if (outer_neighbor_is_dirichlet) {
                 rhs(idx) -= a_ip * bc_outer.value;
             }
@@ -9017,50 +10409,60 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
                 ((j_theta == 0 && j_prev_theta > j_theta) ||
                  (j_theta > 0 && j_prev_theta > j_theta));
             double sign = crosses_boundary ? periodic_sign : 1.0;
-            triplets.push_back({idx, it_theta_prev->second, sign * a_theta_m});
+            local_triplets.push_back({idx, it_theta_prev->second, sign * a_theta_m});
         }
         if (it_theta_next != fine_to_coarse.end()) {
             bool crosses_boundary = is_periodic &&
                 ((j_theta == ntheta-1 && j_next_theta < j_theta) ||
                  (j_theta < ntheta-1 && j_next_theta < j_theta));
             double sign = crosses_boundary ? periodic_sign : 1.0;
-            triplets.push_back({idx, it_theta_next->second, sign * a_theta_p});
+            local_triplets.push_back({idx, it_theta_next->second, sign * a_theta_p});
         }
         coeff_center -= (a_theta_m + a_theta_p);
 
         // Center coefficient
-        triplets.push_back({idx, idx, coeff_center});
+        local_triplets.push_back({idx, idx, coeff_center});
 
         // Source term: -Jz * r (r-weighted, no area scaling for FDM)
         double jz = getJzPolar(jz_map, i_r, j_theta, r_orientation);
         rhs(idx) -= jz * r;
-    }
+    }  // end omp for
+
+        #pragma omp critical
+        {
+            triplets.insert(triplets.end(), local_triplets.begin(), local_triplets.end());
+        }
+    }  // end omp parallel
 
     A.setFromTriplets(triplets.begin(), triplets.end());
 }
 
 void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
-    std::cout << "\n=== Building polar coarsened FDM system ===" << std::endl;
+    std::cout << "\n=== Building polar coarsened system (Galerkin: A_c = P^T * A_f * P) ===" << std::endl;
     std::cout << "Active cells: " << n_active_cells << " / " << (nr * ntheta)
               << " (reduction: " << std::fixed << std::setprecision(1)
               << (100.0 * (1.0 - double(n_active_cells) / (nr * ntheta))) << "%)" << std::endl;
 
     Eigen::SparseMatrix<double> A;
     Eigen::VectorXd rhs;
-    buildMatrixPolarCoarsened(A, rhs);
 
-    std::cout << "Coarsened matrix size: " << A.rows() << "x" << A.cols() << std::endl;
+    // Use Galerkin projection instead of geometric coarsened matrix.
+    // buildMatrixGalerkin() auto-dispatches to Polar via updateFullMatrixCache()
+    // → buildMatrixPolar() and buildProlongationMatrix() → buildProlongationMatrixPolar().
+    buildMatrixGalerkin(A, rhs);
+
+    std::cout << "Galerkin matrix size: " << A.rows() << "x" << A.cols() << std::endl;
     std::cout << "Non-zero elements: " << A.nonZeros() << std::endl;
 
-    // Check matrix symmetry
+    // Verify matrix symmetry (should always pass with Galerkin)
     Eigen::SparseMatrix<double> A_T = A.transpose();
     double symmetry_error = (A - A_T).norm();
     double A_norm = A.norm();
     double relative_symmetry_error = (A_norm > 1e-12) ? (symmetry_error / A_norm) : symmetry_error;
 
-    std::cout << "Matrix symmetry: relative error = " << relative_symmetry_error << std::endl;
+    std::cout << "Galerkin matrix symmetry: relative error = " << relative_symmetry_error << std::endl;
     if (relative_symmetry_error > 1e-8) {
-        std::cerr << "Warning: Matrix not symmetric! Relative error = " << relative_symmetry_error << std::endl;
+        std::cerr << "Warning: Galerkin matrix not symmetric! Relative error = " << relative_symmetry_error << std::endl;
     }
 
     // Solve linear system
@@ -9078,6 +10480,7 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
 
     // Interpolate to full grid
     interpolateToFullGridPolar(Az_coarse);
+    smoothInactiveCells(coarsen_smooth_iterations);
     interpolateMuToFullGrid();
 
     std::cout << "Polar coarsened solve complete!" << std::endl;
@@ -9266,9 +10669,9 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
             triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
 
             // RHS: pure Cartesian formulation (no r-weighting)
-            // This gives a physically consistent pseudo-Cartesian approximation
+            // Include magnetization equivalent current Jz_mag
             // Use += to preserve any accumulated Dirichlet boundary contributions
-            rhs(idx) += -getJzPolar(jz_map, i, j, r_orientation);
+            rhs(idx) += -(getJzPolar(jz_map, i, j, r_orientation) + getJzPolar(Jz_mag_map, i, j, r_orientation));
         }
     }
 
@@ -9329,9 +10732,12 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
     bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
 
     // Calculate field components: Br = (1/r)∂Az/∂θ, Btheta = -∂Az/∂r
-    for (int i = 0; i < nr; i++) {
-        double r = r_coords[i];
-        for (int j = 0; j < ntheta; j++) {
+    // flat k = i*ntheta+j avoids collapse(2) for MSVC OpenMP 2.0 compatibility
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < nr * ntheta; k++) {
+        int i = k / ntheta, j = k % ntheta;
+        {
+            double r = r_coords[i];
             // Get Az values with proper indexing based on r_orientation
             auto getAz = [&](int r_idx, int theta_idx) -> double {
                 if (r_orientation == "horizontal") {
@@ -9419,7 +10825,7 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
         }
     }
 
-    // B magnitude diagnostics
+    // B magnitude diagnostics (sequential — uses reduction)
     double bmax = 0.0;
     for (int i=0;i<Br.rows();++i){
     for (int j=0;j<Br.cols();++j){
@@ -9609,6 +11015,12 @@ double MagneticFieldAnalyzer::evaluateJz(const JzValue& jz_val, int step, const 
                 vars.insert(user_var);
             }
 
+            // Predefined physical constant: mu0 (vacuum permeability = 4π×10⁻⁷ H/m)
+            te_variable mu0_var;
+            mu0_var.m_name = "mu0";
+            mu0_var.m_value = MU_0;
+            vars.insert(mu0_var);
+
             parser.set_variables_and_functions(vars);
 
             double result = parser.evaluate(jz_val.formula);
@@ -9728,6 +11140,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         multigrid_operators_built = false;
         precond_factorization_valid = false;
         full_matrix_cache_valid = false;
+    }
+
+    // Recompute magnetization grids (Mx_map, My_map, Jz_mag_map) for this step
+    // Required for transient/sliding cases where material positions change
+    if (!material_magnetization.empty()) {
+        computeMagnetizationGrids();
     }
 }
 
@@ -10074,9 +11492,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         int slide_start = transient_config.slide_region_start;
                         int slide_end = transient_config.slide_region_end;
 
-                        std::cout << "[DEBUG] Applying partial-region circular shift:" << std::endl;
-                        std::cout << "  Shift: " << shift_pixels << " pixels (theta direction)" << std::endl;
-                        std::cout << "  Region: r index " << slide_start << " to " << slide_end << std::endl;
+                        // std::cout << "[DEBUG] Applying partial-region circular shift:" << std::endl;
+                        // std::cout << "  Shift: " << shift_pixels << " pixels (theta direction)" << std::endl;
+                        // std::cout << "  Region: r index " << slide_start << " to " << slide_end << std::endl;
 
                         // r_orientation=horizontal: image x-axis (horizontal) -> r direction
                         // Slide region defined by image x-coordinate -> r index (ir)
@@ -10099,7 +11517,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                             }
                         }
                     } else {
-                        std::cout << "[DEBUG] Circular shift disabled" << std::endl;
+                        // std::cout << "[DEBUG] Circular shift disabled" << std::endl;
                         x_shifted = previous_solution;
                     }
 
@@ -10112,9 +11530,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         double sigma = 8.0;  // Gaussian σ (pixels) - optimal value
                         int buffer = 10;  // Buffer beyond slide_end
 
-                        std::cout << "[DEBUG] Applying Gaussian smoothing (r-direction only):" << std::endl;
-                        std::cout << "  Region: r=[" << slide_start << ", " << (slide_end + buffer) << "]" << std::endl;
-                        std::cout << "  σ=" << sigma << " pixels" << std::endl;
+                        // std::cout << "[DEBUG] Applying Gaussian smoothing (r-direction only):" << std::endl;
+                        // std::cout << "  Region: r=[" << slide_start << ", " << (slide_end + buffer) << "]" << std::endl;
+                        // std::cout << "  σ=" << sigma << " pixels" << std::endl;
 
                         // Create Gaussian kernel (1D, r-direction)
                         int kernel_radius = static_cast<int>(3 * sigma);  // 3σ coverage
@@ -10218,8 +11636,8 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     double r0_norm = r0.norm();
                     double rel_r0 = (rhs_norm > 1e-12) ? (r0_norm / rhs_norm) : r0_norm;
 
-                    std::cout << "[DEBUG] Warm-start quality:" << std::endl;
-                    std::cout << "  ||r0|| / ||b'|| = " << rel_r0 << std::endl;
+                    // std::cout << "[DEBUG] Warm-start quality:" << std::endl;
+                    // std::cout << "  ||r0|| / ||b'|| = " << rel_r0 << std::endl;
 
                     // Additional diagnostic: Check residual distribution
                     if (transient_config.enable_sliding && coordinate_system == "polar") {
@@ -10418,7 +11836,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         std::cout << "\n[INFO] CG did not converge, falling back to direct solver" << std::endl;
 
                         // Fallback to direct solver
-                        std::cout << "[DEBUG] Using direct solver fallback..." << std::endl;
+                        // std::cout << "[DEBUG] Using direct solver fallback..." << std::endl;
                         auto fallback_start = std::chrono::high_resolution_clock::now();
                         if (A.nonZeros() != transient_matrix_nnz) {
                             transient_solver.compute(A);
@@ -10429,7 +11847,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         Az_flat = transient_solver.solve(rhs);
                         auto fallback_end = std::chrono::high_resolution_clock::now();
                         auto fallback_time = std::chrono::duration_cast<std::chrono::milliseconds>(fallback_end - fallback_start);
-                        std::cout << "[DEBUG] Direct solver fallback complete, time=" << fallback_time.count() << " ms" << std::endl;
+                        // std::cout << "[DEBUG] Direct solver fallback complete, time=" << fallback_time.count() << " ms" << std::endl;
                     }
 
                     // Print total iterative solver time (including all preprocessing)
