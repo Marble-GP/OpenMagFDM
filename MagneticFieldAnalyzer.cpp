@@ -9973,7 +9973,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                 std::cout << "Step " << step+1 << ": Using AMGCL (AMG-preconditioned CG)..." << std::endl;
                 std::cout << "  (Problem size n=" << n << " > 100k threshold)" << std::endl;
 
-                std::cout << "[AMGCL] Using zero initial guess (warm-start prep disabled)" << std::endl;
+                std::cout << "[AMGCL] AR(1) linear extrapolation warm-start enabled" << std::endl;
 
                 // Start timing
                 auto amgcl_total_start = std::chrono::high_resolution_clock::now();
