@@ -22,13 +22,17 @@
 #include <tinyexpr.h>
 
 // AMGCL headers for advanced iterative solvers
-#include <amgcl/backend/eigen.hpp>
+// The `builtin` backend supports OpenMP-parallel SpMV / vector operations
+// inside CG and AMG smoothing. We switched from `backend::eigen` because the
+// latter is single-threaded. The crs_tuple adapter lets us feed
+// (rows, ptr, col, val) tuples derived from Eigen sparse matrices.
+#include <amgcl/backend/builtin.hpp>
+#include <amgcl/adapter/crs_tuple.hpp>
 #include <amgcl/make_solver.hpp>
 #include <amgcl/amg.hpp>
 #include <amgcl/coarsening/smoothed_aggregation.hpp>
 #include <amgcl/relaxation/spai0.hpp>
 #include <amgcl/solver/cg.hpp>
-#include <amgcl/adapter/eigen.hpp>
 
 #define SOLVER_TOLERANCE (1e-6)
 #define SOLVER_MAX_ITERATIONS (5000)

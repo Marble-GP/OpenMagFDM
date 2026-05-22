@@ -5779,34 +5779,49 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
     int n = A.rows();
 
     if (n > AMGCL_THRESHOLD) {
-        // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems
+        // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems.
+        // Uses backend::builtin (OpenMP-parallel SpMV + vector ops) so AMG hierarchy
+        // construction and CG iterations run multi-threaded.
         std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
 
         typedef amgcl::make_solver<
             amgcl::amg<
-                amgcl::backend::eigen<double>,
+                amgcl::backend::builtin<double>,
                 amgcl::coarsening::smoothed_aggregation,
                 amgcl::relaxation::spai0
             >,
-            amgcl::solver::cg<amgcl::backend::eigen<double>>
+            amgcl::solver::cg<amgcl::backend::builtin<double>>
         > AMGSolver;
 
+        // Convert Eigen sparse matrix to CRS arrays with ptrdiff_t indices
+        // (builtin backend uses ptrdiff_t, Eigen defaults to int — must copy).
         Eigen::SparseMatrix<double, Eigen::RowMajor> A_rm = A;
+        A_rm.makeCompressed();
+        ptrdiff_t rows = A_rm.rows();
+        std::vector<ptrdiff_t> ptr(A_rm.outerIndexPtr(), A_rm.outerIndexPtr() + rows + 1);
+        std::vector<ptrdiff_t> col(A_rm.innerIndexPtr(), A_rm.innerIndexPtr() + A_rm.nonZeros());
+        std::vector<double> val(A_rm.valuePtr(), A_rm.valuePtr() + A_rm.nonZeros());
+        auto A_crs = std::tie(rows, ptr, col, val);
 
         AMGSolver::params params;
         params.solver.tol     = SOLVER_TOLERANCE;
         params.solver.maxiter = SOLVER_MAX_ITERATIONS;
 
-        AMGSolver amg(A_rm, params);
+        AMGSolver amg(A_crs, params);
 
         // Warm-start: use previous solution as initial guess (especially useful in nonlinear iterations)
-        Eigen::VectorXd x = (initial_guess.size() == n) ? initial_guess
-                                                         : Eigen::VectorXd::Zero(n);
-        auto [iters, error] = amg(rhs, x);
+        std::vector<double> rhs_vec(rhs.data(), rhs.data() + n);
+        std::vector<double> x_vec(n, 0.0);
+        if (initial_guess.size() == n) {
+            std::copy(initial_guess.data(), initial_guess.data() + n, x_vec.begin());
+        }
+        auto [iters, error] = amg(rhs_vec, x_vec);
 
         std::cout << "  [AMGCL] " << iters << " iters, residual="
                   << std::scientific << std::setprecision(2) << error
                   << std::defaultfloat << std::endl;
+
+        Eigen::VectorXd x = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
         if (error > SOLVER_TOLERANCE * 1000) {
             std::cerr << "WARNING: AMGCL did not converge (error=" << error
@@ -11696,17 +11711,25 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     // Building the hierarchy fresh each step (~85-100 ms on Windows
                     // with AVX2) is currently the right trade-off.
 
-                    // Convert matrix to RowMajor for AMGCL
+                    // Convert Eigen sparse matrix to CRS arrays (ptrdiff_t indices)
+                    // for the OpenMP-parallel builtin backend.
                     Eigen::SparseMatrix<double, Eigen::RowMajor> A_rowmajor = A;
+                    A_rowmajor.makeCompressed();
+                    ptrdiff_t rows = A_rowmajor.rows();
+                    std::vector<ptrdiff_t> A_ptr(A_rowmajor.outerIndexPtr(), A_rowmajor.outerIndexPtr() + rows + 1);
+                    std::vector<ptrdiff_t> A_col(A_rowmajor.innerIndexPtr(), A_rowmajor.innerIndexPtr() + A_rowmajor.nonZeros());
+                    std::vector<double>    A_val(A_rowmajor.valuePtr(),       A_rowmajor.valuePtr()       + A_rowmajor.nonZeros());
+                    auto A_crs = std::tie(rows, A_ptr, A_col, A_val);
 
-                    // Define AMG preconditioner + CG solver with Eigen backend
+                    // Define AMG preconditioner + CG solver with builtin backend
+                    // (OpenMP-parallel SpMV, AMG smoothers, and CG vector ops).
                     typedef amgcl::make_solver<
                         amgcl::amg<
-                            amgcl::backend::eigen<double>,
+                            amgcl::backend::builtin<double>,
                             amgcl::coarsening::smoothed_aggregation,
                             amgcl::relaxation::spai0
                         >,
-                        amgcl::solver::cg<amgcl::backend::eigen<double>>
+                        amgcl::solver::cg<amgcl::backend::builtin<double>>
                     > AMGSolver;
 
                     // AMGCL solver parameters
@@ -11721,7 +11744,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
                     std::cout << "  Building AMG hierarchy..." << std::endl;
                     auto amg_build_start = std::chrono::high_resolution_clock::now();
-                    AMGSolver amg_solve(A_rowmajor, amg_params);
+                    AMGSolver amg_solve(A_crs, amg_params);
                     auto amg_build_end = std::chrono::high_resolution_clock::now();
                     auto amg_build_time = std::chrono::duration_cast<std::chrono::milliseconds>(amg_build_end - amg_build_start);
 
@@ -11747,25 +11770,30 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     // simply running AR(1) on the unshifted solutions, because
                     // CG convergence cares about A-norm of the error, not the
                     // residual L2 norm that shifts try to optimize.
-                    Eigen::VectorXd amg_solution;
+                    // AR(1) warm-start initial guess, materialised as std::vector<double>
+                    // because backend::builtin operates on raw double vectors.
+                    std::vector<double> x_vec(n, 0.0);
                     if (previous_previous_solution.size() == static_cast<Eigen::Index>(n)
                         && previous_solution.size() == static_cast<Eigen::Index>(n)) {
                         // AR(1): linear extrapolation in time
-                        amg_solution = 2.0 * previous_solution - previous_previous_solution;
+                        for (int i = 0; i < n; ++i) {
+                            x_vec[i] = 2.0 * previous_solution(i) - previous_previous_solution(i);
+                        }
                     } else if (previous_solution.size() == static_cast<Eigen::Index>(n)) {
                         // Only one history vector available — use it directly
-                        amg_solution = previous_solution;
-                    } else {
-                        // First step: no history
-                        amg_solution = Eigen::VectorXd::Zero(n);
+                        std::copy(previous_solution.data(), previous_solution.data() + n, x_vec.begin());
                     }
+                    std::vector<double> rhs_vec(rhs.data(), rhs.data() + n);
+
                     std::cout << "  Solving with AMG-CG..." << std::endl;
                     auto amg_solve_start = std::chrono::high_resolution_clock::now();
                     int amg_iters;
                     double amg_error;
-                    std::tie(amg_iters, amg_error) = amg_solve(rhs, amg_solution);
+                    std::tie(amg_iters, amg_error) = amg_solve(rhs_vec, x_vec);
                     auto amg_solve_end = std::chrono::high_resolution_clock::now();
                     auto amg_solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(amg_solve_end - amg_solve_start);
+
+                    Eigen::VectorXd amg_solution = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
                     std::cout << "\n  AMGCL Results:" << std::endl;
                     std::cout << "    AMG build time: " << amg_build_time.count() << " ms" << std::endl;
