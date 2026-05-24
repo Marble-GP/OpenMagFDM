@@ -623,9 +623,15 @@ private:
     bool nl_solver_pattern_valid_ = false;
     int nl_solver_last_n_ = 0;
 
-    // Threshold for switching from SparseLU to AMGCL (AMG-preconditioned CG)
-    // For 2D FDM Poisson, AMGCL is faster above ~170x170 grid (n > 30000)
-    static constexpr int AMGCL_THRESHOLD = 30000;
+    // Adaptive linear solver selection threshold.
+    // The original design called for direct (SparseLU) below ~10k DOFs and
+    // iterative (AMGCL) above; this restores that policy after the threshold
+    // drifted to 30k during the AMGCL migration. SparseLU's O(n^1.5) factor
+    // time wins for very small problems where AMG hierarchy build overhead
+    // dominates, while AMGCL with OpenMP-parallel builtin backend wins for
+    // anything bigger -- including the 250k-DOF Jacobians that show up
+    // inside Newton-Krylov outer iterations.
+    static constexpr int AMGCL_THRESHOLD = 10000;
 
     // Export field selection check (used by exportResults). Empty list = export all (backward compat).
     bool shouldExportField(const std::string& field_name) const;
