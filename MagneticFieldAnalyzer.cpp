@@ -9444,38 +9444,49 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
         double dV = dx * dy;  // [m²] per unit depth
         const int total_cells = rows * cols;
 
-        #pragma omp parallel for schedule(static) reduction(+:total_energy) reduction(max:max_coenergy_density)
-        for (int k = 0; k < total_cells; ++k) {
-            int j = k / cols;
-            int i = k % cols;
-            double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
-            double w;
-            if (need_image_lookup) {
-                cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
-                int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
-                auto lut_it = rgb_to_material.find(rgb_key);
-                const BHTable* bh = nullptr;
-                if (lut_it != rgb_to_material.end()) {
-                    auto bh_it = material_bh_tables.find(lut_it->second.name);
-                    if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
-                        bh = &bh_it->second;
+        // OpenMP 2.0 (the MSVC default with /openmp) does not support
+        // reduction(max:). Do per-thread accumulation into a local_max and
+        // combine in a critical section at the end of the team region.
+        #pragma omp parallel reduction(+:total_energy)
+        {
+            double local_max = 0.0;
+            #pragma omp for schedule(static) nowait
+            for (int k = 0; k < total_cells; ++k) {
+                int j = k / cols;
+                int i = k % cols;
+                double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
+                double w;
+                if (need_image_lookup) {
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                    int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                    auto lut_it = rgb_to_material.find(rgb_key);
+                    const BHTable* bh = nullptr;
+                    if (lut_it != rgb_to_material.end()) {
+                        auto bh_it = material_bh_tables.find(lut_it->second.name);
+                        if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                            bh = &bh_it->second;
+                        }
                     }
-                }
-                if (bh) {
-                    double H_mag = interpolateH_from_B(*bh, B_mag);
-                    w = integrateMagneticCoEnergy(*bh, H_mag);
+                    if (bh) {
+                        double H_mag = interpolateH_from_B(*bh, B_mag);
+                        w = integrateMagneticCoEnergy(*bh, H_mag);
+                    } else {
+                        double mu = mu_map(j, i);
+                        if (mu < 1e-20) mu = MU_0;
+                        w = B_mag * B_mag / (2.0 * mu);
+                    }
                 } else {
                     double mu = mu_map(j, i);
                     if (mu < 1e-20) mu = MU_0;
                     w = B_mag * B_mag / (2.0 * mu);
                 }
-            } else {
-                double mu = mu_map(j, i);
-                if (mu < 1e-20) mu = MU_0;
-                w = B_mag * B_mag / (2.0 * mu);
+                total_energy += w * dV;
+                if (w > local_max) local_max = w;
             }
-            total_energy += w * dV;
-            if (w > max_coenergy_density) max_coenergy_density = w;
+            #pragma omp critical
+            {
+                if (local_max > max_coenergy_density) max_coenergy_density = local_max;
+            }
         }
 
         std::cout << "  Grid size: " << rows << " x " << cols << std::endl;
