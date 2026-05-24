@@ -22,13 +22,17 @@
 #include <tinyexpr.h>
 
 // AMGCL headers for advanced iterative solvers
-#include <amgcl/backend/eigen.hpp>
+// The `builtin` backend supports OpenMP-parallel SpMV / vector operations
+// inside CG and AMG smoothing. We switched from `backend::eigen` because the
+// latter is single-threaded. The crs_tuple adapter lets us feed
+// (rows, ptr, col, val) tuples derived from Eigen sparse matrices.
+#include <amgcl/backend/builtin.hpp>
+#include <amgcl/adapter/crs_tuple.hpp>
 #include <amgcl/make_solver.hpp>
 #include <amgcl/amg.hpp>
 #include <amgcl/coarsening/smoothed_aggregation.hpp>
 #include <amgcl/relaxation/spai0.hpp>
 #include <amgcl/solver/cg.hpp>
-#include <amgcl/adapter/eigen.hpp>
 
 #define SOLVER_TOLERANCE (1e-6)
 #define SOLVER_MAX_ITERATIONS (5000)
@@ -619,9 +623,15 @@ private:
     bool nl_solver_pattern_valid_ = false;
     int nl_solver_last_n_ = 0;
 
-    // Threshold for switching from SparseLU to AMGCL (AMG-preconditioned CG)
-    // For 2D FDM Poisson, AMGCL is faster above ~170x170 grid (n > 30000)
-    static constexpr int AMGCL_THRESHOLD = 30000;
+    // Adaptive linear solver selection threshold.
+    // The original design called for direct (SparseLU) below ~10k DOFs and
+    // iterative (AMGCL) above; this restores that policy after the threshold
+    // drifted to 30k during the AMGCL migration. SparseLU's O(n^1.5) factor
+    // time wins for very small problems where AMG hierarchy build overhead
+    // dominates, while AMGCL with OpenMP-parallel builtin backend wins for
+    // anything bigger -- including the 250k-DOF Jacobians that show up
+    // inside Newton-Krylov outer iterations.
+    static constexpr int AMGCL_THRESHOLD = 10000;
 
     // Export field selection check (used by exportResults). Empty list = export all (backward compat).
     bool shouldExportField(const std::string& field_name) const;

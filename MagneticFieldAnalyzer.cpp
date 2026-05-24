@@ -5779,34 +5779,49 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
     int n = A.rows();
 
     if (n > AMGCL_THRESHOLD) {
-        // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems
+        // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems.
+        // Uses backend::builtin (OpenMP-parallel SpMV + vector ops) so AMG hierarchy
+        // construction and CG iterations run multi-threaded.
         std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
 
         typedef amgcl::make_solver<
             amgcl::amg<
-                amgcl::backend::eigen<double>,
+                amgcl::backend::builtin<double>,
                 amgcl::coarsening::smoothed_aggregation,
                 amgcl::relaxation::spai0
             >,
-            amgcl::solver::cg<amgcl::backend::eigen<double>>
+            amgcl::solver::cg<amgcl::backend::builtin<double>>
         > AMGSolver;
 
+        // Convert Eigen sparse matrix to CRS arrays with ptrdiff_t indices
+        // (builtin backend uses ptrdiff_t, Eigen defaults to int — must copy).
         Eigen::SparseMatrix<double, Eigen::RowMajor> A_rm = A;
+        A_rm.makeCompressed();
+        ptrdiff_t rows = A_rm.rows();
+        std::vector<ptrdiff_t> ptr(A_rm.outerIndexPtr(), A_rm.outerIndexPtr() + rows + 1);
+        std::vector<ptrdiff_t> col(A_rm.innerIndexPtr(), A_rm.innerIndexPtr() + A_rm.nonZeros());
+        std::vector<double> val(A_rm.valuePtr(), A_rm.valuePtr() + A_rm.nonZeros());
+        auto A_crs = std::tie(rows, ptr, col, val);
 
         AMGSolver::params params;
         params.solver.tol     = SOLVER_TOLERANCE;
         params.solver.maxiter = SOLVER_MAX_ITERATIONS;
 
-        AMGSolver amg(A_rm, params);
+        AMGSolver amg(A_crs, params);
 
         // Warm-start: use previous solution as initial guess (especially useful in nonlinear iterations)
-        Eigen::VectorXd x = (initial_guess.size() == n) ? initial_guess
-                                                         : Eigen::VectorXd::Zero(n);
-        auto [iters, error] = amg(rhs, x);
+        std::vector<double> rhs_vec(rhs.data(), rhs.data() + n);
+        std::vector<double> x_vec(n, 0.0);
+        if (initial_guess.size() == n) {
+            std::copy(initial_guess.data(), initial_guess.data() + n, x_vec.begin());
+        }
+        auto [iters, error] = amg(rhs_vec, x_vec);
 
         std::cout << "  [AMGCL] " << iters << " iters, residual="
                   << std::scientific << std::setprecision(2) << error
                   << std::defaultfloat << std::endl;
+
+        Eigen::VectorXd x = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
         if (error > SOLVER_TOLERANCE * 1000) {
             std::cerr << "WARNING: AMGCL did not converge (error=" << error
@@ -9394,6 +9409,21 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
 
     double total_energy = 0.0;
 
+    // Pre-compute outside the loop so we don't pay cv::flip and the
+    // rgb_to_material lookup overhead per cell. Previously the per-cell
+    // calculateCoEnergyDensity() was doing cv::flip() AND iterating
+    // config["materials"] for every one of the 250k cells, costing ~3.7 s
+    // per call on the nonlinear benchmark. Doing it once and using the
+    // rgb_to_material LUT (built at setup time) drops that to <100 ms.
+    cv::Mat image_flipped;
+    bool need_image_lookup = has_nonlinear_materials && !image.empty()
+                             && !rgb_to_material.empty()
+                             && !material_bh_tables.empty();
+    if (need_image_lookup) {
+        cv::flip(image, image_flipped, 0);
+    }
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+
     if (coordinate_system == "cartesian") {
         // Cartesian coordinates
         int rows = Bx.rows();
@@ -9412,13 +9442,50 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
         // For nonlinear materials: W' = ∫B dH using Simpson integration
         double max_coenergy_density = 0.0;
         double dV = dx * dy;  // [m²] per unit depth
+        const int total_cells = rows * cols;
 
-        for (int j = 0; j < rows; ++j) {
-            for (int i = 0; i < cols; ++i) {
+        // OpenMP 2.0 (the MSVC default with /openmp) does not support
+        // reduction(max:). Do per-thread accumulation into a local_max and
+        // combine in a critical section at the end of the team region.
+        #pragma omp parallel reduction(+:total_energy)
+        {
+            double local_max = 0.0;
+            #pragma omp for schedule(static) nowait
+            for (int k = 0; k < total_cells; ++k) {
+                int j = k / cols;
+                int i = k % cols;
                 double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
-                double w = calculateCoEnergyDensity(j, i, B_mag);
+                double w;
+                if (need_image_lookup) {
+                    cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                    int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                    auto lut_it = rgb_to_material.find(rgb_key);
+                    const BHTable* bh = nullptr;
+                    if (lut_it != rgb_to_material.end()) {
+                        auto bh_it = material_bh_tables.find(lut_it->second.name);
+                        if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                            bh = &bh_it->second;
+                        }
+                    }
+                    if (bh) {
+                        double H_mag = interpolateH_from_B(*bh, B_mag);
+                        w = integrateMagneticCoEnergy(*bh, H_mag);
+                    } else {
+                        double mu = mu_map(j, i);
+                        if (mu < 1e-20) mu = MU_0;
+                        w = B_mag * B_mag / (2.0 * mu);
+                    }
+                } else {
+                    double mu = mu_map(j, i);
+                    if (mu < 1e-20) mu = MU_0;
+                    w = B_mag * B_mag / (2.0 * mu);
+                }
                 total_energy += w * dV;
-                if (w > max_coenergy_density) max_coenergy_density = w;
+                if (w > local_max) local_max = w;
+            }
+            #pragma omp critical
+            {
+                if (local_max > max_coenergy_density) max_coenergy_density = local_max;
             }
         }
 
@@ -9441,21 +9508,44 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
         }
 
         // Calculate magnetic co-energy density W' = ∫₀^H B(H') dH'
-        // For current-source systems (Jz specified): F = +∂W'/∂x|_I
-        // For linear materials: W' = W = B²/(2μ)
-        // For nonlinear materials: W' = ∫B dH using Simpson integration
-        for (int j = 0; j < rows; ++j) {
-            for (int i = 0; i < cols; ++i) {
-                double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
-                double w = calculateCoEnergyDensity(j, i, B_mag);
-
-                // Polar volume element: dV = r * dr * dθ
-                int ir = (r_orientation == "horizontal") ? i : j;
-                ir = std::clamp(ir, 0, nr - 1);
-                double r = r_coords[ir];
-                double dV = r * dr * dtheta;
-                total_energy += w * dV;
+        const int total_cells = rows * cols;
+        #pragma omp parallel for schedule(static) reduction(+:total_energy)
+        for (int k = 0; k < total_cells; ++k) {
+            int j = k / cols;
+            int i = k % cols;
+            double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
+            double w;
+            if (need_image_lookup) {
+                cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
+                int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                auto lut_it = rgb_to_material.find(rgb_key);
+                const BHTable* bh = nullptr;
+                if (lut_it != rgb_to_material.end()) {
+                    auto bh_it = material_bh_tables.find(lut_it->second.name);
+                    if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                        bh = &bh_it->second;
+                    }
+                }
+                if (bh) {
+                    double H_mag = interpolateH_from_B(*bh, B_mag);
+                    w = integrateMagneticCoEnergy(*bh, H_mag);
+                } else {
+                    double mu = mu_map(j, i);
+                    if (mu < 1e-20) mu = MU_0;
+                    w = B_mag * B_mag / (2.0 * mu);
+                }
+            } else {
+                double mu = mu_map(j, i);
+                if (mu < 1e-20) mu = MU_0;
+                w = B_mag * B_mag / (2.0 * mu);
             }
+
+            // Polar volume element: dV = r * dr * dθ
+            int ir = (r_orientation == "horizontal") ? i : j;
+            ir = std::clamp(ir, 0, nr - 1);
+            double r = r_coords[ir];
+            double dV = r * dr * dtheta;
+            total_energy += w * dV;
         }
 
         std::cout << "  Grid size (r x theta): " << rows << " x " << cols << std::endl;
@@ -9672,17 +9762,47 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
 
     // Export co-energy density distribution (magnetic co-energy W' = ∫B dH)
     // For current-source systems (Jz specified): F = +∂W'/∂x|_I
+    // (Refactored to lift the cv::flip + LUT lookup out of the inner loop —
+    // same fix as in calculateTotalMagneticEnergy. Without this the export
+    // was redundantly flipping a 500x500 image per cell.)
     if (shouldExportField("EnergyDensity")) {
+        cv::Mat image_flipped_ed;
+        bool need_image_lookup_ed = has_nonlinear_materials && !image.empty()
+                                    && !rgb_to_material.empty()
+                                    && !material_bh_tables.empty();
+        if (need_image_lookup_ed) {
+            cv::flip(image, image_flipped_ed, 0);
+        }
+        const double MU_0 = 4.0 * M_PI * 1e-7;
+        auto co_energy_at = [&](int j, int i, double B_mag) -> double {
+            if (need_image_lookup_ed) {
+                cv::Vec3b pixel = image_flipped_ed.at<cv::Vec3b>(j, i);
+                int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                auto lut_it = rgb_to_material.find(rgb_key);
+                if (lut_it != rgb_to_material.end()) {
+                    auto bh_it = material_bh_tables.find(lut_it->second.name);
+                    if (bh_it != material_bh_tables.end() && bh_it->second.is_valid) {
+                        double H_mag = interpolateH_from_B(bh_it->second, B_mag);
+                        return integrateMagneticCoEnergy(bh_it->second, H_mag);
+                    }
+                }
+            }
+            double mu = mu_map(j, i);
+            if (mu < 1e-20) mu = MU_0;
+            return B_mag * B_mag / (2.0 * mu);
+        };
+
         if (coordinate_system == "cartesian" && Bx.size() > 0 && By.size() > 0 && mu_map.size() > 0) {
             const int rows = Bx.rows();
             const int cols = Bx.cols();
             Eigen::MatrixXd energy_density(rows, cols);
-            for (int j = 0; j < rows; ++j) {
-                for (int i = 0; i < cols; ++i) {
-                    // Calculate co-energy density W' = ∫₀^H B(H') dH'
-                    double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
-                    energy_density(j, i) = calculateCoEnergyDensity(j, i, B_mag);
-                }
+            const int total_cells = rows * cols;
+            #pragma omp parallel for schedule(static)
+            for (int k = 0; k < total_cells; ++k) {
+                int j = k / cols;
+                int i = k % cols;
+                double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
+                energy_density(j, i) = co_energy_at(j, i, B_mag);
             }
             std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
             writeMatrixCSV(energy_density, energy_density_path);
@@ -9691,11 +9811,13 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
             const int rows = Br.rows();
             const int cols = Br.cols();
             Eigen::MatrixXd energy_density(rows, cols);
-            for (int j = 0; j < rows; ++j) {
-                for (int i = 0; i < cols; ++i) {
-                    double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
-                    energy_density(j, i) = calculateCoEnergyDensity(j, i, B_mag);
-                }
+            const int total_cells = rows * cols;
+            #pragma omp parallel for schedule(static)
+            for (int k = 0; k < total_cells; ++k) {
+                int j = k / cols;
+                int i = k % cols;
+                double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
+                energy_density(j, i) = co_energy_at(j, i, B_mag);
             }
             std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
             writeMatrixCSV(energy_density, energy_density_path);
@@ -11696,17 +11818,25 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     // Building the hierarchy fresh each step (~85-100 ms on Windows
                     // with AVX2) is currently the right trade-off.
 
-                    // Convert matrix to RowMajor for AMGCL
+                    // Convert Eigen sparse matrix to CRS arrays (ptrdiff_t indices)
+                    // for the OpenMP-parallel builtin backend.
                     Eigen::SparseMatrix<double, Eigen::RowMajor> A_rowmajor = A;
+                    A_rowmajor.makeCompressed();
+                    ptrdiff_t rows = A_rowmajor.rows();
+                    std::vector<ptrdiff_t> A_ptr(A_rowmajor.outerIndexPtr(), A_rowmajor.outerIndexPtr() + rows + 1);
+                    std::vector<ptrdiff_t> A_col(A_rowmajor.innerIndexPtr(), A_rowmajor.innerIndexPtr() + A_rowmajor.nonZeros());
+                    std::vector<double>    A_val(A_rowmajor.valuePtr(),       A_rowmajor.valuePtr()       + A_rowmajor.nonZeros());
+                    auto A_crs = std::tie(rows, A_ptr, A_col, A_val);
 
-                    // Define AMG preconditioner + CG solver with Eigen backend
+                    // Define AMG preconditioner + CG solver with builtin backend
+                    // (OpenMP-parallel SpMV, AMG smoothers, and CG vector ops).
                     typedef amgcl::make_solver<
                         amgcl::amg<
-                            amgcl::backend::eigen<double>,
+                            amgcl::backend::builtin<double>,
                             amgcl::coarsening::smoothed_aggregation,
                             amgcl::relaxation::spai0
                         >,
-                        amgcl::solver::cg<amgcl::backend::eigen<double>>
+                        amgcl::solver::cg<amgcl::backend::builtin<double>>
                     > AMGSolver;
 
                     // AMGCL solver parameters
@@ -11721,7 +11851,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
                     std::cout << "  Building AMG hierarchy..." << std::endl;
                     auto amg_build_start = std::chrono::high_resolution_clock::now();
-                    AMGSolver amg_solve(A_rowmajor, amg_params);
+                    AMGSolver amg_solve(A_crs, amg_params);
                     auto amg_build_end = std::chrono::high_resolution_clock::now();
                     auto amg_build_time = std::chrono::duration_cast<std::chrono::milliseconds>(amg_build_end - amg_build_start);
 
@@ -11747,25 +11877,30 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     // simply running AR(1) on the unshifted solutions, because
                     // CG convergence cares about A-norm of the error, not the
                     // residual L2 norm that shifts try to optimize.
-                    Eigen::VectorXd amg_solution;
+                    // AR(1) warm-start initial guess, materialised as std::vector<double>
+                    // because backend::builtin operates on raw double vectors.
+                    std::vector<double> x_vec(n, 0.0);
                     if (previous_previous_solution.size() == static_cast<Eigen::Index>(n)
                         && previous_solution.size() == static_cast<Eigen::Index>(n)) {
                         // AR(1): linear extrapolation in time
-                        amg_solution = 2.0 * previous_solution - previous_previous_solution;
+                        for (int i = 0; i < n; ++i) {
+                            x_vec[i] = 2.0 * previous_solution(i) - previous_previous_solution(i);
+                        }
                     } else if (previous_solution.size() == static_cast<Eigen::Index>(n)) {
                         // Only one history vector available — use it directly
-                        amg_solution = previous_solution;
-                    } else {
-                        // First step: no history
-                        amg_solution = Eigen::VectorXd::Zero(n);
+                        std::copy(previous_solution.data(), previous_solution.data() + n, x_vec.begin());
                     }
+                    std::vector<double> rhs_vec(rhs.data(), rhs.data() + n);
+
                     std::cout << "  Solving with AMG-CG..." << std::endl;
                     auto amg_solve_start = std::chrono::high_resolution_clock::now();
                     int amg_iters;
                     double amg_error;
-                    std::tie(amg_iters, amg_error) = amg_solve(rhs, amg_solution);
+                    std::tie(amg_iters, amg_error) = amg_solve(rhs_vec, x_vec);
                     auto amg_solve_end = std::chrono::high_resolution_clock::now();
                     auto amg_solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(amg_solve_end - amg_solve_start);
+
+                    Eigen::VectorXd amg_solution = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
                     std::cout << "\n  AMGCL Results:" << std::endl;
                     std::cout << "    AMG build time: " << amg_build_time.count() << " ms" << std::endl;

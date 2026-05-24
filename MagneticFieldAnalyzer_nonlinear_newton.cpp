@@ -602,8 +602,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Standard direct solve with explicit Jacobian (J = A + diagonal correction)
             Eigen::SparseMatrix<double> J_matrix = A_matrix;
 
-            // Build r-weighted diagonal Jacobian correction for polar + nonlinear
-            if (is_polar && config["materials"]) {
+            // Build r-weighted diagonal Jacobian correction for polar + nonlinear.
+            //
+            // Previously this loop did cv::flip + a full config["materials"]
+            // iteration per cell, costing ~1 s per Newton outer iteration on a
+            // 250k-DOF problem (saturated nonlinear case). Same anti-pattern as
+            // the calculateCoEnergyDensity fix: hoist the flip, replace YAML
+            // iteration with the rgb_to_material LUT, and parallelise.
+            //
+            // We also pre-resolve material_mu pointers so the inner loop only
+            // touches thread-safe data (no YAML node access).
+            if (is_polar && !rgb_to_material.empty() && !material_mu.empty()) {
                 cv::Mat image_to_use;
                 cv::flip(image, image_to_use, 0);  // Match setupMaterialProperties()
 
@@ -613,13 +622,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 double r_end_local = polar_config["r_end"].as<double>();
                 double dr_local = (r_end_local - r_start_local) / (nr - 1);
 
-                for (int idx = 0; idx < Az_vec.size(); idx++) {
-                    // Get grid indices
+                const int n_dof = static_cast<int>(Az_vec.size());
+
+                #pragma omp parallel for schedule(static)
+                for (int idx = 0; idx < n_dof; idx++) {
                     int r_idx, theta_idx;
                     if (using_coarsening) {
                         auto [i, j] = coarse_to_fine[idx];
-                        r_idx = i;      // i_r
-                        theta_idx = j;  // j_theta
+                        r_idx = i;
+                        theta_idx = j;
                     } else {
                         r_idx = idx / ntheta;
                         theta_idx = idx % ntheta;
@@ -643,72 +654,42 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     }
 
                     cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(img_row, img_col);
-                    cv::Scalar rgb(pixel[2], pixel[1], pixel[0]);
+                    int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-                    for (const auto& mat : config["materials"]) {
-                        std::string name = mat.first.as<std::string>();
-                        YAML::Node props = mat.second;
-                        if (!props["rgb"]) continue;
+                    auto lut_it = rgb_to_material.find(rgb_key);
+                    if (lut_it == rgb_to_material.end()) continue;
 
-                        cv::Scalar mat_rgb(
-                            props["rgb"][0].as<int>(),
-                            props["rgb"][1].as<int>(),
-                            props["rgb"][2].as<int>()
-                        );
+                    auto mu_it = material_mu.find(lut_it->second.name);
+                    if (mu_it == material_mu.end()) continue;
+                    if (mu_it->second.type == MuType::STATIC) continue;  // linear material
 
-                        if (rgb[0] == mat_rgb[0] && rgb[1] == mat_rgb[1] && rgb[2] == mat_rgb[2]) {
-                            bool is_nonlinear = false;
-                            if (props["mu_r"]) {
-                                if (props["mu_r"].IsSequence()) {
-                                    is_nonlinear = true;
-                                } else {
-                                    std::string mu_str = props["mu_r"].as<std::string>();
-                                    if (mu_str.find('$') != std::string::npos) {
-                                        is_nonlinear = true;
-                                    }
-                                }
-                            }
+                    double H_val = H_map(img_row, img_col);
+                    double mu_current = mu_map(img_row, img_col);
 
-                            if (is_nonlinear) {
-                                double H_val = H_map(img_row, img_col);
-                                double mu_current = mu_map(img_row, img_col);
+                    double mu_eff = evaluateMu(mu_it->second, H_val);
+                    double dmu_eff_dH = evaluateMuDerivative(mu_it->second, H_val);
+                    double dB_dH = MU_0 * (mu_eff + H_val * dmu_eff_dH);
 
-                                auto mu_it = material_mu.find(name);
-                                if (mu_it != material_mu.end()) {
-                                    double mu_eff = evaluateMu(mu_it->second, H_val);
-                                    double dmu_eff_dH = evaluateMuDerivative(mu_it->second, H_val);
-                                    double dB_dH = MU_0 * (mu_eff + H_val * dmu_eff_dH);
-
-                                    double dmu_dH = 0.0;
-                                    if (H_val > 1.0) {
-                                        double mu_actual = mu_eff * MU_0;
-                                        dmu_dH = (dB_dH - mu_actual) / H_val;
-                                    } else {
-                                        dmu_dH = MU_0 * dmu_eff_dH;
-                                    }
-
-                                    double correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
-                                    correction_factor *= (dr_local * dr_local);
-                                    J_matrix.coeffRef(idx, idx) += correction_factor;
-                                }
-                            }
-                            break;
-                        }
+                    double dmu_dH = 0.0;
+                    if (H_val > 1.0) {
+                        double mu_actual = mu_eff * MU_0;
+                        dmu_dH = (dB_dH - mu_actual) / H_val;
+                    } else {
+                        dmu_dH = MU_0 * dmu_eff_dH;
                     }
+
+                    double correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
+                    correction_factor *= (dr_local * dr_local);
+                    // J_matrix.coeffRef writes to a unique diagonal entry per
+                    // idx — no race even though we are inside a parallel for.
+                    J_matrix.coeffRef(idx, idx) += correction_factor;
                 }
             }
 
-            Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-            solver.compute(J_matrix);
-            if (solver.info() != Eigen::Success) {
-                std::cerr << "ERROR: Matrix factorization failed!" << std::endl;
-                return;
-            }
-            delta_A = solver.solve(-residual_coarse);
-            if (solver.info() != Eigen::Success) {
-                std::cerr << "ERROR: Linear solve failed!" << std::endl;
-                return;
-            }
+            // Adaptive: SparseLU below the AMGCL threshold, AMGCL above.
+            // For full-grid problems (n ~ 250k) this routes through the
+            // OpenMP-parallel builtin backend rather than serial SparseLU.
+            delta_A = solveLinearSystem(J_matrix, -residual_coarse);
         }
 
         // ===== Step 6: Backtracking line search =====
