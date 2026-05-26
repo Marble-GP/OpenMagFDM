@@ -48,6 +48,13 @@ find_package(Eigen3 REQUIRED NO_MODULE)
 find_package(OpenCV REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+# libtiff is needed by the TIFF result writer.
+# We could rely on the libtiff that OpenCV's imgcodecs pulls in, but the
+# OpenCV public API does not expose the floating-point predictor knob, which
+# is what makes deflate compression actually effective on double-precision
+# field data. So we link libtiff directly and call TIFFSetField ourselves.
+find_package(TIFF REQUIRED)
+
 # OpenMP (optional: single-threaded build if not available)
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
@@ -75,5 +82,7 @@ target_link_libraries(MagFDMsolver
     Eigen3::Eigen
     ${OpenCV_LIBS}
     yaml-cpp::yaml-cpp
+    ${TIFF_LIBRARIES}
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
+target_include_directories(MagFDMsolver PRIVATE ${TIFF_INCLUDE_DIRS})

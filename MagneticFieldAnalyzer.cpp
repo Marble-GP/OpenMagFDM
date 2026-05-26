@@ -9,6 +9,7 @@
 #include <set>
 #include <cstdio>
 #include <algorithm>
+#include <tiffio.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -5995,32 +5996,63 @@ void MagneticFieldAnalyzer::writeMatrixCSV(const Eigen::MatrixXd& m, const std::
     file.close();
 }
 
-// TIFF writer using OpenCV imgcodecs (libtiff backend). NaN/Inf bit patterns
-// pass through unchanged (verified bit-exact round-trip for CV_32FC1 and
-// CV_64FC1 on OpenCV 4.6 + libtiff). Eigen defaults to column-major; cv::Mat
-// is row-major, so the cast/copy into a row-major matrix transposes layout
-// without changing semantics (m(j,i) -> mat.at<T>(j,i)).
+// TIFF writer using libtiff directly. Earlier versions used cv::imwrite, but
+// OpenCV 4.6 imgcodecs does not expose IMWRITE_TIFF_PREDICTOR, and without
+// the floating-point predictor (Predictor=3) DEFLATE achieves ~0 compression
+// on double-precision field data because the low mantissa bits look like
+// noise to a byte-level coder. Calling TIFFSetField ourselves lets us turn
+// predictor on; observed file size drops ~3-5x on the polar nonlinear case.
+//
+// NaN / +Inf / -Inf / -0 bit patterns pass through unchanged. Eigen defaults
+// to column-major while libtiff scanlines are row-major, so we materialize
+// a row-major copy of the requested precision and feed scanlines from it.
 void MagneticFieldAnalyzer::writeMatrixTIFF(const Eigen::MatrixXd& m,
                                             const std::string& output_path,
                                             const ExportConfig& opts) {
     const int rows = static_cast<int>(m.rows());
     const int cols = static_cast<int>(m.cols());
+    const bool is_f32 = (opts.precision == ExportConfig::Precision::F32);
+    const uint16_t bits_per_sample = is_f32 ? 32 : 64;
 
-    std::vector<int> params = {cv::IMWRITE_TIFF_COMPRESSION, opts.tiff_compression};
+    TIFF* tif = TIFFOpen(output_path.c_str(), "w");
+    if (!tif) {
+        throw std::runtime_error("Failed to open TIFF for write: " + output_path);
+    }
 
-    if (opts.precision == ExportConfig::Precision::F32) {
-        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m.cast<float>();
-        cv::Mat mat(rows, cols, CV_32FC1, rm.data());
-        if (!cv::imwrite(output_path, mat, params)) {
-            throw std::runtime_error("Failed to write TIFF (float): " + output_path);
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH,      static_cast<uint32_t>(cols));
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH,     static_cast<uint32_t>(rows));
+    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE,   bits_per_sample);
+    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, static_cast<uint16_t>(1));
+    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT,    static_cast<uint16_t>(SAMPLEFORMAT_IEEEFP));
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC,     static_cast<uint16_t>(PHOTOMETRIC_MINISBLACK));
+    TIFFSetField(tif, TIFFTAG_ORIENTATION,     static_cast<uint16_t>(ORIENTATION_TOPLEFT));
+    TIFFSetField(tif, TIFFTAG_PLANARCONFIG,    static_cast<uint16_t>(PLANARCONFIG_CONTIG));
+    TIFFSetField(tif, TIFFTAG_COMPRESSION,     static_cast<uint16_t>(opts.tiff_compression));
+    if (opts.tiff_compression == COMPRESSION_DEFLATE ||
+        opts.tiff_compression == COMPRESSION_LZW) {
+        TIFFSetField(tif, TIFFTAG_PREDICTOR, static_cast<uint16_t>(opts.tiff_predictor));
+    }
+    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, TIFFDefaultStripSize(tif, 0));
+
+    auto write_rows = [&](void* row_ptr_base, size_t row_stride_bytes) {
+        for (int j = 0; j < rows; ++j) {
+            unsigned char* row = static_cast<unsigned char*>(row_ptr_base) + j * row_stride_bytes;
+            if (TIFFWriteScanline(tif, row, j, 0) < 0) {
+                TIFFClose(tif);
+                throw std::runtime_error("TIFFWriteScanline failed: " + output_path);
+            }
         }
+    };
+
+    if (is_f32) {
+        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m.cast<float>();
+        write_rows(rm.data(), static_cast<size_t>(cols) * sizeof(float));
     } else {
         Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m;
-        cv::Mat mat(rows, cols, CV_64FC1, rm.data());
-        if (!cv::imwrite(output_path, mat, params)) {
-            throw std::runtime_error("Failed to write TIFF (double): " + output_path);
-        }
+        write_rows(rm.data(), static_cast<size_t>(cols) * sizeof(double));
     }
+
+    TIFFClose(tif);
 }
 
 // Dispatch writer. The caller passes a base path WITHOUT extension; this routes

@@ -4,7 +4,8 @@
   "dependencies": [
     "eigen3",
     "opencv4",
-    "yaml-cpp"
+    "yaml-cpp",
+    "tiff"
   ],
   "builtin-baseline": "5d57f5a0a5469a23e005fc79a7c1814ab4fc967e"
 }
