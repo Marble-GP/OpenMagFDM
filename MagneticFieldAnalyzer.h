@@ -656,8 +656,14 @@ private:
     // (where each tiny stdio call incurs significant overhead).
     static void writeMatrixCSV(const Eigen::MatrixXd& m, const std::string& output_path);
 
+    // TIFF writer (IEEE 754 float/double native). Precision is selected by
+    // opts.precision (F32 -> CV_32FC1, F64 -> CV_64FC1). NaN/Inf bit patterns
+    // pass through unchanged. Compression is libtiff's COMPRESSION_* code.
+    static void writeMatrixTIFF(const Eigen::MatrixXd& m, const std::string& output_path,
+                                const ExportConfig& opts);
+
     // Dispatch writer: takes a base path WITHOUT extension and routes to CSV/TIFF
-    // writers based on ExportConfig. Phase 1: CSV path only. TIFF is added in Phase 2/3.
+    // writers based on ExportConfig.format.
     void writeMatrix(const Eigen::MatrixXd& m, const std::string& base_path,
                      const ExportConfig& opts) const;
 

@@ -5995,9 +5995,36 @@ void MagneticFieldAnalyzer::writeMatrixCSV(const Eigen::MatrixXd& m, const std::
     file.close();
 }
 
+// TIFF writer using OpenCV imgcodecs (libtiff backend). NaN/Inf bit patterns
+// pass through unchanged (verified bit-exact round-trip for CV_32FC1 and
+// CV_64FC1 on OpenCV 4.6 + libtiff). Eigen defaults to column-major; cv::Mat
+// is row-major, so the cast/copy into a row-major matrix transposes layout
+// without changing semantics (m(j,i) -> mat.at<T>(j,i)).
+void MagneticFieldAnalyzer::writeMatrixTIFF(const Eigen::MatrixXd& m,
+                                            const std::string& output_path,
+                                            const ExportConfig& opts) {
+    const int rows = static_cast<int>(m.rows());
+    const int cols = static_cast<int>(m.cols());
+
+    std::vector<int> params = {cv::IMWRITE_TIFF_COMPRESSION, opts.tiff_compression};
+
+    if (opts.precision == ExportConfig::Precision::F32) {
+        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m.cast<float>();
+        cv::Mat mat(rows, cols, CV_32FC1, rm.data());
+        if (!cv::imwrite(output_path, mat, params)) {
+            throw std::runtime_error("Failed to write TIFF (float): " + output_path);
+        }
+    } else {
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m;
+        cv::Mat mat(rows, cols, CV_64FC1, rm.data());
+        if (!cv::imwrite(output_path, mat, params)) {
+            throw std::runtime_error("Failed to write TIFF (double): " + output_path);
+        }
+    }
+}
+
 // Dispatch writer. The caller passes a base path WITHOUT extension; this routes
-// to the CSV/TIFF writers based on opts.format. Phase 1: TIFF path is not yet
-// implemented and falls through to CSV with a one-time warning.
+// to the CSV/TIFF writers based on opts.format.
 void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
                                         const std::string& base_path,
                                         const ExportConfig& opts) const {
@@ -6010,18 +6037,7 @@ void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
         writeMatrixCSV(m, base_path + ".csv");
     }
     if (want_tiff) {
-        static bool warned = false;
-        if (!warned) {
-            std::cerr << "[Export] WARNING: format=tiff requested but TIFF writer "
-                         "is not yet implemented (Phase 2/3). "
-                      << (want_csv ? "Falling back to CSV only."
-                                   : "Forcing CSV output for this run.")
-                      << std::endl;
-            warned = true;
-        }
-        if (!want_csv) {
-            writeMatrixCSV(m, base_path + ".csv");
-        }
+        writeMatrixTIFF(m, base_path + ".tiff", opts);
     }
 }
 
