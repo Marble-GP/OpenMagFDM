@@ -510,6 +510,21 @@ private:
 
     TransientConfig transient_config;
 
+    // Result export configuration ("how" results are written;
+    // the "what" stays in TransientConfig::export_fields).
+    struct ExportConfig {
+        enum class Format { CSV, TIFF, BOTH };
+        enum class Precision { F32, F64 };
+        Format format = Format::BOTH;
+        Precision precision = Precision::F64;
+        bool async = false;
+        int async_queue_depth = 4;
+        int tiff_compression = 8;  // libtiff COMPRESSION_DEFLATE
+        int tiff_predictor   = 3;  // floating-point predictor
+    };
+
+    ExportConfig export_config;
+
     // Material properties
     Eigen::MatrixXd mu_map;   // Permeability distribution (updated during nonlinear iteration)
     Eigen::MatrixXd jz_map;   // Current density distribution
@@ -640,6 +655,11 @@ private:
     // and writes it in a single call. ~3-5x faster than per-element operator<< on Windows
     // (where each tiny stdio call incurs significant overhead).
     static void writeMatrixCSV(const Eigen::MatrixXd& m, const std::string& output_path);
+
+    // Dispatch writer: takes a base path WITHOUT extension and routes to CSV/TIFF
+    // writers based on ExportConfig. Phase 1: CSV path only. TIFF is added in Phase 2/3.
+    void writeMatrix(const Eigen::MatrixXd& m, const std::string& base_path,
+                     const ExportConfig& opts) const;
 
     // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small
     Eigen::VectorXd solveLinearSystem(const Eigen::SparseMatrix<double>& A,

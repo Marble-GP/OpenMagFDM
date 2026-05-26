@@ -166,6 +166,38 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
             }
         }
 
+        // Load result export configuration. Phase 1 ships the schema + dispatch wiring;
+        // only the CSV path is functional, so behavior is unchanged unless format=tiff
+        // is set (which is rejected at write time until Phase 2/3 lands).
+        if (config["export"]) {
+            auto exp = config["export"];
+            std::string fmt = exp["format"].as<std::string>("both");
+            if (fmt == "csv")       export_config.format = ExportConfig::Format::CSV;
+            else if (fmt == "tiff") export_config.format = ExportConfig::Format::TIFF;
+            else                    export_config.format = ExportConfig::Format::BOTH;
+
+            std::string prec = exp["precision"].as<std::string>("double");
+            export_config.precision = (prec == "float")
+                ? ExportConfig::Precision::F32
+                : ExportConfig::Precision::F64;
+
+            export_config.async = exp["async"].as<bool>(false);
+            export_config.async_queue_depth = exp["async_queue_depth"].as<int>(4);
+
+            if (exp["tiff"]) {
+                std::string comp = exp["tiff"]["compression"].as<std::string>("deflate");
+                if (comp == "none")     export_config.tiff_compression = 1;
+                else if (comp == "lzw") export_config.tiff_compression = 5;
+                else                    export_config.tiff_compression = 8;
+                export_config.tiff_predictor = exp["tiff"]["predictor"].as<int>(3);
+            }
+
+            std::cout << "Export: format=" << fmt
+                      << ", precision=" << prec
+                      << ", async=" << (export_config.async ? "true" : "false")
+                      << std::endl;
+        }
+
         // Parse material presets (reusable B-H curves/properties)
         material_presets.clear();
         if (config["material_presets"]) {
@@ -5963,6 +5995,36 @@ void MagneticFieldAnalyzer::writeMatrixCSV(const Eigen::MatrixXd& m, const std::
     file.close();
 }
 
+// Dispatch writer. The caller passes a base path WITHOUT extension; this routes
+// to the CSV/TIFF writers based on opts.format. Phase 1: TIFF path is not yet
+// implemented and falls through to CSV with a one-time warning.
+void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
+                                        const std::string& base_path,
+                                        const ExportConfig& opts) const {
+    const bool want_csv  = (opts.format == ExportConfig::Format::CSV ||
+                            opts.format == ExportConfig::Format::BOTH);
+    const bool want_tiff = (opts.format == ExportConfig::Format::TIFF ||
+                            opts.format == ExportConfig::Format::BOTH);
+
+    if (want_csv) {
+        writeMatrixCSV(m, base_path + ".csv");
+    }
+    if (want_tiff) {
+        static bool warned = false;
+        if (!warned) {
+            std::cerr << "[Export] WARNING: format=tiff requested but TIFF writer "
+                         "is not yet implemented (Phase 2/3). "
+                      << (want_csv ? "Falling back to CSV only."
+                                   : "Forcing CSV output for this run.")
+                      << std::endl;
+            warned = true;
+        }
+        if (!want_csv) {
+            writeMatrixCSV(m, base_path + ".csv");
+        }
+    }
+}
+
 void MagneticFieldAnalyzer::exportAzToCSV(const std::string& output_path) const {
     if (Az.size() == 0) {
         throw std::runtime_error("No solution to export. Run solve() first.");
@@ -9710,26 +9772,43 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
 
     // Export Az
     if (shouldExportField("Az")) {
-        std::string az_path = az_folder + "/" + step_name + ".csv";
-        exportAzToCSV(az_path);
+        if (Az.size() == 0) {
+            throw std::runtime_error("No solution to export. Run solve() first.");
+        }
+        std::string az_base = az_folder + "/" + step_name;
+        writeMatrix(Az, az_base, export_config);
+        std::cout << "Az array exported to: " << az_base << std::endl;
     }
 
     // Export Mu
     if (shouldExportField("Mu")) {
-        std::string mu_path = mu_folder + "/" + step_name + ".csv";
-        exportMuToCSV(mu_path);
+        if (mu_map.size() == 0) {
+            throw std::runtime_error("No permeability data to export.");
+        }
+        std::string mu_base = mu_folder + "/" + step_name;
+        writeMatrix(mu_map, mu_base, export_config);
+        std::cout << "Permeability distribution exported to: " << mu_base << std::endl;
     }
 
     // Export H (magnetic field intensity magnitude) if available
     if (shouldExportField("H")) {
-        std::string h_path = h_folder + "/" + step_name + ".csv";
-        exportHToCSV(h_path);
+        if (H_map.size() == 0) {
+            std::cerr << "Warning: No H-field data to export (H_map is empty). Skipping H export." << std::endl;
+        } else {
+            std::string h_base = h_folder + "/" + step_name;
+            writeMatrix(H_map, h_base, export_config);
+            std::cout << "Magnetic field intensity |H| exported to: " << h_base << std::endl;
+        }
     }
 
     // Export Jz
     if (shouldExportField("Jz")) {
-        std::string jz_path = jz_folder + "/" + step_name + ".csv";
-        exportJzToCSV(jz_path);
+        if (jz_map.size() == 0) {
+            throw std::runtime_error("No current density data to export.");
+        }
+        std::string jz_base = jz_folder + "/" + step_name;
+        writeMatrix(jz_map, jz_base, export_config);
+        std::cout << "Current density distribution exported to: " << jz_base << std::endl;
     }
 
     // Export boundary image if available
@@ -9804,9 +9883,9 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
                 double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
                 energy_density(j, i) = co_energy_at(j, i, B_mag);
             }
-            std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
-            writeMatrixCSV(energy_density, energy_density_path);
-            std::cout << "Co-energy density exported to: " << energy_density_path << std::endl;
+            std::string energy_density_base = energy_density_folder + "/" + step_name;
+            writeMatrix(energy_density, energy_density_base, export_config);
+            std::cout << "Co-energy density exported to: " << energy_density_base << std::endl;
         } else if (coordinate_system == "polar" && Br.size() > 0 && Btheta.size() > 0 && mu_map.size() > 0) {
             const int rows = Br.rows();
             const int cols = Br.cols();
@@ -9819,9 +9898,9 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
                 double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
                 energy_density(j, i) = co_energy_at(j, i, B_mag);
             }
-            std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
-            writeMatrixCSV(energy_density, energy_density_path);
-            std::cout << "Co-energy density (polar) exported to: " << energy_density_path << std::endl;
+            std::string energy_density_base = energy_density_folder + "/" + step_name;
+            writeMatrix(energy_density, energy_density_base, export_config);
+            std::cout << "Co-energy density (polar) exported to: " << energy_density_base << std::endl;
         }
     }
 
