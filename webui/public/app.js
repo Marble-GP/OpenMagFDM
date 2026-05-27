@@ -1894,33 +1894,27 @@ async function loadQuickPreviewFromResult(resultPath) {
         }
 
         if (azFlat && muFlat) {
-            {
-                // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
-                const azFlipped = flipVertical(azFlat);
-                const muFlipped = flipVertical(muFlat);
+            // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
+            const azFlipped = flipVertical(azFlat);
+            const muFlipped = flipVertical(muFlat);
 
-                console.log('Az data dimensions:', azFlipped.length, 'x', azFlipped[0]?.length);
-                console.log('Mu data dimensions:', muFlipped.length, 'x', muFlipped[0]?.length);
-                console.log('Grid spacing: dx =', dx, ', dy =', dy);
+            console.log('Az data dimensions:', azFlipped.length, 'x', azFlipped[0]?.length);
+            console.log('Mu data dimensions:', muFlipped.length, 'x', muFlipped[0]?.length);
+            console.log('Grid spacing: dx =', dx, ', dy =', dy);
 
-                // Load coarsening mask for coarsening-aware B/H computation
-                const maskResult = await getCoarseningMaskArray(resultPath, 1).catch(() => null);
-                const activeMask = maskResult ? maskResult.mask : null;
+            // Load coarsening mask for coarsening-aware B/H computation
+            const maskResult = await getCoarseningMaskArray(resultPath, 1).catch(() => null);
+            const activeMask = maskResult ? maskResult.mask : null;
 
-                const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
-                console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
-                console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
-                console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
-                console.log('B magnitude sample values:', B[0]?.slice(0, 3));
+            const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
+            console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
+            console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
+            console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
+            console.log('B magnitude sample values:', B[0]?.slice(0, 3));
 
-                // Plot |B| and |H|
-                plotHeatmap('previewPlot2', B, '|B| [T]', true);
-                plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
-            } else {
-                console.error('Az/Mu data loading failed:', { azSuccess: azData.success, muSuccess: muData.success });
-                document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
-                document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
-            }
+            // Plot |B| and |H|
+            plotHeatmap('previewPlot2', B, '|B| [T]', true);
+            plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
         } else {
             document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
             document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
