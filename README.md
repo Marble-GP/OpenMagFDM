@@ -33,6 +33,42 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 - 軽量数式評価に `tinyexpr` を利用
 - WebUI によるインタラクティブな結果確認（REST API による外部制御にも対応）
 
+## v1.4 移行ガイド（出力フォーマット変更）
+
+v1.4 から **デフォルトの結果出力フォーマットが CSV から TIFF (IEEE 754 binary) に切り替わりました**。同時に、書き込みも非同期化されています。
+
+### 主な変更点
+
+- **default `format: tiff`**（CSV 比でファイルサイズが約 1/4〜1/5、step あたりの export 時間も短縮）
+- **default `async: true`**（書き込みをワーカースレッドに移し、ソルバーが I/O を待たない）
+- **`precision: double`** はそのまま（IEEE 754 64-bit、情報落ちなし）
+- **WebUI は両形式に対応**（`/api/load-field` が TIFF / CSV を自動判別。format=both のときは TIFF 優先・CSV フォールバック）
+
+### 既存ユーザの選択肢
+
+| やりたいこと | yaml 設定 |
+|---|---|
+| 新 default（推奨）でそのまま使う | `export:` ブロックなし |
+| 旧挙動（CSV のみ）に戻す | `export:\n  format: csv` |
+| 過渡的に CSV と TIFF の両方を書く | `export:\n  format: both` |
+| ファイルサイズ最優先（精度 32 bit に丸める） | `export:\n  precision: float` |
+| 非同期書き込みを切る（同期 I/O） | `export:\n  async: false` |
+
+### CSV を直接消費する外部スクリプトをお使いの方へ
+
+- WebUI の `/api/load-csv` エンドポイントは引き続き使えますが、ログに deprecation warning が出ます。`/api/load-field` への移行を推奨します（クエリは互換、レスポンスに `format` / `precision` フィールドが追加されているのみ）。
+- 過渡期間中は `export: { format: both }` を yaml に書くことで CSV と TIFF の両方を出力できます。
+
+### TIFF ファイルの可視化
+
+TIFF (32/64-bit float, FP predictor + DEFLATE) は ImageJ / ParaView / Python `tifffile` などの標準ツールでそのまま読めます。Python 例:
+
+```python
+import tifffile
+arr = tifffile.imread("output_xxx/Az/step_0001.tiff")
+print(arr.dtype, arr.shape)  # float64 (500, 500)
+```
+
 ## ダウンロード
 
 ### プリビルドバイナリ（推奨）

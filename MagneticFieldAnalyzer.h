@@ -21,6 +21,8 @@
 #include <variant>
 #include <tinyexpr.h>
 
+#include "AsyncWriter.h"
+
 // AMGCL headers for advanced iterative solvers
 // The `builtin` backend supports OpenMP-parallel SpMV / vector operations
 // inside CG and AMG smoothing. We switched from `backend::eigen` because the
@@ -510,6 +512,31 @@ private:
 
     TransientConfig transient_config;
 
+    // Result export configuration ("how" results are written;
+    // the "what" stays in TransientConfig::export_fields).
+    //
+    // Defaults (v1.4): TIFF + async. Both were verified bit-exact against
+    // the legacy CSV path over the Phase 1..5 work. Set `format: both`
+    // explicitly in yaml if a downstream tool still consumes CSV directly.
+    struct ExportConfig {
+        enum class Format { CSV, TIFF, BOTH };
+        enum class Precision { F32, F64 };
+        Format format = Format::TIFF;
+        Precision precision = Precision::F64;
+        bool async = true;
+        int async_queue_depth = 4;
+        int tiff_compression = 8;  // libtiff COMPRESSION_DEFLATE
+        int tiff_predictor   = 3;  // floating-point predictor
+    };
+
+    ExportConfig export_config;
+
+    // Background writer thread for transient-step output.
+    // Created on demand in loadConfig() when ExportConfig::async is true.
+    // Drained at performTransientAnalysis() exit so its destructor never
+    // runs with pending jobs.
+    std::unique_ptr<AsyncWriter> async_writer_;
+
     // Material properties
     Eigen::MatrixXd mu_map;   // Permeability distribution (updated during nonlinear iteration)
     Eigen::MatrixXd jz_map;   // Current density distribution
@@ -640,6 +667,17 @@ private:
     // and writes it in a single call. ~3-5x faster than per-element operator<< on Windows
     // (where each tiny stdio call incurs significant overhead).
     static void writeMatrixCSV(const Eigen::MatrixXd& m, const std::string& output_path);
+
+    // TIFF writer (IEEE 754 float/double native). Precision is selected by
+    // opts.precision (F32 -> CV_32FC1, F64 -> CV_64FC1). NaN/Inf bit patterns
+    // pass through unchanged. Compression is libtiff's COMPRESSION_* code.
+    static void writeMatrixTIFF(const Eigen::MatrixXd& m, const std::string& output_path,
+                                const ExportConfig& opts);
+
+    // Dispatch writer: takes a base path WITHOUT extension and routes to CSV/TIFF
+    // writers based on ExportConfig.format.
+    void writeMatrix(const Eigen::MatrixXd& m, const std::string& base_path,
+                     const ExportConfig& opts) const;
 
     // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small
     Eigen::VectorXd solveLinearSystem(const Eigen::SparseMatrix<double>& A,

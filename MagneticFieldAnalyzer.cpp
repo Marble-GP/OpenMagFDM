@@ -9,6 +9,8 @@
 #include <set>
 #include <cstdio>
 #include <algorithm>
+#include <filesystem>
+#include <tiffio.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -164,6 +166,45 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                     std::cout << "  Pixels per step: " << transient_config.slide_pixels_per_step << std::endl;
                 }
             }
+        }
+
+        // Load result export configuration. Phase 1 ships the schema + dispatch wiring;
+        // only the CSV path is functional, so behavior is unchanged unless format=tiff
+        // is set (which is rejected at write time until Phase 2/3 lands).
+        if (config["export"]) {
+            auto exp = config["export"];
+            std::string fmt = exp["format"].as<std::string>("both");
+            if (fmt == "csv")       export_config.format = ExportConfig::Format::CSV;
+            else if (fmt == "tiff") export_config.format = ExportConfig::Format::TIFF;
+            else                    export_config.format = ExportConfig::Format::BOTH;
+
+            std::string prec = exp["precision"].as<std::string>("double");
+            export_config.precision = (prec == "float")
+                ? ExportConfig::Precision::F32
+                : ExportConfig::Precision::F64;
+
+            export_config.async = exp["async"].as<bool>(false);
+            export_config.async_queue_depth = exp["async_queue_depth"].as<int>(4);
+
+            if (exp["tiff"]) {
+                std::string comp = exp["tiff"]["compression"].as<std::string>("deflate");
+                if (comp == "none")     export_config.tiff_compression = 1;
+                else if (comp == "lzw") export_config.tiff_compression = 5;
+                else                    export_config.tiff_compression = 8;
+                export_config.tiff_predictor = exp["tiff"]["predictor"].as<int>(3);
+            }
+
+            std::cout << "Export: format=" << fmt
+                      << ", precision=" << prec
+                      << ", async=" << (export_config.async ? "true" : "false")
+                      << std::endl;
+        }
+
+        if (export_config.async) {
+            async_writer_ = std::make_unique<AsyncWriter>(
+                static_cast<std::size_t>(std::max(1, export_config.async_queue_depth)));
+            std::cout << "  Async writer enabled (queue depth = "
+                      << export_config.async_queue_depth << ")" << std::endl;
         }
 
         // Parse material presets (reusable B-H curves/properties)
@@ -5963,6 +6004,109 @@ void MagneticFieldAnalyzer::writeMatrixCSV(const Eigen::MatrixXd& m, const std::
     file.close();
 }
 
+// TIFF writer using libtiff directly. Earlier versions used cv::imwrite, but
+// OpenCV 4.6 imgcodecs does not expose IMWRITE_TIFF_PREDICTOR, and without
+// the floating-point predictor (Predictor=3) DEFLATE achieves ~0 compression
+// on double-precision field data because the low mantissa bits look like
+// noise to a byte-level coder. Calling TIFFSetField ourselves lets us turn
+// predictor on; observed file size drops ~3-5x on the polar nonlinear case.
+//
+// NaN / +Inf / -Inf / -0 bit patterns pass through unchanged. Eigen defaults
+// to column-major while libtiff scanlines are row-major, so we materialize
+// a row-major copy of the requested precision and feed scanlines from it.
+void MagneticFieldAnalyzer::writeMatrixTIFF(const Eigen::MatrixXd& m,
+                                            const std::string& output_path,
+                                            const ExportConfig& opts) {
+    const int rows = static_cast<int>(m.rows());
+    const int cols = static_cast<int>(m.cols());
+    const bool is_f32 = (opts.precision == ExportConfig::Precision::F32);
+    const uint16_t bits_per_sample = is_f32 ? 32 : 64;
+
+    TIFF* tif = TIFFOpen(output_path.c_str(), "w");
+    if (!tif) {
+        throw std::runtime_error("Failed to open TIFF for write: " + output_path);
+    }
+
+    TIFFSetField(tif, TIFFTAG_IMAGEWIDTH,      static_cast<uint32_t>(cols));
+    TIFFSetField(tif, TIFFTAG_IMAGELENGTH,     static_cast<uint32_t>(rows));
+    TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE,   bits_per_sample);
+    TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, static_cast<uint16_t>(1));
+    TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT,    static_cast<uint16_t>(SAMPLEFORMAT_IEEEFP));
+    TIFFSetField(tif, TIFFTAG_PHOTOMETRIC,     static_cast<uint16_t>(PHOTOMETRIC_MINISBLACK));
+    TIFFSetField(tif, TIFFTAG_ORIENTATION,     static_cast<uint16_t>(ORIENTATION_TOPLEFT));
+    TIFFSetField(tif, TIFFTAG_PLANARCONFIG,    static_cast<uint16_t>(PLANARCONFIG_CONTIG));
+    TIFFSetField(tif, TIFFTAG_COMPRESSION,     static_cast<uint16_t>(opts.tiff_compression));
+    if (opts.tiff_compression == COMPRESSION_DEFLATE ||
+        opts.tiff_compression == COMPRESSION_LZW) {
+        TIFFSetField(tif, TIFFTAG_PREDICTOR, static_cast<uint16_t>(opts.tiff_predictor));
+    }
+    TIFFSetField(tif, TIFFTAG_ROWSPERSTRIP, TIFFDefaultStripSize(tif, 0));
+
+    auto write_rows = [&](void* row_ptr_base, size_t row_stride_bytes) {
+        for (int j = 0; j < rows; ++j) {
+            unsigned char* row = static_cast<unsigned char*>(row_ptr_base) + j * row_stride_bytes;
+            if (TIFFWriteScanline(tif, row, j, 0) < 0) {
+                TIFFClose(tif);
+                throw std::runtime_error("TIFFWriteScanline failed: " + output_path);
+            }
+        }
+    };
+
+    if (is_f32) {
+        Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m.cast<float>();
+        write_rows(rm.data(), static_cast<size_t>(cols) * sizeof(float));
+    } else {
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> rm = m;
+        write_rows(rm.data(), static_cast<size_t>(cols) * sizeof(double));
+    }
+
+    TIFFClose(tif);
+}
+
+// Dispatch writer. The caller passes a base path WITHOUT extension; this routes
+// to the CSV/TIFF writers based on opts.format.
+//
+// When opts.async is true and async_writer_ is live, the actual file write is
+// posted to a worker thread. The matrix is copied into the lambda by value so
+// the solver can mutate Az/mu_map/... for the next step without racing the
+// pending write. Async path also goes through a .tmp -> rename dance so the
+// WebUI (or anything else watching the output dir) never sees a half-written
+// file.
+void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
+                                        const std::string& base_path,
+                                        const ExportConfig& opts) const {
+    const bool want_csv  = (opts.format == ExportConfig::Format::CSV ||
+                            opts.format == ExportConfig::Format::BOTH);
+    const bool want_tiff = (opts.format == ExportConfig::Format::TIFF ||
+                            opts.format == ExportConfig::Format::BOTH);
+
+    if (opts.async && async_writer_) {
+        if (want_csv) {
+            async_writer_->enqueue([m, base_path] {
+                const std::string final_path = base_path + ".csv";
+                const std::string tmp_path   = final_path + ".tmp";
+                writeMatrixCSV(m, tmp_path);
+                std::filesystem::rename(tmp_path, final_path);
+            });
+        }
+        if (want_tiff) {
+            async_writer_->enqueue([m, base_path, opts] {
+                const std::string final_path = base_path + ".tiff";
+                const std::string tmp_path   = final_path + ".tmp";
+                writeMatrixTIFF(m, tmp_path, opts);
+                std::filesystem::rename(tmp_path, final_path);
+            });
+        }
+    } else {
+        if (want_csv) {
+            writeMatrixCSV(m, base_path + ".csv");
+        }
+        if (want_tiff) {
+            writeMatrixTIFF(m, base_path + ".tiff", opts);
+        }
+    }
+}
+
 void MagneticFieldAnalyzer::exportAzToCSV(const std::string& output_path) const {
     if (Az.size() == 0) {
         throw std::runtime_error("No solution to export. Run solve() first.");
@@ -9710,26 +9854,43 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
 
     // Export Az
     if (shouldExportField("Az")) {
-        std::string az_path = az_folder + "/" + step_name + ".csv";
-        exportAzToCSV(az_path);
+        if (Az.size() == 0) {
+            throw std::runtime_error("No solution to export. Run solve() first.");
+        }
+        std::string az_base = az_folder + "/" + step_name;
+        writeMatrix(Az, az_base, export_config);
+        std::cout << "Az array exported to: " << az_base << std::endl;
     }
 
     // Export Mu
     if (shouldExportField("Mu")) {
-        std::string mu_path = mu_folder + "/" + step_name + ".csv";
-        exportMuToCSV(mu_path);
+        if (mu_map.size() == 0) {
+            throw std::runtime_error("No permeability data to export.");
+        }
+        std::string mu_base = mu_folder + "/" + step_name;
+        writeMatrix(mu_map, mu_base, export_config);
+        std::cout << "Permeability distribution exported to: " << mu_base << std::endl;
     }
 
     // Export H (magnetic field intensity magnitude) if available
     if (shouldExportField("H")) {
-        std::string h_path = h_folder + "/" + step_name + ".csv";
-        exportHToCSV(h_path);
+        if (H_map.size() == 0) {
+            std::cerr << "Warning: No H-field data to export (H_map is empty). Skipping H export." << std::endl;
+        } else {
+            std::string h_base = h_folder + "/" + step_name;
+            writeMatrix(H_map, h_base, export_config);
+            std::cout << "Magnetic field intensity |H| exported to: " << h_base << std::endl;
+        }
     }
 
     // Export Jz
     if (shouldExportField("Jz")) {
-        std::string jz_path = jz_folder + "/" + step_name + ".csv";
-        exportJzToCSV(jz_path);
+        if (jz_map.size() == 0) {
+            throw std::runtime_error("No current density data to export.");
+        }
+        std::string jz_base = jz_folder + "/" + step_name;
+        writeMatrix(jz_map, jz_base, export_config);
+        std::cout << "Current density distribution exported to: " << jz_base << std::endl;
     }
 
     // Export boundary image if available
@@ -9804,9 +9965,9 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
                 double B_mag = std::sqrt(Bx(j, i) * Bx(j, i) + By(j, i) * By(j, i));
                 energy_density(j, i) = co_energy_at(j, i, B_mag);
             }
-            std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
-            writeMatrixCSV(energy_density, energy_density_path);
-            std::cout << "Co-energy density exported to: " << energy_density_path << std::endl;
+            std::string energy_density_base = energy_density_folder + "/" + step_name;
+            writeMatrix(energy_density, energy_density_base, export_config);
+            std::cout << "Co-energy density exported to: " << energy_density_base << std::endl;
         } else if (coordinate_system == "polar" && Br.size() > 0 && Btheta.size() > 0 && mu_map.size() > 0) {
             const int rows = Br.rows();
             const int cols = Br.cols();
@@ -9819,9 +9980,9 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
                 double B_mag = std::sqrt(Br(j, i) * Br(j, i) + Btheta(j, i) * Btheta(j, i));
                 energy_density(j, i) = co_energy_at(j, i, B_mag);
             }
-            std::string energy_density_path = energy_density_folder + "/" + step_name + ".csv";
-            writeMatrixCSV(energy_density, energy_density_path);
-            std::cout << "Co-energy density (polar) exported to: " << energy_density_path << std::endl;
+            std::string energy_density_base = energy_density_folder + "/" + step_name;
+            writeMatrix(energy_density, energy_density_base, export_config);
+            std::cout << "Co-energy density (polar) exported to: " << energy_density_base << std::endl;
         }
     }
 
@@ -12116,6 +12277,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         exportActiveOnlyResults(output_dir, step);
 
         // <<PROFILING_TIMER_BEGIN>>
+        // In async mode this measures the enqueue cost (typically a few ms);
+        // the actual disk write happens on the worker thread. The drain time
+        // at end-of-analysis covers any backlog and is logged separately.
         prof_d_export = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now() - prof_t_export).count();
         // <<PROFILING_TIMER_END>>
@@ -12162,6 +12326,16 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // <<PROFILING_TIMER_END>>
     }
 
+    // Drain pending async writes before reporting timings or returning.
+    // Any worker-side exception surfaces here on the solver thread.
+    long long drain_ms = 0;
+    if (async_writer_) {
+        auto drain_start = std::chrono::high_resolution_clock::now();
+        async_writer_->drain();
+        drain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - drain_start).count();
+    }
+
     // Calculate total analysis time
     auto analysis_end_time = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(analysis_end_time - analysis_start_time);
@@ -12170,6 +12344,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
     std::cout << "\n=== Transient Analysis Complete ===" << std::endl;
     std::cout << "Total analysis time: " << total_duration.count() << " s ("
               << total_duration_ms.count() << " ms)" << std::endl;
+    if (async_writer_) {
+        std::cout << "Async writer drain time: " << drain_ms << " ms" << std::endl;
+    }
 
     // Export flux linkage results to CSV (if any paths were defined)
     exportFluxLinkageCSV(output_dir);

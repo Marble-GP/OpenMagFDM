@@ -19,6 +19,7 @@ const AppState = {
     isAnimating: false,  // Animation state flag
     analysisConditions: null,  // Analysis conditions from conditions.json
     dataCache: {},  // Data cache for preloaded steps: { 'resultPath:Az:step': data, ... }
+    dataMeta: {},   // Per-entry metadata: { 'resultPath:Az:step': { format: 'tiff'|'csv', precision: 'double'|'float' } }
     maxCacheEntries: 500,  // Maximum cache entries to prevent memory leak (500 * ~2MB = ~1GB max)
     // Polar coordinate transform options
     isPolarCoordinates: false,  // True if current result uses polar coordinates
@@ -1311,6 +1312,7 @@ async function loadSelectedResult() {
             const cacheSize = Object.keys(AppState.dataCache).length;
             console.log(`Switching from ${previousResult} to ${resultPath}, clearing ${cacheSize} cached entries`);
             AppState.dataCache = {};  // Complete cache clear
+            AppState.dataMeta = {};
         }
 
         AppState.resultsData.currentResult = resultPath;
@@ -1329,6 +1331,8 @@ async function loadSelectedResult() {
             console.warn('Failed to load conditions.json:', error);
             AppState.analysisConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
         }
+
+        updateExportFormatBadge();
 
         // Update polar coordinate controls
         updatePolarControls();
@@ -1878,8 +1882,8 @@ async function loadQuickPreviewFromResult(resultPath) {
             (AppState.analysisConditions.dy || AppState.analysisConditions.dtheta || 0.001) : 0.001;
 
         // Load Az and Mu data
-        const azResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Az/step_0001.csv`);
-        const muResponse = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=Mu/step_0001.csv`);
+        const azResponse = await fetch(`/api/load-field?result=${encodeURIComponent(resultPath)}&file=Az/step_0001.csv`);
+        const muResponse = await fetch(`/api/load-field?result=${encodeURIComponent(resultPath)}&file=Mu/step_0001.csv`);
 
         if (azResponse.ok && muResponse.ok) {
             const azData = await azResponse.json();
@@ -2728,8 +2732,8 @@ async function preloadAllSteps() {
             const muFile = `Mu/step_${String(step).padStart(4, '0')}.csv`;
 
             const [azResponse, muResponse] = await Promise.all([
-                fetch(`/api/load-csv?result=${encodeURIComponent(currentResult)}&file=${azFile}`),
-                fetch(`/api/load-csv?result=${encodeURIComponent(currentResult)}&file=${muFile}`)
+                fetch(`/api/load-field?result=${encodeURIComponent(currentResult)}&file=${azFile}`),
+                fetch(`/api/load-field?result=${encodeURIComponent(currentResult)}&file=${muFile}`)
             ]);
 
             // Save to cache with size check
@@ -2746,6 +2750,7 @@ async function preloadAllSteps() {
                 if (azData.success) {
                     const cacheKey = `${currentResult}:Az:${step}`;
                     AppState.dataCache[cacheKey] = azData.data;
+                    AppState.dataMeta[cacheKey] = { format: azData.format, precision: azData.precision };
                 }
             }
 
@@ -2754,6 +2759,7 @@ async function preloadAllSteps() {
                 if (muData.success) {
                     const cacheKey = `${currentResult}:Mu:${step}`;
                     AppState.dataCache[cacheKey] = muData.data;
+                    AppState.dataMeta[cacheKey] = { format: muData.format, precision: muData.precision };
                 }
             }
 
@@ -2826,8 +2832,37 @@ function formatStepFilename(step) {
     return `step_${String(step).padStart(4, '0')}.csv`;
 }
 
-// Helper function to load CSV data with caching
-async function loadCsvData(dataType, step, providedResultPath = null) {
+// Update the small diagnostic badge under the result selector with the
+// export format used by the current run. Reads conditions.json's export
+// block (written by the solver via exportConditionsJSON) for the "intended"
+// format, then refines with dataMeta (what was actually served by the
+// server) once any field has been fetched.
+function updateExportFormatBadge() {
+    const el = document.getElementById('resultMetaBadge');
+    if (!el) return;
+    const cond = AppState.analysisConditions || {};
+    const exp = cond.export || {};
+    const fmt = exp.format || 'unknown';
+    const prec = exp.precision || 'double';
+    const asyncFlag = exp.async === true ? ' / async' : '';
+    let line = `Source intent: ${fmt} (${prec})${asyncFlag}`;
+    // If we've already loaded any field, append what the server actually
+    // returned (useful when format=both — server picks tiff first).
+    const metaKeys = Object.keys(AppState.dataMeta || {});
+    if (metaKeys.length > 0) {
+        const last = AppState.dataMeta[metaKeys[metaKeys.length - 1]];
+        if (last && last.format) {
+            line += ` — served: ${last.format} (${last.precision || '?'})`;
+        }
+    }
+    el.textContent = line;
+}
+
+// Helper function to load field data (CSV or TIFF) with caching.
+// Server-side /api/load-field picks TIFF over CSV when both are present,
+// so the format/precision returned here can vary run-to-run; we track it
+// in AppState.dataMeta for diagnostic UI without polluting the cache key.
+async function loadFieldData(dataType, step, providedResultPath = null) {
     const resultPath = providedResultPath || getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
 
@@ -2838,9 +2873,11 @@ async function loadCsvData(dataType, step, providedResultPath = null) {
         return AppState.dataCache[cacheKey];
     }
 
-    // Cache miss - fetch from server
+    // Cache miss - fetch from server. Pass the bare file stem; the server
+    // probes both .tiff and .csv. Keeping ".csv" works too (it gets stripped
+    // server-side), so legacy URLs continue to function.
     const file = `${dataType}/${formatStepFilename(step)}`;
-    const response = await fetch(`/api/load-csv?result=${encodeURIComponent(resultPath)}&file=${file}`);
+    const response = await fetch(`/api/load-field?result=${encodeURIComponent(resultPath)}&file=${file}`);
     if (!response.ok) throw new Error(`Failed to load ${dataType} data`);
 
     const result = await response.json();
@@ -2851,21 +2888,27 @@ async function loadCsvData(dataType, step, providedResultPath = null) {
     if (currentCacheSize >= AppState.maxCacheEntries) {
         console.warn(`Cache full (${currentCacheSize}/${AppState.maxCacheEntries}), clearing cache to prevent memory leak`);
         AppState.dataCache = {};
+        AppState.dataMeta = {};
     }
     AppState.dataCache[cacheKey] = result.data;
+    AppState.dataMeta[cacheKey] = { format: result.format, precision: result.precision };
+    if (Object.keys(AppState.dataMeta).length === 1) {
+        // first load after a result switch: refresh the diagnostic badge
+        updateExportFormatBadge();
+    }
     return result.data;
 }
 
 // Placeholder implementations - these will call actual data loading and plotting
 async function renderAzContour(containerId, step) {
-    const data = await loadCsvData('Az', step);
+    const data = await loadFieldData('Az', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
     plotContour(containerId, flipped, 'Az [Wb/m]', true);
 }
 
 async function renderAzHeatmap(containerId, step) {
-    const data = await loadCsvData('Az', step);
+    const data = await loadFieldData('Az', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
     // C++ solver already outputs fully-interpolated Az grid (bilinear at inactive cells).
@@ -2874,7 +2917,7 @@ async function renderAzHeatmap(containerId, step) {
 }
 
 async function renderJzDistribution(containerId, step) {
-    const data = await loadCsvData('Jz', step);
+    const data = await loadFieldData('Jz', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
     plotHeatmap(containerId, flipped, 'Jz [A/m²]', true);
@@ -2886,8 +2929,8 @@ async function renderBMagnitude(containerId, step) {
     const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
 
     // Load Az and Mu with caching
-    const azData = await loadCsvData('Az', step);
-    const muData = await loadCsvData('Mu', step);
+    const azData = await loadFieldData('Az', step);
+    const muData = await loadFieldData('Mu', step);
 
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const azFlipped = flipVertical(azData);
@@ -2911,7 +2954,7 @@ async function renderHMagnitude(containerId, step) {
     if (hasNonlinear && nlEnabled) {
         // For nonlinear materials: load H directly from solver output (H.csv)
         try {
-            const hData = await loadCsvData('H', step);
+            const hData = await loadFieldData('H', step);
             // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
             const hFlipped = flipVertical(hData);
             plotHeatmap(containerId, hFlipped, '|H| [A/m] (solver)', true);
@@ -2926,8 +2969,8 @@ async function renderHMagnitude(containerId, step) {
     const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
 
     // Load Az and Mu with caching
-    const azData = await loadCsvData('Az', step);
-    const muData = await loadCsvData('Mu', step);
+    const azData = await loadFieldData('Az', step);
+    const muData = await loadFieldData('Mu', step);
 
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const azFlipped = flipVertical(azData);
@@ -2944,7 +2987,7 @@ async function renderHMagnitude(containerId, step) {
 }
 
 async function renderMuDistribution(containerId, step) {
-    const data = await loadCsvData('Mu', step);
+    const data = await loadFieldData('Mu', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     let flipped = flipVertical(data);
 
@@ -2954,7 +2997,7 @@ async function renderMuDistribution(containerId, step) {
 }
 
 async function renderEnergyDensity(containerId, step) {
-    const data = await loadCsvData('EnergyDensity', step);
+    const data = await loadFieldData('EnergyDensity', step);
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
     plotHeatmap(containerId, flipped, 'Energy [J/m³]', true);
@@ -3608,7 +3651,7 @@ async function renderAzBoundary(containerId, step) {
 
     try {
         // Load Az data with caching
-        const azData = await loadCsvData('Az', step);
+        const azData = await loadFieldData('Az', step);
 
         // Get input image URL (material image as background for field lines)
         const inputImgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
@@ -3834,7 +3877,7 @@ async function renderAzEdge(containerId, step) {
 
     try {
         // Load Az data with caching
-        const azData = await loadCsvData('Az', step);
+        const azData = await loadFieldData('Az', step);
 
         // Get input image URL
         const inputImgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
@@ -4486,8 +4529,8 @@ async function renderLineProfile(containerId, step) {
 
     try {
         // Load Az and Mu data
-        const azData = await loadCsvData('Az', step);
-        const muData = await loadCsvData('Mu', step);
+        const azData = await loadFieldData('Az', step);
+        const muData = await loadFieldData('Mu', step);
 
         if (!azData || azData.length === 0) {
             container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No data available</div>';
@@ -4889,7 +4932,7 @@ async function renderFluxLinkageInteractive(containerId, step) {
 
     try {
         // Load Az data
-        const azData = await loadCsvData('Az', step);
+        const azData = await loadFieldData('Az', step);
 
         if (!azData || azData.length === 0) {
             container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No data available</div>';
@@ -6646,8 +6689,8 @@ async function renderFileManagerPreview(resultPath) {
 
         console.log('Using dx:', dx, 'dy:', dy, 'coordinate_system:', AppState.analysisConditions?.coordinate_system);
 
-        const azData = await loadCsvData('Az', step, resultPath);
-        const muData = await loadCsvData('Mu', step, resultPath);
+        const azData = await loadFieldData('Az', step, resultPath);
+        const muData = await loadFieldData('Mu', step, resultPath);
         console.log('Loaded Az and Mu data');
 
         // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
