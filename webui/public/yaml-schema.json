@@ -12,7 +12,8 @@
     },
     "mesh": {
       "description": "Mesh configuration for Cartesian coordinates",
-      "children": ["dx", "dy"]
+      "children": ["dx", "dy"],
+      "example": "mesh:\n  dx: 0.2e-3\n  dy: 0.2e-3"
     },
     "dx": {
       "description": "Grid spacing in x-direction [m]",
@@ -26,7 +27,8 @@
     },
     "polar_domain": {
       "description": "Polar coordinate domain configuration",
-      "children": ["r_start", "r_end", "r_orientation", "theta_range"]
+      "children": ["r_start", "r_end", "r_orientation", "theta_range"],
+      "example": "polar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # pi/3"
     },
     "r_start": {
       "description": "Inner radius [m], must satisfy 0 < r_start < r_end",
@@ -50,23 +52,28 @@
     },
     "polar_boundary_conditions": {
       "description": "Boundary conditions for polar coordinates (radial: inner/outer, angular: theta_min/theta_max)",
-      "children": ["inner", "outer", "theta_min", "theta_max"]
+      "children": ["inner", "outer", "theta_min", "theta_max"],
+      "example": "polar_boundary_conditions:\n  inner: {type: dirichlet, value: 0.0}\n  outer: {type: dirichlet, value: 0.0}\n  theta_min: {type: periodic, value: 0.0}\n  theta_max: {type: periodic, value: 0.0}"
     },
     "inner": {
       "description": "Inner boundary condition (at r=r_start)",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "inner:\n  type: dirichlet\n  value: 0.0"
     },
     "outer": {
       "description": "Outer boundary condition (at r=r_end)",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "outer:\n  type: dirichlet\n  value: 0.0"
     },
     "theta_min": {
       "description": "Boundary condition at θ=0 (angular start boundary)",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "theta_min:\n  type: periodic\n  value: 0.0"
     },
     "theta_max": {
       "description": "Boundary condition at θ=theta_range (angular end boundary)",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "theta_max:\n  type: periodic\n  value: 0.0"
     },
     "type": {
       "description": "Boundary condition type: 'dirichlet', 'neumann', 'periodic', or 'robin'. For periodic BC with value<0, anti-periodic BC is applied (f(θ=0) = -f(θ=θ_range))",
@@ -92,28 +99,34 @@
     },
     "boundary_conditions": {
       "description": "Boundary conditions for Cartesian coordinates (4 edges)",
-      "children": ["left", "right", "top", "bottom"]
+      "children": ["left", "right", "top", "bottom"],
+      "example": "boundary_conditions:\n  left:   {type: dirichlet, value: 0.0}\n  right:  {type: dirichlet, value: 0.0}\n  top:    {type: dirichlet, value: 0.0}\n  bottom: {type: dirichlet, value: 0.0}"
     },
     "left": {
       "description": "Left boundary condition",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "left:\n  type: dirichlet\n  value: 0.0"
     },
     "right": {
       "description": "Right boundary condition",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "right:\n  type: dirichlet\n  value: 0.0"
     },
     "top": {
       "description": "Top boundary condition",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "top:\n  type: dirichlet\n  value: 0.0"
     },
     "bottom": {
       "description": "Bottom boundary condition",
-      "children": ["type", "value", "alpha", "beta", "gamma"]
+      "children": ["type", "value", "alpha", "beta", "gamma"],
+      "example": "bottom:\n  type: dirichlet\n  value: 0.0"
     },
     "materials": {
       "description": "Material definitions (any material name is allowed)",
       "acceptsAnyChild": true,
-      "childrenProperties": ["rgb", "mu_r", "B-H", "bh_type", "jz", "calc_force", "anti_aliasing", "coarsen", "coarsen_ratio", "preset", "magnetization"]
+      "childrenProperties": ["rgb", "mu_r", "B-H", "bh_type", "jz", "calc_force", "anti_aliasing", "coarsen", "coarsen_ratio", "preset", "magnetization"],
+      "example": "materials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n  iron:\n    rgb: [128, 128, 128]\n    mu_r: 1000.0\n    jz: 0.0\n    calc_force: true"
     },
     "rgb": {
       "description": "RGB color for material identification in input image [R, G, B]",
@@ -194,7 +207,8 @@
     },
     "transient": {
       "description": "Transient analysis configuration",
-      "children": ["enabled", "enable_sliding", "total_steps", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"]
+      "children": ["enabled", "enable_sliding", "total_steps", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
+      "example": "transient:\n  enabled: true\n  total_steps: 100\n  enable_sliding: true\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n  slide_pixels_per_step: 1"
     },
     "enabled": {
       "description": "Enable feature (true/false)",
@@ -234,7 +248,8 @@
     },
     "nonlinear_solver": {
       "description": "Nonlinear solver configuration for materials with field-dependent permeability μ(H)",
-      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence"]
+      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence"],
+      "example": "nonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  max_iterations: 50\n  tolerance: 1.0e-6\n  verbose: false"
     },
     "solver_type": {
       "description": "Nonlinear solver algorithm: 'picard' (simple fixed-point) or 'newton-krylov' (recommended for fast convergence)",
@@ -245,7 +260,8 @@
     "anderson": {
       "description": "Anderson acceleration settings (works with both picard and newton-krylov solvers)",
       "children": ["enabled", "depth", "beta"],
-      "validParents": ["nonlinear_solver"]
+      "validParents": ["nonlinear_solver"],
+      "example": "anderson:\n  enabled: true\n  depth: 5\n  beta: 1.0"
     },
     "depth": {
       "description": "Anderson acceleration history depth (typically 3-10, larger = more acceleration but more memory)",
@@ -346,7 +362,8 @@
     "magnetization": {
       "description": "Permanent magnet magnetization model. Implements equivalent magnetization current Jz_mag=∇×M. Specify Br (preferred) or Hc, then pattern and direction parameters",
       "children": ["Br", "Hc", "pattern", "angle", "p", "cx", "cy", "R_pc", "Mx", "My"],
-      "validParents": ["materials"]
+      "validParents": ["materials"],
+      "example": "magnetization:\n  Br: 1.27\n  pattern: parallel\n  angle: 0.0"
     },
     "pattern": {
       "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward from center (cx, cy)\n  tangential — counter-clockwise from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy)\n  polar_anisotropy — pole-following easy axis (p, R_pc, cx, cy)\n  custom — user expression (Mx, My)",
@@ -410,7 +427,8 @@
     },
     "solver": {
       "description": "Solver performance configuration",
-      "children": ["omp_threads"]
+      "children": ["omp_threads"],
+      "example": "solver:\n  omp_threads: 4"
     },
     "omp_threads": {
       "description": "Number of OpenMP threads for parallel computation. 0 or omitted = use system default (all available cores). Overrides OMP_NUM_THREADS environment variable",
