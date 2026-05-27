@@ -309,6 +309,24 @@ void exportConditionsJSON(const std::string& output_path,
         j["nonlinear_solver"]["solver_type"] = solver_type;
     }
 
+    // Export configuration (which writers were active for this run; lets the
+    // WebUI show "Source: TIFF (double)" badges and pick the right reader).
+    j["export"] = json::object();
+    j["export"]["format"]    = "both";   // default if export: block omitted
+    j["export"]["precision"] = "double";
+    j["export"]["async"]     = false;
+    if (config["export"]) {
+        auto exp = config["export"];
+        if (exp["format"])    j["export"]["format"]    = exp["format"].as<std::string>("both");
+        if (exp["precision"]) j["export"]["precision"] = exp["precision"].as<std::string>("double");
+        if (exp["async"])     j["export"]["async"]     = exp["async"].as<bool>(false);
+        if (exp["tiff"]) {
+            j["export"]["tiff"] = json::object();
+            if (exp["tiff"]["compression"]) j["export"]["tiff"]["compression"] = exp["tiff"]["compression"].as<std::string>("deflate");
+            if (exp["tiff"]["predictor"])   j["export"]["tiff"]["predictor"]   = exp["tiff"]["predictor"].as<int>(3);
+        }
+    }
+
     // Write to file with proper indentation
     std::ofstream json_file(output_path);
     if (!json_file.is_open()) {

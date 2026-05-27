@@ -1332,6 +1332,8 @@ async function loadSelectedResult() {
             AppState.analysisConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
         }
 
+        updateExportFormatBadge();
+
         // Update polar coordinate controls
         updatePolarControls();
 
@@ -2830,6 +2832,32 @@ function formatStepFilename(step) {
     return `step_${String(step).padStart(4, '0')}.csv`;
 }
 
+// Update the small diagnostic badge under the result selector with the
+// export format used by the current run. Reads conditions.json's export
+// block (written by the solver via exportConditionsJSON) for the "intended"
+// format, then refines with dataMeta (what was actually served by the
+// server) once any field has been fetched.
+function updateExportFormatBadge() {
+    const el = document.getElementById('resultMetaBadge');
+    if (!el) return;
+    const cond = AppState.analysisConditions || {};
+    const exp = cond.export || {};
+    const fmt = exp.format || 'unknown';
+    const prec = exp.precision || 'double';
+    const asyncFlag = exp.async === true ? ' / async' : '';
+    let line = `Source intent: ${fmt} (${prec})${asyncFlag}`;
+    // If we've already loaded any field, append what the server actually
+    // returned (useful when format=both — server picks tiff first).
+    const metaKeys = Object.keys(AppState.dataMeta || {});
+    if (metaKeys.length > 0) {
+        const last = AppState.dataMeta[metaKeys[metaKeys.length - 1]];
+        if (last && last.format) {
+            line += ` — served: ${last.format} (${last.precision || '?'})`;
+        }
+    }
+    el.textContent = line;
+}
+
 // Helper function to load field data (CSV or TIFF) with caching.
 // Server-side /api/load-field picks TIFF over CSV when both are present,
 // so the format/precision returned here can vary run-to-run; we track it
@@ -2864,6 +2892,10 @@ async function loadFieldData(dataType, step, providedResultPath = null) {
     }
     AppState.dataCache[cacheKey] = result.data;
     AppState.dataMeta[cacheKey] = { format: result.format, precision: result.precision };
+    if (Object.keys(AppState.dataMeta).length === 1) {
+        // first load after a result switch: refresh the diagnostic badge
+        updateExportFormatBadge();
+    }
     return result.data;
 }
 
