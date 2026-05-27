@@ -2448,8 +2448,14 @@ app.get('/api/load-field', async (req, res) => {
     }
 });
 
-// 特定ステップのCSVファイル読み込み
+// 特定ステップのCSVファイル読み込み (deprecated; use /api/load-field).
+// Kept for backwards compatibility with external scripts and older bookmarks.
+let _loadCsvDeprecationWarned = false;
 app.get('/api/load-csv', async (req, res) => {
+    if (!_loadCsvDeprecationWarned) {
+        console.warn('[deprecated] /api/load-csv hit; please migrate callers to /api/load-field which also handles TIFF.');
+        _loadCsvDeprecationWarned = true;
+    }
     try {
         const resultPath = req.query.result;
         const file = req.query.file; // e.g., "Az/step_0000.csv"

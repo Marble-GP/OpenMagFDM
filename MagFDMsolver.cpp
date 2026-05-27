@@ -311,10 +311,11 @@ void exportConditionsJSON(const std::string& output_path,
 
     // Export configuration (which writers were active for this run; lets the
     // WebUI show "Source: TIFF (double)" badges and pick the right reader).
+    // Defaults here must match ExportConfig in MagneticFieldAnalyzer.h.
     j["export"] = json::object();
-    j["export"]["format"]    = "both";   // default if export: block omitted
+    j["export"]["format"]    = "tiff";    // v1.4 default
     j["export"]["precision"] = "double";
-    j["export"]["async"]     = false;
+    j["export"]["async"]     = true;
     if (config["export"]) {
         auto exp = config["export"];
         if (exp["format"])    j["export"]["format"]    = exp["format"].as<std::string>("both");

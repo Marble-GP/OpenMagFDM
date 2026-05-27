@@ -514,12 +514,16 @@ private:
 
     // Result export configuration ("how" results are written;
     // the "what" stays in TransientConfig::export_fields).
+    //
+    // Defaults (v1.4): TIFF + async. Both were verified bit-exact against
+    // the legacy CSV path over the Phase 1..5 work. Set `format: both`
+    // explicitly in yaml if a downstream tool still consumes CSV directly.
     struct ExportConfig {
         enum class Format { CSV, TIFF, BOTH };
         enum class Precision { F32, F64 };
-        Format format = Format::BOTH;
+        Format format = Format::TIFF;
         Precision precision = Precision::F64;
-        bool async = false;
+        bool async = true;
         int async_queue_depth = 4;
         int tiff_compression = 8;  // libtiff COMPRESSION_DEFLATE
         int tiff_predictor   = 3;  // floating-point predictor
