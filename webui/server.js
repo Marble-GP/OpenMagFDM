@@ -5,7 +5,11 @@ const fsSync = require('fs');
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const yaml = require('js-yaml');
-const { fromArrayBuffer } = require('geotiff');
+// NOTE: TIFF decoding is intentionally NOT done on the server. geotiff's CJS
+// entry pulls in ESM-only quick-lru/web-worker, which breaks when this file
+// is bundled by `pkg` (Node 18 has no CJS->ESM bridge for require()). Instead
+// the server streams raw TIFF bytes and the browser decodes them via the
+// vendored UMD bundle at /lib/geotiff.js.
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -2353,49 +2357,20 @@ app.get('/api/detect-steps', async (req, res) => {
     }
 });
 
-// Format-agnostic field loader. The caller passes file as either
-// "Az/step_0001.csv", "Az/step_0001.tiff", or "Az/step_0001"; we resolve to
-// the actual file on disk and return a 2D array compatible with the legacy
-// /api/load-csv response shape (NaN encoded as null, Y axis flipped).
+// Format-agnostic field loader.
+//
+// CSV path: decodes server-side into a JSON 2D array (legacy response shape).
+// TIFF path: streams the raw TIFF file with Content-Type image/tiff and an
+//            X-Field-* header set; the browser handles decoding via the
+//            vendored geotiff bundle at /lib/geotiff.js. This avoids pulling
+//            geotiff into the Node bundle (it transitively requires ESM-only
+//            modules that pkg cannot handle).
 //
 // Resolution order (when both exist or no extension given):
 //   - ?prefer=csv  -> CSV first, TIFF fallback
-//   - ?prefer=tiff -> TIFF first, CSV fallback
 //   - (default)    -> TIFF first, CSV fallback
-//
-// Response: { success, data, format: "csv"|"tiff", precision: "double"|"float" }
 async function fileExists(p) {
     try { await fs.access(p); return true; } catch { return false; }
-}
-
-async function decodeTiff(filePath) {
-    const buf = await fs.readFile(filePath);
-    // Slice into a fresh ArrayBuffer view (Node Buffers share an underlying
-    // pool, so the raw .buffer often has extra bytes that confuse geotiff).
-    const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-    const tiff = await fromArrayBuffer(ab);
-    const image = await tiff.getImage();
-    const rasters = await image.readRasters();
-    const width = image.getWidth();
-    const height = image.getHeight();
-    const raster = rasters[0];  // single-channel scalar field
-
-    const bps = image.getBitsPerSample();  // returns the first sample's bit count
-    const precision = bps === 64 ? 'double' : 'float';
-
-    // Build a JS 2D array, NaN bit patterns -> null so Plotly + the existing
-    // _fillInactiveScalar() interpolator treat inactive cells as gaps.
-    const data = new Array(height);
-    for (let j = 0; j < height; j++) {
-        const row = new Array(width);
-        for (let i = 0; i < width; i++) {
-            const v = raster[j * width + i];
-            row[i] = Number.isNaN(v) ? null : v;
-        }
-        data[j] = row;
-    }
-    data.reverse();  // match the existing CSV path (image coords, Y down -> Y up)
-    return { data, precision };
 }
 
 async function decodeCsv(filePath) {
@@ -2431,8 +2406,10 @@ app.get('/api/load-field', async (req, res) => {
         for (const p of order) {
             if (!await fileExists(p)) continue;
             if (p.endsWith('.tiff')) {
-                const { data, precision } = await decodeTiff(p);
-                return res.json({ success: true, data, format: 'tiff', precision });
+                // Stream raw TIFF; the browser decodes it.
+                res.setHeader('Content-Type', 'image/tiff');
+                res.setHeader('X-Field-Format', 'tiff');
+                return res.sendFile(p);
             } else {
                 const { data, precision } = await decodeCsv(p);
                 return res.json({ success: true, data, format: 'csv', precision });

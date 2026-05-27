@@ -1881,41 +1881,40 @@ async function loadQuickPreviewFromResult(resultPath) {
         const dy = AppState.analysisConditions ?
             (AppState.analysisConditions.dy || AppState.analysisConditions.dtheta || 0.001) : 0.001;
 
-        // Load Az and Mu data
-        const azResponse = await fetch(`/api/load-field?result=${encodeURIComponent(resultPath)}&file=Az/step_0001.csv`);
-        const muResponse = await fetch(`/api/load-field?result=${encodeURIComponent(resultPath)}&file=Mu/step_0001.csv`);
+        // Load Az and Mu data via the shared loader (handles TIFF/CSV
+        // and populates the cache for the rest of the session).
+        let azFlat = null, muFlat = null;
+        try {
+            [azFlat, muFlat] = await Promise.all([
+                loadFieldData('Az', 1, resultPath),
+                loadFieldData('Mu', 1, resultPath),
+            ]);
+        } catch (e) {
+            console.warn('Quick preview load failed:', e.message);
+        }
 
-        if (azResponse.ok && muResponse.ok) {
-            const azData = await azResponse.json();
-            const muData = await muResponse.json();
+        if (azFlat && muFlat) {
+            // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
+            const azFlipped = flipVertical(azFlat);
+            const muFlipped = flipVertical(muFlat);
 
-            if (azData.success && muData.success) {
-                // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
-                const azFlipped = flipVertical(azData.data);
-                const muFlipped = flipVertical(muData.data);
+            console.log('Az data dimensions:', azFlipped.length, 'x', azFlipped[0]?.length);
+            console.log('Mu data dimensions:', muFlipped.length, 'x', muFlipped[0]?.length);
+            console.log('Grid spacing: dx =', dx, ', dy =', dy);
 
-                console.log('Az data dimensions:', azFlipped.length, 'x', azFlipped[0]?.length);
-                console.log('Mu data dimensions:', muFlipped.length, 'x', muFlipped[0]?.length);
-                console.log('Grid spacing: dx =', dx, ', dy =', dy);
+            // Load coarsening mask for coarsening-aware B/H computation
+            const maskResult = await getCoarseningMaskArray(resultPath, 1).catch(() => null);
+            const activeMask = maskResult ? maskResult.mask : null;
 
-                // Load coarsening mask for coarsening-aware B/H computation
-                const maskResult = await getCoarseningMaskArray(resultPath, 1).catch(() => null);
-                const activeMask = maskResult ? maskResult.mask : null;
+            const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
+            console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
+            console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
+            console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
+            console.log('B magnitude sample values:', B[0]?.slice(0, 3));
 
-                const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
-                console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
-                console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
-                console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
-                console.log('B magnitude sample values:', B[0]?.slice(0, 3));
-
-                // Plot |B| and |H|
-                plotHeatmap('previewPlot2', B, '|B| [T]', true);
-                plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
-            } else {
-                console.error('Az/Mu data loading failed:', { azSuccess: azData.success, muSuccess: muData.success });
-                document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
-                document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Failed to process Az/Mu data</p>';
-            }
+            // Plot |B| and |H|
+            plotHeatmap('previewPlot2', B, '|B| [T]', true);
+            plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
         } else {
             document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
             document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
@@ -2727,16 +2726,8 @@ async function preloadAllSteps() {
         for (let step = 1; step <= AppState.totalSteps; step++) {
             btn.textContent = `Loading ${step}/${AppState.totalSteps}`;
 
-            // Preload Az and Mu data
-            const azFile = `Az/step_${String(step).padStart(4, '0')}.csv`;
-            const muFile = `Mu/step_${String(step).padStart(4, '0')}.csv`;
-
-            const [azResponse, muResponse] = await Promise.all([
-                fetch(`/api/load-field?result=${encodeURIComponent(currentResult)}&file=${azFile}`),
-                fetch(`/api/load-field?result=${encodeURIComponent(currentResult)}&file=${muFile}`)
-            ]);
-
-            // Save to cache with size check
+            // Cap before issuing requests so we don't blow past the limit on
+            // the last iteration.
             const currentCacheSize = Object.keys(AppState.dataCache).length;
             if (currentCacheSize >= AppState.maxCacheEntries) {
                 console.warn(`Cache limit reached during preload at step ${step}/${AppState.totalSteps}, stopping`);
@@ -2745,22 +2736,16 @@ async function preloadAllSteps() {
                 break;
             }
 
-            if (azResponse.ok) {
-                const azData = await azResponse.json();
-                if (azData.success) {
-                    const cacheKey = `${currentResult}:Az:${step}`;
-                    AppState.dataCache[cacheKey] = azData.data;
-                    AppState.dataMeta[cacheKey] = { format: azData.format, precision: azData.precision };
-                }
-            }
-
-            if (muResponse.ok) {
-                const muData = await muResponse.json();
-                if (muData.success) {
-                    const cacheKey = `${currentResult}:Mu:${step}`;
-                    AppState.dataCache[cacheKey] = muData.data;
-                    AppState.dataMeta[cacheKey] = { format: muData.format, precision: muData.precision };
-                }
+            // Preload Az and Mu via the shared loader so TIFF/CSV are decoded
+            // uniformly (server picks the format, browser does the work for
+            // TIFF). loadFieldData populates cache + dataMeta as a side effect.
+            try {
+                await Promise.all([
+                    loadFieldData('Az', step, currentResult),
+                    loadFieldData('Mu', step, currentResult),
+                ]);
+            } catch (e) {
+                console.warn(`Preload failed at step ${step}:`, e.message);
             }
 
             // Preload force data if available
@@ -2858,45 +2843,83 @@ function updateExportFormatBadge() {
     el.textContent = line;
 }
 
+// Decode a TIFF ArrayBuffer (single-channel float32/float64, NaN-aware) into
+// a 2D JS array. NaN bit patterns become null so the existing
+// _fillInactiveScalar() Gauss-Seidel filler treats them as gaps. Y-axis is
+// reversed to match the legacy CSV path (image coords).
+async function decodeTiffArrayBuffer(arrayBuffer) {
+    if (typeof GeoTIFF === 'undefined') {
+        throw new Error('GeoTIFF library not loaded (expected at /lib/geotiff.js)');
+    }
+    const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
+    const image = await tiff.getImage();
+    const rasters = await image.readRasters();
+    const width = image.getWidth();
+    const height = image.getHeight();
+    const raster = rasters[0];
+    const bps = image.getBitsPerSample();
+    const precision = bps === 64 ? 'double' : 'float';
+
+    const data = new Array(height);
+    for (let j = 0; j < height; j++) {
+        const row = new Array(width);
+        for (let i = 0; i < width; i++) {
+            const v = raster[j * width + i];
+            row[i] = Number.isNaN(v) ? null : v;
+        }
+        data[j] = row;
+    }
+    data.reverse();
+    return { data, precision };
+}
+
 // Helper function to load field data (CSV or TIFF) with caching.
-// Server-side /api/load-field picks TIFF over CSV when both are present,
-// so the format/precision returned here can vary run-to-run; we track it
-// in AppState.dataMeta for diagnostic UI without polluting the cache key.
+// Server returns either application/json (CSV path, decoded server-side) or
+// image/tiff (raw TIFF stream, decoded here via GeoTIFF). The cache key does
+// not include format so a format=both run hits cache regardless of which
+// branch served it last time.
 async function loadFieldData(dataType, step, providedResultPath = null) {
     const resultPath = providedResultPath || getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
 
-    // Check cache first
     const cacheKey = `${resultPath}:${dataType}:${step}`;
     if (AppState.dataCache[cacheKey]) {
         console.log(`Cache hit: ${cacheKey}`);
         return AppState.dataCache[cacheKey];
     }
 
-    // Cache miss - fetch from server. Pass the bare file stem; the server
-    // probes both .tiff and .csv. Keeping ".csv" works too (it gets stripped
-    // server-side), so legacy URLs continue to function.
     const file = `${dataType}/${formatStepFilename(step)}`;
     const response = await fetch(`/api/load-field?result=${encodeURIComponent(resultPath)}&file=${file}`);
-    if (!response.ok) throw new Error(`Failed to load ${dataType} data`);
+    if (!response.ok) throw new Error(`Failed to load ${dataType} data (HTTP ${response.status})`);
 
-    const result = await response.json();
-    if (!result.success) throw new Error(`Failed to parse ${dataType} data`);
+    const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
+    let data, format, precision;
+    if (contentType.startsWith('image/tiff')) {
+        const ab = await response.arrayBuffer();
+        const decoded = await decodeTiffArrayBuffer(ab);
+        data = decoded.data;
+        format = 'tiff';
+        precision = decoded.precision;
+    } else {
+        const result = await response.json();
+        if (!result.success) throw new Error(`Failed to parse ${dataType} data: ${result.error || 'unknown error'}`);
+        data = result.data;
+        format = result.format || 'csv';
+        precision = result.precision || 'double';
+    }
 
-    // Store in cache with size limit check
     const currentCacheSize = Object.keys(AppState.dataCache).length;
     if (currentCacheSize >= AppState.maxCacheEntries) {
         console.warn(`Cache full (${currentCacheSize}/${AppState.maxCacheEntries}), clearing cache to prevent memory leak`);
         AppState.dataCache = {};
         AppState.dataMeta = {};
     }
-    AppState.dataCache[cacheKey] = result.data;
-    AppState.dataMeta[cacheKey] = { format: result.format, precision: result.precision };
+    AppState.dataCache[cacheKey] = data;
+    AppState.dataMeta[cacheKey] = { format, precision };
     if (Object.keys(AppState.dataMeta).length === 1) {
-        // first load after a result switch: refresh the diagnostic badge
         updateExportFormatBadge();
     }
-    return result.data;
+    return data;
 }
 
 // Placeholder implementations - these will call actual data loading and plotting
