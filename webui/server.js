@@ -11,6 +11,19 @@ const yaml = require('js-yaml');
 // the server streams raw TIFF bytes and the browser decodes them via the
 // vendored UMD bundle at /lib/geotiff.js.
 
+// Count transient analysis step files in a directory listing. Accepts both
+// CSV (legacy) and TIFF (v1.4 default) outputs. Same step number written in
+// both formats is counted once. Used by /api/detect-steps, /api/results,
+// and the analysis-output listing.
+function countTransientSteps(files) {
+    const ids = new Set();
+    for (const f of files) {
+        const m = f.match(/^step_(\d{4})\.(csv|tiff)$/);
+        if (m) ids.add(m[1]);
+    }
+    return ids.size;
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -1172,16 +1185,17 @@ app.get('/api/results', async (req, res) => {
                 // Check if this is an analysis result folder
                 if (await isAnalysisResult(folderPath)) {
                     try {
-                        // Count steps
+                        // Count steps (CSV or TIFF; same step number written
+                        // in both formats counts once)
                         const azFolder = path.join(folderPath, 'Az');
                         const azFiles = await fs.readdir(azFolder);
-                        const stepFiles = azFiles.filter(f => /^step_\d{4}\.csv$/.test(f));
+                        const stepCount = countTransientSteps(azFiles);
 
                         resultFolders.push({
                             name: folderName,
                             path: `outputs/${userIdKey}/${folderName}`,
                             timestamp: folderName.replace('output_', ''), // Extract timestamp if present
-                            steps: stepFiles.length
+                            steps: stepCount
                         });
                     } catch {
                         // Skip if cannot read Az folder
@@ -1360,12 +1374,12 @@ app.get('/api/user-outputs', async (req, res) => {
                         // Calculate folder size
                         const size = await getDirectorySize(folderPath);
 
-                        // Count steps
+                        // Count steps (CSV and/or TIFF)
                         let stepCount = 0;
                         try {
                             const azFolder = path.join(folderPath, 'Az');
                             const azFiles = await fs.readdir(azFolder);
-                            stepCount = azFiles.filter(f => /^step_\d{4}\.csv$/.test(f)).length;
+                            stepCount = countTransientSteps(azFiles);
                         } catch {
                             // Az folder might not exist
                             stepCount = 0;
@@ -2334,24 +2348,11 @@ app.get('/api/detect-steps', async (req, res) => {
         const azFolder = path.join(BASE_DIR, resultPath, 'Az');
         const files = await fs.readdir(azFolder);
 
-        const stepSet = new Set();
-        let hasTiff = false;
-        let hasCsv = false;
-        for (const f of files) {
-            const m = f.match(/^step_(\d{4})\.(csv|tiff)$/);
-            if (m) {
-                stepSet.add(m[1]);
-                if (m[2] === 'tiff') hasTiff = true;
-                if (m[2] === 'csv')  hasCsv = true;
-            }
-        }
+        const steps = countTransientSteps(files);
+        const hasTiff = files.some(f => /^step_\d{4}\.tiff$/.test(f));
+        const hasCsv  = files.some(f => /^step_\d{4}\.csv$/.test(f));
 
-        res.json({
-            success: true,
-            steps: stepSet.size,
-            hasTiff,
-            hasCsv
-        });
+        res.json({ success: true, steps, hasTiff, hasCsv });
     } catch (error) {
         res.json({ success: false, error: error.message, steps: 1 });
     }
