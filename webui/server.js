@@ -5,6 +5,7 @@ const fsSync = require('fs');
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const yaml = require('js-yaml');
+const { fromArrayBuffer } = require('geotiff');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -2316,6 +2317,9 @@ app.get('/api/get-transient-config', async (req, res) => {
 });
 
 // ステップ数の検出
+// Counts step_XXXX.{csv,tiff} entries in the Az folder. Same step number with
+// both CSV and TIFF is counted once. ".tmp" sentinels written by AsyncWriter
+// mid-write are ignored.
 app.get('/api/detect-steps', async (req, res) => {
     try {
         const resultPath = req.query.result;
@@ -2326,15 +2330,121 @@ app.get('/api/detect-steps', async (req, res) => {
         const azFolder = path.join(BASE_DIR, resultPath, 'Az');
         const files = await fs.readdir(azFolder);
 
-        // step_XXXX.csv 形式のファイルをカウント
-        const stepFiles = files.filter(f => /^step_\d{4}\.csv$/.test(f));
+        const stepSet = new Set();
+        let hasTiff = false;
+        let hasCsv = false;
+        for (const f of files) {
+            const m = f.match(/^step_(\d{4})\.(csv|tiff)$/);
+            if (m) {
+                stepSet.add(m[1]);
+                if (m[2] === 'tiff') hasTiff = true;
+                if (m[2] === 'csv')  hasCsv = true;
+            }
+        }
 
         res.json({
             success: true,
-            steps: stepFiles.length
+            steps: stepSet.size,
+            hasTiff,
+            hasCsv
         });
     } catch (error) {
         res.json({ success: false, error: error.message, steps: 1 });
+    }
+});
+
+// Format-agnostic field loader. The caller passes file as either
+// "Az/step_0001.csv", "Az/step_0001.tiff", or "Az/step_0001"; we resolve to
+// the actual file on disk and return a 2D array compatible with the legacy
+// /api/load-csv response shape (NaN encoded as null, Y axis flipped).
+//
+// Resolution order (when both exist or no extension given):
+//   - ?prefer=csv  -> CSV first, TIFF fallback
+//   - ?prefer=tiff -> TIFF first, CSV fallback
+//   - (default)    -> TIFF first, CSV fallback
+//
+// Response: { success, data, format: "csv"|"tiff", precision: "double"|"float" }
+async function fileExists(p) {
+    try { await fs.access(p); return true; } catch { return false; }
+}
+
+async function decodeTiff(filePath) {
+    const buf = await fs.readFile(filePath);
+    // Slice into a fresh ArrayBuffer view (Node Buffers share an underlying
+    // pool, so the raw .buffer often has extra bytes that confuse geotiff).
+    const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+    const tiff = await fromArrayBuffer(ab);
+    const image = await tiff.getImage();
+    const rasters = await image.readRasters();
+    const width = image.getWidth();
+    const height = image.getHeight();
+    const raster = rasters[0];  // single-channel scalar field
+
+    const bps = image.getBitsPerSample();  // returns the first sample's bit count
+    const precision = bps === 64 ? 'double' : 'float';
+
+    // Build a JS 2D array, NaN bit patterns -> null so Plotly + the existing
+    // _fillInactiveScalar() interpolator treat inactive cells as gaps.
+    const data = new Array(height);
+    for (let j = 0; j < height; j++) {
+        const row = new Array(width);
+        for (let i = 0; i < width; i++) {
+            const v = raster[j * width + i];
+            row[i] = Number.isNaN(v) ? null : v;
+        }
+        data[j] = row;
+    }
+    data.reverse();  // match the existing CSV path (image coords, Y down -> Y up)
+    return { data, precision };
+}
+
+async function decodeCsv(filePath) {
+    const content = await fs.readFile(filePath, 'utf8');
+    const lines = content.trim().split('\n');
+    const data = lines.map(line =>
+        line.split(',').map(val => {
+            if (val.length === 0) return null;  // active-only paths leave blanks for NaN
+            const f = parseFloat(val);
+            return Number.isNaN(f) ? null : f;
+        })
+    );
+    data.reverse();
+    return { data, precision: 'double' };
+}
+
+app.get('/api/load-field', async (req, res) => {
+    try {
+        const resultPath = req.query.result;
+        const file = req.query.file;
+        const prefer = req.query.prefer;  // "csv" | "tiff" | undefined
+        if (!resultPath || !file) {
+            return res.json({ success: false, error: 'Missing parameters' });
+        }
+
+        const base = file.replace(/\.(csv|tiff)$/i, '');
+        const tiffPath = path.join(BASE_DIR, resultPath, base + '.tiff');
+        const csvPath  = path.join(BASE_DIR, resultPath, base + '.csv');
+
+        const preferCsv = prefer === 'csv';
+        const order = preferCsv ? [csvPath, tiffPath] : [tiffPath, csvPath];
+
+        for (const p of order) {
+            if (!await fileExists(p)) continue;
+            if (p.endsWith('.tiff')) {
+                const { data, precision } = await decodeTiff(p);
+                return res.json({ success: true, data, format: 'tiff', precision });
+            } else {
+                const { data, precision } = await decodeCsv(p);
+                return res.json({ success: true, data, format: 'csv', precision });
+            }
+        }
+
+        return res.json({
+            success: false,
+            error: `Neither ${base}.tiff nor ${base}.csv exists under ${resultPath}`
+        });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
     }
 });
 
