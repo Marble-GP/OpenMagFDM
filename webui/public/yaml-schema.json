@@ -417,6 +417,53 @@
       "type": "integer",
       "example": "omp_threads: 4",
       "validParents": ["solver"]
+    },
+    "export": {
+      "description": "Result export configuration: file format, numeric precision, async write, and TIFF compression options. Default is format=both/precision=double/async=false during the migration period; defaults will switch to TIFF + async in a future release.",
+      "children": ["format", "precision", "async", "async_queue_depth", "tiff"],
+      "example": "export:\n  format: tiff\n  precision: double\n  async: true\n  tiff:\n    compression: deflate\n    predictor: 3"
+    },
+    "format": {
+      "description": "Output format: 'csv' (legacy text, large), 'tiff' (IEEE 754 binary, compressed), or 'both' (write both, ~3x slower writes but maximal compatibility while WebUI/tools catch up).",
+      "values": ["csv", "tiff", "both"],
+      "example": "format: tiff",
+      "validParents": ["export"]
+    },
+    "precision": {
+      "description": "Numeric precision for TIFF output. 'double' = full IEEE 754 64-bit (no information loss vs. solver state). 'float' = 32-bit, halves the file size. Default 'double'.",
+      "values": ["double", "float"],
+      "example": "precision: double",
+      "validParents": ["export"]
+    },
+    "async": {
+      "description": "Run file writes on a background worker thread so the solver does not wait on disk. Output ordering is preserved. Default false; flipping to true reduces step wall time by 20-40 % on heavy export cases.",
+      "type": "boolean",
+      "example": "async: true",
+      "validParents": ["export"]
+    },
+    "async_queue_depth": {
+      "description": "Maximum number of pending write jobs before the solver thread blocks (backpressure). Bigger = more overlap, more transient memory. Default 4.",
+      "type": "integer",
+      "example": "async_queue_depth: 4",
+      "validParents": ["export"]
+    },
+    "tiff": {
+      "description": "TIFF-specific options. Ignored when format=csv.",
+      "children": ["compression", "predictor"],
+      "example": "tiff:\n  compression: deflate\n  predictor: 3",
+      "validParents": ["export"]
+    },
+    "compression": {
+      "description": "libtiff compression scheme: 'none' (1), 'lzw' (5), 'deflate' (8). Default 'deflate'; combined with predictor=3 it reduces double-precision field data ~3-5x without loss.",
+      "values": ["none", "deflate", "lzw"],
+      "example": "compression: deflate",
+      "validParents": ["tiff"]
+    },
+    "predictor": {
+      "description": "libtiff TIFFTAG_PREDICTOR. 1 = none (raw bytes), 2 = horizontal differencing (good for integer images), 3 = floating-point predictor (required for double/float to get meaningful compression). Default 3.",
+      "type": "integer",
+      "example": "predictor: 3",
+      "validParents": ["tiff"]
     }
   },
   "snippets": {
@@ -612,6 +659,21 @@
     "lib_preset_magnet_demag": {
       "name": "Preset - Permanent Magnet (demagnetization curve)",
       "snippet": "B-H: [[-960000, -700000, -400000, 0],\n      [0, 0.4, 0.9, 1.27]]\nbh_type: magnet\nmagnetization:\n  pattern: parallel\n  angle: 0"
+    },
+    "export_tiff_template": {
+      "name": "Export - TIFF (double, async)",
+      "trigger": "export",
+      "snippet": "format: tiff\nprecision: double\nasync: true\ntiff:\n  compression: deflate\n  predictor: 3"
+    },
+    "export_both_template": {
+      "name": "Export - both CSV+TIFF (migration safety)",
+      "trigger": "export",
+      "snippet": "format: both\nprecision: double\nasync: false\ntiff:\n  compression: deflate\n  predictor: 3"
+    },
+    "export_csv_legacy": {
+      "name": "Export - CSV only (legacy)",
+      "trigger": "export",
+      "snippet": "format: csv"
     }
   },
   "templates": {
