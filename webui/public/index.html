@@ -17,6 +17,11 @@
     <!-- js-yaml for YAML parsing and validation -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
 
+    <!-- Vendored geotiff UMD bundle for client-side TIFF decoding. Served by
+         server.js as a static file so the standalone (pkg) build works
+         offline. Exposes window.GeoTIFF. -->
+    <script src="lib/geotiff.js"></script>
+
     <style>
         * {
             margin: 0;
