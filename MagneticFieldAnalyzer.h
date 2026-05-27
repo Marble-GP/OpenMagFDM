@@ -21,6 +21,8 @@
 #include <variant>
 #include <tinyexpr.h>
 
+#include "AsyncWriter.h"
+
 // AMGCL headers for advanced iterative solvers
 // The `builtin` backend supports OpenMP-parallel SpMV / vector operations
 // inside CG and AMG smoothing. We switched from `backend::eigen` because the
@@ -524,6 +526,12 @@ private:
     };
 
     ExportConfig export_config;
+
+    // Background writer thread for transient-step output.
+    // Created on demand in loadConfig() when ExportConfig::async is true.
+    // Drained at performTransientAnalysis() exit so its destructor never
+    // runs with pending jobs.
+    std::unique_ptr<AsyncWriter> async_writer_;
 
     // Material properties
     Eigen::MatrixXd mu_map;   // Permeability distribution (updated during nonlinear iteration)

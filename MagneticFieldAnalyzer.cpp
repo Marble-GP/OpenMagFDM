@@ -9,6 +9,7 @@
 #include <set>
 #include <cstdio>
 #include <algorithm>
+#include <filesystem>
 #include <tiffio.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -197,6 +198,13 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                       << ", precision=" << prec
                       << ", async=" << (export_config.async ? "true" : "false")
                       << std::endl;
+        }
+
+        if (export_config.async) {
+            async_writer_ = std::make_unique<AsyncWriter>(
+                static_cast<std::size_t>(std::max(1, export_config.async_queue_depth)));
+            std::cout << "  Async writer enabled (queue depth = "
+                      << export_config.async_queue_depth << ")" << std::endl;
         }
 
         // Parse material presets (reusable B-H curves/properties)
@@ -6057,6 +6065,13 @@ void MagneticFieldAnalyzer::writeMatrixTIFF(const Eigen::MatrixXd& m,
 
 // Dispatch writer. The caller passes a base path WITHOUT extension; this routes
 // to the CSV/TIFF writers based on opts.format.
+//
+// When opts.async is true and async_writer_ is live, the actual file write is
+// posted to a worker thread. The matrix is copied into the lambda by value so
+// the solver can mutate Az/mu_map/... for the next step without racing the
+// pending write. Async path also goes through a .tmp -> rename dance so the
+// WebUI (or anything else watching the output dir) never sees a half-written
+// file.
 void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
                                         const std::string& base_path,
                                         const ExportConfig& opts) const {
@@ -6065,11 +6080,30 @@ void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
     const bool want_tiff = (opts.format == ExportConfig::Format::TIFF ||
                             opts.format == ExportConfig::Format::BOTH);
 
-    if (want_csv) {
-        writeMatrixCSV(m, base_path + ".csv");
-    }
-    if (want_tiff) {
-        writeMatrixTIFF(m, base_path + ".tiff", opts);
+    if (opts.async && async_writer_) {
+        if (want_csv) {
+            async_writer_->enqueue([m, base_path] {
+                const std::string final_path = base_path + ".csv";
+                const std::string tmp_path   = final_path + ".tmp";
+                writeMatrixCSV(m, tmp_path);
+                std::filesystem::rename(tmp_path, final_path);
+            });
+        }
+        if (want_tiff) {
+            async_writer_->enqueue([m, base_path, opts] {
+                const std::string final_path = base_path + ".tiff";
+                const std::string tmp_path   = final_path + ".tmp";
+                writeMatrixTIFF(m, tmp_path, opts);
+                std::filesystem::rename(tmp_path, final_path);
+            });
+        }
+    } else {
+        if (want_csv) {
+            writeMatrixCSV(m, base_path + ".csv");
+        }
+        if (want_tiff) {
+            writeMatrixTIFF(m, base_path + ".tiff", opts);
+        }
     }
 }
 
@@ -12243,6 +12277,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         exportActiveOnlyResults(output_dir, step);
 
         // <<PROFILING_TIMER_BEGIN>>
+        // In async mode this measures the enqueue cost (typically a few ms);
+        // the actual disk write happens on the worker thread. The drain time
+        // at end-of-analysis covers any backlog and is logged separately.
         prof_d_export = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now() - prof_t_export).count();
         // <<PROFILING_TIMER_END>>
@@ -12289,6 +12326,16 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // <<PROFILING_TIMER_END>>
     }
 
+    // Drain pending async writes before reporting timings or returning.
+    // Any worker-side exception surfaces here on the solver thread.
+    long long drain_ms = 0;
+    if (async_writer_) {
+        auto drain_start = std::chrono::high_resolution_clock::now();
+        async_writer_->drain();
+        drain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::high_resolution_clock::now() - drain_start).count();
+    }
+
     // Calculate total analysis time
     auto analysis_end_time = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(analysis_end_time - analysis_start_time);
@@ -12297,6 +12344,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
     std::cout << "\n=== Transient Analysis Complete ===" << std::endl;
     std::cout << "Total analysis time: " << total_duration.count() << " s ("
               << total_duration_ms.count() << " ms)" << std::endl;
+    if (async_writer_) {
+        std::cout << "Async writer drain time: " << drain_ms << " ms" << std::endl;
+    }
 
     // Export flux linkage results to CSV (if any paths were defined)
     exportFluxLinkageCSV(output_dir);

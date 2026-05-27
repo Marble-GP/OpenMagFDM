@@ -11,6 +11,8 @@ add_executable(MagFDMsolver
     MagneticFieldAnalyzer_nonlinear.cpp
     MagneticFieldAnalyzer_nonlinear_newton.cpp
     MagneticFieldAnalyzer.h
+    AsyncWriter.cpp
+    AsyncWriter.h
     tinyexpr/tinyexpr.cpp
     tinyexpr/tinyexpr.h
 )
