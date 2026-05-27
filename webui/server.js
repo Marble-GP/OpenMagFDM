@@ -758,6 +758,368 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
     }
 });
 
+// ============================================================
+// Polar pre-processing pipeline (v1.5)
+// ============================================================
+// Goal: take a Cartesian CAD screenshot of a motor cross-section and
+// produce the polar-warped image that OpenMagFDM's polar analysis expects,
+// together with the matching polar_domain block.
+//
+// detectPolarGeometry() inspects the image and returns initial geometry
+// (center, inner/outer radii in px, full-circle vs sector, and N-fold
+// rotational symmetry). The UI lets the user adjust those values, then
+// warpPolar() rebuilds the actual polar image with nearest-neighbour
+// sampling (material colours are preserved bit-exact).
+
+const POLAR_FOREGROUND_DISTANCE = 20;   // RGB Euclidean distance > this == foreground
+const POLAR_BG_CORNER_PX        = 8;    // size of corner sample for background colour
+const POLAR_CIRCULARITY_THRESHOLD = 0.75;
+
+function colorDistance(r1, g1, b1, r2, g2, b2) {
+    const dr = r1 - r2, dg = g1 - g2, db = b1 - b2;
+    return Math.sqrt(dr * dr + dg * dg + db * db);
+}
+
+// Sample the four corners and return the average RGB. CAD screenshots almost
+// always have a uniform background so this is enough; the .scan() call only
+// touches the 4 * POLAR_BG_CORNER_PX^2 corner pixels.
+function estimateBackgroundColor(jimpImage) {
+    const W = jimpImage.bitmap.width;
+    const H = jimpImage.bitmap.height;
+    const s = POLAR_BG_CORNER_PX;
+    const corners = [
+        [0, 0], [W - s, 0], [0, H - s], [W - s, H - s],
+    ];
+    let r = 0, g = 0, b = 0, n = 0;
+    for (const [x0, y0] of corners) {
+        for (let dy = 0; dy < s; dy++) {
+            for (let dx = 0; dx < s; dx++) {
+                const idx = ((y0 + dy) * W + (x0 + dx)) * 4;
+                r += jimpImage.bitmap.data[idx];
+                g += jimpImage.bitmap.data[idx + 1];
+                b += jimpImage.bitmap.data[idx + 2];
+                n++;
+            }
+        }
+    }
+    return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+}
+
+// Stage 1 + 2: scan every pixel, build a foreground bitmask and bbox, then
+// classify the outer shape (circular vs rectangular) via circularity.
+// Returns { mask, bbox, area, circularity, shape }.
+function buildForegroundMaskAndShape(jimpImage, bg) {
+    const W = jimpImage.bitmap.width;
+    const H = jimpImage.bitmap.height;
+    const mask = new Uint8Array(W * H);
+    let xmin = W, ymin = H, xmax = -1, ymax = -1;
+    let area = 0;
+    const data = jimpImage.bitmap.data;
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            const i4 = (y * W + x) * 4;
+            const d = colorDistance(data[i4], data[i4 + 1], data[i4 + 2], bg[0], bg[1], bg[2]);
+            if (d > POLAR_FOREGROUND_DISTANCE) {
+                mask[y * W + x] = 1;
+                area++;
+                if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+                if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+            }
+        }
+    }
+    if (area === 0) {
+        return { mask, bbox: null, area: 0, circularity: 0, shape: 'rectangular' };
+    }
+
+    // Perimeter via 4-neighbour boundary count (any foreground pixel adjacent
+    // to a background pixel or the image edge contributes).
+    let perimeter = 0;
+    for (let y = ymin; y <= ymax; y++) {
+        for (let x = xmin; x <= xmax; x++) {
+            if (!mask[y * W + x]) continue;
+            const up    = y > 0     ? mask[(y - 1) * W + x] : 0;
+            const down  = y < H - 1 ? mask[(y + 1) * W + x] : 0;
+            const left  = x > 0     ? mask[y * W + x - 1]   : 0;
+            const right = x < W - 1 ? mask[y * W + x + 1]   : 0;
+            if (!up || !down || !left || !right) perimeter++;
+        }
+    }
+    const circularity = perimeter > 0 ? (4 * Math.PI * area) / (perimeter * perimeter) : 0;
+    const bbox = { x: xmin, y: ymin, w: xmax - xmin + 1, h: ymax - ymin + 1 };
+    const aspect = bbox.w / bbox.h;
+    const aspectOk = aspect > 0.85 && aspect < 1.18;
+    const shape = (circularity > POLAR_CIRCULARITY_THRESHOLD && aspectOk) ? 'circular' : 'rectangular';
+    return { mask, bbox, area, circularity, shape };
+}
+
+// Stage 3: center + r_inner_px + r_outer_px from the foreground mask.
+// For circular shapes we walk the distance histogram. For rectangular ones
+// we fall back to the bbox center and look for an interior hole (rotor air).
+function estimateCenterAndRadii(mask, bbox, W, H, shape) {
+    if (!bbox) {
+        return { center_x: Math.floor(W / 2), center_y: Math.floor(H / 2),
+                 r_inner_px: 0, r_outer_px: Math.floor(Math.min(W, H) / 2 - 5) };
+    }
+    let cx = Math.round(bbox.x + bbox.w / 2);
+    let cy = Math.round(bbox.y + bbox.h / 2);
+
+    if (shape === 'circular') {
+        // Distance histogram from the bbox center to every foreground pixel.
+        const maxR = Math.ceil(Math.hypot(Math.max(bbox.w, bbox.h), Math.max(bbox.w, bbox.h)) / 2) + 2;
+        const hist = new Uint32Array(maxR + 1);
+        let total = 0;
+        for (let y = bbox.y; y < bbox.y + bbox.h; y++) {
+            for (let x = bbox.x; x < bbox.x + bbox.w; x++) {
+                if (!mask[y * W + x]) continue;
+                const d = Math.round(Math.hypot(x - cx, y - cy));
+                if (d <= maxR) { hist[d]++; total++; }
+            }
+        }
+        if (total === 0) return { center_x: cx, center_y: cy, r_inner_px: 0, r_outer_px: 0 };
+        // 5% / 95% cumulative percentiles
+        let cum = 0, r_inner = 0, r_outer = maxR;
+        for (let r = 0; r <= maxR; r++) {
+            cum += hist[r];
+            if (r_inner === 0 && cum >= total * 0.05) r_inner = r;
+            if (cum >= total * 0.95) { r_outer = r; break; }
+        }
+        return { center_x: cx, center_y: cy, r_inner_px: r_inner, r_outer_px: r_outer };
+    }
+
+    // rectangular: try to find an interior hole (background-coloured connected
+    // region away from the image border) -> rotor air gap. If none, fall back
+    // to the inscribed circle of the bbox.
+    const visited = new Uint8Array(W * H);
+    let bestHole = null;  // { count, sx, sy, ex, ey, cx, cy }
+    for (let sy = bbox.y + 1; sy < bbox.y + bbox.h - 1; sy++) {
+        for (let sx = bbox.x + 1; sx < bbox.x + bbox.w - 1; sx++) {
+            const idx = sy * W + sx;
+            if (mask[idx] || visited[idx]) continue;
+            // BFS-flood the background region; reject if it touches the image edge.
+            const stack = [[sx, sy]];
+            let cnt = 0, sumX = 0, sumY = 0;
+            let xmin = W, ymin = H, xmax = -1, ymax = -1;
+            let touchesEdge = false;
+            while (stack.length > 0) {
+                const [x, y] = stack.pop();
+                if (x < 0 || x >= W || y < 0 || y >= H) { touchesEdge = true; continue; }
+                const k = y * W + x;
+                if (visited[k] || mask[k]) continue;
+                visited[k] = 1;
+                cnt++; sumX += x; sumY += y;
+                if (x < xmin) xmin = x; if (x > xmax) xmax = x;
+                if (y < ymin) ymin = y; if (y > ymax) ymax = y;
+                if (x === 0 || y === 0 || x === W - 1 || y === H - 1) touchesEdge = true;
+                stack.push([x + 1, y]); stack.push([x - 1, y]);
+                stack.push([x, y + 1]); stack.push([x, y - 1]);
+            }
+            if (touchesEdge) continue;
+            if (!bestHole || cnt > bestHole.count) {
+                bestHole = { count: cnt, cx: Math.round(sumX / cnt), cy: Math.round(sumY / cnt),
+                             w: xmax - xmin + 1, h: ymax - ymin + 1 };
+            }
+        }
+    }
+    if (bestHole && bestHole.count > 25) {
+        // hole-derived center; r_inner = hole radius, r_outer = ~ inscribed of bbox
+        const r_inner = Math.round(Math.max(bestHole.w, bestHole.h) / 2);
+        const r_outer = Math.max(r_inner + 5,
+            Math.floor(Math.min(bbox.w, bbox.h) / 2 - 5));
+        return { center_x: bestHole.cx, center_y: bestHole.cy,
+                 r_inner_px: r_inner, r_outer_px: r_outer };
+    }
+    // no hole found: inscribed-circle fallback, user must adjust
+    return { center_x: cx, center_y: cy,
+             r_inner_px: 0,
+             r_outer_px: Math.max(5, Math.floor(Math.min(bbox.w, bbox.h) / 2 - 5)) };
+}
+
+// Composite: stages 1-3. Stage 4 (periodicity) lands in Phase 5b.
+function detectPolarGeometry(jimpImage, hint) {
+    const W = jimpImage.bitmap.width;
+    const H = jimpImage.bitmap.height;
+    const bg = estimateBackgroundColor(jimpImage);
+    const { mask, bbox, area, circularity, shape: autoShape } =
+        buildForegroundMaskAndShape(jimpImage, bg);
+
+    const shape = (hint && hint.shape && hint.shape !== 'auto') ? hint.shape : autoShape;
+    const { center_x, center_y, r_inner_px, r_outer_px } =
+        estimateCenterAndRadii(mask, bbox, W, H, shape);
+
+    return {
+        shape,
+        auto_shape: autoShape,
+        center_x, center_y,
+        r_inner_px, r_outer_px,
+        is_full_circle: true,
+        theta_start: 0,
+        theta_end: 2 * Math.PI,
+        bg_color: bg,
+        foreground_area: area,
+        circularity: Number(circularity.toFixed(3)),
+        image_width: W,
+        image_height: H,
+        // periodicity is added by Phase 5b
+    };
+}
+
+// Nearest-neighbour Cartesian -> Polar warp. Output layout:
+//   r_orientation == "horizontal" -> (rows=ntheta, cols=nr)
+//   r_orientation == "vertical"   -> (rows=nr,     cols=ntheta)
+// Pixels falling outside the source remain alpha=0 (transparent).
+function warpPolar(srcJimp, opts) {
+    const Jimp = require('jimp');
+    const {
+        center_x, center_y,
+        r_start_px, r_end_px,
+        theta_start, theta_end,
+        nr, ntheta, r_orientation,
+    } = opts;
+
+    const theta_range = theta_end - theta_start;
+    const dr     = nr > 1 ? (r_end_px - r_start_px) / (nr - 1) : 0;
+    const dtheta = ntheta > 0 ? theta_range / ntheta : 0;
+    const horizontal = (r_orientation === 'horizontal');
+    const outW = horizontal ? nr     : ntheta;
+    const outH = horizontal ? ntheta : nr;
+
+    const out = new Jimp(outW, outH, 0x00000000);
+    const src = srcJimp.bitmap.data;
+    const srcW = srcJimp.bitmap.width;
+    const srcH = srcJimp.bitmap.height;
+    const dst = out.bitmap.data;
+
+    for (let j = 0; j < outH; j++) {
+        for (let i = 0; i < outW; i++) {
+            const r_idx = horizontal ? i : j;
+            const t_idx = horizontal ? j : i;
+            const r = r_start_px + r_idx * dr;
+            const theta = theta_start + t_idx * dtheta;
+            const sx = Math.round(center_x + r * Math.cos(theta));
+            const sy = Math.round(center_y + r * Math.sin(theta));
+            if (sx < 0 || sx >= srcW || sy < 0 || sy >= srcH) continue;
+            const sIdx = (sy * srcW + sx) * 4;
+            const dIdx = (j * outW + i) * 4;
+            dst[dIdx]     = src[sIdx];
+            dst[dIdx + 1] = src[sIdx + 1];
+            dst[dIdx + 2] = src[sIdx + 2];
+            dst[dIdx + 3] = 255;
+        }
+    }
+    return out;
+}
+
+// Pick an output filename that does not collide with an existing file in the
+// user's uploads directory. Suffix _polar, _polar_2, _polar_3, ...
+async function chooseOutputFilename(uploadsDir, originalFilename, requested) {
+    if (requested) {
+        return requested.replace(/[^\w.\-]/g, '_');
+    }
+    const ext = path.extname(originalFilename) || '.png';
+    const base = path.basename(originalFilename, ext);
+    let candidate = `${base}_polar${ext}`;
+    let counter = 2;
+    while (true) {
+        try {
+            await fs.access(path.join(uploadsDir, candidate));
+            candidate = `${base}_polar_${counter}${ext}`;
+            counter++;
+            if (counter > 99) throw new Error('Too many polar variants');
+        } catch {
+            return candidate;
+        }
+    }
+}
+
+// POST /api/preprocess-polar/detect
+//   Inspects the image and returns geometry hints for the UI.
+//   Body (JSON): { userId, filename, hint?: { shape: "auto"|"circular"|"rectangular" } }
+app.post('/api/preprocess-polar/detect', async (req, res) => {
+    try {
+        const Jimp = require('jimp');
+        const { userId = 'default', filename } = req.body || {};
+        if (!filename) {
+            return res.status(400).json({ success: false, error: 'filename is required' });
+        }
+        const uploadsDir = getUserUploadsDir(userId);
+        const filePath = path.join(uploadsDir, filename);
+        const img = await Jimp.read(filePath);
+        const hint = (req.body && req.body.hint) || {};
+        const geom = detectPolarGeometry(img, hint);
+        res.json({ success: true, ...geom });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /api/preprocess-polar/warp
+//   Generates the polar-warped image and writes it to /uploads/<userId>/.
+//   Returns the filename and a ready-to-insert polar_domain block.
+app.post('/api/preprocess-polar/warp', async (req, res) => {
+    try {
+        const Jimp = require('jimp');
+        const {
+            userId = 'default', filename,
+            center_x, center_y,
+            r_start_px, r_end_px,
+            theta_start, theta_end,
+            nr, ntheta, r_orientation = 'horizontal',
+            output_filename,
+            r_outer_physical = 1.0,
+        } = req.body || {};
+
+        // Minimum input validation; the UI is the primary guardrail.
+        for (const [k, v] of Object.entries({ filename, center_x, center_y, r_start_px,
+                                              r_end_px, theta_start, theta_end, nr, ntheta })) {
+            if (v === undefined || v === null || Number.isNaN(v)) {
+                return res.status(400).json({ success: false, error: `Missing or invalid: ${k}` });
+            }
+        }
+        if (nr < 2 || ntheta < 2) {
+            return res.status(400).json({ success: false, error: 'nr and ntheta must be >= 2' });
+        }
+
+        const uploadsDir = getUserUploadsDir(userId);
+        const srcPath = path.join(uploadsDir, filename);
+        const src = await Jimp.read(srcPath);
+
+        const warped = warpPolar(src, {
+            center_x, center_y, r_start_px, r_end_px,
+            theta_start, theta_end, nr, ntheta, r_orientation,
+        });
+
+        const outName = await chooseOutputFilename(uploadsDir, filename, output_filename);
+        const outPath = path.join(uploadsDir, outName);
+        await warped.writeAsync(outPath);
+
+        // Best-effort: enforce per-user image cap if helper exists.
+        if (typeof enforceImageLimit === 'function') {
+            try { await enforceImageLimit(userId); } catch { /* ignore */ }
+        }
+
+        // Compute physical polar_domain. r_outer_px maps to r_outer_physical;
+        // r_inner is proportional.
+        const r_outer = Number(r_outer_physical);
+        const r_inner = r_end_px > 0 ? (r_start_px / r_end_px) * r_outer : 0;
+
+        res.json({
+            success: true,
+            filename: outName,
+            path: `/uploads/${userId}/${outName}`,
+            output_width: warped.bitmap.width,
+            output_height: warped.bitmap.height,
+            polar_domain: {
+                r_start: Number(r_inner.toFixed(6)),
+                r_end:   Number(r_outer.toFixed(6)),
+                r_orientation,
+                theta_range: Number((theta_end - theta_start).toFixed(6)),
+            },
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // アップロードされた画像の一覧（ユーザーごと）
 app.get('/api/images', async (req, res) => {
     try {
