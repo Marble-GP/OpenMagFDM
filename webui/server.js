@@ -872,22 +872,56 @@ function computeDistanceHistogram(mask, bbox, W, cx, cy) {
 }
 
 // Histogram-based shape classifier. The perimeter-based circularity from
-// Stage 2 collapses to ~0.2 on ring topologies (the inner boundary inflates
-// the perimeter), so we re-classify here: if a sharp peak around the 95th
-// percentile of the distance histogram concentrates >= 4 % of the
-// foreground mass within +/-3 px, the outer boundary is a clean circle and
-// we promote the classification to "circular".
+// Stage 2 collapses to ~0.2 on ring topologies (inner boundary inflates
+// the perimeter), so the cumulative 95th-percentile rim heuristic also
+// fails on rotors with heavy interior structure (slot+hole+V-magnets)
+// because the cumulative threshold lands just *inside* the actual outer
+// edge. Detect the rim directly as "the highest-density bin in the outer
+// half of the histogram"; that is robust to internal complexity because
+// the outer edge is always a thin annulus of high density regardless of
+// what happens at smaller radii. Then promote to circular if either
+//   (a) the +/-3 px ring around that peak holds >= 4 % of the foreground
+//       (classical "thin ring" case), or
+//   (b) the peak density is >= 1.5x the average per-bin density in the
+//       30-80 % radius band (the IEEJ-D-model case: dense interior but
+//       still a sharp outer circle).
 function refineShapeFromHistogram({ hist, total, maxR }, autoShape) {
-    if (total === 0) return autoShape;
-    let cum = 0, r95 = maxR;
-    for (let r = 0; r <= maxR; r++) {
-        cum += hist[r];
-        if (cum >= total * 0.95) { r95 = r; break; }
+    if (total === 0 || maxR < 10) return autoShape;
+
+    // The histogram is sized to the bbox diagonal, but the foreground itself
+    // tops out at the actual outer radius. Find that extent first, then
+    // search for the rim peak in the upper half of [0, outerExtent].
+    let outerExtent = 0;
+    for (let r = maxR; r >= 0; r--) {
+        if (hist[r] > 0) { outerExtent = r; break; }
     }
+    if (outerExtent < 10) return autoShape;
+    const half = Math.floor(outerExtent / 2);
+    let rimR = half, rimV = 0;
+    for (let r = half; r <= outerExtent; r++) {
+        if (hist[r] > rimV) { rimV = hist[r]; rimR = r; }
+    }
+    if (rimV === 0) return autoShape;
+
+    const rimLo = Math.max(0, rimR - 3);
+    const rimHi = Math.min(maxR, rimR + 3);
     let rim = 0;
-    for (let r = Math.max(0, r95 - 3); r <= Math.min(maxR, r95 + 3); r++) rim += hist[r];
+    for (let r = rimLo; r <= rimHi; r++) rim += hist[r];
     const rimRatio = rim / total;
-    if (rimRatio > 0.04) return 'circular';
+    if (rimRatio >= 0.04) return 'circular';
+
+    const r30 = Math.floor(rimR * 0.30);
+    const r80 = Math.floor(rimR * 0.80);
+    let interior = 0, interiorBins = 0;
+    for (let r = r30; r <= r80; r++) {
+        if (r >= rimLo && r <= rimHi) continue;
+        interior += hist[r];
+        interiorBins++;
+    }
+    if (interiorBins <= 0) return autoShape;
+    const interiorDensity = interior / interiorBins;
+    if (interiorDensity > 0 && rimV / interiorDensity >= 1.5) return 'circular';
+
     return autoShape;
 }
 
@@ -906,12 +940,29 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape, precomputedHist) {
         const { hist, total, maxR } =
             precomputedHist || computeDistanceHistogram(mask, bbox, W, cx, cy);
         if (total === 0) return { center_x: cx, center_y: cy, r_inner_px: 0, r_outer_px: 0 };
-        // 5% / 95% cumulative percentiles
-        let cum = 0, r_inner = 0, r_outer = maxR;
+        // r_inner: 5 % cumulative percentile is fine -- captures the rotor
+        //          surface for typical motor cross sections.
+        // r_outer: the highest-density bin in the outer half of the
+        //          histogram. The cumulative 95 % percentile lands several
+        //          pixels *inside* the actual outer edge on dense rotors
+        //          (IEEJ-D-model style), and that small bias compounded by
+        //          the Hough sweep window made the centre drift; the peak
+        //          bin is robust to interior structure.
+        let cum = 0, r_inner = 0;
         for (let r = 0; r <= maxR; r++) {
             cum += hist[r];
-            if (r_inner === 0 && cum >= total * 0.05) r_inner = r;
-            if (cum >= total * 0.95) { r_outer = r; break; }
+            if (cum >= total * 0.05) { r_inner = r; break; }
+        }
+        // r_outer: rim peak in upper half of the actual foreground extent
+        // (bbox diagonal would put the search above the real outer edge).
+        let outerExtent = 0;
+        for (let r = maxR; r >= 0; r--) {
+            if (hist[r] > 0) { outerExtent = r; break; }
+        }
+        const half = Math.floor(outerExtent / 2);
+        let r_outer = outerExtent, peak = 0;
+        for (let r = half; r <= outerExtent; r++) {
+            if (hist[r] > peak) { peak = hist[r]; r_outer = r; }
         }
         return { center_x: cx, center_y: cy, r_inner_px: r_inner, r_outer_px: r_outer };
     }
