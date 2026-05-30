@@ -964,37 +964,120 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape, precomputedHist) {
              r_outer_px: Math.max(5, Math.floor(Math.min(bbox.w, bbox.h) / 2 - 5)) };
 }
 
-// Stage 4: rotational symmetry detection via circular autocorrelation on
-// an angular colour signature. The signature is a 360-bin RGB profile
-// sampled from the foreground inside the [r_inner, r_outer] ring. For each
-// offset k in [1, 180] we compute the mean colour-distance between
-// sig[i] and sig[(i+k) mod 360]; small values mean the image looks the
-// same after rotating by 2*PI*k/360. We only consider k values that
-// divide 360 to land at integer N-fold symmetries, and we suppress
-// candidates that are merely integer multiples of a stronger one (so
-// "true 6-fold" doesn't get reported as "12-fold" just because it's also
-// 12-periodic).
-function detectPeriodicity(jimpImage, mask, geom) {
+// In-place radix-2 Cooley-Tukey FFT. Works on power-of-two length signals;
+// callers zero-pad arbitrary-length input first. We avoid pulling fft.js
+// because the standalone build packages by pkg and adding deps is fragile.
+function fft1d(re, im) {
+    const N = re.length;
+    // bit reversal permutation
+    for (let i = 1, j = 0; i < N; i++) {
+        let bit = N >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            [re[i], re[j]] = [re[j], re[i]];
+            [im[i], im[j]] = [im[j], im[i]];
+        }
+    }
+    for (let len = 2; len <= N; len <<= 1) {
+        const half = len >> 1;
+        const ang = -2 * Math.PI / len;
+        const wRe = Math.cos(ang), wIm = Math.sin(ang);
+        for (let i = 0; i < N; i += len) {
+            let curRe = 1, curIm = 0;
+            for (let k = 0; k < half; k++) {
+                const xRe = re[i + k + half] * curRe - im[i + k + half] * curIm;
+                const xIm = re[i + k + half] * curIm + im[i + k + half] * curRe;
+                re[i + k + half] = re[i + k] - xRe;
+                im[i + k + half] = im[i + k] - xIm;
+                re[i + k] += xRe;
+                im[i + k] += xIm;
+                const nRe = curRe * wRe - curIm * wIm;
+                curIm = curRe * wIm + curIm * wRe;
+                curRe = nRe;
+            }
+        }
+    }
+}
+
+// 360-point DFT computed directly. Picked over a zero-padded radix-2 FFT
+// because:
+//   * the source signal is angular bins (period == 360), so integer bin
+//     indices already line up with integer N-fold symmetries -- no fractional
+//     frequencies due to a mismatched FFT length;
+//   * with cos/sin tables the O(N^2/2) cost on N=360 is ~5 ms, well below
+//     anything user-visible.
+const DFT_N = 360;
+const DFT_COS = new Float64Array(DFT_N);
+const DFT_SIN = new Float64Array(DFT_N);
+for (let i = 0; i < DFT_N; i++) {
+    DFT_COS[i] = Math.cos(-2 * Math.PI * i / DFT_N);
+    DFT_SIN[i] = Math.sin(-2 * Math.PI * i / DFT_N);
+}
+function fftMagnitude(real360) {
+    // Returns magnitude for k in [0, N/2]; the rest is the complex conjugate
+    // mirror because the input is real.
+    const N = DFT_N;
+    const half = N / 2;
+    const mag = new Float64Array(N);
+    for (let k = 0; k <= half; k++) {
+        let re = 0, im = 0;
+        for (let n = 0; n < N; n++) {
+            const idx = (k * n) % N;
+            re += real360[n] * DFT_COS[idx];
+            im += real360[n] * DFT_SIN[idx];
+        }
+        mag[k] = Math.sqrt(re * re + im * im);
+    }
+    return mag;
+}
+
+// Jacobsen estimator: given the magnitude spectrum and the integer bin
+// index of the peak, return a refined non-integer peak position. Falls
+// back to `kPeak` if neighbouring bins are degenerate.
+function jacobsenInterpolate(mag, kPeak) {
+    if (kPeak <= 0 || kPeak >= mag.length - 1) return kPeak;
+    const xm = mag[kPeak - 1], x0 = mag[kPeak], xp = mag[kPeak + 1];
+    const denom = 2 * x0 - xm - xp;
+    if (Math.abs(denom) < 1e-12) return kPeak;
+    return kPeak + 0.5 * (xm - xp) / denom;
+}
+
+// Build a 360-bin angular signature of the [r_inner, r_outer] ring.
+//   mode === 'grayscale' -> 1 scalar per bin (luminance Y), keeps
+//                           geometric periods (e.g. 24 slots is N=24
+//                           even if the slots are coloured U/V/W).
+//   mode === 'rgb'       -> the L2 norm of the (R, G, B) bin mean,
+//                           which surfaces colour-coded periods like
+//                           a 3-phase coil pattern showing up as N=3.
+//
+// The function returns { values: Float64Array(360), bg_value, has_data:
+// boolean } -- `bg_value` is the bin-average of empty bins (mean of
+// filled ones) so we don't punch holes in the signal.
+function buildAngularSignature(jimpImage, mask, geom, mode) {
     const W = jimpImage.bitmap.width;
     const H = jimpImage.bitmap.height;
     const cx = geom.center_x, cy = geom.center_y;
-    const rMin = Math.max(0, geom.r_inner_px);
-    const rMax = Math.max(rMin + 1, geom.r_outer_px);
-    if (rMax - rMin < 5) {
-        return { n_fold: null, confidence: 0, alternatives: [] };
-    }
-
+    // Trim 8 % off each side of the ring: the inside boundary (rotor surface)
+    // and the outer boundary (stator OD) are angularly uniform on a typical
+    // motor cross-section and only add DC noise. Restricting to the middle
+    // 84 % keeps the coil / pole signal dominant in the spectrum.
+    const r0 = Math.max(0, geom.r_inner_px);
+    const r1 = Math.max(r0 + 1, geom.r_outer_px);
+    const margin = (r1 - r0) * 0.08;
+    const rMin = r0 + margin;
+    const rMax = r1 - margin;
     const N_BIN = 360;
     const sumR = new Float64Array(N_BIN);
     const sumG = new Float64Array(N_BIN);
     const sumB = new Float64Array(N_BIN);
-    const cnt = new Uint32Array(N_BIN);
+    const cnt  = new Uint32Array(N_BIN);
     const data = jimpImage.bitmap.data;
-
     const xmin = Math.max(0, Math.floor(cx - rMax - 1));
     const xmax = Math.min(W - 1, Math.ceil(cx + rMax + 1));
     const ymin = Math.max(0, Math.floor(cy - rMax - 1));
     const ymax = Math.min(H - 1, Math.ceil(cy + rMax + 1));
+    let filled = 0;
     for (let y = ymin; y <= ymax; y++) {
         for (let x = xmin; x <= xmax; x++) {
             if (!mask[y * W + x]) continue;
@@ -1011,75 +1094,142 @@ function detectPeriodicity(jimpImage, mask, geom) {
             cnt[bin]++;
         }
     }
-    // Filled bins; empty bins are skipped during autocorrelation (treated as
-    // "no information at this offset pair") instead of forcing a zero RGB.
-    const sig = new Array(N_BIN);
-    let filled = 0;
+    for (let b = 0; b < N_BIN; b++) if (cnt[b] > 0) filled++;
+    const values = new Float64Array(N_BIN);
+    let runningSum = 0, runningCnt = 0;
     for (let b = 0; b < N_BIN; b++) {
-        if (cnt[b] === 0) { sig[b] = null; continue; }
-        sig[b] = [sumR[b] / cnt[b], sumG[b] / cnt[b], sumB[b] / cnt[b]];
-        filled++;
+        if (cnt[b] === 0) { values[b] = NaN; continue; }
+        const r = sumR[b] / cnt[b];
+        const g = sumG[b] / cnt[b];
+        const bl = sumB[b] / cnt[b];
+        const v = (mode === 'grayscale')
+            ? (0.299 * r + 0.587 * g + 0.114 * bl)
+            : Math.sqrt(r * r + g * g + bl * bl);
+        values[b] = v;
+        runningSum += v;
+        runningCnt++;
     }
-    if (filled < N_BIN * 0.5) {
-        return { n_fold: null, confidence: 0, alternatives: [] };
-    }
+    // Backfill NaN bins with the overall mean so the FFT sees a smooth signal.
+    const mean = runningCnt > 0 ? runningSum / runningCnt : 0;
+    for (let b = 0; b < N_BIN; b++) if (!Number.isFinite(values[b])) values[b] = mean;
+    // DC-subtract so the period peaks dominate the spectrum.
+    for (let b = 0; b < N_BIN; b++) values[b] -= mean;
+    return { values, mean, filled, has_data: filled >= N_BIN * 0.5 };
+}
 
-    // Mean color distance over offset k.
-    function meanDist(k) {
-        let s = 0, n = 0;
-        for (let i = 0; i < N_BIN; i++) {
-            const a = sig[i], b = sig[(i + k) % N_BIN];
-            if (!a || !b) continue;
-            const dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
-            s += Math.sqrt(dr * dr + dg * dg + db * db);
-            n++;
-        }
-        return n > 0 ? s / n : Infinity;
-    }
-
-    // Baseline: average of "uncorrelated" offsets (k = 90, 180 averaged with
-    // a few others is robust against accidental matches).
-    let baseline = 0, bcnt = 0;
-    for (const k of [37, 91, 137, 181, 233]) {
-        const v = meanDist(k % 180 === 0 ? 180 : k);
-        if (isFinite(v)) { baseline += v; bcnt++; }
-    }
-    baseline = bcnt > 0 ? baseline / bcnt : 1;
-    if (baseline === 0) {
-        return { n_fold: null, confidence: 0, alternatives: [] };
-    }
-
-    // Candidate N values where 360 % N === 0 and 2 <= N <= 36.
+// Scan the magnitude spectrum for peaks corresponding to N in [Nmin..Nmax]
+// where a "peak" means a strict local max with at least minSNR signal-
+// to-baseline ratio. The Jacobsen interpolation gives the non-integer
+// k position; non-integer N = k_true (since N_FFT = 512 and the source
+// signal is 360 long, the relationship is N = k_true * 360 / N_FFT, but
+// because we zero-padded, k_true directly corresponds to "cycles within
+// the original 360 bins" which is what we want).
+function findPeakCandidates(mag, Nmin, Nmax, minSNR) {
+    // baseline = median over bins 1..N/2 (DC and Nyquist excluded)
+    const half = mag.length / 2;
+    const buf = mag.slice(1, half);
+    buf.sort();
+    const baseline = buf[Math.floor(buf.length / 2)] || 1e-9;
     const candidates = [];
-    for (let N = 2; N <= 36; N++) {
-        if (360 % N !== 0) continue;
-        const k = 360 / N;
-        const dk = meanDist(k);
-        const confidence = Math.max(0, 1 - dk / baseline);
-        candidates.push({ N, k, dist: dk, confidence });
+    // Because N_FFT = 512 and the source has 360 samples, the relevant
+    // "N-fold" bin is k = N * 512 / 360. Search a contiguous window for
+    // each integer N to find the best local max, then refine.
+    // With the direct 360-point DFT, integer bin k corresponds exactly to
+    // N=k cycles per signal, so the per-N search window is just the bin
+    // itself plus immediate neighbours for parabolic interpolation.
+    for (let N = Nmin; N <= Nmax; N++) {
+        const k = N;
+        if (k < 1 || k >= half) continue;
+        if (mag[k] < mag[k - 1] || mag[k] < mag[k + 1]) continue;  // not a local max
+        const snr = mag[k] / baseline;
+        if (snr < minSNR) continue;
+        const kTrue = jacobsenInterpolate(mag, k);
+        candidates.push({
+            n_fold: Number(kTrue.toFixed(3)),
+            n_integer: Math.round(kTrue),
+            confidence: Number(Math.min(1, snr / 20).toFixed(3)),
+            snr: Number(snr.toFixed(2)),
+            peak_bin: k,
+        });
     }
-    candidates.sort((a, b) => b.confidence - a.confidence);
+    // sort by SNR desc
+    candidates.sort((a, b) => b.snr - a.snr);
+    return candidates;
+}
 
-    // Suppress weaker multiples of stronger candidates so 6-fold doesn't
-    // also show up reported as 12 or 18-fold.
-    const filtered = [];
+// Run FFT-based periodicity detection on a single signature mode.
+function periodicityForMode(jimpImage, mask, geom, mode, Nmin, Nmax) {
+    const sig = buildAngularSignature(jimpImage, mask, geom, mode);
+    if (!sig.has_data) return { n_fold: null, confidence: 0, alternatives: [] };
+    const mag = fftMagnitude(sig.values);
+    const candidates = findPeakCandidates(mag, Nmin, Nmax, 4 /* minSNR */);
+    if (candidates.length === 0) return { n_fold: null, confidence: 0, alternatives: [] };
+    // Suppress multiples of a stronger lower-N candidate AND suppress
+    // candidates that latch on to the same spectral peak (because the
+    // per-N search windows overlap, a real peak in between two integer
+    // Ns can be picked up by both -- we only want the strongest one).
+    const kept = [];
     for (const c of candidates) {
-        const dominated = filtered.some(f => c.N % f.N === 0 && c.N !== f.N);
-        if (!dominated) filtered.push(c);
+        const sameBin = kept.some(k => Math.abs(k.peak_bin - c.peak_bin) < 1.5);
+        if (sameBin) continue;
+        const dominated = kept.some(k =>
+            k.n_integer > 0 && c.n_integer % k.n_integer === 0 && c.n_integer !== k.n_integer);
+        if (!dominated) kept.push(c);
     }
-    const top = filtered[0];
-    if (!top || top.confidence < 0.3) {
-        return { n_fold: null, confidence: 0, alternatives: [] };
-    }
+    const top = kept[0];
     return {
-        n_fold: top.N,
-        confidence: Number(top.confidence.toFixed(3)),
-        sector_theta_range: Number((2 * Math.PI / top.N).toFixed(6)),
-        alternatives: filtered.slice(1, 3).map(c => ({
-            n_fold: c.N,
-            confidence: Number(c.confidence.toFixed(3)),
+        n_fold: top.n_fold,
+        n_integer: top.n_integer,
+        confidence: top.confidence,
+        snr: top.snr,
+        sector_theta_range: Number((2 * Math.PI / top.n_fold).toFixed(6)),
+        alternatives: kept.slice(1, 3).map(c => ({
+            n_fold: c.n_fold, n_integer: c.n_integer,
+            confidence: c.confidence, snr: c.snr,
         })),
     };
+}
+
+// Stage 4: rotational symmetry detection.
+// Runs grayscale + RGB-magnitude signatures in parallel:
+//   - grayscale picks up geometric period (slot count even for 3-phase coil
+//     colouring)
+//   - rgb     picks up colour-coded period (3-phase phases, N/S magnets)
+// Also computes a `recommended_ntheta` so the UI can default to a value
+// where each detected sector lands on an integer number of output pixels.
+function detectPeriodicity(jimpImage, mask, geom) {
+    const rMin = Math.max(0, geom.r_inner_px);
+    const rMax = Math.max(rMin + 1, geom.r_outer_px);
+    if (rMax - rMin < 5) {
+        return {
+            grayscale: { n_fold: null, confidence: 0, alternatives: [] },
+            rgb:       { n_fold: null, confidence: 0, alternatives: [] },
+            recommended_ntheta: null,
+        };
+    }
+
+    // Bound the N search by the geometric "smallest resolvable" period: at
+    // r_outer_px we want at least ~5 px per sector, otherwise sampling is
+    // hopeless. We still cap at 64 as a sanity ceiling.
+    const Nmax = Math.min(64, Math.floor((2 * Math.PI * rMax) / 5));
+    const Nmin = 2;
+
+    const grayscale = periodicityForMode(jimpImage, mask, geom, 'grayscale', Nmin, Nmax);
+    const rgb       = periodicityForMode(jimpImage, mask, geom, 'rgb',       Nmin, Nmax);
+
+    // Recommended ntheta: take the grayscale N (geometric), round it to the
+    // nearest integer, then snap a naive 2*PI*r_outer total length so each
+    // sector ends up with an integer pixel count. Falls back to RGB if
+    // grayscale finds nothing.
+    const dominant = grayscale.n_integer || rgb.n_integer;
+    let recommended_ntheta = null;
+    if (dominant && dominant >= 2) {
+        const naive = Math.round(2 * Math.PI * rMax);
+        const perSector = Math.max(2, Math.round(naive / dominant));
+        recommended_ntheta = perSector * dominant;
+    }
+
+    return { grayscale, rgb, recommended_ntheta };
 }
 
 // Composite: stages 1-4.
