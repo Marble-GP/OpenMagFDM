@@ -852,10 +852,49 @@ function buildForegroundMaskAndShape(jimpImage, bg) {
     return { mask, bbox, area, circularity, shape };
 }
 
+// Build a center-to-foreground-pixel distance histogram (1 px bins).
+// Returned shape: { hist: Uint32Array, total, maxR }. Used by both the
+// radius estimator and the histogram-based shape refinement (which lets
+// us spot ring topologies that fool the perimeter-based circularity).
+function computeDistanceHistogram(mask, bbox, W, cx, cy) {
+    if (!bbox) return { hist: new Uint32Array(1), total: 0, maxR: 0 };
+    const maxR = Math.ceil(Math.hypot(bbox.w, bbox.h)) + 2;
+    const hist = new Uint32Array(maxR + 1);
+    let total = 0;
+    for (let y = bbox.y; y < bbox.y + bbox.h; y++) {
+        for (let x = bbox.x; x < bbox.x + bbox.w; x++) {
+            if (!mask[y * W + x]) continue;
+            const d = Math.round(Math.hypot(x - cx, y - cy));
+            if (d <= maxR) { hist[d]++; total++; }
+        }
+    }
+    return { hist, total, maxR };
+}
+
+// Histogram-based shape classifier. The perimeter-based circularity from
+// Stage 2 collapses to ~0.2 on ring topologies (the inner boundary inflates
+// the perimeter), so we re-classify here: if a sharp peak around the 95th
+// percentile of the distance histogram concentrates >= 4 % of the
+// foreground mass within +/-3 px, the outer boundary is a clean circle and
+// we promote the classification to "circular".
+function refineShapeFromHistogram({ hist, total, maxR }, autoShape) {
+    if (total === 0) return autoShape;
+    let cum = 0, r95 = maxR;
+    for (let r = 0; r <= maxR; r++) {
+        cum += hist[r];
+        if (cum >= total * 0.95) { r95 = r; break; }
+    }
+    let rim = 0;
+    for (let r = Math.max(0, r95 - 3); r <= Math.min(maxR, r95 + 3); r++) rim += hist[r];
+    const rimRatio = rim / total;
+    if (rimRatio > 0.04) return 'circular';
+    return autoShape;
+}
+
 // Stage 3: center + r_inner_px + r_outer_px from the foreground mask.
 // For circular shapes we walk the distance histogram. For rectangular ones
 // we fall back to the bbox center and look for an interior hole (rotor air).
-function estimateCenterAndRadii(mask, bbox, W, H, shape) {
+function estimateCenterAndRadii(mask, bbox, W, H, shape, precomputedHist) {
     if (!bbox) {
         return { center_x: Math.floor(W / 2), center_y: Math.floor(H / 2),
                  r_inner_px: 0, r_outer_px: Math.floor(Math.min(W, H) / 2 - 5) };
@@ -864,17 +903,8 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape) {
     let cy = Math.round(bbox.y + bbox.h / 2);
 
     if (shape === 'circular') {
-        // Distance histogram from the bbox center to every foreground pixel.
-        const maxR = Math.ceil(Math.hypot(Math.max(bbox.w, bbox.h), Math.max(bbox.w, bbox.h)) / 2) + 2;
-        const hist = new Uint32Array(maxR + 1);
-        let total = 0;
-        for (let y = bbox.y; y < bbox.y + bbox.h; y++) {
-            for (let x = bbox.x; x < bbox.x + bbox.w; x++) {
-                if (!mask[y * W + x]) continue;
-                const d = Math.round(Math.hypot(x - cx, y - cy));
-                if (d <= maxR) { hist[d]++; total++; }
-            }
-        }
+        const { hist, total, maxR } =
+            precomputedHist || computeDistanceHistogram(mask, bbox, W, cx, cy);
         if (total === 0) return { center_x: cx, center_y: cy, r_inner_px: 0, r_outer_px: 0 };
         // 5% / 95% cumulative percentiles
         let cum = 0, r_inner = 0, r_outer = maxR;
@@ -934,21 +964,158 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape) {
              r_outer_px: Math.max(5, Math.floor(Math.min(bbox.w, bbox.h) / 2 - 5)) };
 }
 
-// Composite: stages 1-3. Stage 4 (periodicity) lands in Phase 5b.
+// Stage 4: rotational symmetry detection via circular autocorrelation on
+// an angular colour signature. The signature is a 360-bin RGB profile
+// sampled from the foreground inside the [r_inner, r_outer] ring. For each
+// offset k in [1, 180] we compute the mean colour-distance between
+// sig[i] and sig[(i+k) mod 360]; small values mean the image looks the
+// same after rotating by 2*PI*k/360. We only consider k values that
+// divide 360 to land at integer N-fold symmetries, and we suppress
+// candidates that are merely integer multiples of a stronger one (so
+// "true 6-fold" doesn't get reported as "12-fold" just because it's also
+// 12-periodic).
+function detectPeriodicity(jimpImage, mask, geom) {
+    const W = jimpImage.bitmap.width;
+    const H = jimpImage.bitmap.height;
+    const cx = geom.center_x, cy = geom.center_y;
+    const rMin = Math.max(0, geom.r_inner_px);
+    const rMax = Math.max(rMin + 1, geom.r_outer_px);
+    if (rMax - rMin < 5) {
+        return { n_fold: null, confidence: 0, alternatives: [] };
+    }
+
+    const N_BIN = 360;
+    const sumR = new Float64Array(N_BIN);
+    const sumG = new Float64Array(N_BIN);
+    const sumB = new Float64Array(N_BIN);
+    const cnt = new Uint32Array(N_BIN);
+    const data = jimpImage.bitmap.data;
+
+    const xmin = Math.max(0, Math.floor(cx - rMax - 1));
+    const xmax = Math.min(W - 1, Math.ceil(cx + rMax + 1));
+    const ymin = Math.max(0, Math.floor(cy - rMax - 1));
+    const ymax = Math.min(H - 1, Math.ceil(cy + rMax + 1));
+    for (let y = ymin; y <= ymax; y++) {
+        for (let x = xmin; x <= xmax; x++) {
+            if (!mask[y * W + x]) continue;
+            const dx = x - cx, dy = y - cy;
+            const r2 = dx * dx + dy * dy;
+            if (r2 < rMin * rMin || r2 > rMax * rMax) continue;
+            let t = Math.atan2(dy, dx);
+            if (t < 0) t += 2 * Math.PI;
+            const bin = Math.floor((t / (2 * Math.PI)) * N_BIN) % N_BIN;
+            const i4 = (y * W + x) * 4;
+            sumR[bin] += data[i4];
+            sumG[bin] += data[i4 + 1];
+            sumB[bin] += data[i4 + 2];
+            cnt[bin]++;
+        }
+    }
+    // Filled bins; empty bins are skipped during autocorrelation (treated as
+    // "no information at this offset pair") instead of forcing a zero RGB.
+    const sig = new Array(N_BIN);
+    let filled = 0;
+    for (let b = 0; b < N_BIN; b++) {
+        if (cnt[b] === 0) { sig[b] = null; continue; }
+        sig[b] = [sumR[b] / cnt[b], sumG[b] / cnt[b], sumB[b] / cnt[b]];
+        filled++;
+    }
+    if (filled < N_BIN * 0.5) {
+        return { n_fold: null, confidence: 0, alternatives: [] };
+    }
+
+    // Mean color distance over offset k.
+    function meanDist(k) {
+        let s = 0, n = 0;
+        for (let i = 0; i < N_BIN; i++) {
+            const a = sig[i], b = sig[(i + k) % N_BIN];
+            if (!a || !b) continue;
+            const dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+            s += Math.sqrt(dr * dr + dg * dg + db * db);
+            n++;
+        }
+        return n > 0 ? s / n : Infinity;
+    }
+
+    // Baseline: average of "uncorrelated" offsets (k = 90, 180 averaged with
+    // a few others is robust against accidental matches).
+    let baseline = 0, bcnt = 0;
+    for (const k of [37, 91, 137, 181, 233]) {
+        const v = meanDist(k % 180 === 0 ? 180 : k);
+        if (isFinite(v)) { baseline += v; bcnt++; }
+    }
+    baseline = bcnt > 0 ? baseline / bcnt : 1;
+    if (baseline === 0) {
+        return { n_fold: null, confidence: 0, alternatives: [] };
+    }
+
+    // Candidate N values where 360 % N === 0 and 2 <= N <= 36.
+    const candidates = [];
+    for (let N = 2; N <= 36; N++) {
+        if (360 % N !== 0) continue;
+        const k = 360 / N;
+        const dk = meanDist(k);
+        const confidence = Math.max(0, 1 - dk / baseline);
+        candidates.push({ N, k, dist: dk, confidence });
+    }
+    candidates.sort((a, b) => b.confidence - a.confidence);
+
+    // Suppress weaker multiples of stronger candidates so 6-fold doesn't
+    // also show up reported as 12 or 18-fold.
+    const filtered = [];
+    for (const c of candidates) {
+        const dominated = filtered.some(f => c.N % f.N === 0 && c.N !== f.N);
+        if (!dominated) filtered.push(c);
+    }
+    const top = filtered[0];
+    if (!top || top.confidence < 0.3) {
+        return { n_fold: null, confidence: 0, alternatives: [] };
+    }
+    return {
+        n_fold: top.N,
+        confidence: Number(top.confidence.toFixed(3)),
+        sector_theta_range: Number((2 * Math.PI / top.N).toFixed(6)),
+        alternatives: filtered.slice(1, 3).map(c => ({
+            n_fold: c.N,
+            confidence: Number(c.confidence.toFixed(3)),
+        })),
+    };
+}
+
+// Composite: stages 1-4.
 function detectPolarGeometry(jimpImage, hint) {
     const W = jimpImage.bitmap.width;
     const H = jimpImage.bitmap.height;
     const bg = estimateBackgroundColor(jimpImage);
-    const { mask, bbox, area, circularity, shape: autoShape } =
-        buildForegroundMaskAndShape(jimpImage, bg);
+    const stage12 = buildForegroundMaskAndShape(jimpImage, bg);
+    const { mask, bbox, area, circularity, shape: perimeterShape } = stage12;
 
+    // Stage 2.5: histogram-based shape refinement. We need a provisional
+    // center for the histogram; bbox center is good enough at this stage.
+    let provisionalShape = perimeterShape;
+    let provisionalCx = bbox ? Math.round(bbox.x + bbox.w / 2) : Math.floor(W / 2);
+    let provisionalCy = bbox ? Math.round(bbox.y + bbox.h / 2) : Math.floor(H / 2);
+    const histPre = computeDistanceHistogram(mask, bbox, W, provisionalCx, provisionalCy);
+    if (perimeterShape === 'rectangular') {
+        provisionalShape = refineShapeFromHistogram(histPre, perimeterShape);
+    }
+    const autoShape = provisionalShape;
     const shape = (hint && hint.shape && hint.shape !== 'auto') ? hint.shape : autoShape;
+
+    // Stage 3: center + radii. Pass the pre-computed histogram so we don't
+    // walk the foreground a second time when shape ends up being circular.
     const { center_x, center_y, r_inner_px, r_outer_px } =
-        estimateCenterAndRadii(mask, bbox, W, H, shape);
+        estimateCenterAndRadii(mask, bbox, W, H, shape, histPre);
+
+    // Stage 4: rotational symmetry over the [r_inner, r_outer] ring.
+    const periodicity = detectPeriodicity(jimpImage, mask, {
+        center_x, center_y, r_inner_px, r_outer_px,
+    });
 
     return {
         shape,
         auto_shape: autoShape,
+        perimeter_shape: perimeterShape,
         center_x, center_y,
         r_inner_px, r_outer_px,
         is_full_circle: true,
@@ -959,7 +1126,7 @@ function detectPolarGeometry(jimpImage, hint) {
         circularity: Number(circularity.toFixed(3)),
         image_width: W,
         image_height: H,
-        // periodicity is added by Phase 5b
+        periodicity,
     };
 }
 
