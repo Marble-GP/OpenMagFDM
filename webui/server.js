@@ -871,37 +871,38 @@ function computeDistanceHistogram(mask, bbox, W, cx, cy) {
     return { hist, total, maxR };
 }
 
-// Locate the air-gap dip in the distance histogram. Real motor cross
-// sections have a 1-3 px wide annulus of pure background between rotor
-// and stator (and CAD screenshots even more so), so the gap shows up as
-// a single histogram bin whose raw count is a tiny fraction of its
-// immediate neighbours. We sweep from the rim peak inward and return the
-// outermost bin whose raw count is < 20 % of the +/-5 px neighbourhood
-// average (the neighbourhood excludes the dip bin itself so a thin gap
-// is not self-suppressing). The 20 % threshold is tight enough that
-// inter-slot or inter-tooth gaps -- which usually drop by ~50-60 % --
-// are *not* picked up; a thin all-background ring (the real air gap)
-// drops by 80 %+ on the cross sections we have seen. Returns -1 when no
-// clear dip is found; the caller can fall back to the cumulative 5 %
-// percentile and the UI lets the user adjust manually if needed.
-// Return up to `maxCandidates` air-gap dip candidates, sorted best-first.
-// A "dip" is a histogram bin whose density falls below 20 % of the +/-5 px
-// neighbour mean (the neighbourhood excludes the dip bin itself so a thin
-// gap is not self-suppressing). To stay robust across topologies we apply
-// a *bidirectional* sanity check: both the inner band (r-30..r-5) and the
-// outer band (r+5..r+30) must carry meaningful material (>= 100 mean
-// density). That accepts:
-//   * inner rotor (rotor inside, stator outside) -- both sides dense
-//   * outer rotor (stator inside, rotor ring outside) -- both sides dense
-// and rejects:
-//   * bore-with-sparse-coils synthetic patterns (outer side sparse)
-//   * the inside edge of a thin ring (one side empty)
-// Score = (1 - ratio) * min(innerBand, outerBand): deeper dip + denser
-// surrounding material ranks higher. Neighbour dips within +/- 5 px of an
-// accepted candidate are suppressed so a single wide gap doesn't dominate
-// the list. The caller can use the top entry as r_inner_px and expose the
-// full list as `dip_candidates` so the user can switch in the UI if the
-// best-scored guess isn't the physical air gap.
+// Locate air-gap dips in the distance histogram and return the top-N
+// candidates, sorted best-first.
+//
+// What is a "dip" here:
+//   * deep enough relative to the +/-5 px neighbourhood (excluding the
+//     +/-1 px around the dip itself so a thin gap is not self-suppressing):
+//     hist[r] < 0.85 of that mean -- i.e. at least a 15 % drop. The
+//     threshold is intentionally loose because real CAD / paper-screenshot
+//     air gaps are often only 5-8 px wide with anti-aliased edges, so
+//     density drops 20-40 % rather than the 80-100 % we see on synthetic
+//     fixtures or the IEEJ-D-model. A monotone slope is naturally rejected
+//     because for a linear hist[r], the symmetric neighbourhood mean
+//     equals hist[r], giving ratio ~= 1.
+//   * bidirectional band sanity: both the inner band (r-30..r-5) and the
+//     outer band (r+5..r+30) must carry >= 100 mean density. That accepts:
+//       * inner rotor (rotor inside, stator outside) -- both sides dense
+//       * outer rotor (stator inside, rotor ring outside) -- both sides dense
+//     and rejects:
+//       * bore-with-sparse-coils synthetic patterns (outer side sparse)
+//       * the inside edge of a thin ring (one side empty)
+//
+// Score = (1 - ratio) * min(innerBand, outerBand). Deeper drop with
+// denser surrounding material ranks higher. The IEEJ-D-model and
+// synthetic fixtures keep ratio ~0, so the air gap clearly wins on
+// those; shallower real-world dips compete only with other dips on
+// the same image. After scoring we suppress neighbours within +/-5 px
+// of an already-accepted candidate so a single wide gap contributes
+// one entry. The caller uses the top entry as r_inner_px and exposes
+// the full list as `dip_candidates` so the UI dropdown can switch when
+// the highest-scored guess isn't the physical air gap (e.g. when an
+// aux mid-yoke gap outscores the rotor/stator gap on a multi-gap
+// design, or when two adjacent dips are both physically plausible).
 function findAirGapDipCandidates(hist, r_outer, maxCandidates = 5) {
     const minMargin = 30;
     if (r_outer - minMargin < 40) return [];
@@ -928,7 +929,7 @@ function findAirGapDipCandidates(hist, r_outer, maxCandidates = 5) {
         const ne = neighbourMean(r);
         if (ne < 100) continue;
         const ratio = hist[r] / ne;
-        if (ratio >= 0.2) continue;
+        if (ratio >= 0.85) continue;
         const innerBand = bandDensity(Math.max(0, r - 30), r - 5);
         const outerBand = bandDensity(r + 5, Math.min(hist.length - 1, r + 30));
         if (innerBand < 100 || outerBand < 100) continue;
