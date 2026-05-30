@@ -871,6 +871,56 @@ function computeDistanceHistogram(mask, bbox, W, cx, cy) {
     return { hist, total, maxR };
 }
 
+// Locate the air-gap dip in the distance histogram. Real motor cross
+// sections have a 1-3 px wide annulus of pure background between rotor
+// and stator (and CAD screenshots even more so), so the gap shows up as
+// a single histogram bin whose raw count is a tiny fraction of its
+// immediate neighbours. We sweep from the rim peak inward and return the
+// outermost bin whose raw count is < 20 % of the +/-5 px neighbourhood
+// average (the neighbourhood excludes the dip bin itself so a thin gap
+// is not self-suppressing). The 20 % threshold is tight enough that
+// inter-slot or inter-tooth gaps -- which usually drop by ~50-60 % --
+// are *not* picked up; a thin all-background ring (the real air gap)
+// drops by 80 %+ on the cross sections we have seen. Returns -1 when no
+// clear dip is found; the caller can fall back to the cumulative 5 %
+// percentile and the UI lets the user adjust manually if needed.
+function findAirGapInner(hist, r_outer) {
+    const minMargin = 30;
+    if (r_outer - minMargin < 40) return -1;
+    const neighWindow = 5;
+    function neighbourMean(r) {
+        let s = 0, n = 0;
+        for (let k = r - neighWindow; k <= r - 2; k++) {
+            if (k >= 0) { s += hist[k]; n++; }
+        }
+        for (let k = r + 2; k <= r + neighWindow; k++) {
+            if (k < hist.length) { s += hist[k]; n++; }
+        }
+        return n > 0 ? s / n : 0;
+    }
+    // Also check that the dip is sandwiched between dense rings on both
+    // sides -- a real rotor/stator gap has the rotor inside it. This
+    // rejects dips that are merely the inside boundary of a bore that
+    // sits *between* a stator and a coil ring (a synthetic-fixture
+    // pattern), as opposed to between a stator and a rotor.
+    function bandDensity(rLo, rHi) {
+        let s = 0, n = 0;
+        for (let k = rLo; k <= rHi; k++) {
+            if (k >= 0 && k < hist.length) { s += hist[k]; n++; }
+        }
+        return n > 0 ? s / n : 0;
+    }
+    for (let r = r_outer - minMargin; r >= 40; r--) {
+        const ne = neighbourMean(r);
+        if (ne < 100) continue;
+        if (hist[r] / ne >= 0.2) continue;
+        const innerBand = bandDensity(Math.max(0, r - 30), r - 5);
+        if (innerBand < 200) continue;
+        return r;
+    }
+    return -1;
+}
+
 // Histogram-based shape classifier. The perimeter-based circularity from
 // Stage 2 collapses to ~0.2 on ring topologies (inner boundary inflates
 // the perimeter), so the cumulative 95th-percentile rim heuristic also
@@ -940,21 +990,8 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape, precomputedHist) {
         const { hist, total, maxR } =
             precomputedHist || computeDistanceHistogram(mask, bbox, W, cx, cy);
         if (total === 0) return { center_x: cx, center_y: cy, r_inner_px: 0, r_outer_px: 0 };
-        // r_inner: 5 % cumulative percentile is fine -- captures the rotor
-        //          surface for typical motor cross sections.
-        // r_outer: the highest-density bin in the outer half of the
-        //          histogram. The cumulative 95 % percentile lands several
-        //          pixels *inside* the actual outer edge on dense rotors
-        //          (IEEJ-D-model style), and that small bias compounded by
-        //          the Hough sweep window made the centre drift; the peak
-        //          bin is robust to interior structure.
-        let cum = 0, r_inner = 0;
-        for (let r = 0; r <= maxR; r++) {
-            cum += hist[r];
-            if (cum >= total * 0.05) { r_inner = r; break; }
-        }
-        // r_outer: rim peak in upper half of the actual foreground extent
-        // (bbox diagonal would put the search above the real outer edge).
+        // r_outer: highest-density bin in the upper half of the actual
+        //          foreground extent. Robust to dense interiors.
         let outerExtent = 0;
         for (let r = maxR; r >= 0; r--) {
             if (hist[r] > 0) { outerExtent = r; break; }
@@ -963,6 +1000,20 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape, precomputedHist) {
         let r_outer = outerExtent, peak = 0;
         for (let r = half; r <= outerExtent; r++) {
             if (hist[r] > peak) { peak = hist[r]; r_outer = r; }
+        }
+        // r_inner: prefer the air-gap dip (outermost histogram valley
+        //          between rotor and stator) so the polar warp covers the
+        //          actual airgap-to-stator-OD band. Fall back to the 5 %
+        //          cumulative percentile if no clear dip is detected --
+        //          the user can correct it manually either way.
+        let r_inner = findAirGapInner(hist, r_outer);
+        if (r_inner < 0) {
+            let cum = 0;
+            r_inner = 0;
+            for (let r = 0; r <= maxR; r++) {
+                cum += hist[r];
+                if (cum >= total * 0.05) { r_inner = r; break; }
+            }
         }
         return { center_x: cx, center_y: cy, r_inner_px: r_inner, r_outer_px: r_outer };
     }
