@@ -916,88 +916,163 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape, precomputedHist) {
         return { center_x: cx, center_y: cy, r_inner_px: r_inner, r_outer_px: r_outer };
     }
 
-    // rectangular: try to find an interior hole (background-coloured connected
-    // region away from the image border) -> rotor air gap. If none, fall back
-    // to the inscribed circle of the bbox.
-    const visited = new Uint8Array(W * H);
-    let bestHole = null;  // { count, sx, sy, ex, ey, cx, cy }
-    for (let sy = bbox.y + 1; sy < bbox.y + bbox.h - 1; sy++) {
-        for (let sx = bbox.x + 1; sx < bbox.x + bbox.w - 1; sx++) {
-            const idx = sy * W + sx;
-            if (mask[idx] || visited[idx]) continue;
-            // BFS-flood the background region; reject if it touches the image edge.
-            const stack = [[sx, sy]];
-            let cnt = 0, sumX = 0, sumY = 0;
-            let xmin = W, ymin = H, xmax = -1, ymax = -1;
-            let touchesEdge = false;
-            while (stack.length > 0) {
-                const [x, y] = stack.pop();
-                if (x < 0 || x >= W || y < 0 || y >= H) { touchesEdge = true; continue; }
-                const k = y * W + x;
-                if (visited[k] || mask[k]) continue;
-                visited[k] = 1;
-                cnt++; sumX += x; sumY += y;
-                if (x < xmin) xmin = x; if (x > xmax) xmax = x;
-                if (y < ymin) ymin = y; if (y > ymax) ymax = y;
-                if (x === 0 || y === 0 || x === W - 1 || y === H - 1) touchesEdge = true;
-                stack.push([x + 1, y]); stack.push([x - 1, y]);
-                stack.push([x, y + 1]); stack.push([x, y - 1]);
-            }
-            if (touchesEdge) continue;
-            if (!bestHole || cnt > bestHole.count) {
-                bestHole = { count: cnt, cx: Math.round(sumX / cnt), cy: Math.round(sumY / cnt),
-                             w: xmax - xmin + 1, h: ymax - ymin + 1 };
-            }
-        }
-    }
-    if (bestHole && bestHole.count > 25) {
-        // hole-derived center; r_inner = hole radius, r_outer = ~ inscribed of bbox
-        const r_inner = Math.round(Math.max(bestHole.w, bestHole.h) / 2);
-        const r_outer = Math.max(r_inner + 5,
-            Math.floor(Math.min(bbox.w, bbox.h) / 2 - 5));
-        return { center_x: bestHole.cx, center_y: bestHole.cy,
-                 r_inner_px: r_inner, r_outer_px: r_outer };
-    }
-    // no hole found: inscribed-circle fallback, user must adjust
-    return { center_x: cx, center_y: cy,
-             r_inner_px: 0,
-             r_outer_px: Math.max(5, Math.floor(Math.min(bbox.w, bbox.h) / 2 - 5)) };
+    // rectangular: a square/rectangular stator outline does not encode the
+    // physical rotation axis directly, but on every real motor cross-section
+    // (a) the stator is roughly centered in the bbox, and (b) the rotor sits
+    // along the rotation axis. We therefore seed with the bbox center; if a
+    // rotor exists it shows up as the dominant circular signal in the Hough
+    // refinement (Stage 3.5), which will snap the seed to it. A previous
+    // "largest interior hole" heuristic mis-identified the bore-shaped
+    // connected component on a fixture with a centered rotor, so it's gone.
+    const r_outer = Math.max(5, Math.floor(Math.min(bbox.w, bbox.h) / 2 - 5));
+    return { center_x: cx, center_y: cy, r_inner_px: 0, r_outer_px: r_outer };
 }
 
-// In-place radix-2 Cooley-Tukey FFT. Works on power-of-two length signals;
-// callers zero-pad arbitrary-length input first. We avoid pulling fft.js
-// because the standalone build packages by pkg and adding deps is fragile.
-function fft1d(re, im) {
-    const N = re.length;
-    // bit reversal permutation
-    for (let i = 1, j = 0; i < N; i++) {
-        let bit = N >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            [re[i], re[j]] = [re[j], re[i]];
-            [im[i], im[j]] = [im[j], im[i]];
+// ---- Stage 3.5: Hough circle refinement (Phase 5b.6) ----
+// Stage 3 gets the center "in the right neighbourhood" from bbox or hole
+// flood-fill. For rectangular outer shapes that can still be 50+ pixels
+// off the physical rotation axis (rotor offset inside a square stator).
+// We refine by Sobel + a tiny forward-voting Hough that scores integrated
+// edge strength along each candidate (cx, cy, r) within a small window
+// around the coarse seed. Cost is bounded because both search ranges are
+// tight (~21x21 center * ~7 radii * 90 angles = ~130k ops, ~5 ms).
+
+// Sobel-magnitude edge map on the grayscale view of the input. Returned
+// as a Float32Array of length W*H; the border row/col stay 0.
+function computeEdgeMap(jimpImage) {
+    const W = jimpImage.bitmap.width;
+    const H = jimpImage.bitmap.height;
+    const data = jimpImage.bitmap.data;
+    const gray = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+        const i4 = i * 4;
+        gray[i] = 0.299 * data[i4] + 0.587 * data[i4 + 1] + 0.114 * data[i4 + 2];
+    }
+    const edge = new Float32Array(W * H);
+    for (let y = 1; y < H - 1; y++) {
+        for (let x = 1; x < W - 1; x++) {
+            const i = y * W + x;
+            const gx = -gray[i - W - 1] + gray[i - W + 1]
+                     - 2 * gray[i - 1] + 2 * gray[i + 1]
+                     - gray[i + W - 1] + gray[i + W + 1];
+            const gy = -gray[i - W - 1] - 2 * gray[i - W] - gray[i - W + 1]
+                     + gray[i + W - 1] + 2 * gray[i + W] + gray[i + W + 1];
+            edge[i] = Math.sqrt(gx * gx + gy * gy);
         }
     }
-    for (let len = 2; len <= N; len <<= 1) {
-        const half = len >> 1;
-        const ang = -2 * Math.PI / len;
-        const wRe = Math.cos(ang), wIm = Math.sin(ang);
-        for (let i = 0; i < N; i += len) {
-            let curRe = 1, curIm = 0;
-            for (let k = 0; k < half; k++) {
-                const xRe = re[i + k + half] * curRe - im[i + k + half] * curIm;
-                const xIm = re[i + k + half] * curIm + im[i + k + half] * curRe;
-                re[i + k + half] = re[i + k] - xRe;
-                im[i + k + half] = im[i + k] - xIm;
-                re[i + k] += xRe;
-                im[i + k] += xIm;
-                const nRe = curRe * wRe - curIm * wIm;
-                curIm = curRe * wIm + curIm * wRe;
-                curRe = nRe;
+    return edge;
+}
+
+// Precomputed unit-circle samples used by the Hough scoring loop. 90 angles
+// are enough: at the radii we score (100-300 px) the angular resolution
+// (4 deg) maps to ~7-21 px arc steps, so we still touch most edge pixels
+// while keeping the per-trial cost down.
+const HOUGH_ANGLES = 90;
+const HOUGH_COS = new Float64Array(HOUGH_ANGLES);
+const HOUGH_SIN = new Float64Array(HOUGH_ANGLES);
+for (let a = 0; a < HOUGH_ANGLES; a++) {
+    HOUGH_COS[a] = Math.cos(2 * Math.PI * a / HOUGH_ANGLES);
+    HOUGH_SIN[a] = Math.sin(2 * Math.PI * a / HOUGH_ANGLES);
+}
+
+// Forward-voting Hough: scan a small (cx, cy, r) cube around the seed
+// and pick the trial whose integrated edge strength (normalised by the
+// number of in-bounds samples) is highest. Returns {center_x, center_y,
+// r_px, score} or null if the search was no better than ~the seed.
+function houghRefineCircle(edge, W, H, cx0, cy0, r0, opts) {
+    const centerHalf = opts.centerHalfWindow != null ? opts.centerHalfWindow : 15;
+    const radiusHalf = opts.radiusHalfWindow != null ? opts.radiusHalfWindow : 3;
+    let bestScore = -1, bestCx = cx0, bestCy = cy0, bestR = r0;
+    const cxLo = Math.max(0, cx0 - centerHalf);
+    const cxHi = Math.min(W - 1, cx0 + centerHalf);
+    const cyLo = Math.max(0, cy0 - centerHalf);
+    const cyHi = Math.min(H - 1, cy0 + centerHalf);
+    const rLo  = Math.max(5, r0 - radiusHalf);
+    const rHi  = Math.max(rLo, r0 + radiusHalf);
+    for (let cy = cyLo; cy <= cyHi; cy++) {
+        for (let cx = cxLo; cx <= cxHi; cx++) {
+            for (let r = rLo; r <= rHi; r++) {
+                let s = 0, hits = 0;
+                for (let a = 0; a < HOUGH_ANGLES; a++) {
+                    const x = (cx + r * HOUGH_COS[a]) | 0;
+                    const y = (cy + r * HOUGH_SIN[a]) | 0;
+                    if (x < 0 || x >= W || y < 0 || y >= H) continue;
+                    s += edge[y * W + x];
+                    hits++;
+                }
+                if (hits < HOUGH_ANGLES * 0.5) continue;  // mostly off-image: skip
+                const norm = s / hits;
+                if (norm > bestScore) {
+                    bestScore = norm; bestCx = cx; bestCy = cy; bestR = r;
+                }
             }
         }
     }
+    if (bestScore < 0) return null;
+    return { center_x: bestCx, center_y: bestCy, r_px: bestR, score: bestScore };
+}
+
+// Apply Hough refinement to the appropriate circle for the given shape:
+//   circular   -> refine the outer ring  (r_outer_px)
+//   rectangular w/ rotor hole -> refine the inner hole (r_inner_px) so the
+//                                center jumps to the actual rotation axis
+// We only accept the refined values if their Hough score beats the score
+// of the seed by a meaningful margin (>= 10 %): otherwise we trust the
+// coarse seed (avoids drifting on rectangular/no-circle images).
+function refineWithHough(jimpImage, coarse, shape) {
+    if (!coarse || coarse.r_outer_px <= 0) return coarse;
+    const W = jimpImage.bitmap.width;
+    const H = jimpImage.bitmap.height;
+    const edge = computeEdgeMap(jimpImage);
+
+    // For a centered circular outline the bbox already pins the center
+    // within a few pixels, so a small 20-px window is enough. For a
+    // rectangular stator the bbox center is centered relative to the
+    // rectangle itself but the rotation axis (= rotor center) can be way
+    // off; we widen the search to bracket the likely rotor position. Also
+    // sweep a wider band of radii: the bbox-inscribed-circle seed will be
+    // a few tens of pixels larger than the actual rotor.
+    const isRect = (shape === 'rectangular');
+    const centerHalf = isRect ? 80 : 20;
+    const radiusHalf = isRect ? 30 : 4;
+
+    // For rectangular the seed radius is "inscribed bbox / 2" which is too
+    // large to score the rotor; sweep down from there. We pick the seed
+    // radius midway between a plausible rotor (~r_outer/3) and the bbox
+    // inscribed value so that radiusHalf brackets both extremes.
+    const seedR = isRect
+        ? Math.round((coarse.r_outer_px + Math.max(15, coarse.r_outer_px * 0.3)) / 2)
+        : coarse.r_outer_px;
+
+    const seed = houghRefineCircle(edge, W, H,
+        coarse.center_x, coarse.center_y, seedR,
+        { centerHalfWindow: 0, radiusHalfWindow: 0 });
+    const refined = houghRefineCircle(edge, W, H,
+        coarse.center_x, coarse.center_y, seedR,
+        { centerHalfWindow: centerHalf, radiusHalfWindow: radiusHalf });
+    if (!seed || !refined) return coarse;
+    if (refined.score < seed.score * 1.1) return coarse;
+
+    // Carry the refined values back. For a rectangular outline the Hough
+    // search was deliberately tuned to lock on to the rotor surface, so the
+    // refined radius becomes r_inner_px; we keep the bbox-inscribed value
+    // for r_outer_px. For a circular outline the refined radius is the
+    // outer ring itself; if there was an inner radius from Stage 3 we
+    // rescale it proportionally to preserve the user-visible ratio.
+    const out = { ...coarse, center_x: refined.center_x, center_y: refined.center_y };
+    if (isRect) {
+        out.r_inner_px = refined.r_px;
+        // r_outer is whatever the bbox suggested; the user can adjust.
+    } else {
+        const scale = refined.r_px / Math.max(1, coarse.r_outer_px);
+        out.r_outer_px = refined.r_px;
+        out.r_inner_px = coarse.r_inner_px > 0
+            ? Math.max(1, Math.round(coarse.r_inner_px * scale))
+            : 0;
+    }
+    out.hough_score = refined.score;
+    out.hough_seed_score = seed.score;
+    return out;
 }
 
 // 360-point DFT computed directly. Picked over a zero-padded radix-2 FFT
@@ -1254,8 +1329,15 @@ function detectPolarGeometry(jimpImage, hint) {
 
     // Stage 3: center + radii. Pass the pre-computed histogram so we don't
     // walk the foreground a second time when shape ends up being circular.
-    const { center_x, center_y, r_inner_px, r_outer_px } =
-        estimateCenterAndRadii(mask, bbox, W, H, shape, histPre);
+    const coarse = estimateCenterAndRadii(mask, bbox, W, H, shape, histPre);
+
+    // Stage 3.5: Hough refinement (Phase 5b.6). Coarse-to-fine: only a tiny
+    // window around the seed gets scored, so the cost stays in the ms range
+    // and the result either confirms the seed or snaps it to the actual
+    // outer circle / rotor bore.
+    const refined = refineWithHough(jimpImage, coarse, shape);
+    const { center_x, center_y, r_inner_px, r_outer_px,
+            hough_score, hough_seed_score } = refined;
 
     // Stage 4: rotational symmetry over the [r_inner, r_outer] ring.
     const periodicity = detectPeriodicity(jimpImage, mask, {
@@ -1268,6 +1350,11 @@ function detectPolarGeometry(jimpImage, hint) {
         perimeter_shape: perimeterShape,
         center_x, center_y,
         r_inner_px, r_outer_px,
+        hough: hough_score != null
+            ? { score: Number(hough_score.toFixed(2)),
+                seed_score: Number(hough_seed_score.toFixed(2)),
+                gain: Number((hough_score / Math.max(1e-9, hough_seed_score)).toFixed(2)) }
+            : null,
         is_full_circle: true,
         theta_start: 0,
         theta_end: 2 * Math.PI,
