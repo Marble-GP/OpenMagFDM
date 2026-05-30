@@ -740,6 +740,149 @@
         }
         .lib-file-item:hover { background: #f0f4ff; }
         .lib-file-item.active { background: #e8ecff; color: #3a4ecc; font-weight: 600; }
+
+        /* ============= Polar Preprocess Modal (v1.5) ============= */
+        .polar-preview-pane {
+            flex: 0 0 60%;
+            background: #222;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            overflow: hidden;
+        }
+        .polar-preview-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            outline: none;
+        }
+        .polar-preview-container:focus {
+            box-shadow: inset 0 0 0 2px #667eea;
+        }
+        #polarSourceImg {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            user-select: none;
+            -webkit-user-drag: none;
+            display: block;
+        }
+        #polarOverlay {
+            position: absolute;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            pointer-events: auto;
+            cursor: default;
+        }
+        #polarOverlay .handle {
+            cursor: grab;
+        }
+        #polarOverlay .handle:active { cursor: grabbing; }
+        #polarOverlay .handle-center { fill: #e53935; stroke: #fff; stroke-width: 1.5; }
+        #polarOverlay .handle-inner  { fill: #26c6da; stroke: #fff; stroke-width: 1.5; }
+        #polarOverlay .handle-outer  { fill: #9ccc65; stroke: #fff; stroke-width: 1.5; }
+        #polarOverlay .handle-theta  { fill: #ffb300; stroke: #fff; stroke-width: 1.5; }
+        #polarOverlay .guide-inner   { fill: none; stroke: #26c6da; stroke-width: 1.8; stroke-dasharray: 6,4; }
+        #polarOverlay .guide-outer   { fill: none; stroke: #9ccc65; stroke-width: 2; }
+        #polarOverlay .guide-theta   { stroke: #ffb300; stroke-width: 1.8; }
+        #polarOverlay .guide-period  { stroke: rgba(255,255,255,0.35); stroke-width: 1; stroke-dasharray: 2,3; }
+        #polarOverlay .center-cross  { stroke: #e53935; stroke-width: 1.5; }
+        .polar-loading-overlay {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.45);
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.1rem;
+            display: none;
+        }
+        .polar-loading-overlay.active { display: flex; }
+
+        .polar-control-pane {
+            flex: 0 0 40%;
+            overflow-y: auto;
+            padding: 14px 16px;
+            background: #fafbfc;
+            border-left: 1px solid #e0e0e0;
+        }
+        .polar-section { margin-bottom: 14px; padding: 10px 12px; background: #fff; border-radius: 6px; border: 1px solid #e6e8eb; }
+        .polar-section-title { font-weight: 600; font-size: 0.88rem; color: #3a4ecc; margin-bottom: 6px; }
+        .polar-status-text { font-size: 0.82rem; color: #495057; line-height: 1.45; margin-bottom: 6px; }
+        .polar-input-grid {
+            display: grid;
+            grid-template-columns: 5em 1fr 2.2em;
+            gap: 4px 6px;
+            align-items: center;
+            font-size: 0.84rem;
+        }
+        .polar-input-grid label { color: #495057; }
+        .polar-input-grid input[type="number"] {
+            padding: 3px 6px;
+            border: 1px solid #ced4da;
+            border-radius: 3px;
+            font-size: 0.82rem;
+        }
+        .polar-input-grid .polar-unit { color: #868e96; font-size: 0.75rem; }
+        .polar-mini-btn { padding: 4px 10px; font-size: 0.78rem; margin-top: 6px; }
+        .polar-color-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-height: 180px;
+            overflow-y: auto;
+            font-size: 0.8rem;
+            color: #495057;
+        }
+        .polar-color-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: #f8f9fa;
+            border-radius: 3px;
+            padding: 3px 6px;
+        }
+        .polar-color-swatch {
+            width: 18px; height: 18px;
+            border: 1px solid #ccc;
+            border-radius: 2px;
+            flex: 0 0 auto;
+        }
+        .polar-color-row select {
+            margin-left: auto;
+            padding: 2px 4px;
+            font-size: 0.76rem;
+            border: 1px solid #ced4da;
+            border-radius: 3px;
+        }
+        .polar-thumb-wrap {
+            position: relative;
+            width: 160px;
+            height: 160px;
+            background: #222;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #polarPreviewThumb { display: block; max-width: 100%; max-height: 100%; }
+        .polar-dirty-badge {
+            position: absolute;
+            top: 4px; left: 4px;
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+            border-radius: 10px;
+            padding: 2px 8px;
+            font-size: 0.7rem;
+            display: none;
+        }
+        .polar-dirty-badge.active { display: inline-block; }
     </style>
 </head>
 <body>
@@ -813,6 +956,11 @@
                             onclick="detectColors()"
                             style="width: 100%; margin-top: 10px; display: none;">
                         Detect Colors &amp; Generate YAML Template
+                    </button>
+                    <button class="btn-secondary" id="polarizeBtn"
+                            onclick="openPolarPreprocessModal()"
+                            style="width: 100%; margin-top: 6px; display: none;">
+                        Polarize Cross-Section (v1.5)
                     </button>
                 </div>
 
@@ -1174,6 +1322,109 @@
                     <button class="btn-primary"   id="libSaveBtn"   onclick="saveLibrary()"     style="display: none;">Save</button>
                     <button class="btn-secondary" onclick="closeLibraryManager()">Close</button>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Polar Preprocess Modal (v1.5) -->
+    <div id="polarPreprocessModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 1200px; width: 95%; height: 90vh; max-height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3>Polar Preprocess — Cross-Section Geometry &amp; Symmetry</h3>
+                <button onclick="closePolarPreprocessModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
+            </div>
+            <div class="modal-body" style="display: flex; flex: 1; overflow: hidden; padding: 0;">
+                <!-- LEFT: image + SVG overlay -->
+                <div class="polar-preview-pane">
+                    <div class="polar-preview-container" id="polarPreviewContainer" tabindex="0">
+                        <img id="polarSourceImg" draggable="false" alt="source" />
+                        <svg id="polarOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+                        <div id="polarPreviewLoading" class="polar-loading-overlay">Detecting…</div>
+                    </div>
+                </div>
+                <!-- RIGHT: control panel -->
+                <div class="polar-control-pane">
+                    <!-- Section 1: Auto-detect status -->
+                    <div class="polar-section">
+                        <div class="polar-section-title">Auto-detect</div>
+                        <div id="polarStatusSummary" class="polar-status-text">—</div>
+                        <button class="btn-secondary polar-mini-btn" id="polarRedetectBtn" onclick="rerunPolarDetect()">Re-detect</button>
+                    </div>
+
+                    <!-- Section 2: Center & Radii -->
+                    <div class="polar-section">
+                        <div class="polar-section-title">Center &amp; Radii</div>
+                        <div class="polar-input-grid">
+                            <label>center x</label><input type="number" id="polarCenterX" step="1" data-pp="center_x"><span class="polar-unit">px</span>
+                            <label>center y</label><input type="number" id="polarCenterY" step="1" data-pp="center_y"><span class="polar-unit">px</span>
+                            <label>r_inner</label><input type="number" id="polarRInner" step="1" min="0" data-pp="r_inner_px"><span class="polar-unit">px</span>
+                            <label>r_outer</label><input type="number" id="polarROuter" step="1" min="1" data-pp="r_outer_px"><span class="polar-unit">px</span>
+                            <label>r_outer (phys)</label><input type="number" id="polarROuterPhys" step="0.001" min="0.001" data-pp="r_outer_physical"><span class="polar-unit">m</span>
+                        </div>
+                    </div>
+
+                    <!-- Section 3: Theta range -->
+                    <div class="polar-section">
+                        <div class="polar-section-title">Theta range</div>
+                        <div style="display:flex; gap:12px; margin-bottom:6px;">
+                            <label><input type="radio" name="polarThetaMode" value="full" checked data-pp="is_sector_false"> Full circle</label>
+                            <label><input type="radio" name="polarThetaMode" value="sector" data-pp="is_sector_true"> Sector</label>
+                        </div>
+                        <div class="polar-input-grid" id="polarSectorInputs" style="display:none;">
+                            <label>θ start</label><input type="number" id="polarThetaStart" step="1" data-pp="theta_start_deg"><span class="polar-unit">deg</span>
+                            <label>θ end</label><input type="number" id="polarThetaEnd" step="1" data-pp="theta_end_deg"><span class="polar-unit">deg</span>
+                        </div>
+                        <button class="btn-secondary polar-mini-btn" id="polarSnapSectorBtn" onclick="snapToDetectedPeriod()" disabled>Snap to 1 sector (1/N)</button>
+                    </div>
+
+                    <!-- Section 4: Output -->
+                    <div class="polar-section">
+                        <div class="polar-section-title">Output</div>
+                        <div class="polar-input-grid">
+                            <label>nr</label><input type="number" id="polarNr" step="1" min="2" data-pp="nr"><span class="polar-unit">px</span>
+                            <label>ntheta</label><input type="number" id="polarNtheta" step="1" min="2" data-pp="ntheta"><span class="polar-unit">px</span>
+                        </div>
+                        <div style="margin-top:6px;">
+                            <label><input type="checkbox" id="polarSnapNtheta" data-pp="snap_ntheta" checked> Snap ntheta to N-multiple</label>
+                        </div>
+                        <div style="margin-top:6px; display:flex; gap:12px;">
+                            <label><input type="radio" name="polarROrient" value="horizontal" checked data-pp="r_orientation"> horizontal</label>
+                            <label><input type="radio" name="polarROrient" value="vertical" data-pp="r_orientation"> vertical</label>
+                        </div>
+                    </div>
+
+                    <!-- Section 5: External shape + color grouping -->
+                    <div class="polar-section">
+                        <div class="polar-section-title">External shape</div>
+                        <div style="display:flex; gap:10px;">
+                            <label><input type="radio" name="polarShapeHint" value="auto" checked data-pp="shape_hint"> auto</label>
+                            <label><input type="radio" name="polarShapeHint" value="circular" data-pp="shape_hint"> circular</label>
+                            <label><input type="radio" name="polarShapeHint" value="rectangular" data-pp="shape_hint"> rectangular</label>
+                        </div>
+                        <div class="polar-section-title" style="margin-top:10px;">Color grouping</div>
+                        <div id="polarColorGroupGrid" class="polar-color-grid">— detecting —</div>
+                        <button class="btn-secondary polar-mini-btn" id="polarRecomputeBtn" onclick="recomputeWithGroupedColors()" disabled>Recompute periodicity with groups</button>
+                    </div>
+
+                    <!-- Section 6: Save target -->
+                    <div class="polar-section">
+                        <div class="polar-section-title">Save target</div>
+                        <div style="display:flex; flex-direction:column; gap:4px;">
+                            <label><input type="radio" name="polarSaveAs" value="polar" checked data-pp="save_as"> Polar warped image (coord=polar, fills polar_domain)</label>
+                            <label><input type="radio" name="polarSaveAs" value="cartesian" data-pp="save_as"> Original cartesian image (coord=cartesian, fills mesh.dx/dy)</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer" style="display:flex; align-items:center; gap:10px;">
+                <div class="polar-thumb-wrap">
+                    <canvas id="polarPreviewThumb" width="160" height="160"></canvas>
+                    <div id="polarDirtyBadge" class="polar-dirty-badge">⚠ 未更新の情報があります</div>
+                </div>
+                <div style="flex:1"></div>
+                <button class="btn-secondary" onclick="closePolarPreprocessModal()">Cancel</button>
+                <button class="btn-secondary" onclick="applyPolarTransform()">Apply Transform</button>
+                <button class="btn-primary" onclick="savePolarAndInsert()">Save &amp; Insert YAML</button>
             </div>
         </div>
     </div>

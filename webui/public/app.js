@@ -855,6 +855,7 @@ async function handleImageUpload(event) {
         AppState.uploadedImageFilename = result.filename;
         showStatus('solverStatus', `Image uploaded: ${result.filename}`, 'success');
         document.getElementById('detectColorsBtn').style.display = 'block';
+        document.getElementById('polarizeBtn').style.display = 'block';
 
         // Refresh image list
         await refreshImageList();
@@ -901,6 +902,7 @@ function loadSelectedImage() {
     img.src = `/uploads/${AppState.userId}/${filename}`;
     img.classList.remove('hidden');
     document.getElementById('detectColorsBtn').style.display = 'block';
+    document.getElementById('polarizeBtn').style.display = 'block';
     showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
 }
 
@@ -929,6 +931,7 @@ async function deleteSelectedImage() {
             AppState.uploadedImageFilename = null;
             document.getElementById('uploadedImage').classList.add('hidden');
             document.getElementById('detectColorsBtn').style.display = 'none';
+            document.getElementById('polarizeBtn').style.display = 'none';
         }
     } catch (error) {
         showStatus('solverStatus', `Delete error: ${error.message}`, 'error');
@@ -939,46 +942,51 @@ async function deleteSelectedImage() {
 // Detect Colors Feature
 // =====================================================
 
-async function detectColors() {
+// Internal color detection: POSTs /api/materials/detect with the currently
+// selected image. Returns the parsed result or throws. Separated from the
+// modal opener so the Polar Preprocess Modal (v1.5) can request the same
+// detection in parallel with /api/preprocess-polar/detect without opening
+// the Detect Colors modal.
+async function detectColorsInternal(opts = {}) {
     if (!AppState.uploadedImageFilename) {
-        showStatus('solverStatus', 'Please upload or select an image first', 'error');
-        return;
+        throw new Error('No image selected');
     }
+    const rareThreshold = opts.rareThreshold != null
+        ? opts.rareThreshold
+        : (parseFloat(document.getElementById('detectRareThreshold').value || '5') / 100);
+    const blendTolerance = opts.blendTolerance != null
+        ? opts.blendTolerance
+        : parseInt(document.getElementById('detectBlendTolerance').value || '8', 10);
 
-    const rareThreshold = parseFloat(document.getElementById('detectRareThreshold').value || '5') / 100;
-    const blendTolerance = parseInt(document.getElementById('detectBlendTolerance').value || '8', 10);
+    const imgResponse = await fetch(`/uploads/${AppState.userId}/${AppState.uploadedImageFilename}`);
+    if (!imgResponse.ok) throw new Error('Failed to fetch image');
+    const blob = await imgResponse.blob();
 
+    const formData = new FormData();
+    formData.append('image', blob, AppState.uploadedImageFilename);
+    formData.append('userId', AppState.userId);
+
+    const params = new URLSearchParams({
+        rareThreshold: String(rareThreshold),
+        blendTolerance: String(blendTolerance),
+    });
+    const response = await fetch(`/api/materials/detect?${params}`, {
+        method: 'POST',
+        body: formData,
+    });
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: response.statusText }));
+        throw new Error(err.error || 'Detection failed');
+    }
+    return await response.json();
+}
+
+async function detectColors() {
     try {
-        // Fetch the image file as a blob
-        const imgResponse = await fetch(`/uploads/${AppState.userId}/${AppState.uploadedImageFilename}`);
-        if (!imgResponse.ok) throw new Error('Failed to fetch image');
-        const blob = await imgResponse.blob();
-
-        // Post to detect endpoint
-        const formData = new FormData();
-        formData.append('image', blob, AppState.uploadedImageFilename);
-        formData.append('userId', AppState.userId);
-
-        const params = new URLSearchParams({
-            rareThreshold: rareThreshold.toString(),
-            blendTolerance: blendTolerance.toString()
-        });
-
-        const response = await fetch(`/api/materials/detect?${params}`, {
-            method: 'POST',
-            body: formData
-        });
-
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error || 'Detection failed');
-        }
-
-        const result = await response.json();
+        const result = await detectColorsInternal();
         AppState.lastDetectResult = result;
         renderDetectModal(result);
         document.getElementById('detectColorsModal').style.display = 'flex';
-
     } catch (error) {
         showStatus('solverStatus', `Detect error: ${error.message}`, 'error');
     }
@@ -1095,6 +1103,366 @@ function insertMaterialsSection() {
     } catch (e) {
         showStatus('solverStatus', `Insert failed: ${e.message}`, 'error');
     }
+}
+
+// =====================================================
+// Polar Preprocess Modal (v1.5) — Phase 5c (skeleton)
+// =====================================================
+// Phase 5c implements: state holder, open/close, read-only overlay drawn
+// from the auto-detect response, numeric input one-way sync (state -> input,
+// no edit handling yet), color chip list with non-functional dropdowns.
+// Phase 5d adds mouse/wheel/key editing + backend color_groups; Phase 5e
+// adds preview + save & insert. Keep this section self-contained.
+
+AppState.polarPreprocess = {
+    sourceFilename: null,
+    imageNaturalWidth: 0,
+    imageNaturalHeight: 0,
+    detection: null,
+    colorDetection: null,
+    colorGroups: {},
+    current: {
+        center_x: 0, center_y: 0,
+        r_inner_px: 0, r_outer_px: 0,
+        theta_start: 0, theta_end: 2 * Math.PI,
+        is_sector: false,
+        nr: 0, ntheta: 0,
+        snap_ntheta: true,
+        r_orientation: 'horizontal',
+        shape_hint: 'auto',
+        r_outer_physical: 1.0,
+        save_as: 'polar',
+    },
+    lastPreview: { filename: null, path: null, polar_domain: null, width: 0, height: 0 },
+    isDirty: false,
+    isWarping: false,
+    isDetecting: false,
+    _debounceTimer: null,
+    _activeDrag: null,
+    _rafScheduled: false,
+};
+
+function resetPolarPreprocessState() {
+    const pp = AppState.polarPreprocess;
+    pp.sourceFilename = null;
+    pp.imageNaturalWidth = 0;
+    pp.imageNaturalHeight = 0;
+    pp.detection = null;
+    pp.colorDetection = null;
+    pp.colorGroups = {};
+    Object.assign(pp.current, {
+        center_x: 0, center_y: 0,
+        r_inner_px: 0, r_outer_px: 0,
+        theta_start: 0, theta_end: 2 * Math.PI,
+        is_sector: false,
+        nr: 0, ntheta: 0,
+        snap_ntheta: true,
+        r_orientation: 'horizontal',
+        shape_hint: 'auto',
+        r_outer_physical: 1.0,
+        save_as: 'polar',
+    });
+    pp.lastPreview = { filename: null, path: null, polar_domain: null, width: 0, height: 0 };
+    pp.isDirty = false;
+    pp.isWarping = false;
+    pp.isDetecting = false;
+    if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }
+    pp._activeDrag = null;
+    pp._rafScheduled = false;
+}
+
+async function openPolarPreprocessModal() {
+    const modal = document.getElementById('polarPreprocessModal');
+    if (modal.style.display === 'flex') return;
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'Please upload or select an image first', 'error');
+        return;
+    }
+    resetPolarPreprocessState();
+    const pp = AppState.polarPreprocess;
+    pp.sourceFilename = AppState.uploadedImageFilename;
+
+    // Show modal first so user sees instant feedback
+    modal.style.display = 'flex';
+    setPolarLoading(true, 'Loading image…');
+
+    try {
+        await loadPolarSourceImage();
+        // Parallel: geometry detect + color detect (color is best-effort)
+        const [detectRes, colorRes] = await Promise.allSettled([
+            fetch('/api/preprocess-polar/detect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    userId: AppState.userId,
+                    filename: pp.sourceFilename,
+                }),
+            }).then(r => r.json()),
+            detectColorsInternal().catch(() => null),
+        ]);
+        if (detectRes.status !== 'fulfilled' || !detectRes.value.success) {
+            throw new Error(detectRes.reason || (detectRes.value && detectRes.value.error) || 'detect failed');
+        }
+        pp.detection = detectRes.value;
+        pp.colorDetection = colorRes.status === 'fulfilled' ? colorRes.value : null;
+
+        applyDetectionToCurrent(pp.detection);
+        renderPolarStatusSummary();
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+        renderPolarColorChips();
+    } catch (err) {
+        showStatus('solverStatus', `Polar detect failed: ${err.message}`, 'error');
+        renderPolarStatusSummary(err.message);
+    } finally {
+        setPolarLoading(false);
+    }
+}
+
+function closePolarPreprocessModal(saved = false) {
+    if (!saved && AppState.polarPreprocess.isDirty && AppState.polarPreprocess.lastPreview.filename) {
+        if (!confirm('未保存の編集があります。閉じますか?')) return;
+    }
+    const pp = AppState.polarPreprocess;
+    if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }
+    document.getElementById('polarPreprocessModal').style.display = 'none';
+    // Release image src so we don't keep the bitmap in memory
+    const img = document.getElementById('polarSourceImg');
+    if (img) img.src = '';
+    const svg = document.getElementById('polarOverlay');
+    if (svg) svg.innerHTML = '';
+}
+
+function setPolarLoading(on, msg) {
+    const overlay = document.getElementById('polarPreviewLoading');
+    if (!overlay) return;
+    overlay.textContent = msg || 'Loading…';
+    overlay.classList.toggle('active', !!on);
+}
+
+async function loadPolarSourceImage() {
+    const pp = AppState.polarPreprocess;
+    const img = document.getElementById('polarSourceImg');
+    return new Promise((resolve, reject) => {
+        img.onload = () => {
+            pp.imageNaturalWidth = img.naturalWidth;
+            pp.imageNaturalHeight = img.naturalHeight;
+            const svg = document.getElementById('polarOverlay');
+            svg.setAttribute('viewBox', `0 0 ${img.naturalWidth} ${img.naturalHeight}`);
+            resolve();
+        };
+        img.onerror = () => reject(new Error('image load failed'));
+        img.src = `/uploads/${AppState.userId}/${pp.sourceFilename}`;
+    });
+}
+
+// Pull center / radii / theta / nr / ntheta initial values from the detect
+// response into the editable state object.
+function applyDetectionToCurrent(detection) {
+    const cur = AppState.polarPreprocess.current;
+    cur.center_x = detection.center_x;
+    cur.center_y = detection.center_y;
+    cur.r_inner_px = detection.r_inner_px;
+    cur.r_outer_px = detection.r_outer_px;
+    cur.theta_start = detection.theta_start;
+    cur.theta_end = detection.theta_end;
+    cur.is_sector = !detection.is_full_circle;
+    cur.shape_hint = detection.shape || 'auto';
+    const per = detection.periodicity || {};
+    if (per.recommended_ntheta && per.recommended_ntheta > 1) {
+        cur.ntheta = per.recommended_ntheta;
+    } else {
+        cur.ntheta = Math.max(2, Math.round(2 * Math.PI * detection.r_outer_px));
+    }
+    cur.nr = Math.max(2, detection.r_outer_px - detection.r_inner_px);
+}
+
+function renderPolarStatusSummary(errMsg) {
+    const el = document.getElementById('polarStatusSummary');
+    if (errMsg) {
+        el.textContent = `Detection error: ${errMsg}`;
+        return;
+    }
+    const det = AppState.polarPreprocess.detection;
+    if (!det) { el.textContent = '—'; return; }
+    const per = det.periodicity || {};
+    const gray = per.grayscale || {};
+    const rgb = per.rgb || {};
+    const lines = [];
+    lines.push(`shape: ${det.shape}  center: (${det.center_x}, ${det.center_y})  r=[${det.r_inner_px}, ${det.r_outer_px}]`);
+    if (det.hough) lines.push(`Hough gain: ${det.hough.gain > 99 ? '>99' : det.hough.gain.toFixed(2)}x`);
+    const gN = gray.n_fold != null ? `N≈${gray.n_fold} (int ${gray.n_integer})` : '—';
+    const rN = rgb.n_fold  != null ? `N≈${rgb.n_fold} (int ${rgb.n_integer})`   : '—';
+    lines.push(`periodicity grayscale: ${gN}`);
+    lines.push(`periodicity rgb     : ${rN}`);
+    if (per.recommended_ntheta) lines.push(`recommended ntheta: ${per.recommended_ntheta}`);
+    el.innerHTML = lines.map(s => `<div>${s}</div>`).join('');
+    // Enable sector snap button if N is detected
+    const snapBtn = document.getElementById('polarSnapSectorBtn');
+    if (snapBtn) snapBtn.disabled = !(gray.n_fold || rgb.n_fold);
+}
+
+// Render SVG overlay from the current state. Phase 5c is read-only: this is
+// just visualisation, no event handlers attached. Phase 5d will add the
+// drag handlers and call renderPolarOverlay() again whenever current changes.
+function renderPolarOverlay() {
+    const svg = document.getElementById('polarOverlay');
+    if (!svg) return;
+    const cur = AppState.polarPreprocess.current;
+    const det = AppState.polarPreprocess.detection;
+    const W = AppState.polarPreprocess.imageNaturalWidth || 1;
+    const H = AppState.polarPreprocess.imageNaturalHeight || 1;
+    const cx = cur.center_x, cy = cur.center_y;
+    const rIn = cur.r_inner_px, rOut = cur.r_outer_px;
+    const crossArm = Math.max(8, Math.min(W, H) * 0.02);
+
+    let html = '';
+
+    // Period guides (drawn first so they sit behind the rings)
+    const periodGray = det && det.periodicity && det.periodicity.grayscale;
+    const N = periodGray && periodGray.n_integer;
+    if (N && N >= 2 && N <= 64 && rOut > 0) {
+        for (let k = 0; k < N; k++) {
+            const ang = 2 * Math.PI * k / N + (cur.theta_start || 0);
+            const x2 = cx + (rOut + 10) * Math.cos(ang);
+            const y2 = cy + (rOut + 10) * Math.sin(ang);
+            html += `<line class="guide-period" x1="${cx}" y1="${cy}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}"/>`;
+        }
+    }
+
+    // Inner / outer radius circles (or arcs for sector mode)
+    if (rIn > 0) {
+        html += `<circle class="guide-inner" cx="${cx}" cy="${cy}" r="${rIn}"/>`;
+    }
+    if (rOut > 0) {
+        html += `<circle class="guide-outer" cx="${cx}" cy="${cy}" r="${rOut}"/>`;
+    }
+
+    // Sector boundary lines
+    if (cur.is_sector) {
+        const r = Math.max(rOut, rIn || 0) + 4;
+        const xs = cx + r * Math.cos(cur.theta_start);
+        const ys = cy + r * Math.sin(cur.theta_start);
+        const xe = cx + r * Math.cos(cur.theta_end);
+        const ye = cy + r * Math.sin(cur.theta_end);
+        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xs.toFixed(2)}" y2="${ys.toFixed(2)}"/>`;
+        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xe.toFixed(2)}" y2="${ye.toFixed(2)}"/>`;
+    }
+
+    // Center cross + handle (drawn last so it sits on top)
+    html += `<line class="center-cross" x1="${cx - crossArm}" y1="${cy}" x2="${cx + crossArm}" y2="${cy}"/>`;
+    html += `<line class="center-cross" x1="${cx}" y1="${cy - crossArm}" x2="${cx}" y2="${cy + crossArm}"/>`;
+    html += `<circle class="handle handle-center" data-handle="center" cx="${cx}" cy="${cy}" r="6"/>`;
+
+    // Radius handles at 0 rad (right side)
+    if (rIn > 0) {
+        html += `<circle class="handle handle-inner" data-handle="inner" cx="${cx + rIn}" cy="${cy}" r="7"/>`;
+    }
+    if (rOut > 0) {
+        html += `<circle class="handle handle-outer" data-handle="outer" cx="${cx + rOut}" cy="${cy}" r="7"/>`;
+    }
+    // Sector theta handles at the ring outer edge
+    if (cur.is_sector && rOut > 0) {
+        const xs = cx + rOut * Math.cos(cur.theta_start);
+        const ys = cy + rOut * Math.sin(cur.theta_start);
+        const xe = cx + rOut * Math.cos(cur.theta_end);
+        const ye = cy + rOut * Math.sin(cur.theta_end);
+        html += `<circle class="handle handle-theta" data-handle="theta_start" cx="${xs.toFixed(2)}" cy="${ys.toFixed(2)}" r="7"/>`;
+        html += `<circle class="handle handle-theta" data-handle="theta_end"   cx="${xe.toFixed(2)}" cy="${ye.toFixed(2)}" r="7"/>`;
+    }
+
+    svg.innerHTML = html;
+}
+
+// State -> input one-way sync (Phase 5c is read-only). Phase 5d will add
+// the reverse direction.
+function syncPolarInputsFromState() {
+    const cur = AppState.polarPreprocess.current;
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    setVal('polarCenterX', cur.center_x);
+    setVal('polarCenterY', cur.center_y);
+    setVal('polarRInner', cur.r_inner_px);
+    setVal('polarROuter', cur.r_outer_px);
+    setVal('polarROuterPhys', cur.r_outer_physical);
+    setVal('polarNr', cur.nr);
+    setVal('polarNtheta', cur.ntheta);
+    const snap = document.getElementById('polarSnapNtheta');
+    if (snap) snap.checked = cur.snap_ntheta;
+    // theta inputs (deg)
+    setVal('polarThetaStart', radToDegRounded(cur.theta_start));
+    setVal('polarThetaEnd', radToDegRounded(cur.theta_end));
+    // theta mode radio
+    document.querySelectorAll('input[name="polarThetaMode"]').forEach(r => {
+        r.checked = (r.value === (cur.is_sector ? 'sector' : 'full'));
+    });
+    document.getElementById('polarSectorInputs').style.display = cur.is_sector ? '' : 'none';
+    // orientation
+    document.querySelectorAll('input[name="polarROrient"]').forEach(r => {
+        r.checked = (r.value === cur.r_orientation);
+    });
+    // shape hint
+    document.querySelectorAll('input[name="polarShapeHint"]').forEach(r => {
+        r.checked = (r.value === cur.shape_hint);
+    });
+    // save target
+    document.querySelectorAll('input[name="polarSaveAs"]').forEach(r => {
+        r.checked = (r.value === cur.save_as);
+    });
+}
+
+function radToDegRounded(rad) { return Math.round(rad * 180 / Math.PI * 100) / 100; }
+
+// Render the color chip list. Phase 5c shows non-functional dropdowns so
+// users can see the grouping UI shape; recompute is wired in Phase 5d.
+function renderPolarColorChips() {
+    const grid = document.getElementById('polarColorGroupGrid');
+    if (!grid) return;
+    const col = AppState.polarPreprocess.colorDetection;
+    if (!col || !col.colors || col.colors.length === 0) {
+        grid.textContent = 'No colour detection result (open Detect Colors first or upload a clearer image).';
+        return;
+    }
+    const groups = AppState.polarPreprocess.colorGroups;
+    grid.innerHTML = '';
+    col.colors
+        .filter(c => !c.antialias)
+        .forEach(c => {
+            const hex = '#' + c.rgb.map(v => v.toString(16).padStart(2, '0')).join('');
+            const key = c.rgb.join(',');
+            const cur = groups[key] || '';
+            const row = document.createElement('div');
+            row.className = 'polar-color-row';
+            row.innerHTML = `
+                <div class="polar-color-swatch" style="background:${hex}"></div>
+                <span style="font-family:monospace; font-size:0.78rem;">${hex}</span>
+                <span style="color:#868e96; font-size:0.72rem;">${((c.ratio || 0) * 100).toFixed(1)}%</span>
+                <select data-color-key="${key}" disabled>
+                    <option value="" ${cur === '' ? 'selected' : ''}>None</option>
+                    <option value="A" ${cur === 'A' ? 'selected' : ''}>Group A</option>
+                    <option value="B" ${cur === 'B' ? 'selected' : ''}>Group B</option>
+                    <option value="C" ${cur === 'C' ? 'selected' : ''}>Group C</option>
+                    <option value="D" ${cur === 'D' ? 'selected' : ''}>Group D</option>
+                </select>`;
+            grid.appendChild(row);
+        });
+}
+
+// Stubs for Phase 5d/5e - they get real implementations in later commits.
+// Defined here so the button onclick handlers in index.html resolve at load.
+async function rerunPolarDetect() {
+    showStatus('solverStatus', 'Re-detect: not yet implemented (Phase 5d)', 'error');
+}
+function snapToDetectedPeriod() {
+    showStatus('solverStatus', 'Snap-to-sector: not yet implemented (Phase 5d)', 'error');
+}
+function recomputeWithGroupedColors() {
+    showStatus('solverStatus', 'Color grouping recompute: not yet implemented (Phase 5d)', 'error');
+}
+function applyPolarTransform() {
+    showStatus('solverStatus', 'Apply Transform: not yet implemented (Phase 5e)', 'error');
+}
+function savePolarAndInsert() {
+    showStatus('solverStatus', 'Save & Insert: not yet implemented (Phase 5e)', 'error');
 }
 
 async function deleteConfig() {
