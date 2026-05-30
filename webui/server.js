@@ -884,9 +884,27 @@ function computeDistanceHistogram(mask, bbox, W, cx, cy) {
 // drops by 80 %+ on the cross sections we have seen. Returns -1 when no
 // clear dip is found; the caller can fall back to the cumulative 5 %
 // percentile and the UI lets the user adjust manually if needed.
-function findAirGapInner(hist, r_outer) {
+// Return up to `maxCandidates` air-gap dip candidates, sorted best-first.
+// A "dip" is a histogram bin whose density falls below 20 % of the +/-5 px
+// neighbour mean (the neighbourhood excludes the dip bin itself so a thin
+// gap is not self-suppressing). To stay robust across topologies we apply
+// a *bidirectional* sanity check: both the inner band (r-30..r-5) and the
+// outer band (r+5..r+30) must carry meaningful material (>= 100 mean
+// density). That accepts:
+//   * inner rotor (rotor inside, stator outside) -- both sides dense
+//   * outer rotor (stator inside, rotor ring outside) -- both sides dense
+// and rejects:
+//   * bore-with-sparse-coils synthetic patterns (outer side sparse)
+//   * the inside edge of a thin ring (one side empty)
+// Score = (1 - ratio) * min(innerBand, outerBand): deeper dip + denser
+// surrounding material ranks higher. Neighbour dips within +/- 5 px of an
+// accepted candidate are suppressed so a single wide gap doesn't dominate
+// the list. The caller can use the top entry as r_inner_px and expose the
+// full list as `dip_candidates` so the user can switch in the UI if the
+// best-scored guess isn't the physical air gap.
+function findAirGapDipCandidates(hist, r_outer, maxCandidates = 5) {
     const minMargin = 30;
-    if (r_outer - minMargin < 40) return -1;
+    if (r_outer - minMargin < 40) return [];
     const neighWindow = 5;
     function neighbourMean(r) {
         let s = 0, n = 0;
@@ -898,11 +916,6 @@ function findAirGapInner(hist, r_outer) {
         }
         return n > 0 ? s / n : 0;
     }
-    // Also check that the dip is sandwiched between dense rings on both
-    // sides -- a real rotor/stator gap has the rotor inside it. This
-    // rejects dips that are merely the inside boundary of a bore that
-    // sits *between* a stator and a coil ring (a synthetic-fixture
-    // pattern), as opposed to between a stator and a rotor.
     function bandDensity(rLo, rHi) {
         let s = 0, n = 0;
         for (let k = rLo; k <= rHi; k++) {
@@ -910,15 +923,41 @@ function findAirGapInner(hist, r_outer) {
         }
         return n > 0 ? s / n : 0;
     }
+    const raw = [];
     for (let r = r_outer - minMargin; r >= 40; r--) {
         const ne = neighbourMean(r);
         if (ne < 100) continue;
-        if (hist[r] / ne >= 0.2) continue;
+        const ratio = hist[r] / ne;
+        if (ratio >= 0.2) continue;
         const innerBand = bandDensity(Math.max(0, r - 30), r - 5);
-        if (innerBand < 200) continue;
-        return r;
+        const outerBand = bandDensity(r + 5, Math.min(hist.length - 1, r + 30));
+        if (innerBand < 100 || outerBand < 100) continue;
+        const score = (1 - ratio) * Math.min(innerBand, outerBand);
+        raw.push({
+            r,
+            ratio: Number(ratio.toFixed(3)),
+            inner_band: Math.round(innerBand),
+            outer_band: Math.round(outerBand),
+            score: Math.round(score),
+        });
     }
-    return -1;
+    // Sort best-first, then suppress neighbours within +/- 5 px so a wide
+    // gap that produces 4-5 adjacent qualifying bins only contributes one
+    // entry. (We sort *before* suppressing so the best bin of each gap wins.)
+    raw.sort((a, b) => b.score - a.score);
+    const out = [];
+    for (const c of raw) {
+        if (out.some(o => Math.abs(o.r - c.r) <= 5)) continue;
+        out.push(c);
+        if (out.length >= maxCandidates) break;
+    }
+    return out;
+}
+
+// Backwards-compatible wrapper: returns the r of the best dip, or -1.
+function findAirGapInner(hist, r_outer) {
+    const cs = findAirGapDipCandidates(hist, r_outer, 1);
+    return cs.length > 0 ? cs[0].r : -1;
 }
 
 // Histogram-based shape classifier. The perimeter-based circularity from
@@ -1001,21 +1040,35 @@ function estimateCenterAndRadii(mask, bbox, W, H, shape, precomputedHist) {
         for (let r = half; r <= outerExtent; r++) {
             if (hist[r] > peak) { peak = hist[r]; r_outer = r; }
         }
-        // r_inner: prefer the air-gap dip (outermost histogram valley
-        //          between rotor and stator) so the polar warp covers the
-        //          actual airgap-to-stator-OD band. Fall back to the 5 %
-        //          cumulative percentile if no clear dip is detected --
-        //          the user can correct it manually either way.
-        let r_inner = findAirGapInner(hist, r_outer);
-        if (r_inner < 0) {
+        // r_inner: prefer the air-gap dip (the strongest histogram valley
+        //          between rotor and stator -- best score across the
+        //          bidirectional candidate list) so the polar warp covers
+        //          the actual airgap-to-stator-OD band. Fall back to the 5 %
+        //          cumulative percentile if no clear dip is detected; the
+        //          UI also exposes the full candidate list so the user can
+        //          switch (useful on outer-rotor / multi-airgap topologies
+        //          where the highest-scored dip isn't always the physical
+        //          air gap).
+        const dipCandidates = findAirGapDipCandidates(hist, r_outer, 5);
+        let r_inner;
+        let dipFallback = false;
+        if (dipCandidates.length > 0) {
+            r_inner = dipCandidates[0].r;
+        } else {
             let cum = 0;
             r_inner = 0;
             for (let r = 0; r <= maxR; r++) {
                 cum += hist[r];
                 if (cum >= total * 0.05) { r_inner = r; break; }
             }
+            dipFallback = true;
         }
-        return { center_x: cx, center_y: cy, r_inner_px: r_inner, r_outer_px: r_outer };
+        return {
+            center_x: cx, center_y: cy,
+            r_inner_px: r_inner, r_outer_px: r_outer,
+            dip_candidates: dipCandidates,
+            dip_fallback: dipFallback,
+        };
     }
 
     // rectangular: a square/rectangular stator outline does not encode the
@@ -1171,6 +1224,14 @@ function refineWithHough(jimpImage, coarse, shape) {
         out.r_inner_px = coarse.r_inner_px > 0
             ? Math.max(1, Math.round(coarse.r_inner_px * scale))
             : 0;
+        // dip candidates were computed in the pre-Hough histogram frame;
+        // rescale so the r values stay meaningful in the refined frame.
+        if (Array.isArray(coarse.dip_candidates) && coarse.dip_candidates.length > 0) {
+            out.dip_candidates = coarse.dip_candidates.map(c => ({
+                ...c,
+                r: Math.max(1, Math.round(c.r * scale)),
+            }));
+        }
     }
     out.hough_score = refined.score;
     out.hough_seed_score = seed.score;
@@ -1440,6 +1501,8 @@ function detectPolarGeometry(jimpImage, hint) {
     const refined = refineWithHough(jimpImage, coarse, shape);
     const { center_x, center_y, r_inner_px, r_outer_px,
             hough_score, hough_seed_score } = refined;
+    const dip_candidates = Array.isArray(refined.dip_candidates) ? refined.dip_candidates : [];
+    const dip_fallback = !!refined.dip_fallback;
 
     // Stage 4: rotational symmetry over the [r_inner, r_outer] ring.
     const periodicity = detectPeriodicity(jimpImage, mask, {
@@ -1452,6 +1515,8 @@ function detectPolarGeometry(jimpImage, hint) {
         perimeter_shape: perimeterShape,
         center_x, center_y,
         r_inner_px, r_outer_px,
+        dip_candidates,
+        dip_fallback,
         hough: hough_score != null
             ? { score: Number(hough_score.toFixed(2)),
                 seed_score: Number(hough_seed_score.toFixed(2)),
