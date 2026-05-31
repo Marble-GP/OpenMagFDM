@@ -1529,6 +1529,25 @@
                 </div>
                 <!-- RIGHT: control panel -->
                 <div class="polar-control-pane">
+                    <!-- AA-noise / JPEG-derived image warning. Shown when
+                         the parallel /api/materials/detect call reports
+                         >1000 unique RGB values (i.e. enough AA fragments
+                         that downstream materials assignment will struggle).
+                         The "Open filter" button routes the user to the
+                         same Quantize Filter modal as the Detect Colors
+                         banner. -->
+                    <div id="polarNoisyBanner" class="noisy-banner" style="display: none;">
+                        <div class="noisy-banner-text">
+                            <strong>⚠ 画像にアンチエイリアシング由来のノイズが多い可能性があります。</strong>
+                            <span id="polarNoisyBannerDetail"></span>
+                            一様色での塗りつぶしフィルタの適用を推奨します。
+                        </div>
+                        <button class="btn-primary" onclick="openQuantizeFilterModal()"
+                                style="padding: 6px 14px; white-space: nowrap;">
+                            一様色フィルタ
+                        </button>
+                    </div>
+
                     <!-- Section 1: Auto-detect status -->
                     <div class="polar-section">
                         <div class="polar-section-title">Auto-detect</div>

@@ -1532,11 +1532,36 @@ async function openPolarPreprocessModal() {
         renderPolarOverlay();
         syncPolarInputsFromState();
         renderPolarColorChips();
+        renderPolarNoisyBanner();
     } catch (err) {
         showStatus('solverStatus', `Polar detect failed: ${err.message}`, 'error');
         renderPolarStatusSummary(err.message);
     } finally {
         setPolarLoading(false);
+    }
+}
+
+// Reuse the Detect Colors banner heuristic (uniqueColors > 1000) inside
+// the Polar Preprocess modal. The colour detection runs in parallel when
+// the polar modal opens, so this is just a render of an already-fetched
+// number -- no extra round trip. The Filter modal "Apply" path re-fetches
+// the colour detect when it closes, so the banner refreshes automatically
+// once the user runs the filter.
+function renderPolarNoisyBanner() {
+    const banner = document.getElementById('polarNoisyBanner');
+    const detail = document.getElementById('polarNoisyBannerDetail');
+    if (!banner) return;
+    const cd = AppState.polarPreprocess.colorDetection;
+    const unique = cd && Number.isFinite(cd.uniqueColors) ? cd.uniqueColors : 0;
+    const aaTotal = cd && Number.isFinite(cd.aaBlendsTotal) ? cd.aaBlendsTotal : 0;
+    if (unique > 1000) {
+        if (detail) {
+            detail.textContent =
+                ` (画素値の種類: ${unique.toLocaleString()} 色, AA blend: ${aaTotal.toLocaleString()}).`;
+        }
+        banner.style.display = 'flex';
+    } else {
+        banner.style.display = 'none';
     }
 }
 
