@@ -1924,9 +1924,10 @@ function syncPolarInputsFromState() {
     setVal('polarNtheta', cur.ntheta);
     const snap = document.getElementById('polarSnapNtheta');
     if (snap) snap.checked = cur.snap_ntheta;
-    // theta inputs (deg)
-    setVal('polarThetaStart', radToDegRounded(cur.theta_start));
-    setVal('polarThetaEnd', radToDegRounded(cur.theta_end));
+    // theta inputs (deg, CCW math convention -- negated from the
+    // internal image-coord state).
+    setVal('polarThetaStart', -radToDegRounded(cur.theta_start));
+    setVal('polarThetaEnd',   -radToDegRounded(cur.theta_end));
     // theta mode radio
     document.querySelectorAll('input[name="polarThetaMode"]').forEach(r => {
         r.checked = (r.value === (cur.is_sector ? 'sector' : 'full'));
@@ -2222,8 +2223,11 @@ function bindPolarInputs() {
         r_outer_physical:   ['r_outer_physical',   v => Math.max(0.001, Number(v))],
         nr:                 ['nr',                 v => Math.max(2, Math.round(Number(v)))],
         ntheta:             ['ntheta',             v => Math.max(2, Math.round(Number(v)))],
-        theta_start_deg:    ['theta_start',        v => Number(v) * Math.PI / 180],
-        theta_end_deg:      ['theta_end',          v => Number(v) * Math.PI / 180],
+        // Theta inputs are shown in CCW (math) convention. The internal
+        // state and the SVG / warp pipelines use the image-coord (Y-down,
+        // CW visually) convention, so we negate at the UI boundary.
+        theta_start_deg:    ['theta_start',        v => -Number(v) * Math.PI / 180],
+        theta_end_deg:      ['theta_end',          v => -Number(v) * Math.PI / 180],
     };
     root.querySelectorAll('input[type=number]').forEach(input => {
         const key = input.dataset.pp;
@@ -2258,10 +2262,13 @@ function bindPolarInputs() {
             cur().is_sector = (r.value === 'sector');
             document.getElementById('polarSectorInputs').style.display =
                 cur().is_sector ? '' : 'none';
-            // Initialise sector range if just switched on with full-circle theta.
+            // Initialise sector range if just switched on with full-circle
+            // theta. State stays in image-coord (Y-down) convention but
+            // the chosen pair displays as a clean increasing CCW range
+            // (-45°, +45° in the user-facing math convention).
             if (cur().is_sector && Math.abs(cur().theta_end - cur().theta_start - 2 * Math.PI) < 1e-6) {
-                cur().theta_start = -Math.PI / 4;
-                cur().theta_end   =  Math.PI / 4;
+                cur().theta_start =  Math.PI / 4;   // displays as -45°
+                cur().theta_end   = -Math.PI / 4;   // displays as +45°
             }
             renderPolarOverlay();
             syncPolarInputsFromState();
@@ -2437,8 +2444,11 @@ function snapToDetectedPeriod() {
     }
     const cur = pp.current;
     cur.is_sector = true;
+    // Snap one sector with start=0 and width 2pi/N going CCW in the
+    // user-facing math convention. The internal state is in image-coord
+    // (Y-down) so the end angle is negated.
     cur.theta_start = 0;
-    cur.theta_end = 2 * Math.PI / N;
+    cur.theta_end   = -2 * Math.PI / N;
     document.getElementById('polarSectorInputs').style.display = '';
     renderPolarOverlay();
     syncPolarInputsFromState();
