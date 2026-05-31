@@ -1456,6 +1456,62 @@ function findPeakCandidates(mag, Nmin, Nmax, minSNR) {
 }
 
 // Run FFT-based periodicity detection on a single signature mode.
+// Grouped signature: per-bin mean of *group IDs* over pixels whose exact
+// RGB matches one of the user-supplied colour groups. Bins that contain
+// no grouped pixels are backfilled with the overall mean (same backfill
+// trick as the grayscale/rgb signature) so the DFT input stays smooth.
+// `colorMap` is a Map<rgbKey, groupIndex> (rgbKey = (r<<16)|(g<<8)|b).
+function buildGroupedAngularSignature(jimpImage, mask, geom, colorMap) {
+    const W = jimpImage.bitmap.width;
+    const H = jimpImage.bitmap.height;
+    const cx = geom.center_x, cy = geom.center_y;
+    const r0 = Math.max(0, geom.r_inner_px);
+    const r1 = Math.max(r0 + 1, geom.r_outer_px);
+    const margin = (r1 - r0) * 0.08;
+    const rMin = r0 + margin;
+    const rMax = r1 - margin;
+    const N_BIN = 360;
+    const sumG = new Float64Array(N_BIN);
+    const cntG = new Uint32Array(N_BIN);
+    const data = jimpImage.bitmap.data;
+    const xmin = Math.max(0, Math.floor(cx - rMax - 1));
+    const xmax = Math.min(W - 1, Math.ceil(cx + rMax + 1));
+    const ymin = Math.max(0, Math.floor(cy - rMax - 1));
+    const ymax = Math.min(H - 1, Math.ceil(cy + rMax + 1));
+    for (let y = ymin; y <= ymax; y++) {
+        for (let x = xmin; x <= xmax; x++) {
+            if (!mask[y * W + x]) continue;
+            const dx = x - cx, dy = y - cy;
+            const r2 = dx * dx + dy * dy;
+            if (r2 < rMin * rMin || r2 > rMax * rMax) continue;
+            const i4 = (y * W + x) * 4;
+            const key = (data[i4] << 16) | (data[i4 + 1] << 8) | data[i4 + 2];
+            const gid = colorMap.get(key);
+            if (gid === undefined) continue;
+            let t = Math.atan2(dy, dx);
+            if (t < 0) t += 2 * Math.PI;
+            const bin = Math.floor((t / (2 * Math.PI)) * N_BIN) % N_BIN;
+            sumG[bin] += gid;
+            cntG[bin]++;
+        }
+    }
+    let filled = 0;
+    const values = new Float64Array(N_BIN);
+    let runningSum = 0, runningCnt = 0;
+    for (let b = 0; b < N_BIN; b++) {
+        if (cntG[b] === 0) { values[b] = NaN; continue; }
+        filled++;
+        const v = sumG[b] / cntG[b];
+        values[b] = v;
+        runningSum += v;
+        runningCnt++;
+    }
+    const mean = runningCnt > 0 ? runningSum / runningCnt : 0;
+    for (let b = 0; b < N_BIN; b++) if (!Number.isFinite(values[b])) values[b] = mean;
+    for (let b = 0; b < N_BIN; b++) values[b] -= mean;
+    return { values, mean, filled, has_data: filled >= N_BIN * 0.25 };
+}
+
 function periodicityForMode(jimpImage, mask, geom, mode, Nmin, Nmax) {
     const sig = buildAngularSignature(jimpImage, mask, geom, mode);
     if (!sig.has_data) return { n_fold: null, confidence: 0, alternatives: [] };
@@ -1495,7 +1551,7 @@ function periodicityForMode(jimpImage, mask, geom, mode, Nmin, Nmax) {
 //   - rgb     picks up colour-coded period (3-phase phases, N/S magnets)
 // Also computes a `recommended_ntheta` so the UI can default to a value
 // where each detected sector lands on an integer number of output pixels.
-function detectPeriodicity(jimpImage, mask, geom) {
+function detectPeriodicity(jimpImage, mask, geom, colorGroups) {
     const rMin = Math.max(0, geom.r_inner_px);
     const rMax = Math.max(rMin + 1, geom.r_outer_px);
     if (rMax - rMin < 5) {
@@ -1515,6 +1571,63 @@ function detectPeriodicity(jimpImage, mask, geom) {
     const grayscale = periodicityForMode(jimpImage, mask, geom, 'grayscale', Nmin, Nmax);
     const rgb       = periodicityForMode(jimpImage, mask, geom, 'rgb',       Nmin, Nmax);
 
+    // Optional "grouped" mode (Phase 5d.3). Each group is an array of
+    // RGB triples that share the same group id; the user assigns these
+    // through the colour-chip dropdowns in the Polar Preprocess modal.
+    // For a 3-phase outer-rotor SPMSM where the user groups all phase
+    // colours under one id, the dominant period drops from N=12 (the
+    // raw slot count) to N=12/3=4 (the geometric phase symmetry).
+    let grouped = null;
+    if (Array.isArray(colorGroups) && colorGroups.length > 0) {
+        const colorMap = new Map();
+        for (let i = 0; i < colorGroups.length; i++) {
+            const list = Array.isArray(colorGroups[i].colors) ? colorGroups[i].colors : [];
+            for (const rgb of list) {
+                if (!Array.isArray(rgb) || rgb.length < 3) continue;
+                const r = rgb[0] | 0, g = rgb[1] | 0, b = rgb[2] | 0;
+                const key = (r << 16) | (g << 8) | b;
+                colorMap.set(key, i);
+            }
+        }
+        if (colorMap.size > 0) {
+            const sig = buildGroupedAngularSignature(jimpImage, mask, geom, colorMap);
+            if (sig.has_data) {
+                const mag = fftMagnitude(sig.values);
+                const cands = findPeakCandidates(mag, Nmin, Nmax, 4);
+                const kept = [];
+                for (const c of cands) {
+                    if (kept.some(k => Math.abs(k.peak_bin - c.peak_bin) < 1.5)) continue;
+                    if (kept.some(k => k.n_integer > 0
+                        && c.n_integer % k.n_integer === 0
+                        && c.n_integer !== k.n_integer)) continue;
+                    kept.push(c);
+                }
+                if (kept.length > 0) {
+                    const top = kept[0];
+                    grouped = {
+                        n_fold: top.n_fold,
+                        n_integer: top.n_integer,
+                        confidence: top.confidence,
+                        snr: top.snr,
+                        sector_theta_range: Number((2 * Math.PI / top.n_fold).toFixed(6)),
+                        group_count: colorGroups.length,
+                        matched_colors: colorMap.size,
+                        alternatives: kept.slice(1, 3).map(c => ({
+                            n_fold: c.n_fold, n_integer: c.n_integer,
+                            confidence: c.confidence, snr: c.snr,
+                        })),
+                    };
+                } else {
+                    grouped = { n_fold: null, confidence: 0, group_count: colorGroups.length,
+                                matched_colors: colorMap.size, alternatives: [] };
+                }
+            } else {
+                grouped = { n_fold: null, confidence: 0, group_count: colorGroups.length,
+                            matched_colors: colorMap.size, alternatives: [], reason: 'insufficient grouped pixels in ring' };
+            }
+        }
+    }
+
     // Recommended ntheta: take the grayscale N (geometric), round it to the
     // nearest integer, then snap a naive 2*PI*r_outer total length so each
     // sector ends up with an integer pixel count. Falls back to RGB if
@@ -1527,11 +1640,11 @@ function detectPeriodicity(jimpImage, mask, geom) {
         recommended_ntheta = perSector * dominant;
     }
 
-    return { grayscale, rgb, recommended_ntheta };
+    return { grayscale, rgb, grouped, recommended_ntheta };
 }
 
 // Composite: stages 1-4.
-function detectPolarGeometry(jimpImage, hint) {
+function detectPolarGeometry(jimpImage, hint, colorGroups) {
     const W = jimpImage.bitmap.width;
     const H = jimpImage.bitmap.height;
     const bg = estimateBackgroundColor(jimpImage);
@@ -1567,7 +1680,7 @@ function detectPolarGeometry(jimpImage, hint) {
     // Stage 4: rotational symmetry over the [r_inner, r_outer] ring.
     const periodicity = detectPeriodicity(jimpImage, mask, {
         center_x, center_y, r_inner_px, r_outer_px,
-    });
+    }, colorGroups);
 
     return {
         shape,
@@ -1676,7 +1789,13 @@ app.post('/api/preprocess-polar/detect', async (req, res) => {
         const filePath = path.join(uploadsDir, filename);
         const img = await Jimp.read(filePath);
         const hint = (req.body && req.body.hint) || {};
-        const geom = detectPolarGeometry(img, hint);
+        // Optional colour groupings drive the new periodicity.grouped
+        // field. Shape: [{id: 'A', colors: [[r,g,b], ...]}, ...]. Anything
+        // missing or malformed just falls through to "no grouped result".
+        const colorGroups = Array.isArray(req.body && req.body.color_groups)
+            ? req.body.color_groups
+            : null;
+        const geom = detectPolarGeometry(img, hint, colorGroups);
         res.json({ success: true, ...geom });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });

@@ -1757,6 +1757,10 @@ function renderPolarStatusSummary(errMsg) {
     const rN = rgb.n_fold  != null ? `N≈${rgb.n_fold} (int ${rgb.n_integer})`   : '—';
     lines.push(`periodicity grayscale: ${gN}`);
     lines.push(`periodicity rgb     : ${rN}`);
+    const grp = per.grouped;
+    if (grp && grp.n_fold != null) {
+        lines.push(`periodicity grouped : N≈${grp.n_fold} (int ${grp.n_integer})`);
+    }
     if (per.recommended_ntheta) lines.push(`recommended ntheta: ${per.recommended_ntheta}`);
     el.innerHTML = lines.map(s => `<div>${s}</div>`).join('');
     // Enable sector snap button if N is detected
@@ -1882,6 +1886,7 @@ function renderPolarColorChips() {
     const col = AppState.polarPreprocess.colorDetection;
     if (!col || !col.colors || col.colors.length === 0) {
         grid.textContent = 'No colour detection result (open Detect Colors first or upload a clearer image).';
+        document.getElementById('polarRecomputeBtn').disabled = true;
         return;
     }
     const groups = AppState.polarPreprocess.colorGroups;
@@ -1898,7 +1903,7 @@ function renderPolarColorChips() {
                 <div class="polar-color-swatch" style="background:${hex}"></div>
                 <span style="font-family:monospace; font-size:0.78rem;">${hex}</span>
                 <span style="color:#868e96; font-size:0.72rem;">${((c.ratio || 0) * 100).toFixed(1)}%</span>
-                <select data-color-key="${key}" disabled>
+                <select data-color-key="${key}">
                     <option value="" ${cur === '' ? 'selected' : ''}>None</option>
                     <option value="A" ${cur === 'A' ? 'selected' : ''}>Group A</option>
                     <option value="B" ${cur === 'B' ? 'selected' : ''}>Group B</option>
@@ -1907,6 +1912,26 @@ function renderPolarColorChips() {
                 </select>`;
             grid.appendChild(row);
         });
+    // Wire (or re-wire) the per-chip dropdowns. We replace innerHTML on
+    // every render so binding once at modal-open isn't enough; attach
+    // listeners to every select element we just inserted.
+    grid.querySelectorAll('select[data-color-key]').forEach(sel => {
+        sel.addEventListener('change', () => {
+            const key = sel.dataset.colorKey;
+            if (sel.value) {
+                AppState.polarPreprocess.colorGroups[key] = sel.value;
+            } else {
+                delete AppState.polarPreprocess.colorGroups[key];
+            }
+            // Enable Recompute when at least one chip is grouped.
+            const anyGrouped = Object.keys(AppState.polarPreprocess.colorGroups).length > 0;
+            document.getElementById('polarRecomputeBtn').disabled = !anyGrouped;
+        });
+    });
+    // Initial state of the Recompute button reflects any pre-existing
+    // groupings (e.g. when the user re-opens the modal after editing).
+    const anyGrouped = Object.keys(groups).length > 0;
+    document.getElementById('polarRecomputeBtn').disabled = !anyGrouped;
 }
 
 // ============================================================
@@ -2190,8 +2215,65 @@ function snapToDetectedPeriod() {
     markPolarDirty();
 }
 
-function recomputeWithGroupedColors() {
-    showStatus('solverStatus', 'Color grouping recompute: not yet implemented (Phase 5d.3)', 'error');
+async function recomputeWithGroupedColors() {
+    const pp = AppState.polarPreprocess;
+    if (pp.isDetecting || !pp.sourceFilename) return;
+    // Build the color_groups payload from the current chip selections.
+    // We send one entry per group letter that has at least one colour.
+    const buckets = {};
+    for (const [key, gid] of Object.entries(pp.colorGroups)) {
+        if (!gid) continue;
+        if (!buckets[gid]) buckets[gid] = [];
+        buckets[gid].push(key.split(',').map(Number));
+    }
+    const color_groups = Object.entries(buckets).map(([id, colors]) => ({ id, colors }));
+    if (color_groups.length === 0) {
+        showStatus('solverStatus', 'Assign at least one colour to a group first', 'error');
+        return;
+    }
+    pp.isDetecting = true;
+    setPolarLoading(true, 'Recomputing periodicity with groups…');
+    try {
+        const res = await fetch('/api/preprocess-polar/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId:   AppState.userId,
+                filename: pp.sourceFilename,
+                hint:     { shape: pp.current.shape_hint },
+                color_groups,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'detect failed');
+        // The grouped recompute is intended to refine the *periodicity*
+        // estimate; we keep the user's centre / radii / theta untouched
+        // and only swap in the new periodicity values.
+        pp.detection = { ...(pp.detection || {}), periodicity: res.periodicity };
+        renderPolarStatusSummary();
+        renderPolarOverlay();
+        // Surface the grouped result in a small status line under the chips.
+        const note = document.getElementById('polarRecomputeNote');
+        if (note) {
+            const g = res.periodicity && res.periodicity.grouped;
+            if (g && g.n_fold) {
+                note.textContent =
+                    `grouped N = ${g.n_fold.toFixed(2)} (int ${g.n_integer}, snr ${g.snr ? g.snr.toFixed(1) : '-'}, ${g.matched_colors} colour(s) in ${g.group_count} group(s))`;
+                note.style.color = '#2b7a3a';
+            } else if (g) {
+                note.textContent =
+                    `grouped recompute returned no periodic peak (${g.matched_colors} colour(s) in ${g.group_count} group(s); try grouping the colours into distinct ids).`;
+                note.style.color = '#8a6d3b';
+            } else {
+                note.textContent = 'grouped recompute returned no result.';
+                note.style.color = '#8a6d3b';
+            }
+        }
+    } catch (err) {
+        showStatus('solverStatus', `Recompute failed: ${err.message}`, 'error');
+    } finally {
+        pp.isDetecting = false;
+        setPolarLoading(false);
+    }
 }
 function applyPolarTransform() {
     showStatus('solverStatus', 'Apply Transform: not yet implemented (Phase 5e)', 'error');
