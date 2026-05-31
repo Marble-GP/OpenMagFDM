@@ -1472,6 +1472,11 @@
                 <span id="qfilterFooterNote" style="font-size: 0.8rem; color: #6c757d;"></span>
                 <div style="display: flex; gap: 8px;">
                     <button class="btn-secondary" onclick="closeQuantizeFilterModal()">Cancel</button>
+                    <button class="btn-secondary" id="qfilterAutoTuneBtn"
+                            onclick="runAutoTune()"
+                            title="Optimize rareThreshold / minTargetDist / despeckleRadius / bilateral σ to minimize scattered noise. N is held at the current slider value.">
+                        Auto-tune
+                    </button>
                     <button class="btn-primary" id="qfilterApplyBtn" onclick="applyQuantizeFilter()">Apply (Replace Image)</button>
                 </div>
             </div>

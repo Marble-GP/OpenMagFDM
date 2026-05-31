@@ -1294,6 +1294,77 @@ async function applyQuantizeFilter() {
     }
 }
 
+// Helper for runAutoTune(): set both the range and the number input of
+// a slider pair to the same value (without triggering the input event
+// 5 times in a row, which would re-fire the preview debounce).
+function setQuantizeSlider(numId, rangeId, value) {
+    const num = document.getElementById(numId);
+    const rng = document.getElementById(rangeId);
+    if (num) num.value = value;
+    if (rng) rng.value = value;
+}
+
+async function runAutoTune() {
+    const qf = AppState.quantizeFilter;
+    if (qf.busy || !qf.sourceFilename) return;
+    qf.busy = true;
+    const status   = document.getElementById('qfilterStatus');
+    const tuneBtn  = document.getElementById('qfilterAutoTuneBtn');
+    const applyBtn = document.getElementById('qfilterApplyBtn');
+    tuneBtn.disabled = true;
+    applyBtn.disabled = true;
+    status.textContent = 'Optimising (this may take a few seconds)…';
+
+    // Start the search from the user's current slider values so they can
+    // pre-seed the optimiser. The backend clamps to its own bounds.
+    const cur = currentQuantizeParams();
+    const seed = [
+        cur.rareThreshold,
+        cur.minTargetDist,
+        cur.despeckleRadius,
+        cur.bilateralSigmaSpatial,
+        cur.bilateralSigmaColor,
+    ];
+
+    try {
+        const res = await fetch('/api/preprocess-filter/auto-tune', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: qf.sourceFilename,
+                nTargets: cur.nTargets,
+                maxEvals: 60,
+                subsampleSize: 256,
+                initial: seed,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'auto-tune failed');
+
+        const p = res.params;
+        setQuantizeSlider('qfilterThreshold', 'qfilterThresholdRange', (p.rareThreshold * 100).toFixed(2));
+        setQuantizeSlider('qfilterMinDist',   'qfilterMinDistRange',   Math.round(p.minTargetDist));
+        setQuantizeSlider('qfilterDespeckle', 'qfilterDespeckleRange', p.despeckleRadius);
+        setQuantizeSlider('qfilterBilSpace',  'qfilterBilSpaceRange',  p.bilateralSigmaSpatial.toFixed(1));
+        setQuantizeSlider('qfilterBilColor',  'qfilterBilColorRange',  Math.round(p.bilateralSigmaColor));
+
+        const before = res.score_initial;
+        const after  = res.score_final;
+        const pct = before > 0 ? Math.round(100 * (1 - after / before)) : 0;
+        status.textContent =
+            `Auto-tune: scattered noise ${(before * 100).toFixed(2)}% → ${(after * 100).toFixed(2)}% ` +
+            `(${pct}% reduction, ${res.evals} evals, ${res.elapsed_ms} ms, subsample ${res.subsample_w}×${res.subsample_h}).`;
+        // Re-render the preview at full resolution with the new params.
+        scheduleQuantizePreview(50);
+    } catch (err) {
+        status.textContent = `Auto-tune error: ${err.message}`;
+    } finally {
+        qf.busy = false;
+        tuneBtn.disabled = false;
+        applyBtn.disabled = false;
+    }
+}
+
 async function copyDetectedYaml() {
     if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
         return;

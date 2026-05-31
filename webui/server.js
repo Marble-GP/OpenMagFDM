@@ -1883,6 +1883,288 @@ app.post('/api/preprocess-filter/quick-stats', async (req, res) => {
     }
 });
 
+// ============================================================
+// Auto-tune helpers (Phase 5c.5b)
+// ============================================================
+// Self-contained re-implementation of the quantize pipeline that runs
+// on a small RGBA buffer and returns a single scalar "scattered noise"
+// score, so Nelder-Mead can drive the parameters toward a noise minimum
+// without bouncing off Jimp / disk I/O on every evaluation.
+
+// Score = number of opaque pixels whose palette index is strictly
+// outvoted by another index in the 3x3 neighbourhood (i.e. the pixel is
+// a minority island). Lower = cleaner.
+function boundaryNoiseScore(idxMap, W, H, K) {
+    let score = 0;
+    const counts = new Int32Array(K);
+    for (let y = 0; y < H; y++) {
+        const y0 = y > 0 ? y - 1 : 0;
+        const y1 = y < H - 1 ? y + 1 : H - 1;
+        for (let x = 0; x < W; x++) {
+            const p = y * W + x;
+            const my = idxMap[p];
+            if (my === 0xFF) continue;
+            const x0 = x > 0 ? x - 1 : 0;
+            const x1 = x < W - 1 ? x + 1 : W - 1;
+            counts.fill(0);
+            for (let yy = y0; yy <= y1; yy++) {
+                const row = yy * W;
+                for (let xx = x0; xx <= x1; xx++) {
+                    const v = idxMap[row + xx];
+                    if (v !== 0xFF) counts[v]++;
+                }
+            }
+            const myCount = counts[my];
+            let bestC = myCount;
+            for (let k = 0; k < K; k++) {
+                if (counts[k] > bestC) bestC = counts[k];
+            }
+            if (bestC > myCount) score++;
+        }
+    }
+    return score;
+}
+
+// Single evaluation of the quantize pipeline on a small RGBA buffer.
+// `params` = [rareThreshold, minTargetDist, despeckleRadius, bilateralSigmaSpatial, bilateralSigmaColor].
+// `N` is the fixed target count from the user.
+function evaluateQuantizeParams(srcData, W, H, params, N) {
+    const [rare, mtd, dspF, bfs, bfc] = params;
+    const dsp = Math.max(0, Math.min(10, Math.round(dspF)));
+    const mtd2 = mtd * mtd;
+
+    const data = new Uint8Array(srcData);
+    if (bfs > 0) applyBilateralFilterRGB(data, W, H, bfs, bfc);
+
+    // Count colours.
+    const colorCounts = new Map();
+    const len = W * H * 4;
+    for (let i = 0; i < len; i += 4) {
+        if (data[i + 3] === 0) continue;
+        const k = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2];
+        colorCounts.set(k, (colorCounts.get(k) || 0) + 1);
+    }
+    if (colorCounts.size === 0) return Infinity;
+    const totalPixels = W * H;
+    const sorted = Array.from(colorCounts.entries())
+        .map(([k, c]) => ({
+            r: (k >> 16) & 0xff, g: (k >> 8) & 0xff, b: k & 0xff,
+            count: c, ratio: c / totalPixels,
+        }))
+        .sort((a, b) => b.count - a.count);
+
+    let eligible = sorted.filter(c => c.ratio >= rare);
+    if (eligible.length === 0) eligible = sorted;
+    const targets = [];
+    for (const c of eligible) {
+        let ok = true;
+        for (const t of targets) {
+            const dr = c.r - t.r, dg = c.g - t.g, db = c.b - t.b;
+            if (dr * dr + dg * dg + db * db < mtd2) { ok = false; break; }
+        }
+        if (ok) targets.push(c);
+        if (targets.length >= N) break;
+    }
+    const K = targets.length;
+    if (K === 0) return Infinity;
+
+    const tR = new Int32Array(K);
+    const tG = new Int32Array(K);
+    const tB = new Int32Array(K);
+    for (let k = 0; k < K; k++) {
+        tR[k] = targets[k].r; tG[k] = targets[k].g; tB[k] = targets[k].b;
+    }
+    const idxMap = new Uint8Array(W * H);
+    for (let i = 0, p = 0; i < len; i += 4, p++) {
+        if (data[i + 3] === 0) { idxMap[p] = 0xFF; continue; }
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        let bestD = Infinity, bestI = 0;
+        for (let k = 0; k < K; k++) {
+            const dr = r - tR[k], dg = g - tG[k], db = b - tB[k];
+            const d = dr * dr + dg * dg + db * db;
+            if (d < bestD) { bestD = d; bestI = k; }
+        }
+        idxMap[p] = bestI;
+    }
+
+    if (dsp > 0) {
+        const counts = new Int32Array(K);
+        const passes = (dsp === 1) ? 2 : 1;
+        for (let pass = 0; pass < passes; pass++) {
+            const src2 = new Uint8Array(idxMap);
+            for (let y = 0; y < H; y++) {
+                const y0 = Math.max(0, y - dsp);
+                const y1 = Math.min(H - 1, y + dsp);
+                for (let x = 0; x < W; x++) {
+                    const p = y * W + x;
+                    const my = src2[p];
+                    if (my === 0xFF) continue;
+                    const x0 = Math.max(0, x - dsp);
+                    const x1 = Math.min(W - 1, x + dsp);
+                    counts.fill(0);
+                    for (let yy = y0; yy <= y1; yy++) {
+                        const row = yy * W;
+                        for (let xx = x0; xx <= x1; xx++) {
+                            const v = src2[row + xx];
+                            if (v !== 0xFF) counts[v]++;
+                        }
+                    }
+                    const myCount = counts[my];
+                    let bestK = my, bestC = myCount;
+                    for (let k = 0; k < K; k++) {
+                        if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
+                    }
+                    if (bestK !== my && bestC > myCount * 1.5) idxMap[p] = bestK;
+                }
+            }
+        }
+    }
+
+    // Normalised noise count so changes in image size don't dominate.
+    return boundaryNoiseScore(idxMap, W, H, K) / totalPixels;
+}
+
+// Standard Nelder-Mead simplex search. Works on a scaled (~normalised)
+// representation internally so each parameter's per-unit step is
+// comparable, then maps back to native units before each evaluation.
+function nelderMead(fn, x0, bounds, maxEvals = 60) {
+    const n = x0.length;
+    const lo = bounds.map(b => b[0]);
+    const hi = bounds.map(b => b[1]);
+    const range = bounds.map((b, i) => Math.max(1e-9, b[1] - b[0]));
+    const toNorm = (x) => x.map((v, i) => (v - lo[i]) / range[i]);
+    const toReal = (u) => u.map((v, i) => lo[i] + Math.max(0, Math.min(1, v)) * range[i]);
+
+    const x0n = toNorm(x0);
+    const simplex = [x0n.slice()];
+    for (let i = 0; i < n; i++) {
+        const v = x0n.slice();
+        v[i] = Math.min(1, v[i] + 0.18);
+        simplex.push(v);
+    }
+    let evals = 0;
+    const scores = simplex.map(v => { evals++; return fn(toReal(v)); });
+    const order = () => {
+        const idx = scores.map((_, i) => i).sort((a, b) => scores[a] - scores[b]);
+        const ns = idx.map(i => simplex[i]);
+        const nss = idx.map(i => scores[i]);
+        for (let i = 0; i < simplex.length; i++) { simplex[i] = ns[i]; scores[i] = nss[i]; }
+    };
+    order();
+
+    while (evals < maxEvals) {
+        order();
+        // Centroid of best n vertices.
+        const centroid = new Array(n).fill(0);
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < n; j++) centroid[j] += simplex[i][j];
+        }
+        for (let j = 0; j < n; j++) centroid[j] /= n;
+        const worst = simplex[n];
+        // Reflect (alpha=1).
+        const reflect = centroid.map((c, j) => c + (c - worst[j]));
+        const sR = fn(toReal(reflect)); evals++;
+        if (sR < scores[n - 1] && sR >= scores[0]) {
+            simplex[n] = reflect; scores[n] = sR; continue;
+        }
+        if (sR < scores[0]) {
+            // Expand (gamma=2).
+            const expand = centroid.map((c, j) => c + 2 * (reflect[j] - c));
+            const sE = fn(toReal(expand)); evals++;
+            if (sE < sR) { simplex[n] = expand; scores[n] = sE; }
+            else         { simplex[n] = reflect; scores[n] = sR; }
+            continue;
+        }
+        // Contract (rho=0.5).
+        const contract = centroid.map((c, j) => c + 0.5 * (worst[j] - c));
+        const sC = fn(toReal(contract)); evals++;
+        if (sC < scores[n]) { simplex[n] = contract; scores[n] = sC; continue; }
+        // Shrink (sigma=0.5).
+        for (let i = 1; i < simplex.length; i++) {
+            for (let j = 0; j < n; j++) simplex[i][j] = simplex[0][j] + 0.5 * (simplex[i][j] - simplex[0][j]);
+            scores[i] = fn(toReal(simplex[i])); evals++;
+            if (evals >= maxEvals) break;
+        }
+    }
+    order();
+    return { best: toReal(simplex[0]), bestScore: scores[0], evals };
+}
+
+app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
+    try {
+        const Jimp = require('jimp');
+        const {
+            userId = 'default', filename,
+            nTargets = 8,
+            maxEvals = 60,
+            subsampleSize = 256,
+            initial,            // optional: start from the user's current sliders
+        } = req.body || {};
+        if (!filename) {
+            return res.status(400).json({ success: false, error: 'filename required' });
+        }
+        const N = Math.max(1, Math.min(64, Math.floor(nTargets)));
+
+        const uploadsDir = getUserUploadsDir(userId);
+        const srcPath = path.join(uploadsDir, filename);
+        const src = await Jimp.read(srcPath);
+        const fullW = src.bitmap.width;
+        const fullH = src.bitmap.height;
+        // Downsample to keep per-eval cost ~50-150 ms even for 4 MP sources.
+        let scaleFactor = 1;
+        if (Math.max(fullW, fullH) > subsampleSize) {
+            scaleFactor = subsampleSize / Math.max(fullW, fullH);
+        }
+        const small = scaleFactor < 1
+            ? src.clone().scale(scaleFactor)
+            : src.clone();
+        const W = small.bitmap.width;
+        const H = small.bitmap.height;
+        const srcData = small.bitmap.data;
+
+        const bounds = [
+            [0.0001, 0.05],   // rareThreshold (0.01..5%)
+            [1,      80],     // minTargetDist
+            [0,      5],      // despeckleRadius
+            [0,      5],      // bilateralSigmaSpatial
+            [5,      60],     // bilateralSigmaColor
+        ];
+        const defaults = [0.005, 10, 1, 0, 20];
+        const x0 = Array.isArray(initial) && initial.length === 5
+            ? initial.map((v, i) => Math.max(bounds[i][0], Math.min(bounds[i][1], Number(v))))
+            : defaults;
+
+        const fn = (p) => evaluateQuantizeParams(srcData, W, H, p, N);
+        const t0 = Date.now();
+        const initialScore = fn(x0);
+        const result = nelderMead(fn, x0, bounds, Math.max(20, Math.min(200, Math.floor(maxEvals))));
+        const elapsedMs = Date.now() - t0;
+
+        const [rt, mtd, dspF, bfs, bfc] = result.best;
+        res.json({
+            success: true,
+            params: {
+                rareThreshold:         Number(rt.toFixed(5)),
+                minTargetDist:         Number(mtd.toFixed(2)),
+                despeckleRadius:       Math.max(0, Math.min(10, Math.round(dspF))),
+                bilateralSigmaSpatial: Number(bfs.toFixed(2)),
+                bilateralSigmaColor:   Number(bfc.toFixed(1)),
+            },
+            n_targets:        N,
+            score_initial:    Number(initialScore.toFixed(6)),
+            score_final:      Number(result.bestScore.toFixed(6)),
+            evals:            result.evals,
+            elapsed_ms:       elapsedMs,
+            subsample_w:      W,
+            subsample_h:      H,
+            full_w:           fullW,
+            full_h:           fullH,
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.post('/api/preprocess-filter/quantize', async (req, res) => {
     try {
         const Jimp = require('jimp');
