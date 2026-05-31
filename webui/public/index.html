@@ -1602,6 +1602,14 @@
                             <label>r_outer</label><input type="number" id="polarROuter" step="1" min="1" data-pp="r_outer_px"><span class="polar-unit">px</span>
                             <label>r_outer (phys)</label><input type="number" id="polarROuterPhys" step="0.001" min="0.001" data-pp="r_outer_physical"><span class="polar-unit">m</span>
                         </div>
+                        <!-- Dip candidate dropdown (Phase 5d.2). Populated from
+                             detection.dip_candidates so the user can switch
+                             r_inner between the auto-detected air-gap dips
+                             without typing the value manually. -->
+                        <div class="polar-dip-row" style="display: none; margin-top: 6px; font-size: 0.83rem; display: flex; align-items: center; gap: 6px;" id="polarDipRow">
+                            <span style="color: #6c757d;">Air-gap candidate:</span>
+                            <select id="polarDipSelect" style="flex: 1; padding: 3px 5px; font-size: 0.82rem;"></select>
+                        </div>
                     </div>
 
                     <!-- Section 3: Theta range -->

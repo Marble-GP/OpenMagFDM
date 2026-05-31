@@ -1634,6 +1634,7 @@ async function openPolarPreprocessModal() {
         renderPolarOverlay();
         syncPolarInputsFromState();
         renderPolarColorChips();
+        renderPolarDipDropdown();
     } catch (err) {
         showStatus('solverStatus', `Polar detect failed: ${err.message}`, 'error');
         renderPolarStatusSummary(err.message);
@@ -1926,6 +1927,49 @@ function markPolarDirty() {
     AppState.polarPreprocess.isDirty = true;
 }
 
+// Dip-candidate dropdown (Phase 5d.2). Backend returns
+// detection.dip_candidates = [{r, ratio, inner_band, outer_band, score}]
+// sorted best-first; the dropdown lets the user pick one as r_inner when
+// the highest-scored guess isn't the physical air gap (e.g. an aux
+// mid-yoke gap outscoring the rotor/stator gap on a multi-gap design).
+function renderPolarDipDropdown() {
+    const row = document.getElementById('polarDipRow');
+    const sel = document.getElementById('polarDipSelect');
+    if (!row || !sel) return;
+    const det = AppState.polarPreprocess.detection;
+    const list = (det && Array.isArray(det.dip_candidates)) ? det.dip_candidates : [];
+    if (list.length < 2) {
+        row.style.display = 'none';
+        sel.innerHTML = '';
+        return;
+    }
+    row.style.display = 'flex';
+    sel.innerHTML = list.map((c, i) => {
+        const marker = (i === 0) ? '★' : ' ';
+        return `<option value="${c.r}">${marker} r=${c.r}  ratio=${c.ratio.toFixed(2)}  score=${c.score}</option>`;
+    }).join('');
+    // Reflect the current r_inner_px back into the selection so the user
+    // sees which candidate is active. If r_inner_px doesn't match any
+    // candidate (e.g. fallback / manual edit) the first option stays
+    // visually selected but the user can pick another.
+    const cur = AppState.polarPreprocess.current;
+    const match = list.findIndex(c => c.r === cur.r_inner_px);
+    if (match >= 0) sel.selectedIndex = match;
+    // (Re-)attach the change handler -- idempotent via the wrapper.
+    if (!sel._ppBound) {
+        sel.addEventListener('change', () => {
+            const v = Number(sel.value);
+            if (Number.isFinite(v) && v > 0) {
+                AppState.polarPreprocess.current.r_inner_px = v;
+                renderPolarOverlay();
+                syncPolarInputsFromState();
+                markPolarDirty();
+            }
+        });
+        sel._ppBound = true;
+    }
+}
+
 function bindPolarInputs() {
     const root = document.getElementById('polarPreprocessModal');
     if (!root || root._ppInputsBound) return;
@@ -2119,6 +2163,7 @@ async function rerunPolarDetect() {
         renderPolarStatusSummary();
         renderPolarOverlay();
         syncPolarInputsFromState();
+        renderPolarDipDropdown();
     } catch (err) {
         showStatus('solverStatus', `Re-detect failed: ${err.message}`, 'error');
     } finally {
