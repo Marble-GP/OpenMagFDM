@@ -1440,7 +1440,15 @@
                             <input type="number" id="qfilterDespeckle" min="0" max="10" step="1" value="1">
                         </div>
                         <div style="font-size: 0.78rem; color: #6c757d;">
-                            Spatial majority filter after quantization. 0 = off, 1 = 3×3 (two passes, default), 2 = 5×5, … 10 = 21×21. Removes isolated pixels whose snapped target colour is not present in the neighbourhood (e.g. a dark phase colour spuriously appearing in grey AA region).
+                            Spatial majority filter after quantization. 0 = off, 1 = 3×3 (two passes, default), 2 = 5×5, … 10 = 21×21. Removes isolated pixels whose snapped target colour is not present in the neighbourhood.
+                        </div>
+                        <div class="qfilter-slider-row" style="margin-top: 8px;">
+                            <label for="qfilterMinIsland">Min island size</label>
+                            <input type="range" id="qfilterMinIslandRange" min="0" max="50" step="1" value="0">
+                            <input type="number" id="qfilterMinIsland" min="0" max="200" step="1" value="0">
+                        </div>
+                        <div style="font-size: 0.78rem; color: #6c757d;">
+                            Connected-component shrink. Same-colour regions smaller than this pixel count are dissolved into the local majority colour. 0 disables the pass. Reduces the number of separate islands per material — useful after despeckle to clean up residual fragments.
                         </div>
                     </div>
                     <div class="qfilter-section">

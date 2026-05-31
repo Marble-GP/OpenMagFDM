@@ -1925,13 +1925,90 @@ function boundaryNoiseScore(idxMap, W, H, K) {
     return score;
 }
 
+// Per-colour connected-component "island erosion". 4-connectivity
+// Union-Find labels every same-colour region; components whose pixel
+// count is below `minSize` are then dissolved by repainting each of
+// their pixels to the most common *different* colour in the 3x3
+// neighbourhood. Repeats until no further changes (capped at 4 passes)
+// so a fragment that survives one pass partly intact still collapses
+// on the next. Cost: O(W*H * passes), milliseconds even on 1 MP.
+function shrinkIslands(idxMap, W, H, K, minSize, maxPasses = 4) {
+    if (!(minSize >= 2)) return 0;
+    const N = W * H;
+    const parent = new Int32Array(N);
+    const counts = new Int32Array(K);
+    let totalChanges = 0;
+
+    for (let pass = 0; pass < maxPasses; pass++) {
+        for (let i = 0; i < N; i++) parent[i] = i;
+        const find = (x) => {
+            let r = x;
+            while (parent[r] !== r) r = parent[r];
+            while (parent[x] !== r) { const nx = parent[x]; parent[x] = r; x = nx; }
+            return r;
+        };
+        const union = (a, b) => {
+            const ra = find(a), rb = find(b);
+            if (ra !== rb) parent[ra] = rb;
+        };
+
+        for (let y = 0; y < H; y++) {
+            const row = y * W;
+            for (let x = 0; x < W; x++) {
+                const p = row + x;
+                const my = idxMap[p];
+                if (my === 0xFF) continue;
+                if (x > 0 && idxMap[p - 1] === my) union(p, p - 1);
+                if (y > 0 && idxMap[p - W] === my) union(p, p - W);
+            }
+        }
+        const sizes = new Int32Array(N);  // sparse: only roots populated
+        for (let i = 0; i < N; i++) {
+            if (idxMap[i] === 0xFF) continue;
+            sizes[find(i)]++;
+        }
+        let changes = 0;
+        for (let y = 0; y < H; y++) {
+            const row = y * W;
+            const y0 = y > 0 ? y - 1 : 0;
+            const y1 = y < H - 1 ? y + 1 : H - 1;
+            for (let x = 0; x < W; x++) {
+                const p = row + x;
+                const my = idxMap[p];
+                if (my === 0xFF) continue;
+                if (sizes[find(p)] >= minSize) continue;
+                const x0 = x > 0 ? x - 1 : 0;
+                const x1 = x < W - 1 ? x + 1 : W - 1;
+                counts.fill(0);
+                for (let yy = y0; yy <= y1; yy++) {
+                    const r2 = yy * W;
+                    for (let xx = x0; xx <= x1; xx++) {
+                        const v = idxMap[r2 + xx];
+                        if (v !== 0xFF && v !== my) counts[v]++;
+                    }
+                }
+                let bestK = my, bestC = 0;
+                for (let k = 0; k < K; k++) {
+                    if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
+                }
+                if (bestK !== my) { idxMap[p] = bestK; changes++; }
+            }
+        }
+        totalChanges += changes;
+        if (changes === 0) break;
+    }
+    return totalChanges;
+}
+
 // Single evaluation of the quantize pipeline on a small RGBA buffer.
-// `params` = [minTargetDist, despeckleRadius, bilateralSigmaSpatial, bilateralSigmaColor].
+// `params` = [minTargetDist, despeckleRadius, bilateralSigmaSpatial,
+//             bilateralSigmaColor, minIslandSize].
 // `N` and `rare` are held fixed by the caller -- both define which colours
 // count as "materials" and so are user-controlled.
 function evaluateQuantizeParams(srcData, W, H, params, N, rare) {
-    const [mtd, dspF, bfs, bfc] = params;
+    const [mtd, dspF, bfs, bfc, misF] = params;
     const dsp = Math.max(0, Math.min(10, Math.round(dspF)));
+    const mis = Math.max(0, Math.min(64, Math.round(misF)));
     const mtd2 = mtd * mtd;
 
     const data = new Uint8Array(srcData);
@@ -2020,6 +2097,8 @@ function evaluateQuantizeParams(srcData, W, H, params, N, rare) {
             }
         }
     }
+
+    if (mis >= 2) shrinkIslands(idxMap, W, H, K, mis, 4);
 
     // Normalised noise count so changes in image size don't dominate.
     return boundaryNoiseScore(idxMap, W, H, K) / totalPixels;
@@ -2137,9 +2216,10 @@ app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
             [0,  5],      // despeckleRadius
             [0,  5],      // bilateralSigmaSpatial
             [5,  60],     // bilateralSigmaColor
+            [0,  30],     // minIslandSize (connected-component shrink)
         ];
-        const defaults = [10, 1, 0, 20];
-        const x0 = Array.isArray(initial) && initial.length === 4
+        const defaults = [10, 1, 0, 20, 4];
+        const x0 = Array.isArray(initial) && initial.length === 5
             ? initial.map((v, i) => Math.max(bounds[i][0], Math.min(bounds[i][1], Number(v))))
             : defaults;
 
@@ -2149,7 +2229,7 @@ app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
         const result = nelderMead(fn, x0, bounds, Math.max(20, Math.min(200, Math.floor(maxEvals))));
         const elapsedMs = Date.now() - t0;
 
-        const [mtd, dspF, bfs, bfc] = result.best;
+        const [mtd, dspF, bfs, bfc, misF] = result.best;
         res.json({
             success: true,
             params: {
@@ -2157,6 +2237,7 @@ app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
                 despeckleRadius:       Math.max(0, Math.min(10, Math.round(dspF))),
                 bilateralSigmaSpatial: Number(bfs.toFixed(2)),
                 bilateralSigmaColor:   Number(bfc.toFixed(1)),
+                minIslandSize:         Math.max(0, Math.min(64, Math.round(misF))),
             },
             n_targets:        N,
             rare_threshold:   rare,
@@ -2185,6 +2266,7 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
             despeckleRadius = 1,
             bilateralSigmaSpatial = 0,
             bilateralSigmaColor   = 20,
+            minIslandSize = 0,
             preview = false,
             output_filename,
         } = req.body || {};
@@ -2201,6 +2283,10 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
         // window radius is 2 * sigmaSpatial (clamped to [0, 8]).
         const BFS = Math.max(0, Math.min(8, Number(bilateralSigmaSpatial)));
         const BFC = Math.max(1, Math.min(150, Number(bilateralSigmaColor)));
+        // Connected-component "island shrink" pass after despeckle.
+        // 0 or 1 disables it; otherwise components below this pixel
+        // count get dissolved into the local majority colour.
+        const MIS = Math.max(0, Math.min(1024, Math.floor(minIslandSize)));
 
         const uploadsDir = getUserUploadsDir(userId);
         const srcPath = path.join(uploadsDir, filename);
@@ -2346,6 +2432,24 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
                             data[i4 + 2] = tB[bestK];
                         }
                     }
+                }
+            }
+        }
+
+        // Connected-component shrink: drop small same-colour islands
+        // (< MIS pixels) into the local majority colour. Runs *after*
+        // despeckle so neighbour majorities reflect the cleaned state.
+        // Mirrors the changes into the RGBA buffer.
+        if (MIS >= 2) {
+            const changes = shrinkIslands(idxMap, W, H, K, MIS, 4);
+            if (changes > 0) {
+                for (let p = 0; p < idxMap.length; p++) {
+                    const v = idxMap[p];
+                    if (v === 0xFF) continue;
+                    const i4 = p * 4;
+                    data[i4]     = tR[v];
+                    data[i4 + 1] = tG[v];
+                    data[i4 + 2] = tB[v];
                 }
             }
         }
