@@ -688,6 +688,14 @@ private:
     void loadConfig(const std::string& config_path);
     void loadImage(const std::string& image_path);
     void parseUserVariables();  // Parse and evaluate user-defined variables from YAML
+    // v1.5 / Phase B.1: walk every YAML node and substitute "$name" tokens
+    // with the corresponding value from user_variables. Lets the user write
+    // e.g. `mesh: { dx: $cell_size }` or `transient: { total_steps: $N }`
+    // without each field having to opt in to substitution. Must be called
+    // AFTER parseUserVariables() (otherwise the variable map is empty).
+    void expandUserVariablesGlobally();
+    void expandUserVariablesInNode(YAML::Node node);
+    std::string substituteDollarVarsInString(const std::string& s) const;
     void setupCartesianSystem();
     void setupPolarSystem();
     void setupMaterialProperties();

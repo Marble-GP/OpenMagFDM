@@ -3,6 +3,8 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
+#include <cctype>
 #include <stdexcept>
 #include <cmath>
 #include <chrono>
@@ -38,6 +40,13 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
                                              const std::string& image_path) {
     loadConfig(config_path);
     loadImage(image_path);
+
+    // v1.5 / Phase B.1: parse user-defined variables and expand `$name`
+    // tokens throughout the YAML tree BEFORE any other parsing pass, so
+    // every downstream field (mesh, polar_domain, nonlinear_solver,
+    // transient, flux_linkage, ...) sees the substituted numeric strings.
+    parseUserVariables();
+    expandUserVariablesGlobally();
 
     // Initialize flags BEFORE setup methods
     // Transient analysis optimization flags
@@ -124,7 +133,9 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         setupCartesianSystem();
     }
 
-    parseUserVariables();  // Parse user-defined variables before material properties
+    // (parseUserVariables + expandUserVariablesGlobally already ran at
+    // the top of the constructor; setupMaterialProperties just needs the
+    // user_variables map populated.)
     setupMaterialProperties();  // This may set has_nonlinear_materials = true
     validateBoundaryConditions();
 
@@ -523,6 +534,99 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         user_variables[var_name] = var_value;
         std::cout << "  $" << var_name << " = " << var_value << std::endl;
     }
+}
+
+// --------------------------------------------------------------------------
+// v1.5 / Phase B.1: Global "$name" substitution across the YAML tree
+// --------------------------------------------------------------------------
+// Previously only material formulas (jz, mu_r, B-H) and the variables
+// section itself recognised $name tokens. Every other scalar field
+// (mesh.dx/dy, polar_domain.{r_start,r_end,theta_range},
+// polar_boundary_conditions.value, nonlinear_solver.*, transient.*,
+// flux_linkage.*, magnetization.*) went through `.as<double>()` directly
+// and tripped on the literal "$omega" string.
+//
+// This pass walks the YAML tree once after parseUserVariables() has
+// populated user_variables and replaces every "$name" that matches a
+// known user variable with the variable's numeric value (17-digit precision
+// so tinyexpr round-trips lossless). Reserved tokens like $step, $H, $N,
+// $A, $dx, $dy, $dr, $dtheta are *not* in user_variables and so survive
+// untouched -- they continue to be expanded at material / formula
+// evaluation time when their values become available.
+//
+// The walker explicitly skips the "variables:" section: those entries
+// were already evaluated to numeric values by parseUserVariables() and
+// re-substituting their formulas would be wasted work.
+
+std::string MagneticFieldAnalyzer::substituteDollarVarsInString(
+        const std::string& s) const {
+    if (s.find('$') == std::string::npos) return s;
+    // Sort by name length descending so $omega doesn't partial-match
+    // before $o gets a chance, matching parseUserVariables' contract.
+    std::vector<std::pair<std::string, double>> sorted_vars(
+        user_variables.begin(), user_variables.end());
+    std::sort(sorted_vars.begin(), sorted_vars.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first.length() > b.first.length();
+              });
+    std::string out = s;
+    for (const auto& [name, value] : sorted_vars) {
+        const std::string needle = "$" + name;
+        std::size_t pos = 0;
+        while ((pos = out.find(needle, pos)) != std::string::npos) {
+            // Word-boundary check: $omega should not match inside $omegax.
+            const std::size_t after = pos + needle.length();
+            if (after < out.size()) {
+                const char c = out[after];
+                if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
+                    pos = after;
+                    continue;
+                }
+            }
+            std::ostringstream oss;
+            oss << std::setprecision(17) << value;
+            const std::string replacement = oss.str();
+            out.replace(pos, needle.length(), replacement);
+            pos += replacement.length();
+        }
+    }
+    return out;
+}
+
+void MagneticFieldAnalyzer::expandUserVariablesInNode(YAML::Node node) {
+    if (node.IsMap()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const std::string key = it->first.as<std::string>("");
+            // Skip self-defining variables section; it was already evaluated
+            // by parseUserVariables() and the unsubstituted formulas are
+            // expected (recursive references like $a depending on $b).
+            if (key == "variables") continue;
+            YAML::Node child = it->second;
+            if (child.IsScalar()) {
+                std::string s = child.as<std::string>();
+                std::string out = substituteDollarVarsInString(s);
+                if (out != s) it->second = out;
+            } else {
+                expandUserVariablesInNode(child);
+            }
+        }
+    } else if (node.IsSequence()) {
+        for (std::size_t i = 0; i < node.size(); ++i) {
+            YAML::Node child = node[i];
+            if (child.IsScalar()) {
+                std::string s = child.as<std::string>();
+                std::string out = substituteDollarVarsInString(s);
+                if (out != s) node[i] = out;
+            } else {
+                expandUserVariablesInNode(child);
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::expandUserVariablesGlobally() {
+    if (user_variables.empty()) return;  // nothing to substitute
+    expandUserVariablesInNode(config);
 }
 
 void MagneticFieldAnalyzer::setupMaterialProperties() {
