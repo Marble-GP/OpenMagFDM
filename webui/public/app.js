@@ -859,6 +859,10 @@ async function handleImageUpload(event) {
 
         // Refresh image list
         await refreshImageList();
+        // Probe for AA-noise so the warning banner + filter button can
+        // surface in the Input Image panel without the user having to
+        // open Detect Colors or Polar Preprocess first.
+        checkInputImageNoise(result.filename);
     } catch (error) {
         showStatus('solverStatus', `Upload error: ${error.message}`, 'error');
     }
@@ -904,6 +908,7 @@ function loadSelectedImage() {
     document.getElementById('detectColorsBtn').style.display = 'block';
     document.getElementById('polarizeBtn').style.display = 'block';
     showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
+    checkInputImageNoise(filename);
 }
 
 async function deleteSelectedImage() {
@@ -932,6 +937,8 @@ async function deleteSelectedImage() {
             document.getElementById('uploadedImage').classList.add('hidden');
             document.getElementById('detectColorsBtn').style.display = 'none';
             document.getElementById('polarizeBtn').style.display = 'none';
+            document.getElementById('quantizeFilterBtn').style.display = 'none';
+            document.getElementById('inputImageNoiseBanner').style.display = 'none';
         }
     } catch (error) {
         showStatus('solverStatus', `Delete error: ${error.message}`, 'error');
@@ -1003,7 +1010,7 @@ function renderDetectModal(result) {
     const aaTotal = Number(result.aaBlendsTotal) || 0;
     if (unique > 1000) {
         detail.textContent =
-            `(検出された画素値の種類: ${unique.toLocaleString()} 色 / AA blend: ${aaTotal.toLocaleString()}).`;
+            `(Number of unique colors: ${unique.toLocaleString()} / AA blends: ${aaTotal.toLocaleString()}).`;
         banner.style.display = 'flex';
     } else {
         banner.style.display = 'none';
@@ -1089,7 +1096,7 @@ AppState.quantizeFilter = {
 async function openQuantizeFilterModal() {
     const qf = AppState.quantizeFilter;
     if (!AppState.uploadedImageFilename) {
-        showStatus('solverStatus', '画像が選択されていません', 'error');
+        showStatus('solverStatus', 'No image selected', 'error');
         return;
     }
     qf.sourceFilename = AppState.uploadedImageFilename;
@@ -1166,7 +1173,7 @@ async function runQuantizePreview() {
     const loading = document.getElementById('qfilterLoading');
     const status = document.getElementById('qfilterStatus');
     loading.classList.add('active');
-    status.textContent = 'プレビュー生成中…';
+    status.textContent = 'Generating preview…';
 
     const params = currentQuantizeParams();
     try {
@@ -1194,7 +1201,7 @@ async function runQuantizePreview() {
             `(N=${res.n_targets_used}, source uniqueColors=${res.unique_colors_in.toLocaleString()})`;
         status.textContent = '';
     } catch (err) {
-        status.textContent = `エラー: ${err.message}`;
+        status.textContent = `Error: ${err.message}`;
     } finally {
         qf.busy = false;
         loading.classList.remove('active');
@@ -1232,7 +1239,7 @@ async function applyQuantizeFilter() {
     const status = document.getElementById('qfilterStatus');
     const applyBtn = document.getElementById('qfilterApplyBtn');
     applyBtn.disabled = true;
-    status.textContent = '画像を生成・保存中…';
+    status.textContent = 'Generating and saving image…';
     const params = currentQuantizeParams();
     try {
         const res = await fetch('/api/preprocess-filter/quantize', {
@@ -1258,7 +1265,7 @@ async function applyQuantizeFilter() {
         await loadSelectedImage();
 
         showStatus('solverStatus',
-            `一様色フィルタを適用: ${res.filename} (${res.n_targets_used} 色)`,
+            `Color uniformization filter applied: ${res.filename} (${res.n_targets_used} colors)`,
             'success');
         closeQuantizeFilterModal();
         // If the Detect Colors modal is still open, rerun it so the user
@@ -1268,7 +1275,7 @@ async function applyQuantizeFilter() {
             await detectColors();
         }
     } catch (err) {
-        status.textContent = `エラー: ${err.message}`;
+        status.textContent = `Error: ${err.message}`;
     } finally {
         qf.busy = false;
         applyBtn.disabled = false;
@@ -1532,7 +1539,6 @@ async function openPolarPreprocessModal() {
         renderPolarOverlay();
         syncPolarInputsFromState();
         renderPolarColorChips();
-        renderPolarNoisyBanner();
     } catch (err) {
         showStatus('solverStatus', `Polar detect failed: ${err.message}`, 'error');
         renderPolarStatusSummary(err.message);
@@ -1541,33 +1547,47 @@ async function openPolarPreprocessModal() {
     }
 }
 
-// Reuse the Detect Colors banner heuristic (uniqueColors > 1000) inside
-// the Polar Preprocess modal. The colour detection runs in parallel when
-// the polar modal opens, so this is just a render of an already-fetched
-// number -- no extra round trip. The Filter modal "Apply" path re-fetches
-// the colour detect when it closes, so the banner refreshes automatically
-// once the user runs the filter.
-function renderPolarNoisyBanner() {
-    const banner = document.getElementById('polarNoisyBanner');
-    const detail = document.getElementById('polarNoisyBannerDetail');
-    if (!banner) return;
-    const cd = AppState.polarPreprocess.colorDetection;
-    const unique = cd && Number.isFinite(cd.uniqueColors) ? cd.uniqueColors : 0;
-    const aaTotal = cd && Number.isFinite(cd.aaBlendsTotal) ? cd.aaBlendsTotal : 0;
-    if (unique > 1000) {
-        if (detail) {
-            detail.textContent =
-                ` (画素値の種類: ${unique.toLocaleString()} 色, AA blend: ${aaTotal.toLocaleString()}).`;
+// AA-noise probe + warning + filter-button toggle. Runs on every image
+// upload / load via /api/preprocess-filter/quick-stats (lightweight: just
+// counts distinct RGB values, no AA blend classification). If the count
+// exceeds the noisy threshold an inline banner appears in the Input
+// Image panel, independent of any other modal so the user sees it the
+// moment they pick the image. The "Apply Color Uniformization Filter"
+// button is exposed regardless so the user can also pre-emptively run
+// the filter on borderline images.
+async function checkInputImageNoise(filename) {
+    const banner = document.getElementById('inputImageNoiseBanner');
+    const detail = document.getElementById('inputImageNoiseBannerDetail');
+    const filterBtn = document.getElementById('quantizeFilterBtn');
+    if (!banner || !filterBtn) return;
+    banner.style.display = 'none';
+    filterBtn.style.display = 'none';
+    if (!filename) return;
+    try {
+        const res = await fetch('/api/preprocess-filter/quick-stats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, filename }),
+        }).then(r => r.json());
+        if (!res.success) return;
+        filterBtn.style.display = 'block';
+        if (res.looks_noisy) {
+            if (detail) {
+                detail.textContent =
+                    ` (Unique color count: ${Number(res.unique_colors).toLocaleString()}).`;
+            }
+            banner.style.display = 'flex';
         }
-        banner.style.display = 'flex';
-    } else {
-        banner.style.display = 'none';
+    } catch (err) {
+        // Best-effort: stay silent on failure (the rest of the app still
+        // works without the noise banner).
+        console.warn('quick-stats failed:', err);
     }
 }
 
 function closePolarPreprocessModal(saved = false) {
     if (!saved && AppState.polarPreprocess.isDirty && AppState.polarPreprocess.lastPreview.filename) {
-        if (!confirm('未保存の編集があります。閉じますか?')) return;
+        if (!confirm('There are unsaved changes. Close anyway?')) return;
     }
     const pp = AppState.polarPreprocess;
     if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }

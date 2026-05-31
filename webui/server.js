@@ -1774,6 +1774,45 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
 //
 // Output: a PNG that contains at most nTargets distinct RGB values plus
 // any fully-transparent pixels from the source.
+// Lightweight per-image AA-noise probe. Counts the number of distinct
+// RGB values (ignoring fully transparent pixels) and reports it so the
+// frontend can show a noise warning on image load without paying for
+// the full materials/detect (AA blend classification, YAML template,
+// dominant/rare partitioning). Typical runtime: ~50-200 ms on a 4 MP
+// image vs. ~1 s for materials/detect.
+app.post('/api/preprocess-filter/quick-stats', async (req, res) => {
+    try {
+        const Jimp = require('jimp');
+        const { userId = 'default', filename } = req.body || {};
+        if (!filename) {
+            return res.status(400).json({ success: false, error: 'filename required' });
+        }
+        const uploadsDir = getUserUploadsDir(userId);
+        const srcPath = path.join(uploadsDir, filename);
+        const src = await Jimp.read(srcPath);
+        const W = src.bitmap.width;
+        const H = src.bitmap.height;
+        const data = src.bitmap.data;
+        const len = W * H * 4;
+        const seen = new Set();
+        for (let i = 0; i < len; i += 4) {
+            if (data[i + 3] === 0) continue;
+            seen.add((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
+        }
+        res.json({
+            success: true,
+            unique_colors: seen.size,
+            image_width: W,
+            image_height: H,
+            // Match the heuristic used inline by the frontend so both sides
+            // agree on what "noisy" means.
+            looks_noisy: seen.size > 1000,
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.post('/api/preprocess-filter/quantize', async (req, res) => {
     try {
         const Jimp = require('jimp');

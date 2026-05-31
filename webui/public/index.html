@@ -1053,10 +1053,29 @@
                     </div>
                     <input type="file" id="imageUpload" accept="image/*" style="display: none;" onchange="handleImageUpload(event)">
                     <img id="uploadedImage" class="preview-image hidden" alt="Uploaded image">
+                    <!-- AA-noise warning. Populated by checkInputImageNoise()
+                         on every image upload / load. Hidden when uniqueColors
+                         is below the threshold. -->
+                    <div id="inputImageNoiseBanner" class="noisy-banner" style="display: none;">
+                        <div class="noisy-banner-text">
+                            <strong>⚠ The image may contain a lot of noise due to anti-aliasing.</strong>
+                            <span id="inputImageNoiseBannerDetail"></span>
+                            Applying the color uniformization filter can improve analysis quality.
+                        </div>
+                        <button class="btn-primary" onclick="openQuantizeFilterModal()"
+                                style="padding: 6px 12px; white-space: nowrap;">
+                            Open Filter
+                        </button>
+                    </div>
                     <button class="btn-secondary" id="detectColorsBtn"
                             onclick="detectColors()"
                             style="width: 100%; margin-top: 10px; display: none;">
                         Detect Colors &amp; Generate YAML Template
+                    </button>
+                    <button class="btn-secondary" id="quantizeFilterBtn"
+                            onclick="openQuantizeFilterModal()"
+                            style="width: 100%; margin-top: 6px; display: none;">
+                        Apply Color Uniformization Filter
                     </button>
                     <button class="btn-secondary" id="polarizeBtn"
                             onclick="openPolarPreprocessModal()"
@@ -1338,13 +1357,13 @@
                      the detected response carries uniqueColors > 1000.    -->
                 <div id="detectNoisyBanner" class="noisy-banner" style="display: none;">
                     <div class="noisy-banner-text">
-                        <strong>⚠ 画像にアンチエイリアシング由来のノイズが多い可能性があります。</strong>
+                        <strong>⚠ The image may contain a lot of noise due to anti-aliasing. </strong>
                         <span id="detectNoisyBannerDetail"></span>
-                        一様色での塗りつぶしフィルタを適用すると、解析品質が改善します。
+                        Applying the color uniformization filter can improve analysis quality.
                     </div>
                     <button class="btn-primary" onclick="openQuantizeFilterModal()"
                             style="padding: 6px 14px; white-space: nowrap;">
-                        一様色フィルタを開く
+                        Apply Color Uniformization Filter
                     </button>
                 </div>
                 <!-- Dominant colors grid -->
@@ -1397,27 +1416,27 @@
                             <input type="number" id="qfilterThreshold" min="0" max="50" step="0.1" value="0.5"> %
                         </div>
                         <div style="font-size: 0.78rem; color: #6c757d;">
-                            この値以上の coverage を持つ色のみがフィルタ対象 (=「材料候補」) になります。
+                            Only colors with coverage above this threshold will be considered for filtering (= "material candidates").
                         </div>
                     </div>
                     <div class="qfilter-section">
-                        <h4>2. 塗りつぶし対象数</h4>
+                        <h4>2. Number of Fill Targets</h4>
                         <div class="qfilter-slider-row">
-                            <label for="qfilterN">上位 N =</label>
+                            <label for="qfilterN">Top N =</label>
                             <input type="range" id="qfilterNRange" min="2" max="32" step="1" value="8">
                             <input type="number" id="qfilterN" min="2" max="32" step="1" value="8">
                         </div>
                         <div class="qfilter-slider-row">
-                            <label for="qfilterMinDist">最小色距離</label>
+                            <label for="qfilterMinDist">Minimum Color Distance</label>
                             <input type="range" id="qfilterMinDistRange" min="0" max="100" step="5" value="30">
                             <input type="number" id="qfilterMinDist" min="0" max="100" step="1" value="30">
                         </div>
                         <div style="font-size: 0.78rem; color: #6c757d;">
-                            AA 由来の近接色 (例: <code>[255,255,255]</code> と <code>[254,254,254]</code>) を 1 つに統合する RGB 距離閾値です。
+                            The threshold for merging nearby colors (e.g., <code>[255,255,255]</code> and <code>[254,254,254]</code>) into a single color.
                         </div>
                     </div>
                     <div class="qfilter-section">
-                        <h4>3. 適用される塗りつぶし色 <span id="qfilterTargetCount" style="font-weight: normal; color: #6c757d;"></span></h4>
+                        <h4>3. Number of Applied Fill Colors <span id="qfilterTargetCount" style="font-weight: normal; color: #6c757d;"></span></h4>
                         <div id="qfilterTargetChips"></div>
                     </div>
                     <div class="qfilter-section">
@@ -1428,8 +1447,8 @@
             <div class="modal-footer" style="justify-content: space-between;">
                 <span id="qfilterFooterNote" style="font-size: 0.8rem; color: #6c757d;"></span>
                 <div style="display: flex; gap: 8px;">
-                    <button class="btn-secondary" onclick="closeQuantizeFilterModal()">キャンセル</button>
-                    <button class="btn-primary" id="qfilterApplyBtn" onclick="applyQuantizeFilter()">適用 (画像を置換)</button>
+                    <button class="btn-secondary" onclick="closeQuantizeFilterModal()">Cancel</button>
+                    <button class="btn-primary" id="qfilterApplyBtn" onclick="applyQuantizeFilter()">Apply (Replace Image)</button>
                 </div>
             </div>
         </div>
@@ -1529,25 +1548,6 @@
                 </div>
                 <!-- RIGHT: control panel -->
                 <div class="polar-control-pane">
-                    <!-- AA-noise / JPEG-derived image warning. Shown when
-                         the parallel /api/materials/detect call reports
-                         >1000 unique RGB values (i.e. enough AA fragments
-                         that downstream materials assignment will struggle).
-                         The "Open filter" button routes the user to the
-                         same Quantize Filter modal as the Detect Colors
-                         banner. -->
-                    <div id="polarNoisyBanner" class="noisy-banner" style="display: none;">
-                        <div class="noisy-banner-text">
-                            <strong>⚠ 画像にアンチエイリアシング由来のノイズが多い可能性があります。</strong>
-                            <span id="polarNoisyBannerDetail"></span>
-                            一様色での塗りつぶしフィルタの適用を推奨します。
-                        </div>
-                        <button class="btn-primary" onclick="openQuantizeFilterModal()"
-                                style="padding: 6px 14px; white-space: nowrap;">
-                            一様色フィルタ
-                        </button>
-                    </div>
-
                     <!-- Section 1: Auto-detect status -->
                     <div class="polar-section">
                         <div class="polar-section-title">Auto-detect</div>
@@ -1623,7 +1623,7 @@
             <div class="modal-footer" style="display:flex; align-items:center; gap:10px;">
                 <div class="polar-thumb-wrap">
                     <canvas id="polarPreviewThumb" width="160" height="160"></canvas>
-                    <div id="polarDirtyBadge" class="polar-dirty-badge">⚠ 未更新の情報があります</div>
+                    <div id="polarDirtyBadge" class="polar-dirty-badge">⚠ There are unupdated changes</div>
                 </div>
                 <div style="flex:1"></div>
                 <button class="btn-secondary" onclick="closePolarPreprocessModal()">Cancel</button>
