@@ -1439,8 +1439,6 @@ AppState.polarPreprocess = {
     imageNaturalWidth: 0,
     imageNaturalHeight: 0,
     detection: null,
-    colorDetection: null,
-    colorGroups: {},
     current: {
         center_x: 0, center_y: 0,
         // r_inner_px is the *warp* inner radius. Defaults to 0 so the
@@ -1455,7 +1453,6 @@ AppState.polarPreprocess = {
         nr: 0, ntheta: 0,
         snap_ntheta: true,
         r_orientation: 'horizontal',
-        shape_hint: 'auto',
         r_outer_physical: 1.0,
         save_as: 'polar',
     },
@@ -1565,8 +1562,6 @@ function resetPolarPreprocessState() {
     pp.imageNaturalWidth = 0;
     pp.imageNaturalHeight = 0;
     pp.detection = null;
-    pp.colorDetection = null;
-    pp.colorGroups = {};
     Object.assign(pp.current, {
         center_x: 0, center_y: 0,
         r_inner_px: 0, r_outer_px: 0,
@@ -1576,7 +1571,6 @@ function resetPolarPreprocessState() {
         nr: 0, ntheta: 0,
         snap_ntheta: true,
         r_orientation: 'horizontal',
-        shape_hint: 'auto',
         r_outer_physical: 1.0,
         save_as: 'polar',
     });
@@ -1624,29 +1618,23 @@ async function openPolarPreprocessModal() {
 
     try {
         await loadPolarSourceImage();
-        // Parallel: geometry detect + color detect (color is best-effort)
-        const [detectRes, colorRes] = await Promise.allSettled([
-            fetch('/api/preprocess-polar/detect', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    userId: AppState.userId,
-                    filename: pp.sourceFilename,
-                }),
-            }).then(r => r.json()),
-            detectColorsInternal().catch(() => null),
-        ]);
-        if (detectRes.status !== 'fulfilled' || !detectRes.value.success) {
-            throw new Error(detectRes.reason || (detectRes.value && detectRes.value.error) || 'detect failed');
+        const detectRes = await fetch('/api/preprocess-polar/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: pp.sourceFilename,
+            }),
+        }).then(r => r.json());
+        if (!detectRes.success) {
+            throw new Error(detectRes.error || 'detect failed');
         }
-        pp.detection = detectRes.value;
-        pp.colorDetection = colorRes.status === 'fulfilled' ? colorRes.value : null;
+        pp.detection = detectRes;
 
         applyDetectionToCurrent(pp.detection);
         renderPolarStatusSummary();
         renderPolarOverlay();
         syncPolarInputsFromState();
-        renderPolarColorChips();
         renderPolarDipDropdown();
         // Phase 5f.2: fire an initial warp so the "Warp output" tab has
         // something to show without the user having to wait for the 1.5 s
@@ -1778,7 +1766,6 @@ function applyDetectionToCurrent(detection) {
     cur.theta_start = detection.theta_start;
     cur.theta_end = detection.theta_end;
     cur.is_sector = !detection.is_full_circle;
-    cur.shape_hint = detection.shape || 'auto';
     const per = detection.periodicity || {};
     if (per.recommended_ntheta && per.recommended_ntheta > 1) {
         cur.ntheta = per.recommended_ntheta;
@@ -1937,10 +1924,6 @@ function syncPolarInputsFromState() {
     document.querySelectorAll('input[name="polarROrient"]').forEach(r => {
         r.checked = (r.value === cur.r_orientation);
     });
-    // shape hint
-    document.querySelectorAll('input[name="polarShapeHint"]').forEach(r => {
-        r.checked = (r.value === cur.shape_hint);
-    });
     // save target
     document.querySelectorAll('input[name="polarSaveAs"]').forEach(r => {
         r.checked = (r.value === cur.save_as);
@@ -1948,62 +1931,6 @@ function syncPolarInputsFromState() {
 }
 
 function radToDegRounded(rad) { return Math.round(rad * 180 / Math.PI * 100) / 100; }
-
-// Render the color chip list. Phase 5c shows non-functional dropdowns so
-// users can see the grouping UI shape; recompute is wired in Phase 5d.
-function renderPolarColorChips() {
-    const grid = document.getElementById('polarColorGroupGrid');
-    if (!grid) return;
-    const col = AppState.polarPreprocess.colorDetection;
-    if (!col || !col.colors || col.colors.length === 0) {
-        grid.textContent = 'No colour detection result (open Detect Colors first or upload a clearer image).';
-        document.getElementById('polarRecomputeBtn').disabled = true;
-        return;
-    }
-    const groups = AppState.polarPreprocess.colorGroups;
-    grid.innerHTML = '';
-    col.colors
-        .filter(c => !c.antialias)
-        .forEach(c => {
-            const hex = '#' + c.rgb.map(v => v.toString(16).padStart(2, '0')).join('');
-            const key = c.rgb.join(',');
-            const cur = groups[key] || '';
-            const row = document.createElement('div');
-            row.className = 'polar-color-row';
-            row.innerHTML = `
-                <div class="polar-color-swatch" style="background:${hex}"></div>
-                <span style="font-family:monospace; font-size:0.78rem;">${hex}</span>
-                <span style="color:#868e96; font-size:0.72rem;">${((c.ratio || 0) * 100).toFixed(1)}%</span>
-                <select data-color-key="${key}">
-                    <option value="" ${cur === '' ? 'selected' : ''}>None</option>
-                    <option value="A" ${cur === 'A' ? 'selected' : ''}>Group A</option>
-                    <option value="B" ${cur === 'B' ? 'selected' : ''}>Group B</option>
-                    <option value="C" ${cur === 'C' ? 'selected' : ''}>Group C</option>
-                    <option value="D" ${cur === 'D' ? 'selected' : ''}>Group D</option>
-                </select>`;
-            grid.appendChild(row);
-        });
-    // Wire (or re-wire) the per-chip dropdowns. We replace innerHTML on
-    // every render so binding once at modal-open isn't enough; attach
-    // listeners to every select element we just inserted.
-    grid.querySelectorAll('select[data-color-key]').forEach(sel => {
-        sel.addEventListener('change', () => {
-            const key = sel.dataset.colorKey;
-            if (sel.value) {
-                AppState.polarPreprocess.colorGroups[key] = sel.value;
-            } else {
-                delete AppState.polarPreprocess.colorGroups[key];
-            }
-            // Enable Recompute when at least one chip is grouped.
-            const anyGrouped = Object.keys(AppState.polarPreprocess.colorGroups).length > 0;
-            document.getElementById('polarRecomputeBtn').disabled = !anyGrouped;
-        });
-    });
-    // Initial state of the Recompute button reflects any pre-existing
-    // groupings (e.g. when the user re-opens the modal after editing).
-    const anyGrouped = Object.keys(groups).length > 0;
-    document.getElementById('polarRecomputeBtn').disabled = !anyGrouped;
-}
 
 // ============================================================
 // Polar Preprocess interactivity (Phase 5d.1)
@@ -2280,11 +2207,6 @@ function bindPolarInputs() {
             if (r.checked) { cur().r_orientation = r.value; markPolarDirty(); }
         });
     });
-    root.querySelectorAll('input[name=polarShapeHint]').forEach(r => {
-        r.addEventListener('change', () => {
-            if (r.checked) { cur().shape_hint = r.value; markPolarDirty(); }
-        });
-    });
     root.querySelectorAll('input[name=polarSaveAs]').forEach(r => {
         r.addEventListener('change', () => {
             if (r.checked) cur().save_as = r.value;
@@ -2416,7 +2338,6 @@ async function rerunPolarDetect() {
             body: JSON.stringify({
                 userId:   AppState.userId,
                 filename: pp.sourceFilename,
-                hint: { shape: pp.current.shape_hint },
             }),
         }).then(r => r.json());
         if (!res.success) throw new Error(res.error || 'detect failed');
@@ -2455,66 +2376,6 @@ function snapToDetectedPeriod() {
     markPolarDirty();
 }
 
-async function recomputeWithGroupedColors() {
-    const pp = AppState.polarPreprocess;
-    if (pp.isDetecting || !pp.sourceFilename) return;
-    // Build the color_groups payload from the current chip selections.
-    // We send one entry per group letter that has at least one colour.
-    const buckets = {};
-    for (const [key, gid] of Object.entries(pp.colorGroups)) {
-        if (!gid) continue;
-        if (!buckets[gid]) buckets[gid] = [];
-        buckets[gid].push(key.split(',').map(Number));
-    }
-    const color_groups = Object.entries(buckets).map(([id, colors]) => ({ id, colors }));
-    if (color_groups.length === 0) {
-        showStatus('solverStatus', 'Assign at least one colour to a group first', 'error');
-        return;
-    }
-    pp.isDetecting = true;
-    setPolarLoading(true, 'Recomputing periodicity with groups…');
-    try {
-        const res = await fetch('/api/preprocess-polar/detect', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                userId:   AppState.userId,
-                filename: pp.sourceFilename,
-                hint:     { shape: pp.current.shape_hint },
-                color_groups,
-            }),
-        }).then(r => r.json());
-        if (!res.success) throw new Error(res.error || 'detect failed');
-        // The grouped recompute is intended to refine the *periodicity*
-        // estimate; we keep the user's centre / radii / theta untouched
-        // and only swap in the new periodicity values.
-        pp.detection = { ...(pp.detection || {}), periodicity: res.periodicity };
-        renderPolarStatusSummary();
-        renderPolarOverlay();
-        // Surface the grouped result in a small status line under the chips.
-        const note = document.getElementById('polarRecomputeNote');
-        if (note) {
-            const g = res.periodicity && res.periodicity.grouped;
-            if (g && g.n_fold) {
-                note.textContent =
-                    `grouped N = ${g.n_fold.toFixed(2)} (int ${g.n_integer}, snr ${g.snr ? g.snr.toFixed(1) : '-'}, ${g.matched_colors} colour(s) in ${g.group_count} group(s))`;
-                note.style.color = '#2b7a3a';
-            } else if (g) {
-                note.textContent =
-                    `grouped recompute returned no periodic peak (${g.matched_colors} colour(s) in ${g.group_count} group(s); try grouping the colours into distinct ids).`;
-                note.style.color = '#8a6d3b';
-            } else {
-                note.textContent = 'grouped recompute returned no result.';
-                note.style.color = '#8a6d3b';
-            }
-        }
-    } catch (err) {
-        showStatus('solverStatus', `Recompute failed: ${err.message}`, 'error');
-    } finally {
-        pp.isDetecting = false;
-        setPolarLoading(false);
-    }
-}
 function applyPolarTransform() {
     const pp = AppState.polarPreprocess;
     if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }

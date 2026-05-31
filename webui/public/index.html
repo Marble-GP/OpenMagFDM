@@ -959,36 +959,6 @@
         }
         .polar-input-grid .polar-unit { color: #868e96; font-size: 0.75rem; }
         .polar-mini-btn { padding: 4px 10px; font-size: 0.78rem; margin-top: 6px; }
-        .polar-color-grid {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            max-height: 180px;
-            overflow-y: auto;
-            font-size: 0.8rem;
-            color: #495057;
-        }
-        .polar-color-row {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            background: #f8f9fa;
-            border-radius: 3px;
-            padding: 3px 6px;
-        }
-        .polar-color-swatch {
-            width: 18px; height: 18px;
-            border: 1px solid #ccc;
-            border-radius: 2px;
-            flex: 0 0 auto;
-        }
-        .polar-color-row select {
-            margin-left: auto;
-            padding: 2px 4px;
-            font-size: 0.76rem;
-            border: 1px solid #ced4da;
-            border-radius: 3px;
-        }
         .polar-thumb-wrap {
             position: relative;
             width: 160px;
@@ -1697,21 +1667,7 @@
                         </div>
                     </div>
 
-                    <!-- Section 5: External shape + color grouping -->
-                    <div class="polar-section">
-                        <div class="polar-section-title">External shape</div>
-                        <div style="display:flex; gap:10px;">
-                            <label><input type="radio" name="polarShapeHint" value="auto" checked data-pp="shape_hint"> auto</label>
-                            <label><input type="radio" name="polarShapeHint" value="circular" data-pp="shape_hint"> circular</label>
-                            <label><input type="radio" name="polarShapeHint" value="rectangular" data-pp="shape_hint"> rectangular</label>
-                        </div>
-                        <div class="polar-section-title" style="margin-top:10px;">Color grouping</div>
-                        <div id="polarColorGroupGrid" class="polar-color-grid">— detecting —</div>
-                        <button class="btn-secondary polar-mini-btn" id="polarRecomputeBtn" onclick="recomputeWithGroupedColors()" disabled>Recompute periodicity with groups</button>
-                        <div id="polarRecomputeNote" style="font-size: 0.78rem; margin-top: 4px;"></div>
-                    </div>
-
-                    <!-- Section 6: Save target -->
+                    <!-- Section 5: Save target -->
                     <div class="polar-section">
                         <div class="polar-section-title">Save target</div>
                         <div style="display:flex; flex-direction:column; gap:4px;">
