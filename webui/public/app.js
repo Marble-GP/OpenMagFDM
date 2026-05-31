@@ -1604,6 +1604,10 @@ async function openPolarPreprocessModal() {
         { indicatorEl: document.getElementById('polarZoomIndicator') }
     );
     if (zp) zp.reset();
+    // Interactivity wiring (Phase 5d.1). All three are idempotent.
+    bindPolarInputs();
+    attachPolarSvgDrag();
+    attachPolarKeyboard();
 
     try {
         await loadPolarSourceImage();
@@ -1904,16 +1908,245 @@ function renderPolarColorChips() {
         });
 }
 
-// Stubs for Phase 5d/5e - they get real implementations in later commits.
-// Defined here so the button onclick handlers in index.html resolve at load.
+// ============================================================
+// Polar Preprocess interactivity (Phase 5d.1)
+// ============================================================
+// Three independent wirings, all idempotent so the open-modal flow can
+// call them every time without piling up duplicate listeners:
+//   - bindPolarInputs(): every number / radio / checkbox edits the
+//     state and triggers a re-render. Wheel on number inputs steps
+//     +/- (Shift = x10).
+//   - attachPolarSvgDrag(): left-click on any data-handle element on
+//     the SVG overlay starts a drag that updates the corresponding
+//     centre / r_inner / r_outer / theta in the state and re-renders.
+//   - attachPolarKeyboard(): arrow keys on the focused preview
+//     container nudge the centre by +/-1 px (Shift = +/-10).
+
+function markPolarDirty() {
+    AppState.polarPreprocess.isDirty = true;
+}
+
+function bindPolarInputs() {
+    const root = document.getElementById('polarPreprocessModal');
+    if (!root || root._ppInputsBound) return;
+    const cur = () => AppState.polarPreprocess.current;
+
+    // numericMap: data-pp key -> [state field, parser]
+    const numericMap = {
+        center_x:           ['center_x',           v => Math.round(Number(v))],
+        center_y:           ['center_y',           v => Math.round(Number(v))],
+        r_inner_px:         ['r_inner_px',         v => Math.max(0, Math.round(Number(v)))],
+        r_outer_px:         ['r_outer_px',         v => Math.max(1, Math.round(Number(v)))],
+        r_outer_physical:   ['r_outer_physical',   v => Math.max(0.001, Number(v))],
+        nr:                 ['nr',                 v => Math.max(2, Math.round(Number(v)))],
+        ntheta:             ['ntheta',             v => Math.max(2, Math.round(Number(v)))],
+        theta_start_deg:    ['theta_start',        v => Number(v) * Math.PI / 180],
+        theta_end_deg:      ['theta_end',          v => Number(v) * Math.PI / 180],
+    };
+    root.querySelectorAll('input[type=number]').forEach(input => {
+        const key = input.dataset.pp;
+        const spec = numericMap[key];
+        if (!spec) return;
+        const [stateField, parse] = spec;
+        input.addEventListener('input', () => {
+            cur()[stateField] = parse(input.value);
+            renderPolarOverlay();
+            markPolarDirty();
+        });
+        input.addEventListener('wheel', e => {
+            e.preventDefault();
+            const step = Number(input.step) || 1;
+            const factor = e.shiftKey ? 10 : 1;
+            const dir = e.deltaY < 0 ? 1 : -1;
+            const v = Number(input.value) + step * factor * dir;
+            input.value = v;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        }, { passive: false });
+    });
+
+    const snap = document.getElementById('polarSnapNtheta');
+    if (snap) snap.addEventListener('change', () => {
+        cur().snap_ntheta = snap.checked;
+        markPolarDirty();
+    });
+
+    root.querySelectorAll('input[name=polarThetaMode]').forEach(r => {
+        r.addEventListener('change', () => {
+            if (!r.checked) return;
+            cur().is_sector = (r.value === 'sector');
+            document.getElementById('polarSectorInputs').style.display =
+                cur().is_sector ? '' : 'none';
+            // Initialise sector range if just switched on with full-circle theta.
+            if (cur().is_sector && Math.abs(cur().theta_end - cur().theta_start - 2 * Math.PI) < 1e-6) {
+                cur().theta_start = -Math.PI / 4;
+                cur().theta_end   =  Math.PI / 4;
+            }
+            renderPolarOverlay();
+            syncPolarInputsFromState();
+            markPolarDirty();
+        });
+    });
+    root.querySelectorAll('input[name=polarROrient]').forEach(r => {
+        r.addEventListener('change', () => {
+            if (r.checked) { cur().r_orientation = r.value; markPolarDirty(); }
+        });
+    });
+    root.querySelectorAll('input[name=polarShapeHint]').forEach(r => {
+        r.addEventListener('change', () => {
+            if (r.checked) { cur().shape_hint = r.value; markPolarDirty(); }
+        });
+    });
+    root.querySelectorAll('input[name=polarSaveAs]').forEach(r => {
+        r.addEventListener('change', () => {
+            if (r.checked) cur().save_as = r.value;
+        });
+    });
+    root._ppInputsBound = true;
+}
+
+function attachPolarSvgDrag() {
+    const svg = document.getElementById('polarOverlay');
+    if (!svg || svg._ppDragBound) return;
+    function svgPoint(e) {
+        const pt = svg.createSVGPoint();
+        pt.x = e.clientX; pt.y = e.clientY;
+        const ctm = svg.getScreenCTM();
+        return ctm ? pt.matrixTransform(ctm.inverse()) : { x: 0, y: 0 };
+    }
+    svg.addEventListener('mousedown', e => {
+        if (e.button !== 0) return;
+        const handle = e.target.closest('[data-handle]');
+        if (!handle) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const kind = handle.dataset.handle;
+        const p0 = svgPoint(e);
+        const cur = AppState.polarPreprocess.current;
+        AppState.polarPreprocess._activeDrag = {
+            kind,
+            p0,
+            start: {
+                cx: cur.center_x, cy: cur.center_y,
+                rIn: cur.r_inner_px, rOut: cur.r_outer_px,
+                ts: cur.theta_start, te: cur.theta_end,
+            },
+        };
+        document.body.style.cursor = 'grabbing';
+    });
+    window.addEventListener('mousemove', e => {
+        const drag = AppState.polarPreprocess._activeDrag;
+        if (!drag) return;
+        const p = svgPoint(e);
+        const cur = AppState.polarPreprocess.current;
+        const W = AppState.polarPreprocess.imageNaturalWidth;
+        const H = AppState.polarPreprocess.imageNaturalHeight;
+        switch (drag.kind) {
+            case 'center': {
+                cur.center_x = Math.max(0, Math.min(W, Math.round(drag.start.cx + (p.x - drag.p0.x))));
+                cur.center_y = Math.max(0, Math.min(H, Math.round(drag.start.cy + (p.y - drag.p0.y))));
+                break;
+            }
+            case 'inner': {
+                const dx = p.x - drag.start.cx, dy = p.y - drag.start.cy;
+                cur.r_inner_px = Math.max(0, Math.round(Math.hypot(dx, dy)));
+                break;
+            }
+            case 'outer': {
+                const dx = p.x - drag.start.cx, dy = p.y - drag.start.cy;
+                cur.r_outer_px = Math.max(1, Math.round(Math.hypot(dx, dy)));
+                break;
+            }
+            case 'theta_start':
+                cur.theta_start = Math.atan2(p.y - drag.start.cy, p.x - drag.start.cx);
+                break;
+            case 'theta_end':
+                cur.theta_end   = Math.atan2(p.y - drag.start.cy, p.x - drag.start.cx);
+                break;
+        }
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+        markPolarDirty();
+    });
+    window.addEventListener('mouseup', () => {
+        if (AppState.polarPreprocess._activeDrag) {
+            AppState.polarPreprocess._activeDrag = null;
+            document.body.style.cursor = '';
+        }
+    });
+    svg._ppDragBound = true;
+}
+
+function attachPolarKeyboard() {
+    const container = document.getElementById('polarPreviewContainer');
+    if (!container || container._ppKeysBound) return;
+    container.addEventListener('keydown', e => {
+        if (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
+        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+        e.preventDefault();
+        const cur = AppState.polarPreprocess.current;
+        const step = e.shiftKey ? 10 : 1;
+        if (e.key === 'ArrowLeft')  cur.center_x -= step;
+        if (e.key === 'ArrowRight') cur.center_x += step;
+        if (e.key === 'ArrowUp')    cur.center_y -= step;
+        if (e.key === 'ArrowDown')  cur.center_y += step;
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+        markPolarDirty();
+    });
+    container._ppKeysBound = true;
+}
+
+// Re-runs /api/preprocess-polar/detect with the current image and shape
+// hint. Used by the "Re-detect" button in the Auto-detect section.
 async function rerunPolarDetect() {
-    showStatus('solverStatus', 'Re-detect: not yet implemented (Phase 5d)', 'error');
+    const pp = AppState.polarPreprocess;
+    if (pp.isDetecting || !pp.sourceFilename) return;
+    pp.isDetecting = true;
+    setPolarLoading(true, 'Re-detecting…');
+    try {
+        const res = await fetch('/api/preprocess-polar/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId:   AppState.userId,
+                filename: pp.sourceFilename,
+                hint: { shape: pp.current.shape_hint },
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'detect failed');
+        pp.detection = res;
+        applyDetectionToCurrent(res);
+        renderPolarStatusSummary();
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+    } catch (err) {
+        showStatus('solverStatus', `Re-detect failed: ${err.message}`, 'error');
+    } finally {
+        pp.isDetecting = false;
+        setPolarLoading(false);
+    }
 }
+
 function snapToDetectedPeriod() {
-    showStatus('solverStatus', 'Snap-to-sector: not yet implemented (Phase 5d)', 'error');
+    const pp = AppState.polarPreprocess;
+    const per = pp.detection && pp.detection.periodicity;
+    const N = per && per.grayscale && per.grayscale.n_integer;
+    if (!N || N < 2) {
+        showStatus('solverStatus', 'No detected period to snap to', 'error');
+        return;
+    }
+    const cur = pp.current;
+    cur.is_sector = true;
+    cur.theta_start = 0;
+    cur.theta_end = 2 * Math.PI / N;
+    document.getElementById('polarSectorInputs').style.display = '';
+    renderPolarOverlay();
+    syncPolarInputsFromState();
+    markPolarDirty();
 }
+
 function recomputeWithGroupedColors() {
-    showStatus('solverStatus', 'Color grouping recompute: not yet implemented (Phase 5d)', 'error');
+    showStatus('solverStatus', 'Color grouping recompute: not yet implemented (Phase 5d.3)', 'error');
 }
 function applyPolarTransform() {
     showStatus('solverStatus', 'Apply Transform: not yet implemented (Phase 5e)', 'error');
