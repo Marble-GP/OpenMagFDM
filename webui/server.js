@@ -1780,6 +1780,76 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
 // the full materials/detect (AA blend classification, YAML template,
 // dominant/rare partitioning). Typical runtime: ~50-200 ms on a 4 MP
 // image vs. ~1 s for materials/detect.
+// Bilateral filter on RGB image (in-place). Edge-preserving smoothing:
+// each pixel becomes a weighted average of its neighbours where the
+// weight is the product of a Gaussian in space (controlled by
+// sigmaSpatial) and a Gaussian in colour distance (sigmaColor). Pixels
+// across a colour edge contribute very little, so the boundary stays
+// crisp while AA fragments get pulled toward the dominant colour on
+// their own side of the edge -- exactly what we want before quantize.
+//
+// The spatial window radius is 2 * sigmaSpatial (truncates the Gaussian
+// at the 2-sigma tail where the weight is ~13 % of peak). Spatial
+// weights are pre-computed once. Colour weight uses an exp() lookup
+// table on the squared-distance / (2 sigma_c^2) ratio mapped to 0..255.
+function applyBilateralFilterRGB(data, W, H, sigmaSpatial, sigmaColor) {
+    const R = Math.max(1, Math.round(2 * sigmaSpatial));
+    const ws = 2 * R + 1;
+    // Precompute spatial weights for the (2R+1)x(2R+1) window.
+    const sw = new Float32Array(ws * ws);
+    const inv2ss = 1 / (2 * sigmaSpatial * sigmaSpatial);
+    for (let dy = -R; dy <= R; dy++) {
+        for (let dx = -R; dx <= R; dx++) {
+            sw[(dy + R) * ws + (dx + R)] = Math.exp(-(dx * dx + dy * dy) * inv2ss);
+        }
+    }
+    // exp() lookup for colour weights. Index in [0..1023] maps to
+    // colourDistSq in [0..1024]. Anything larger has weight ~0.
+    const colorLUT = new Float32Array(1024);
+    const inv2sc = 1 / (2 * sigmaColor * sigmaColor);
+    for (let i = 0; i < 1024; i++) {
+        colorLUT[i] = Math.exp(-i * inv2sc);
+    }
+    // Work on a copy so writes don't pollute reads.
+    const src = new Uint8Array(data);
+    for (let y = 0; y < H; y++) {
+        const y0 = Math.max(0, y - R);
+        const y1 = Math.min(H - 1, y + R);
+        for (let x = 0; x < W; x++) {
+            const p4 = (y * W + x) * 4;
+            if (src[p4 + 3] === 0) continue;
+            const cR = src[p4], cG = src[p4 + 1], cB = src[p4 + 2];
+            const x0 = Math.max(0, x - R);
+            const x1 = Math.min(W - 1, x + R);
+            let sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+            for (let yy = y0; yy <= y1; yy++) {
+                const dy = yy - y;
+                for (let xx = x0; xx <= x1; xx++) {
+                    const i4 = (yy * W + xx) * 4;
+                    if (src[i4 + 3] === 0) continue;
+                    const dx = xx - x;
+                    const dr = src[i4]     - cR;
+                    const dg = src[i4 + 1] - cG;
+                    const db = src[i4 + 2] - cB;
+                    const cd = (dr * dr + dg * dg + db * db) >> 2;  // /4
+                    const cw = cd >= 1024 ? 0 : colorLUT[cd];
+                    if (cw === 0) continue;
+                    const w = sw[(dy + R) * ws + (dx + R)] * cw;
+                    sumR += w * src[i4];
+                    sumG += w * src[i4 + 1];
+                    sumB += w * src[i4 + 2];
+                    sumW += w;
+                }
+            }
+            if (sumW > 0) {
+                data[p4]     = Math.min(255, Math.max(0, Math.round(sumR / sumW)));
+                data[p4 + 1] = Math.min(255, Math.max(0, Math.round(sumG / sumW)));
+                data[p4 + 2] = Math.min(255, Math.max(0, Math.round(sumB / sumW)));
+            }
+        }
+    }
+}
+
 app.post('/api/preprocess-filter/quick-stats', async (req, res) => {
     try {
         const Jimp = require('jimp');
@@ -1822,6 +1892,8 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
             nTargets = 8,
             minTargetDist = 30,
             despeckleRadius = 1,
+            bilateralSigmaSpatial = 0,
+            bilateralSigmaColor   = 20,
             preview = false,
             output_filename,
         } = req.body || {};
@@ -1833,7 +1905,11 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
         const RT = Math.max(0, Math.min(1, Number(rareThreshold)));
         const MTD = Math.max(0, Number(minTargetDist));     // RGB Euclidean
         const MTD2 = MTD * MTD;
-        const DSP = Math.max(0, Math.min(3, Math.floor(despeckleRadius)));
+        const DSP = Math.max(0, Math.min(10, Math.floor(despeckleRadius)));
+        // Bilateral pre-filter. SigmaSpatial=0 disables it. The spatial
+        // window radius is 2 * sigmaSpatial (clamped to [0, 8]).
+        const BFS = Math.max(0, Math.min(8, Number(bilateralSigmaSpatial)));
+        const BFC = Math.max(1, Math.min(150, Number(bilateralSigmaColor)));
 
         const uploadsDir = getUserUploadsDir(userId);
         const srcPath = path.join(uploadsDir, filename);
@@ -1841,6 +1917,14 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
         const W = src.bitmap.width;
         const H = src.bitmap.height;
         const totalPixels = W * H;
+
+        // Bilateral pre-filter (edge-preserving smoothing). Removes
+        // chromatic noise in flat AA regions so the nearest-target snap
+        // doesn't pull JPEG-noised pixels toward unrelated palette colours.
+        // sigmaSpatial=0 disables it entirely (no copy, no work).
+        if (BFS > 0) {
+            applyBilateralFilterRGB(src.bitmap.data, W, H, BFS, BFC);
+        }
 
         // Count occurrences of each unique RGB (skip fully-transparent pixels).
         const colorCounts = new Map();

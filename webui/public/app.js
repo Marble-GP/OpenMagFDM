@@ -1143,6 +1143,8 @@ function bindQuantizeFilterControls() {
         ['qfilterNRange',         'qfilterN'],
         ['qfilterMinDistRange',   'qfilterMinDist'],
         ['qfilterDespeckleRange', 'qfilterDespeckle'],
+        ['qfilterBilSpaceRange',  'qfilterBilSpace'],
+        ['qfilterBilColorRange',  'qfilterBilColor'],
     ];
     for (const [rangeId, numId] of pairs) {
         const r = document.getElementById(rangeId);
@@ -1188,6 +1190,8 @@ async function runQuantizePreview() {
                 nTargets: params.nTargets,
                 minTargetDist: params.minTargetDist,
                 despeckleRadius: params.despeckleRadius,
+                bilateralSigmaSpatial: params.bilateralSigmaSpatial,
+                bilateralSigmaColor:   params.bilateralSigmaColor,
                 preview: true,
             }),
         }).then(r => r.json());
@@ -1212,10 +1216,12 @@ async function runQuantizePreview() {
 
 function currentQuantizeParams() {
     return {
-        rareThreshold:   Math.max(0, Number(document.getElementById('qfilterThreshold').value || 0)) / 100,
-        nTargets:        Math.max(1, Number(document.getElementById('qfilterN').value || 8)),
-        minTargetDist:   Math.max(0, Number(document.getElementById('qfilterMinDist').value || 30)),
-        despeckleRadius: Math.max(0, Math.min(3, Math.floor(Number(document.getElementById('qfilterDespeckle').value || 1)))),
+        rareThreshold:        Math.max(0, Number(document.getElementById('qfilterThreshold').value || 0)) / 100,
+        nTargets:             Math.max(1, Number(document.getElementById('qfilterN').value || 8)),
+        minTargetDist:        Math.max(0, Number(document.getElementById('qfilterMinDist').value || 30)),
+        despeckleRadius:      Math.max(0, Math.min(10, Math.floor(Number(document.getElementById('qfilterDespeckle').value || 1)))),
+        bilateralSigmaSpatial: Math.max(0, Number(document.getElementById('qfilterBilSpace').value || 0)),
+        bilateralSigmaColor:   Math.max(1, Number(document.getElementById('qfilterBilColor').value || 20)),
     };
 }
 
@@ -1255,6 +1261,8 @@ async function applyQuantizeFilter() {
                 nTargets: params.nTargets,
                 minTargetDist: params.minTargetDist,
                 despeckleRadius: params.despeckleRadius,
+                bilateralSigmaSpatial: params.bilateralSigmaSpatial,
+                bilateralSigmaColor:   params.bilateralSigmaColor,
                 preview: false,
             }),
         }).then(r => r.json());

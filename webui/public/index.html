@@ -1436,15 +1436,31 @@
                         </div>
                         <div class="qfilter-slider-row" style="margin-top: 8px;">
                             <label for="qfilterDespeckle">Despeckle radius</label>
-                            <input type="range" id="qfilterDespeckleRange" min="0" max="3" step="1" value="1">
-                            <input type="number" id="qfilterDespeckle" min="0" max="3" step="1" value="1">
+                            <input type="range" id="qfilterDespeckleRange" min="0" max="10" step="1" value="1">
+                            <input type="number" id="qfilterDespeckle" min="0" max="10" step="1" value="1">
                         </div>
                         <div style="font-size: 0.78rem; color: #6c757d;">
-                            Spatial despeckle pass after quantization. 0 = off, 1 = 3×3 majority (two passes, default), 2 = 5×5, 3 = 7×7. Removes isolated pixels whose snapped target colour is not present in the neighbourhood (e.g. a dark phase colour spuriously appearing in grey AA region).
+                            Spatial majority filter after quantization. 0 = off, 1 = 3×3 (two passes, default), 2 = 5×5, … 10 = 21×21. Removes isolated pixels whose snapped target colour is not present in the neighbourhood (e.g. a dark phase colour spuriously appearing in grey AA region).
                         </div>
                     </div>
                     <div class="qfilter-section">
-                        <h4>3. Number of Applied Fill Colors <span id="qfilterTargetCount" style="font-weight: normal; color: #6c757d;"></span></h4>
+                        <h4>3. Bilateral pre-filter (edge-preserving smoothing)</h4>
+                        <div class="qfilter-slider-row">
+                            <label for="qfilterBilSpace">σ spatial</label>
+                            <input type="range" id="qfilterBilSpaceRange" min="0" max="6" step="0.1" value="0">
+                            <input type="number" id="qfilterBilSpace" min="0" max="6" step="0.1" value="0">
+                        </div>
+                        <div class="qfilter-slider-row">
+                            <label for="qfilterBilColor">σ color</label>
+                            <input type="range" id="qfilterBilColorRange" min="1" max="80" step="1" value="20">
+                            <input type="number" id="qfilterBilColor" min="1" max="80" step="1" value="20">
+                        </div>
+                        <div style="font-size: 0.78rem; color: #6c757d;">
+                            Applied <em>before</em> quantization. σ-spatial controls the smoothing radius (0 disables the filter), σ-color how aggressively colours across an edge are blocked from contributing. Higher σ-spatial = more JPEG-noise cleanup; lower σ-color = better edge preservation.
+                        </div>
+                    </div>
+                    <div class="qfilter-section">
+                        <h4>4. Number of Applied Fill Colors <span id="qfilterTargetCount" style="font-weight: normal; color: #6c757d;"></span></h4>
                         <div id="qfilterTargetChips"></div>
                     </div>
                     <div class="qfilter-section">
