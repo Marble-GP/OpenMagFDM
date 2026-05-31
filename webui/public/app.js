@@ -993,6 +993,22 @@ async function detectColors() {
 }
 
 function renderDetectModal(result) {
+    // Noise / AA-heavy warning banner. Heuristic: a CAD image typically
+    // has 5-50 unique RGB values; if we see thousands the image is
+    // either JPEG-derived or aggressively anti-aliased and the uniform-
+    // colour filter is the recommended cleanup before downstream use.
+    const banner = document.getElementById('detectNoisyBanner');
+    const detail = document.getElementById('detectNoisyBannerDetail');
+    const unique = Number(result.uniqueColors) || 0;
+    const aaTotal = Number(result.aaBlendsTotal) || 0;
+    if (unique > 1000) {
+        detail.textContent =
+            `(検出された画素値の種類: ${unique.toLocaleString()} 色 / AA blend: ${aaTotal.toLocaleString()}).`;
+        banner.style.display = 'flex';
+    } else {
+        banner.style.display = 'none';
+    }
+
     // Render dominant color grid
     const grid = document.getElementById('detectColorGrid');
     grid.innerHTML = '';
@@ -1051,6 +1067,212 @@ async function rerunDetect() {
 
 function closeDetectColorsModal() {
     document.getElementById('detectColorsModal').style.display = 'none';
+}
+
+// ============================================================
+// Uniform-colour quantization filter modal (Phase 5c.2)
+// ============================================================
+// Triggered from the warning banner on Detect Colors modal (or any other
+// caller that knows there's a loaded image). Live preview is generated
+// server-side via /api/preprocess-filter/quantize?preview=true with a
+// 350 ms debounce on slider changes; Apply persists a non-preview output
+// and swaps it in as the loaded image.
+AppState.quantizeFilter = {
+    sourceFilename: null,
+    previewFilename: null,
+    busy: false,
+    debounceTimer: null,
+    lastResult: null,
+    closing: false,
+};
+
+async function openQuantizeFilterModal() {
+    const qf = AppState.quantizeFilter;
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', '画像が選択されていません', 'error');
+        return;
+    }
+    qf.sourceFilename = AppState.uploadedImageFilename;
+    qf.previewFilename = null;
+    qf.lastResult = null;
+    qf.closing = false;
+
+    const modal = document.getElementById('quantizeFilterModal');
+    modal.style.display = 'flex';
+
+    // Attach zoom/pan once and reset to 100 %.
+    const zp = attachZoomPan(
+        document.getElementById('qfilterPreviewContainer'),
+        document.getElementById('qfilterZoomStage'),
+        { indicatorEl: document.getElementById('qfilterZoomIndicator') }
+    );
+    if (zp) zp.reset();
+
+    // Initialise preview to source so the user sees the un-filtered image
+    // before the first server round-trip lands.
+    document.getElementById('qfilterPreviewImg').src =
+        `/uploads/${AppState.userId}/${qf.sourceFilename}?t=${Date.now()}`;
+    document.getElementById('qfilterStatus').textContent = '';
+    document.getElementById('qfilterFooterNote').textContent =
+        `source: ${qf.sourceFilename}`;
+    bindQuantizeFilterControls();
+
+    // Fire an initial preview render with the default slider values.
+    scheduleQuantizePreview(50);
+}
+
+function closeQuantizeFilterModal() {
+    const qf = AppState.quantizeFilter;
+    qf.closing = true;
+    if (qf.debounceTimer) { clearTimeout(qf.debounceTimer); qf.debounceTimer = null; }
+    document.getElementById('quantizeFilterModal').style.display = 'none';
+    document.getElementById('qfilterPreviewImg').src = '';
+}
+
+// Wire range<->number pairs and slider->preview debounce. Idempotent.
+function bindQuantizeFilterControls() {
+    const pairs = [
+        ['qfilterThresholdRange', 'qfilterThreshold'],
+        ['qfilterNRange',         'qfilterN'],
+        ['qfilterMinDistRange',   'qfilterMinDist'],
+    ];
+    for (const [rangeId, numId] of pairs) {
+        const r = document.getElementById(rangeId);
+        const n = document.getElementById(numId);
+        if (r._qfBound) continue;
+        r.addEventListener('input', () => {
+            n.value = r.value;
+            scheduleQuantizePreview();
+        });
+        n.addEventListener('input', () => {
+            const v = Number(n.value);
+            if (Number.isFinite(v)) r.value = v;
+            scheduleQuantizePreview();
+        });
+        r._qfBound = true;
+    }
+}
+
+function scheduleQuantizePreview(delayMs = 350) {
+    const qf = AppState.quantizeFilter;
+    if (qf.debounceTimer) clearTimeout(qf.debounceTimer);
+    qf.debounceTimer = setTimeout(() => runQuantizePreview(), delayMs);
+}
+
+async function runQuantizePreview() {
+    const qf = AppState.quantizeFilter;
+    if (qf.busy || qf.closing || !qf.sourceFilename) return;
+    qf.busy = true;
+    const loading = document.getElementById('qfilterLoading');
+    const status = document.getElementById('qfilterStatus');
+    loading.classList.add('active');
+    status.textContent = 'プレビュー生成中…';
+
+    const params = currentQuantizeParams();
+    try {
+        const res = await fetch('/api/preprocess-filter/quantize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: qf.sourceFilename,
+                rareThreshold: params.rareThreshold,
+                nTargets: params.nTargets,
+                minTargetDist: params.minTargetDist,
+                preview: true,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'preview failed');
+        qf.previewFilename = res.filename;
+        qf.lastResult = res;
+        const img = document.getElementById('qfilterPreviewImg');
+        // Bust the cache: the preview file is overwritten on each request
+        // so we have to force the browser to re-fetch the same URL.
+        img.src = `${res.path}?t=${Date.now()}`;
+        renderQuantizeTargetChips(res.targets || []);
+        document.getElementById('qfilterTargetCount').textContent =
+            `(N=${res.n_targets_used}, source uniqueColors=${res.unique_colors_in.toLocaleString()})`;
+        status.textContent = '';
+    } catch (err) {
+        status.textContent = `エラー: ${err.message}`;
+    } finally {
+        qf.busy = false;
+        loading.classList.remove('active');
+    }
+}
+
+function currentQuantizeParams() {
+    return {
+        rareThreshold: Math.max(0, Number(document.getElementById('qfilterThreshold').value || 0)) / 100,
+        nTargets:      Math.max(1, Number(document.getElementById('qfilterN').value || 8)),
+        minTargetDist: Math.max(0, Number(document.getElementById('qfilterMinDist').value || 30)),
+    };
+}
+
+function renderQuantizeTargetChips(targets) {
+    const host = document.getElementById('qfilterTargetChips');
+    host.innerHTML = '';
+    targets.forEach(t => {
+        const [r, g, b] = t.rgb;
+        const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+        const chip = document.createElement('span');
+        chip.className = 'qfilter-chip';
+        chip.innerHTML = `
+            <span class="qfilter-chip-swatch" style="background:${hex}"></span>
+            <span>${hex}</span>
+            <span style="color:#6c757d;">${(t.ratio * 100).toFixed(2)}%</span>`;
+        host.appendChild(chip);
+    });
+}
+
+async function applyQuantizeFilter() {
+    const qf = AppState.quantizeFilter;
+    if (qf.busy || !qf.sourceFilename) return;
+    qf.busy = true;
+    const status = document.getElementById('qfilterStatus');
+    const applyBtn = document.getElementById('qfilterApplyBtn');
+    applyBtn.disabled = true;
+    status.textContent = '画像を生成・保存中…';
+    const params = currentQuantizeParams();
+    try {
+        const res = await fetch('/api/preprocess-filter/quantize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: qf.sourceFilename,
+                rareThreshold: params.rareThreshold,
+                nTargets: params.nTargets,
+                minTargetDist: params.minTargetDist,
+                preview: false,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'apply failed');
+
+        // Swap the new filtered image in as the loaded image and re-render
+        // the YAML/material flows that depend on it.
+        AppState.uploadedImageFilename = res.filename;
+        await refreshImageList();
+        const sel = document.getElementById('imageSelect');
+        if (sel) sel.value = res.filename;
+        await loadSelectedImage();
+
+        showStatus('solverStatus',
+            `一様色フィルタを適用: ${res.filename} (${res.n_targets_used} 色)`,
+            'success');
+        closeQuantizeFilterModal();
+        // If the Detect Colors modal is still open, rerun it so the user
+        // sees the new "noise" count drop to ~the materials count.
+        const dm = document.getElementById('detectColorsModal');
+        if (dm && dm.style.display === 'flex') {
+            await detectColors();
+        }
+    } catch (err) {
+        status.textContent = `エラー: ${err.message}`;
+    } finally {
+        qf.busy = false;
+        applyBtn.disabled = false;
+    }
 }
 
 async function copyDetectedYaml() {

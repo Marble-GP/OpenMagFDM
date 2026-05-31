@@ -1751,6 +1751,175 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
     }
 });
 
+// ============================================================
+// Uniform-colour quantization filter (Phase 5c.2)
+// ============================================================
+// Many real CAD/paper screenshots reach us with JPEG-style compression
+// noise: the visible structure is a handful of solid colours but the file
+// has thousands of one-pixel AA fragments around every boundary. Material
+// detection still works (the rare-colour AA detector handles it) but
+// downstream pipelines that expect "one RGB == one material" fail badly.
+//
+// This endpoint snaps every pixel to its nearest dominant colour. The
+// caller supplies:
+//   - rareThreshold : minimum coverage (0..1) for a source colour to be
+//                     eligible as a "target". Anything below this is
+//                     treated as AA noise and gets folded into a target.
+//   - nTargets      : how many of the eligible dominant colours to keep
+//                     as targets (sorted by coverage desc).
+//   - preview       : true -> write to a deterministic filename so the UI
+//                     can show a live thumbnail without piling up files
+//                     (overwritten on each request). false -> create a
+//                     normal new file with chooseOutputFilename().
+//
+// Output: a PNG that contains at most nTargets distinct RGB values plus
+// any fully-transparent pixels from the source.
+app.post('/api/preprocess-filter/quantize', async (req, res) => {
+    try {
+        const Jimp = require('jimp');
+        const {
+            userId = 'default', filename,
+            rareThreshold = 0.005,
+            nTargets = 8,
+            minTargetDist = 30,
+            preview = false,
+            output_filename,
+        } = req.body || {};
+
+        if (!filename) {
+            return res.status(400).json({ success: false, error: 'filename required' });
+        }
+        const N = Math.max(1, Math.min(64, Math.floor(nTargets)));
+        const RT = Math.max(0, Math.min(1, Number(rareThreshold)));
+        const MTD = Math.max(0, Number(minTargetDist));     // RGB Euclidean
+        const MTD2 = MTD * MTD;
+
+        const uploadsDir = getUserUploadsDir(userId);
+        const srcPath = path.join(uploadsDir, filename);
+        const src = await Jimp.read(srcPath);
+        const W = src.bitmap.width;
+        const H = src.bitmap.height;
+        const totalPixels = W * H;
+
+        // Count occurrences of each unique RGB (skip fully-transparent pixels).
+        const colorCounts = new Map();
+        src.scan(0, 0, W, H, (x, y, idx) => {
+            const a = src.bitmap.data[idx + 3];
+            if (a === 0) return;
+            const r = src.bitmap.data[idx];
+            const g = src.bitmap.data[idx + 1];
+            const b = src.bitmap.data[idx + 2];
+            const key = (r << 16) | (g << 8) | b;
+            colorCounts.set(key, (colorCounts.get(key) || 0) + 1);
+        });
+
+        const sorted = Array.from(colorCounts.entries())
+            .map(([key, count]) => ({
+                r: (key >> 16) & 0xff,
+                g: (key >> 8) & 0xff,
+                b: key & 0xff,
+                count,
+                ratio: count / totalPixels,
+            }))
+            .sort((a, b) => b.count - a.count);
+
+        if (sorted.length === 0) {
+            return res.status(400).json({ success: false, error: 'No opaque pixels in source' });
+        }
+
+        // Eligible = above threshold; if the threshold is so strict that
+        // nothing qualifies, fall back to the full sorted list so we
+        // always produce something usable.
+        let eligible = sorted.filter(c => c.ratio >= RT);
+        if (eligible.length === 0) eligible = sorted;
+        // Greedy farthest-point pick from `eligible`, sorted by coverage:
+        // walk the list, keep the next colour only if it's at least MTD
+        // away (RGB Euclidean) from every already-chosen target. This
+        // suppresses anti-aliased neighbours of dominant colours -- e.g.
+        // [254,254,254] sits 1.7 away from [255,255,255] so it gets
+        // rejected and the AA pixels later snap to the white target.
+        // Without this, raw-count-only selection drops genuine minor
+        // materials (a red magnet at 0.6 %) in favour of AA-white
+        // fragments (a blend at 0.7 %) that aren't physical materials.
+        const targets = [];
+        for (const c of eligible) {
+            let ok = true;
+            for (const t of targets) {
+                const dr = c.r - t.r, dg = c.g - t.g, db = c.b - t.b;
+                if (dr * dr + dg * dg + db * db < MTD2) { ok = false; break; }
+            }
+            if (ok) targets.push(c);
+            if (targets.length >= N) break;
+        }
+
+        // Quantize: nearest-target lookup with squared-Euclidean RGB distance.
+        // ~1 ns/pixel/target -> well under 100 ms even for 4 MP images.
+        const K = targets.length;
+        const tR = new Int32Array(K);
+        const tG = new Int32Array(K);
+        const tB = new Int32Array(K);
+        for (let k = 0; k < K; k++) {
+            tR[k] = targets[k].r; tG[k] = targets[k].g; tB[k] = targets[k].b;
+        }
+
+        const out = src.clone();
+        const data = out.bitmap.data;
+        const len = W * H * 4;
+        for (let i = 0; i < len; i += 4) {
+            if (data[i + 3] === 0) continue;
+            const r = data[i], g = data[i + 1], b = data[i + 2];
+            let bestD = Infinity, bestI = 0;
+            for (let k = 0; k < K; k++) {
+                const dr = r - tR[k], dg = g - tG[k], db = b - tB[k];
+                const d = dr * dr + dg * dg + db * db;
+                if (d < bestD) { bestD = d; bestI = k; }
+            }
+            data[i]     = tR[bestI];
+            data[i + 1] = tG[bestI];
+            data[i + 2] = tB[bestI];
+        }
+
+        // Filename: preview overwrites a deterministic file per source so we
+        // don't pile up uploads; final goes through chooseOutputFilename.
+        let outName;
+        if (preview) {
+            const stem = filename.replace(/\.[^.]+$/, '');
+            outName = `${stem}.__quantize_preview__.png`;
+        } else {
+            const suggested = output_filename
+                || `${filename.replace(/\.[^.]+$/, '')}_uniformN${K}.png`;
+            outName = await chooseOutputFilename(uploadsDir, filename, suggested);
+        }
+        const outPath = path.join(uploadsDir, outName);
+        await out.writeAsync(outPath);
+
+        if (!preview && typeof enforceImageLimit === 'function') {
+            try { await enforceImageLimit(userId); } catch { /* ignore */ }
+        }
+
+        res.json({
+            success: true,
+            filename: outName,
+            path: `/uploads/${userId}/${outName}`,
+            preview: !!preview,
+            targets: targets.map(t => ({
+                rgb: [t.r, t.g, t.b],
+                ratio: Number(t.ratio.toFixed(6)),
+                count: t.count,
+            })),
+            unique_colors_in: sorted.length,
+            n_targets_used: K,
+            // Heuristic: an image with thousands of unique RGB values and a
+            // long ratio tail is the canonical "JPEG-AA noise" case. Surface
+            // this so the UI can show a recommendation badge without having
+            // to recompute on the client.
+            looks_noisy: sorted.length > 1000,
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // アップロードされた画像の一覧（ユーザーごと）
 app.get('/api/images', async (req, res) => {
     try {
