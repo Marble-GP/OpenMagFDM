@@ -1604,10 +1604,11 @@ async function openPolarPreprocessModal() {
         { indicatorEl: document.getElementById('polarZoomIndicator') }
     );
     if (zp) zp.reset();
-    // Interactivity wiring (Phase 5d.1). All three are idempotent.
+    // Interactivity wiring (Phase 5d.1 / 5f). All idempotent.
     bindPolarInputs();
     attachPolarSvgDrag();
     attachPolarKeyboard();
+    attachPolarEscKey();
 
     try {
         await loadPolarSourceImage();
@@ -1762,6 +1763,20 @@ function renderPolarStatusSummary(errMsg) {
         lines.push(`periodicity grouped : N≈${grp.n_fold} (int ${grp.n_integer})`);
     }
     if (per.recommended_ntheta) lines.push(`recommended ntheta: ${per.recommended_ntheta}`);
+    // Phase 5f edge-case hints. These surface once per detection in the
+    // auto-detect status block so the user has the relevant warning
+    // right where they read the rest of the detection summary.
+    const pp = AppState.polarPreprocess;
+    const W = pp.imageNaturalWidth || det.image_width || 0;
+    const H = pp.imageNaturalHeight || det.image_height || 0;
+    if (W * H > 4_000_000) {
+        lines.push(`<span style="color:#8a6d3b">⚠ large image (${W}×${H}) — preview warp may take 1–2 s per change.</span>`);
+    }
+    if (det.shape === 'rectangular') {
+        lines.push(
+            `<span style="color:#8a6d3b">ℹ rectangular stator — r_inner is seeded from the Hough rotor lock-on; ` +
+            `verify it traces the actual rotor surface and adjust manually if needed.</span>`);
+    }
     el.innerHTML = lines.map(s => `<div>${s}</div>`).join('');
     // Enable sector snap button if N is detected
     const snapBtn = document.getElementById('polarSnapSectorBtn');
@@ -2243,6 +2258,23 @@ function attachPolarKeyboard() {
         markPolarDirty();
     });
     container._ppKeysBound = true;
+}
+
+// Esc anywhere in the document closes the polar modal if it is open
+// (after the existing dirty-confirmation in closePolarPreprocessModal).
+// One global listener -- idempotent flag on document.body so reloads
+// don't pile up duplicates.
+function attachPolarEscKey() {
+    if (document.body._ppEscBound) return;
+    document.addEventListener('keydown', e => {
+        if (e.key !== 'Escape') return;
+        const modal = document.getElementById('polarPreprocessModal');
+        if (modal && modal.style.display === 'flex') {
+            e.preventDefault();
+            closePolarPreprocessModal(false);
+        }
+    });
+    document.body._ppEscBound = true;
 }
 
 // Re-runs /api/preprocess-polar/detect with the current image and shape

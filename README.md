@@ -69,6 +69,40 @@ arr = tifffile.imread("output_xxx/Az/step_0001.tiff")
 print(arr.dtype, arr.shape)  # float64 (500, 500)
 ```
 
+## v1.5 リリースノート（WebUI 画像処理パイプライン）
+
+v1.5 では、CAD モータ断面の **スクリーンショットを直接 OpenMagFDM の解析にかけられる状態まで整える前処理 WebUI** が追加されました。コアソルバーには変更ありません。
+
+### Uniform-colour Filter — `/api/preprocess-filter/quantize`
+
+JPEG 由来 / アンチエイリアスで何万色にも分かれた CAD 画像を、少数の "材料色" に圧縮します。
+
+- Input Image パネルで `uniqueColors > 1000` が検出されたら黄色の警告バナーが自動表示
+- 「Apply Color Uniformization Filter」ボタンでフィルタ用モーダルを起動
+- スライダー: rare threshold (%) / Top N targets / Minimum colour distance / Despeckle radius / Min island size / Bilateral σ-spatial / σ-color
+- **Auto-tune** ボタン — N と rare threshold をユーザーが固定し、残りを Nelder-Mead で boundary-noise 最小化方向に探索 (subsample 256 px, 60-80 評価, 1 秒未満)
+- 中心ボタンクリック → 即時プレビュー / 1.5 秒 debounce 自動プレビュー / Apply で元画像を量子化済みに差し替え
+- ホイールズーム + 中ボタンドラッグでプレビューをパン
+
+### Polar Preprocess — `/api/preprocess-polar/{detect,warp}`
+
+回転機の断面画像から、中心 / 内径 / 外径 / セクタ角 / 周期 N を自動検出し、極座標 warp を出力。
+
+- 自動検出パイプライン (Stage 1–4): 前景マスク + 形状分類 → ヒストグラム精密化 + Hough 補正 → エアギャップ dip 検出 → 360-pt DFT で N-fold 周期検出 (grayscale + RGB のデュアル) + Jacobsen 補間
+- インターラクティブ編集: SVG オーバーレイ上の中心 / 内径 / 外径 / θ ハンドルをマウスドラッグ、数値 input は同期、ホイール ±step (Shift = ±10×)、矢印キーで中心を ±1 px ナッジ
+- **Air-gap candidate dropdown** — 多重ギャップ構造 (mid-yoke 補助エアギャップ等) で上位スコアが物理エアギャップでない場合、トップ N 候補から手動選択
+- **Color grouping** — カラーチップに dropdown (None / A / B / C / D)、Recompute で grouped 周期検出 (3 相 UVW グループ化 → 8-fold 対称性のような色ベースの幾何対称を検出)
+- Hybrid preview: 1.5 秒 debounce 自動 warp + Apply Transform 即時実行 + 黄色 dirty バッジ + 160×160 サムネ
+- **Save & Insert** — Section 6 ラジオで polar / cartesian を選択
+  - polar: `coordinate_system: polar` + `polar_domain: { r_start, r_end, theta_range, r_orientation }` + `image_path` = warp 出力ファイル
+  - cartesian: `coordinate_system: cartesian` + `image_path` = 元画像 (`mesh.dx/dy` のデフォルトを補完)
+
+### 既知の制約
+
+- 大画像 (4MP 超) で warp は 1–2 秒 / 回。Polar Preprocess Modal の右上にヒント表示
+- 矩形 stator は Hough が rotor 内縁を捕捉、 r_inner は手動補正前提
+- Auto-tune は完全に AA に支配された JPEG 系画像 (EEEEpaper outerSPMSM 等) では完璧ではなく、Bilateral σ-spatial を上げる余地あり
+
 ## ダウンロード
 
 ### プリビルドバイナリ（推奨）
