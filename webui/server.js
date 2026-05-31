@@ -1816,6 +1816,7 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
             nr, ntheta, r_orientation = 'horizontal',
             output_filename,
             r_outer_physical = 1.0,
+            preview = false,
         } = req.body || {};
 
         // Minimum input validation; the UI is the primary guardrail.
@@ -1838,12 +1839,23 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
             theta_start, theta_end, nr, ntheta, r_orientation,
         });
 
-        const outName = await chooseOutputFilename(uploadsDir, filename, output_filename);
+        // Preview mode (default for the modal's live preview) writes to a
+        // deterministic filename that gets overwritten on every request,
+        // so debounced slider edits don't pile up files. The frontend can
+        // clean it up explicitly via /api/preprocess-polar/cleanup-preview.
+        let outName;
+        if (preview) {
+            const stem = filename.replace(/\.[^.]+$/, '');
+            outName = `${stem}.__warp_preview__.png`;
+        } else {
+            outName = await chooseOutputFilename(uploadsDir, filename, output_filename);
+        }
         const outPath = path.join(uploadsDir, outName);
         await warped.writeAsync(outPath);
 
-        // Best-effort: enforce per-user image cap if helper exists.
-        if (typeof enforceImageLimit === 'function') {
+        // Best-effort: enforce per-user image cap only for permanent saves;
+        // the preview file is overwritten so it doesn't contribute to the cap.
+        if (!preview && typeof enforceImageLimit === 'function') {
             try { await enforceImageLimit(userId); } catch { /* ignore */ }
         }
 
@@ -1856,6 +1868,7 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
             success: true,
             filename: outName,
             path: `/uploads/${userId}/${outName}`,
+            preview: !!preview,
             output_width: warped.bitmap.width,
             output_height: warped.bitmap.height,
             polar_domain: {
@@ -1865,6 +1878,35 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
                 theta_range: Number((theta_end - theta_start).toFixed(6)),
             },
         });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Clean up the deterministic preview file. Called from the polar modal's
+// close path so we don't leave stale `__warp_preview__.png` files behind
+// for sources the user has stopped working on.
+app.post('/api/preprocess-polar/cleanup-preview', async (req, res) => {
+    try {
+        const { userId = 'default', filename } = req.body || {};
+        if (!filename) {
+            return res.json({ success: true, deleted: false });
+        }
+        const uploadsDir = getUserUploadsDir(userId);
+        const stem = filename.replace(/\.[^.]+$/, '');
+        const previewName = `${stem}.__warp_preview__.png`;
+        const previewPath = path.join(uploadsDir, previewName);
+        try {
+            await fs.unlink(previewPath);
+            res.json({ success: true, deleted: true, filename: previewName });
+        } catch (e) {
+            // Missing file is fine; surface other errors only.
+            if (e && e.code === 'ENOENT') {
+                res.json({ success: true, deleted: false });
+            } else {
+                res.status(500).json({ success: false, error: e.message });
+            }
+        }
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }

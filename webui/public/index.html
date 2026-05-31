@@ -1729,7 +1729,10 @@
                 <div style="flex:1"></div>
                 <button class="btn-secondary" onclick="closePolarPreprocessModal()">Cancel</button>
                 <button class="btn-secondary" onclick="applyPolarTransform()">Apply Transform</button>
-                <button class="btn-primary" onclick="savePolarAndInsert()">Save &amp; Insert YAML</button>
+                <button class="btn-secondary" id="polarSaveImageBtn" onclick="savePolarImage()"
+                        title="Commits the current preview as a permanent file in your uploads. Does not touch the YAML editor.">Save image</button>
+                <button class="btn-primary" id="polarInsertYamlBtn" onclick="insertPolarYaml()"
+                        title="Writes coordinate_system / polar_domain / image_path into the YAML editor. Uses the most recently saved image when available; otherwise the source.">Insert YAML</button>
             </div>
         </div>
     </div>

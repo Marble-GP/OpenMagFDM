@@ -1460,6 +1460,7 @@ AppState.polarPreprocess = {
         save_as: 'polar',
     },
     lastPreview: { filename: null, path: null, polar_domain: null, width: 0, height: 0 },
+    lastSaved:   null,  // Set by Save image; { filename, path, polar_domain, width, height }
     isDirty: false,
     isWarping: false,
     isDetecting: false,
@@ -1580,6 +1581,7 @@ function resetPolarPreprocessState() {
         save_as: 'polar',
     });
     pp.lastPreview = { filename: null, path: null, polar_domain: null, width: 0, height: 0 };
+    pp.lastSaved = null;
     pp.isDirty = false;
     pp.isWarping = false;
     pp.isDetecting = false;
@@ -1697,17 +1699,41 @@ async function checkInputImageNoise(filename) {
 }
 
 function closePolarPreprocessModal(saved = false) {
-    if (!saved && AppState.polarPreprocess.isDirty && AppState.polarPreprocess.lastPreview.filename) {
+    const pp = AppState.polarPreprocess;
+    // The "dirty" guard now means "user has been editing geometry but
+    // hasn't saved a permanent warp file" -- the preview file is
+    // disposable. We keep the confirmation only when there's actually
+    // unsaved geometry work (isDirty AND we never produced a saved
+    // image). After Save image the user can close freely.
+    if (!saved && pp.isDirty && !(pp.lastSaved && pp.lastSaved.filename)) {
         if (!confirm('There are unsaved changes. Close anyway?')) return;
     }
-    const pp = AppState.polarPreprocess;
     if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }
     document.getElementById('polarPreprocessModal').style.display = 'none';
     // Release image src so we don't keep the bitmap in memory
     const img = document.getElementById('polarSourceImg');
     if (img) img.src = '';
+    const warpImg = document.getElementById('polarWarpImg');
+    if (warpImg) warpImg.src = '';
     const svg = document.getElementById('polarOverlay');
     if (svg) svg.innerHTML = '';
+    // Best-effort cleanup of the deterministic warp preview file (named
+    // from the source filename, e.g. motor.__warp_preview__.png). Fire-
+    // and-forget; failure (permissions, race with another session) is
+    // non-fatal because the file is overwritten on every future open
+    // and `enforceImageLimit` will eventually evict it anyway.
+    if (pp.sourceFilename) {
+        fetch('/api/preprocess-polar/cleanup-preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, filename: pp.sourceFilename }),
+        }).catch(() => {});
+    }
+    // Reset the lastSaved / lastPreview tracking so the next open starts
+    // clean. (resetPolarPreprocessState() will also do this when the
+    // modal reopens.)
+    pp.lastPreview = { filename: null, path: null, polar_domain: null, width: 0, height: 0 };
+    pp.lastSaved   = null;
 }
 
 function setPolarLoading(on, msg) {
@@ -2033,6 +2059,10 @@ async function triggerPolarPreviewWarp() {
                 ntheta:           cur.ntheta,
                 r_orientation:    cur.r_orientation,
                 r_outer_physical: cur.r_outer_physical,
+                // Always overwrite the deterministic preview file -- the
+                // user gets a permanent file only when they press
+                // "Save image".
+                preview: true,
             }),
         }).then(r => r.json());
         if (!res.success) throw new Error(res.error || 'warp failed');
@@ -2481,39 +2511,95 @@ function applyPolarTransform() {
     triggerPolarPreviewWarp();
 }
 
-// Save & Insert.
-//   save_as === 'polar'     -> warp the source (if dirty), then
-//                              coordinate_system: polar +
-//                              polar_domain block + image_path =
-//                              warped filename. Drops mesh.
-//   save_as === 'cartesian' -> the polar geometry is informational
-//                              only; image_path stays on the source
-//                              and we install coordinate_system:
-//                              cartesian with a default mesh block
-//                              (only if none already present).
-async function savePolarAndInsert() {
+// "Save image" -- polar mode only. Triggers a fresh warp with preview=false
+// so the backend writes a permanent unique filename (e.g. motor_polar.png,
+// motor_polar_1.png, ...). The cartesian case has nothing to save here --
+// the source file already exists in /uploads -- so we show a hint instead.
+async function savePolarImage() {
     const pp = AppState.polarPreprocess;
     const cur = pp.current;
     if (!pp.sourceFilename) {
         showStatus('solverStatus', 'No source image loaded', 'error');
         return;
     }
-    if (cur.save_as === 'polar') {
-        // Make sure the warped file matches the current settings.
-        if (pp.isDirty || !pp.lastPreview.filename) {
-            await triggerPolarPreviewWarp();
-        }
-        if (!pp.lastPreview.filename) {
-            showStatus('solverStatus', 'Polar warp not available; cannot save as polar', 'error');
-            return;
-        }
+    if (cur.save_as === 'cartesian') {
+        showStatus('solverStatus',
+            'Cartesian save target: nothing to save here (the source image already exists in /uploads).',
+            'info');
+        return;
+    }
+    if (!(cur.r_outer_px > cur.r_inner_px)) {
+        showStatus('solverStatus', 'r_outer must be greater than r_inner', 'error');
+        return;
+    }
+    const btn = document.getElementById('polarSaveImageBtn');
+    if (btn) btn.disabled = true;
+    setPolarWarpLoading(true);
+    try {
+        const res = await fetch('/api/preprocess-polar/warp', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId:           AppState.userId,
+                filename:         pp.sourceFilename,
+                center_x:         cur.center_x,
+                center_y:         cur.center_y,
+                r_start_px:       cur.r_inner_px,
+                r_end_px:         cur.r_outer_px,
+                theta_start:      cur.theta_start,
+                theta_end:        cur.theta_end,
+                nr:               cur.nr,
+                ntheta:           cur.ntheta,
+                r_orientation:    cur.r_orientation,
+                r_outer_physical: cur.r_outer_physical,
+                preview: false,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'save failed');
+        // Track the saved image separately from the live preview. Insert
+        // YAML will reference this one if present.
+        pp.lastSaved = {
+            filename:     res.filename,
+            path:         res.path,
+            polar_domain: res.polar_domain,
+            width:        res.output_width,
+            height:       res.output_height,
+        };
+        await refreshImageList();
+        // Surface the new file in the image dropdown selection.
+        const sel = document.getElementById('imageSelect');
+        if (sel) sel.value = res.filename;
+        AppState.uploadedImageFilename = res.filename;
+        try { loadSelectedImage(); } catch { /* best effort */ }
+        showStatus('solverStatus',
+            `Saved warped image: ${res.filename} (${res.output_width} × ${res.output_height} px). ` +
+            `Press "Insert YAML" to add the polar_domain block to the editor.`,
+            'success');
+    } catch (err) {
+        showStatus('solverStatus', `Save image failed: ${err.message}`, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+        setPolarWarpLoading(false);
+    }
+}
+
+// "Insert YAML" -- writes coordinate_system + polar_domain + image_path
+// (polar mode) or coordinate_system + image_path + mesh (cartesian) into
+// the YAML editor. Independent from "Save image"; the polar branch
+// prefers the most recently saved image, falling back to the preview
+// filename and warning the user that they're referring to a transient
+// preview file.
+async function insertPolarYaml() {
+    const pp = AppState.polarPreprocess;
+    const cur = pp.current;
+    if (!pp.sourceFilename) {
+        showStatus('solverStatus', 'No source image loaded', 'error');
+        return;
     }
     if (!AppState.aceEditor) {
         showStatus('solverStatus', 'YAML editor not available', 'error');
         return;
     }
-    // Edit the YAML in-memory; jsyaml.dump round-trips nicely for the
-    // small documents we touch here.
     let doc;
     try {
         doc = jsyaml.load(AppState.aceEditor.getValue()) || {};
@@ -2522,36 +2608,57 @@ async function savePolarAndInsert() {
         doc = {};
     }
     let targetFilename;
+    let polarDomain;
     let toastMsg;
+    let toastKind = 'success';
     if (cur.save_as === 'polar') {
+        // Prefer the permanently saved image; fall back to the live
+        // preview file (and warn) so the user can iterate quickly.
+        let usingPreview = false;
+        if (pp.lastSaved && pp.lastSaved.filename) {
+            targetFilename = pp.lastSaved.filename;
+            polarDomain    = pp.lastSaved.polar_domain;
+        } else if (pp.lastPreview && pp.lastPreview.filename) {
+            targetFilename = pp.lastPreview.filename;
+            polarDomain    = pp.lastPreview.polar_domain;
+            usingPreview = true;
+        } else {
+            showStatus('solverStatus',
+                'No polar warp available. Press "Apply Transform" or "Save image" first.',
+                'error');
+            return;
+        }
         doc.coordinate_system = 'polar';
-        doc.polar_domain = pp.lastPreview.polar_domain;
-        doc.image_path   = pp.lastPreview.filename;
+        doc.polar_domain = polarDomain;
+        doc.image_path   = targetFilename;
         delete doc.mesh;
-        targetFilename = pp.lastPreview.filename;
-        toastMsg = `polar_domain inserted; image set to ${targetFilename}. ` +
-                   `Tip: re-run Detect Colors on the warped image.`;
+        toastMsg = usingPreview
+            ? `YAML updated to reference preview file ${targetFilename}. ` +
+              `This is a transient file and is removed when the modal closes -- press "Save image" to keep it.`
+            : `YAML updated: polar_domain + image_path = ${targetFilename}. ` +
+              `Tip: re-run Detect Colors on the warped image.`;
+        if (usingPreview) toastKind = 'info';
     } else {
         doc.coordinate_system = 'cartesian';
         delete doc.polar_domain;
         doc.image_path = pp.sourceFilename;
         if (!doc.mesh) doc.mesh = { dx: 0.2e-3, dy: 0.2e-3 };
         targetFilename = pp.sourceFilename;
-        toastMsg = `cartesian kept; image stays on ${targetFilename}. ` +
+        toastMsg = `YAML updated: coordinate_system: cartesian, image_path = ${targetFilename}. ` +
                    `Verify mesh.dx / mesh.dy in the editor.`;
     }
     AppState.aceEditor.setValue(jsyaml.dump(doc, { indent: 2, lineWidth: -1 }), -1);
-
-    // Reflect the new active image in the image list and the input panel.
-    await refreshImageList();
-    const sel = document.getElementById('imageSelect');
-    if (sel) sel.value = targetFilename;
-    AppState.uploadedImageFilename = targetFilename;
-    try { loadSelectedImage(); } catch { /* best effort */ }
-
-    closePolarPreprocessModal(true);
     if (typeof switchTab === 'function') switchTab('config');
-    showStatus('solverStatus', toastMsg, 'success');
+    showStatus('solverStatus', toastMsg, toastKind);
+}
+
+// Legacy entry point preserved so anything still calling
+// savePolarAndInsert() does the closest thing: save image (if polar)
+// then insert YAML. The footer no longer wires this.
+async function savePolarAndInsert() {
+    const pp = AppState.polarPreprocess;
+    if (pp.current.save_as === 'polar') await savePolarImage();
+    await insertPolarYaml();
 }
 
 async function deleteConfig() {
