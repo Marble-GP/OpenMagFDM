@@ -1316,10 +1316,12 @@ async function runAutoTune() {
     status.textContent = 'Optimising (this may take a few seconds)…';
 
     // Start the search from the user's current slider values so they can
-    // pre-seed the optimiser. The backend clamps to its own bounds.
+    // pre-seed the optimiser. N and rareThreshold are held fixed by the
+    // backend (they define "what counts as a material" -- a user
+    // decision -- so optimising them tends to drive the output toward
+    // the dominant background colour).
     const cur = currentQuantizeParams();
     const seed = [
-        cur.rareThreshold,
         cur.minTargetDist,
         cur.despeckleRadius,
         cur.bilateralSigmaSpatial,
@@ -1333,16 +1335,16 @@ async function runAutoTune() {
             body: JSON.stringify({
                 userId: AppState.userId,
                 filename: qf.sourceFilename,
-                nTargets: cur.nTargets,
-                maxEvals: 60,
+                nTargets:      cur.nTargets,
+                rareThreshold: cur.rareThreshold,
+                maxEvals:      60,
                 subsampleSize: 256,
-                initial: seed,
+                initial:       seed,
             }),
         }).then(r => r.json());
         if (!res.success) throw new Error(res.error || 'auto-tune failed');
 
         const p = res.params;
-        setQuantizeSlider('qfilterThreshold', 'qfilterThresholdRange', (p.rareThreshold * 100).toFixed(2));
         setQuantizeSlider('qfilterMinDist',   'qfilterMinDistRange',   Math.round(p.minTargetDist));
         setQuantizeSlider('qfilterDespeckle', 'qfilterDespeckleRange', p.despeckleRadius);
         setQuantizeSlider('qfilterBilSpace',  'qfilterBilSpaceRange',  p.bilateralSigmaSpatial.toFixed(1));

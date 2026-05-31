@@ -1926,10 +1926,11 @@ function boundaryNoiseScore(idxMap, W, H, K) {
 }
 
 // Single evaluation of the quantize pipeline on a small RGBA buffer.
-// `params` = [rareThreshold, minTargetDist, despeckleRadius, bilateralSigmaSpatial, bilateralSigmaColor].
-// `N` is the fixed target count from the user.
-function evaluateQuantizeParams(srcData, W, H, params, N) {
-    const [rare, mtd, dspF, bfs, bfc] = params;
+// `params` = [minTargetDist, despeckleRadius, bilateralSigmaSpatial, bilateralSigmaColor].
+// `N` and `rare` are held fixed by the caller -- both define which colours
+// count as "materials" and so are user-controlled.
+function evaluateQuantizeParams(srcData, W, H, params, N, rare) {
+    const [mtd, dspF, bfs, bfc] = params;
     const dsp = Math.max(0, Math.min(10, Math.round(dspF)));
     const mtd2 = mtd * mtd;
 
@@ -2122,35 +2123,43 @@ app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
         const H = small.bitmap.height;
         const srcData = small.bitmap.data;
 
+        // N and rareThreshold are user-controlled "what counts as a
+        // material" decisions, not noise-suppression knobs, so the
+        // optimiser leaves them alone. If the user hasn't supplied a
+        // rare value we fall back to the same default the manual flow
+        // ships with.
+        const rare = Number.isFinite(Number(req.body && req.body.rareThreshold))
+            ? Math.max(0, Math.min(1, Number(req.body.rareThreshold)))
+            : 0.005;
+
         const bounds = [
-            [0.0001, 0.05],   // rareThreshold (0.01..5%)
-            [1,      80],     // minTargetDist
-            [0,      5],      // despeckleRadius
-            [0,      5],      // bilateralSigmaSpatial
-            [5,      60],     // bilateralSigmaColor
+            [1,  80],     // minTargetDist
+            [0,  5],      // despeckleRadius
+            [0,  5],      // bilateralSigmaSpatial
+            [5,  60],     // bilateralSigmaColor
         ];
-        const defaults = [0.005, 10, 1, 0, 20];
-        const x0 = Array.isArray(initial) && initial.length === 5
+        const defaults = [10, 1, 0, 20];
+        const x0 = Array.isArray(initial) && initial.length === 4
             ? initial.map((v, i) => Math.max(bounds[i][0], Math.min(bounds[i][1], Number(v))))
             : defaults;
 
-        const fn = (p) => evaluateQuantizeParams(srcData, W, H, p, N);
+        const fn = (p) => evaluateQuantizeParams(srcData, W, H, p, N, rare);
         const t0 = Date.now();
         const initialScore = fn(x0);
         const result = nelderMead(fn, x0, bounds, Math.max(20, Math.min(200, Math.floor(maxEvals))));
         const elapsedMs = Date.now() - t0;
 
-        const [rt, mtd, dspF, bfs, bfc] = result.best;
+        const [mtd, dspF, bfs, bfc] = result.best;
         res.json({
             success: true,
             params: {
-                rareThreshold:         Number(rt.toFixed(5)),
                 minTargetDist:         Number(mtd.toFixed(2)),
                 despeckleRadius:       Math.max(0, Math.min(10, Math.round(dspF))),
                 bilateralSigmaSpatial: Number(bfs.toFixed(2)),
                 bilateralSigmaColor:   Number(bfc.toFixed(1)),
             },
             n_targets:        N,
+            rare_threshold:   rare,
             score_initial:    Number(initialScore.toFixed(6)),
             score_final:      Number(result.bestScore.toFixed(6)),
             evals:            result.evals,
