@@ -759,10 +759,42 @@
             align-items: center;
             justify-content: center;
             outline: none;
+            overflow: hidden;
         }
         .polar-preview-container:focus {
             box-shadow: inset 0 0 0 2px #667eea;
         }
+        /* The zoom stage holds the image + overlay; CSS transform is applied
+           here so wheel-zoom and middle-button-drag-pan don't disturb the
+           outer container, and the SVG getScreenCTM() inversion still gives
+           correct image-pixel coords for handle hit-tests. */
+        .zoom-stage {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transform-origin: 0 0;
+            transform: translate(0px, 0px) scale(1);
+            will-change: transform;
+        }
+        .zoom-indicator {
+            position: absolute;
+            bottom: 6px;
+            right: 8px;
+            background: rgba(0,0,0,0.5);
+            color: #fff;
+            font-size: 0.75rem;
+            padding: 2px 7px;
+            border-radius: 10px;
+            font-family: monospace;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.25s;
+        }
+        .zoom-indicator.visible { opacity: 1; }
+        .panning { cursor: grabbing !important; }
         #polarSourceImg {
             max-width: 100%;
             max-height: 100%;
@@ -1336,9 +1368,13 @@
             <div class="modal-body" style="display: flex; flex: 1; overflow: hidden; padding: 0;">
                 <!-- LEFT: image + SVG overlay -->
                 <div class="polar-preview-pane">
-                    <div class="polar-preview-container" id="polarPreviewContainer" tabindex="0">
-                        <img id="polarSourceImg" draggable="false" alt="source" />
-                        <svg id="polarOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+                    <div class="polar-preview-container" id="polarPreviewContainer" tabindex="0"
+                         title="Wheel: zoom around cursor · Middle-button drag: pan · Double-click: reset">
+                        <div class="zoom-stage" id="polarZoomStage">
+                            <img id="polarSourceImg" draggable="false" alt="source" />
+                            <svg id="polarOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+                        </div>
+                        <div class="zoom-indicator" id="polarZoomIndicator">100%</div>
                         <div id="polarPreviewLoading" class="polar-loading-overlay">Detecting…</div>
                     </div>
                 </div>

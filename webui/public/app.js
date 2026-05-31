@@ -1142,6 +1142,96 @@ AppState.polarPreprocess = {
     _rafScheduled: false,
 };
 
+// ============================================================
+// Reusable zoom + pan helper (used by the Polar Preprocess preview and the
+// uniform-colour Filter preview). Wheel zooms around the cursor, middle
+// mouse drag pans, double-click resets. SVG overlays still get correct
+// image-pixel coords through getScreenCTM().inverse() because CSS
+// transforms are reflected in the SVG CTM, so handle hit-tests don't need
+// any adjustment when zoomed.
+function attachZoomPan(containerEl, stageEl, opts = {}) {
+    if (!containerEl || !stageEl) return null;
+    if (containerEl._zoomPan) return containerEl._zoomPan;
+    const indicatorEl = opts.indicatorEl || null;
+    const minScale = opts.minScale ?? 0.25;
+    const maxScale = opts.maxScale ?? 16;
+    const zoomFactor = opts.zoomFactor ?? 1.15;
+    const state = { scale: 1, tx: 0, ty: 0, panning: false, panStart: null };
+    let indicatorTimer = null;
+
+    function apply() {
+        stageEl.style.transform =
+            `translate(${state.tx}px, ${state.ty}px) scale(${state.scale})`;
+        if (indicatorEl) {
+            indicatorEl.textContent = Math.round(state.scale * 100) + '%';
+            indicatorEl.classList.add('visible');
+            clearTimeout(indicatorTimer);
+            indicatorTimer = setTimeout(
+                () => indicatorEl.classList.remove('visible'), 1200);
+        }
+    }
+    function reset() {
+        state.scale = 1; state.tx = 0; state.ty = 0;
+        apply();
+    }
+    function onWheel(e) {
+        e.preventDefault();
+        const rect = containerEl.getBoundingClientRect();
+        const dx = e.clientX - rect.left;
+        const dy = e.clientY - rect.top;
+        // Cursor position in stage-local coords (pre-transform).
+        const wx = (dx - state.tx) / state.scale;
+        const wy = (dy - state.ty) / state.scale;
+        const f = e.deltaY < 0 ? zoomFactor : 1 / zoomFactor;
+        const next = Math.max(minScale, Math.min(maxScale, state.scale * f));
+        if (next === state.scale) return;
+        state.scale = next;
+        // Keep the cursor over the same stage point.
+        state.tx = dx - wx * state.scale;
+        state.ty = dy - wy * state.scale;
+        apply();
+    }
+    function onMouseDown(e) {
+        if (e.button !== 1) return;  // middle button only
+        e.preventDefault();
+        state.panning = true;
+        state.panStart = { x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
+        containerEl.classList.add('panning');
+    }
+    function onMouseMove(e) {
+        if (!state.panning) return;
+        state.tx = state.panStart.tx + (e.clientX - state.panStart.x);
+        state.ty = state.panStart.ty + (e.clientY - state.panStart.y);
+        apply();
+    }
+    function onMouseUp(e) {
+        if (!state.panning) return;
+        if (e.button === 1 || e.button === undefined) {
+            state.panning = false;
+            containerEl.classList.remove('panning');
+        }
+    }
+    function onAuxClick(e) {
+        // Prevent the browser's middle-click "auto-scroll" handler kicking in.
+        if (e.button === 1) e.preventDefault();
+    }
+    function onDblClick(e) {
+        // Only reset on background dbl-click; let handles handle their own.
+        if (e.target.closest('.handle')) return;
+        reset();
+    }
+    containerEl.addEventListener('wheel', onWheel, { passive: false });
+    containerEl.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    containerEl.addEventListener('auxclick', onAuxClick);
+    containerEl.addEventListener('dblclick', onDblClick);
+    apply();
+    const api = { reset, get scale() { return state.scale; } };
+    containerEl._zoomPan = api;
+    return api;
+}
+
 function resetPolarPreprocessState() {
     const pp = AppState.polarPreprocess;
     pp.sourceFilename = null;
@@ -1185,6 +1275,15 @@ async function openPolarPreprocessModal() {
     // Show modal first so user sees instant feedback
     modal.style.display = 'flex';
     setPolarLoading(true, 'Loading image…');
+
+    // Wire up wheel-zoom / middle-drag-pan / dbl-click-reset on the preview
+    // (idempotent: attachZoomPan returns the existing handle if already set).
+    const zp = attachZoomPan(
+        document.getElementById('polarPreviewContainer'),
+        document.getElementById('polarZoomStage'),
+        { indicatorEl: document.getElementById('polarZoomIndicator') }
+    );
+    if (zp) zp.reset();
 
     try {
         await loadPolarSourceImage();
