@@ -576,6 +576,16 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
         const RARE_THRESHOLD  = parseFloat(req.query.rareThreshold  ?? '0.05'); // coverage ratio
         const BLEND_TOLERANCE = parseFloat(req.query.blendTolerance  ?? '8');   // per-channel [0-255]
         const MIN_COLOR_DIST  = parseFloat(req.query.minColorDist    ?? '30');  // Euclidean distance
+        // Anti-aliasing blends are mixtures of *material* colours, not of other
+        // AA fragments. Restricting the candidate base set to colours whose
+        // coverage is >= this fraction turns the rare-colour AA check from
+        // O(N^3) -- N filter passes through the full sorted list, each scanning
+        // an O(N) candidate window pair-wise -- into O(N * K^2) where K is the
+        // number of plausible material colours (typically 5-30 on a CAD image
+        // even when the image has tens of thousands of unique RGB values from
+        // anti-aliasing). On a 1197x896 outer-SPMSM screenshot this cuts the
+        // endpoint runtime from ~3.5 min to <1 sec.
+        const BLEND_BASE_MIN_RATIO = parseFloat(req.query.blendBaseMinRatio ?? '0.001');
 
         // Returns t∈[0,1] if C ≈ t·A + (1-t)·B, otherwise null.
         function isLinearBlend(C, A, B) {
@@ -647,26 +657,47 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
         const antialiasBaseIdx = new Set(); // indices into dominant[]
         const aaBlends = [];               // detected blend records
 
+        // Pre-restrict candidate AA bases to colours whose coverage is at
+        // least BLEND_BASE_MIN_RATIO (sorted desc by ratio). On a CAD image
+        // with ~40k unique RGB values from antialiasing this is typically
+        // 5-30 entries; only these can plausibly be "material" colours, so
+        // restricting blends to mixtures of them is both faster *and* more
+        // physically meaningful than considering every higher-coverage
+        // fragment.
+        const blendBases = sorted.filter(c => c.ratio >= BLEND_BASE_MIN_RATIO);
+        // O(1) lookup into dominant[] keyed by "r,g,b" so we don't run a
+        // linear findIndex per matched blend.
+        const dominantIdxByKey = new Map();
+        for (let i = 0; i < dominant.length; i++) {
+            const [dr, dg, db] = dominant[i].rgb;
+            dominantIdxByKey.set(`${dr},${dg},${db}`, i);
+        }
+
         const rareUnique = [];  // rare colors that are NOT AA blends → treated as materials
+        let aaNoiseCount = 0;    // singletons that don't blend-match; reported as a count only
         for (const rareColor of rare) {
             let found = false;
-            // Find all colors with higher coverage than this rare color
-            const higherCoverage = sorted.filter(c => c.ratio > rareColor.ratio);
-            for (let i = 0; i < higherCoverage.length && !found; i++) {
-                for (let j = i + 1; j < higherCoverage.length && !found; j++) {
-                    const t = isLinearBlend(rareColor.rgb, higherCoverage[i].rgb, higherCoverage[j].rgb);
+            // blendBases is sorted desc, so once a base's ratio drops to <=
+            // rareColor.ratio we can stop scanning -- everything after it
+            // has equal-or-lower coverage and isn't a valid base.
+            for (let i = 0; i < blendBases.length && !found; i++) {
+                if (blendBases[i].ratio <= rareColor.ratio) break;
+                for (let j = i + 1; j < blendBases.length && !found; j++) {
+                    if (blendBases[j].ratio <= rareColor.ratio) break;
+                    const t = isLinearBlend(rareColor.rgb, blendBases[i].rgb, blendBases[j].rgb);
                     if (t !== null) {
-                        // Record base indices in dominant[] for antialias:true flag
-                        const idxA = dominant.findIndex(d => d.rgb[0] === higherCoverage[i].rgb[0] && d.rgb[1] === higherCoverage[i].rgb[1] && d.rgb[2] === higherCoverage[i].rgb[2]);
-                        const idxB = dominant.findIndex(d => d.rgb[0] === higherCoverage[j].rgb[0] && d.rgb[1] === higherCoverage[j].rgb[1] && d.rgb[2] === higherCoverage[j].rgb[2]);
-                        if (idxA >= 0) antialiasBaseIdx.add(idxA);
-                        if (idxB >= 0) antialiasBaseIdx.add(idxB);
+                        const [ar, ag, ab] = blendBases[i].rgb;
+                        const [br, bg, bb] = blendBases[j].rgb;
+                        const idxA = dominantIdxByKey.get(`${ar},${ag},${ab}`);
+                        const idxB = dominantIdxByKey.get(`${br},${bg},${bb}`);
+                        if (idxA != null) antialiasBaseIdx.add(idxA);
+                        if (idxB != null) antialiasBaseIdx.add(idxB);
                         aaBlends.push({
                             rgb:   rareColor.rgb,
                             count: rareColor.count,
                             ratio: rareColor.ratio,
-                            baseA: higherCoverage[i].rgb,
-                            baseB: higherCoverage[j].rgb,
+                            baseA: blendBases[i].rgb,
+                            baseB: blendBases[j].rgb,
                             t:     Math.round(t * 1000) / 1000
                         });
                         found = true;
@@ -674,9 +705,18 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
                 }
             }
             if (!found) {
-                // This rare color cannot be explained as an AA blend of two higher-coverage colors
-                // → it is a unique material color with small coverage
-                rareUnique.push(rareColor);
+                // A rare colour that doesn't blend-match any pair of
+                // material-class bases. We treat it as a real (minor)
+                // material only if its coverage is itself >= the
+                // material-class threshold; anything below that is AA
+                // noise / dithering artefacts and gets dropped silently
+                // (counted, not enumerated) so we don't inflate the
+                // materials list with thousands of sub-ppm RGBs.
+                if (rareColor.ratio >= BLEND_BASE_MIN_RATIO) {
+                    rareUnique.push(rareColor);
+                } else {
+                    aaNoiseCount++;
+                }
             }
         }
 
@@ -687,14 +727,16 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             b.toString(16).padStart(2, '0');
 
         const totalMaterials = dominant.length + rareUnique.length;
+        const aaTotal = aaBlends.length + aaNoiseCount;
         const lines = [
             `# Auto-generated from ${req.file.originalname}`,
             `# ${totalMaterials} material color(s) detected` +
                 (rareUnique.length > 0
                     ? ` (${dominant.length} dominant + ${rareUnique.length} rare-unique)`
                     : '') +
-                (aaBlends.length > 0
-                    ? `, ${aaBlends.length} anti-aliasing blend(s) excluded`
+                (aaTotal > 0
+                    ? `, ${aaTotal} anti-aliasing blend(s) excluded`
+                      + (aaNoiseCount > 0 ? ` (${aaNoiseCount} singleton noise)` : '')
                     : ''),
             `# Fill in mu_r and jz for each material`,
             `coordinate_system: cartesian`,
@@ -719,9 +761,15 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${(ru.ratio * 100).toFixed(2)}%)`);
             lines.push(`    jz: 0.0`);
         }
+        // Cap the YAML AA-comment to the strongest blends so the template
+        // stays readable on antialiased CAD images (full count is in the
+        // header). Sort by coverage so the most visible blends come first.
+        const AA_YAML_MAX = 50;
         if (aaBlends.length > 0) {
-            lines.push(``, `# Anti-aliasing blends detected (excluded from materials):`);
-            for (const blend of aaBlends) {
+            const aaSortedDesc = aaBlends.slice().sort((a, b) => b.ratio - a.ratio);
+            const shown = aaSortedDesc.slice(0, AA_YAML_MAX);
+            lines.push(``, `# Anti-aliasing blends detected (excluded from materials, top ${shown.length}/${aaBlends.length}):`);
+            for (const blend of shown) {
                 const pct = (blend.ratio * 100).toFixed(2);
                 lines.push(`#   [${blend.rgb}]  ${pct}%  =  t=${blend.t} · [${blend.baseA}]  +  (1-t) · [${blend.baseB}]`);
             }
@@ -744,13 +792,24 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             }))
         ];
 
+        // Cap the wire payload: render-all-DOM-rows on the frontend hangs
+        // for many seconds when the list has tens of thousands of entries,
+        // and the frontend only displays the top-N anyway. Keep the totals
+        // in the response so the UI can show "+X more not shown" if it
+        // wants to.
+        const AA_RESPONSE_MAX = 200;
+        const aaForResponse = aaBlends.length > AA_RESPONSE_MAX
+            ? aaBlends.slice().sort((a, b) => b.ratio - a.ratio).slice(0, AA_RESPONSE_MAX)
+            : aaBlends;
+
         res.json({
-            success:      true,
-            colors:       allMaterialColors,
-            allColors:    sorted.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
-            aaBlends,
-            rareUnique:   rareUnique.map(({ rgb, count, ratio }) => ({ rgb, count, ratio })),
-            yamlTemplate: lines.join('\n')
+            success:        true,
+            colors:         allMaterialColors,
+            aaBlends:       aaForResponse,
+            aaBlendsTotal:  aaBlends.length + aaNoiseCount,
+            aaNoiseCount,
+            uniqueColors:   sorted.length,
+            yamlTemplate:   lines.join('\n')
         });
     } catch (error) {
         if (tmpPath) { try { await fs.unlink(tmpPath); } catch { /* ignore */ } }
