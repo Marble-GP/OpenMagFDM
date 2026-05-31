@@ -1412,8 +1412,8 @@
                         <h4>1. Auto-detect threshold</h4>
                         <div class="qfilter-slider-row">
                             <label for="qfilterThreshold">rare ≥</label>
-                            <input type="range" id="qfilterThresholdRange" min="0" max="50" step="1" value="5">
-                            <input type="number" id="qfilterThreshold" min="0" max="50" step="0.1" value="0.5"> %
+                            <input type="range" id="qfilterThresholdRange" min="0" max="5" step="0.01" value="0.5">
+                            <input type="number" id="qfilterThreshold" min="0" max="5" step="0.01" value="0.5"> %
                         </div>
                         <div style="font-size: 0.78rem; color: #6c757d;">
                             Only colors with coverage above this threshold will be considered for filtering (= "material candidates").
@@ -1428,7 +1428,7 @@
                         </div>
                         <div class="qfilter-slider-row">
                             <label for="qfilterMinDist">Minimum Color Distance</label>
-                            <input type="range" id="qfilterMinDistRange" min="0" max="100" step="5" value="30">
+                            <input type="range" id="qfilterMinDistRange" min="0" max="100" step="1" value="30">
                             <input type="number" id="qfilterMinDist" min="0" max="100" step="1" value="30">
                         </div>
                         <div style="font-size: 0.78rem; color: #6c757d;">
