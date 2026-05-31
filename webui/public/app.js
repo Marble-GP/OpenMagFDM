@@ -1948,8 +1948,88 @@ function renderPolarColorChips() {
 //   - attachPolarKeyboard(): arrow keys on the focused preview
 //     container nudge the centre by +/-1 px (Shift = +/-10).
 
+// markPolarDirty: every state edit feeds through here. The yellow
+// "unupdated" badge surfaces immediately so the user knows the on-
+// screen overlay no longer matches the last warped preview; a 1.5 s
+// debounce then auto-fires a fresh warp. The user can also press
+// "Apply Transform" to skip the wait.
 function markPolarDirty() {
-    AppState.polarPreprocess.isDirty = true;
+    const pp = AppState.polarPreprocess;
+    pp.isDirty = true;
+    const badge = document.getElementById('polarDirtyBadge');
+    if (badge) badge.classList.add('active');
+    if (pp._debounceTimer) clearTimeout(pp._debounceTimer);
+    pp._debounceTimer = setTimeout(triggerPolarPreviewWarp, 1500);
+}
+
+async function triggerPolarPreviewWarp() {
+    const pp = AppState.polarPreprocess;
+    if (pp.isWarping || !pp.sourceFilename) return;
+    const cur = pp.current;
+    if (!(cur.r_outer_px > cur.r_inner_px)) {
+        // Geometry is invalid; leave the badge on and skip the warp.
+        return;
+    }
+    pp.isWarping = true;
+    try {
+        const res = await fetch('/api/preprocess-polar/warp', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId:           AppState.userId,
+                filename:         pp.sourceFilename,
+                center_x:         cur.center_x,
+                center_y:         cur.center_y,
+                r_start_px:       cur.r_inner_px,
+                r_end_px:         cur.r_outer_px,
+                theta_start:      cur.theta_start,
+                theta_end:        cur.theta_end,
+                nr:               cur.nr,
+                ntheta:           cur.ntheta,
+                r_orientation:    cur.r_orientation,
+                r_outer_physical: cur.r_outer_physical,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'warp failed');
+        pp.lastPreview = {
+            filename:     res.filename,
+            path:         res.path,
+            polar_domain: res.polar_domain,
+            width:        res.output_width,
+            height:       res.output_height,
+        };
+        pp.isDirty = false;
+        const badge = document.getElementById('polarDirtyBadge');
+        if (badge) badge.classList.remove('active');
+        renderPolarPreviewThumb(res.path);
+    } catch (err) {
+        showStatus('solverStatus', `Polar warp failed: ${err.message}`, 'error');
+    } finally {
+        pp.isWarping = false;
+    }
+}
+
+function renderPolarPreviewThumb(path) {
+    const canvas = document.getElementById('polarPreviewThumb');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const img = new Image();
+    img.onload = () => {
+        const w = canvas.width;
+        const h = canvas.height;
+        ctx.fillStyle = '#222';
+        ctx.fillRect(0, 0, w, h);
+        const ratio = Math.min(w / img.naturalWidth, h / img.naturalHeight);
+        const dw = img.naturalWidth * ratio;
+        const dh = img.naturalHeight * ratio;
+        ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    };
+    img.onerror = () => {
+        ctx.fillStyle = '#222'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#888'; ctx.font = '12px sans-serif';
+        ctx.fillText('preview unavailable', 8, 80);
+    };
+    img.src = `${path}?t=${Date.now()}`;
 }
 
 // Dip-candidate dropdown (Phase 5d.2). Backend returns
@@ -2276,10 +2356,82 @@ async function recomputeWithGroupedColors() {
     }
 }
 function applyPolarTransform() {
-    showStatus('solverStatus', 'Apply Transform: not yet implemented (Phase 5e)', 'error');
+    const pp = AppState.polarPreprocess;
+    if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }
+    triggerPolarPreviewWarp();
 }
-function savePolarAndInsert() {
-    showStatus('solverStatus', 'Save & Insert: not yet implemented (Phase 5e)', 'error');
+
+// Save & Insert.
+//   save_as === 'polar'     -> warp the source (if dirty), then
+//                              coordinate_system: polar +
+//                              polar_domain block + image_path =
+//                              warped filename. Drops mesh.
+//   save_as === 'cartesian' -> the polar geometry is informational
+//                              only; image_path stays on the source
+//                              and we install coordinate_system:
+//                              cartesian with a default mesh block
+//                              (only if none already present).
+async function savePolarAndInsert() {
+    const pp = AppState.polarPreprocess;
+    const cur = pp.current;
+    if (!pp.sourceFilename) {
+        showStatus('solverStatus', 'No source image loaded', 'error');
+        return;
+    }
+    if (cur.save_as === 'polar') {
+        // Make sure the warped file matches the current settings.
+        if (pp.isDirty || !pp.lastPreview.filename) {
+            await triggerPolarPreviewWarp();
+        }
+        if (!pp.lastPreview.filename) {
+            showStatus('solverStatus', 'Polar warp not available; cannot save as polar', 'error');
+            return;
+        }
+    }
+    if (!AppState.aceEditor) {
+        showStatus('solverStatus', 'YAML editor not available', 'error');
+        return;
+    }
+    // Edit the YAML in-memory; jsyaml.dump round-trips nicely for the
+    // small documents we touch here.
+    let doc;
+    try {
+        doc = jsyaml.load(AppState.aceEditor.getValue()) || {};
+        if (typeof doc !== 'object') doc = {};
+    } catch (e) {
+        doc = {};
+    }
+    let targetFilename;
+    let toastMsg;
+    if (cur.save_as === 'polar') {
+        doc.coordinate_system = 'polar';
+        doc.polar_domain = pp.lastPreview.polar_domain;
+        doc.image_path   = pp.lastPreview.filename;
+        delete doc.mesh;
+        targetFilename = pp.lastPreview.filename;
+        toastMsg = `polar_domain inserted; image set to ${targetFilename}. ` +
+                   `Tip: re-run Detect Colors on the warped image.`;
+    } else {
+        doc.coordinate_system = 'cartesian';
+        delete doc.polar_domain;
+        doc.image_path = pp.sourceFilename;
+        if (!doc.mesh) doc.mesh = { dx: 0.2e-3, dy: 0.2e-3 };
+        targetFilename = pp.sourceFilename;
+        toastMsg = `cartesian kept; image stays on ${targetFilename}. ` +
+                   `Verify mesh.dx / mesh.dy in the editor.`;
+    }
+    AppState.aceEditor.setValue(jsyaml.dump(doc, { indent: 2, lineWidth: -1 }), -1);
+
+    // Reflect the new active image in the image list and the input panel.
+    await refreshImageList();
+    const sel = document.getElementById('imageSelect');
+    if (sel) sel.value = targetFilename;
+    AppState.uploadedImageFilename = targetFilename;
+    try { loadSelectedImage(); } catch { /* best effort */ }
+
+    closePolarPreprocessModal(true);
+    if (typeof switchTab === 'function') switchTab('config');
+    showStatus('solverStatus', toastMsg, 'success');
 }
 
 async function deleteConfig() {
