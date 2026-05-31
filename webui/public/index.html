@@ -1434,6 +1434,14 @@
                         <div style="font-size: 0.78rem; color: #6c757d;">
                             The threshold for merging nearby colors (e.g., <code>[255,255,255]</code> and <code>[254,254,254]</code>) into a single color.
                         </div>
+                        <div class="qfilter-slider-row" style="margin-top: 8px;">
+                            <label for="qfilterDespeckle">Despeckle radius</label>
+                            <input type="range" id="qfilterDespeckleRange" min="0" max="3" step="1" value="1">
+                            <input type="number" id="qfilterDespeckle" min="0" max="3" step="1" value="1">
+                        </div>
+                        <div style="font-size: 0.78rem; color: #6c757d;">
+                            Spatial despeckle pass after quantization. 0 = off, 1 = 3×3 majority (two passes, default), 2 = 5×5, 3 = 7×7. Removes isolated pixels whose snapped target colour is not present in the neighbourhood (e.g. a dark phase colour spuriously appearing in grey AA region).
+                        </div>
                     </div>
                     <div class="qfilter-section">
                         <h4>3. Number of Applied Fill Colors <span id="qfilterTargetCount" style="font-weight: normal; color: #6c757d;"></span></h4>

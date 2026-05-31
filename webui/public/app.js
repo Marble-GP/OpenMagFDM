@@ -1142,6 +1142,7 @@ function bindQuantizeFilterControls() {
         ['qfilterThresholdRange', 'qfilterThreshold'],
         ['qfilterNRange',         'qfilterN'],
         ['qfilterMinDistRange',   'qfilterMinDist'],
+        ['qfilterDespeckleRange', 'qfilterDespeckle'],
     ];
     for (const [rangeId, numId] of pairs) {
         const r = document.getElementById(rangeId);
@@ -1186,6 +1187,7 @@ async function runQuantizePreview() {
                 rareThreshold: params.rareThreshold,
                 nTargets: params.nTargets,
                 minTargetDist: params.minTargetDist,
+                despeckleRadius: params.despeckleRadius,
                 preview: true,
             }),
         }).then(r => r.json());
@@ -1210,9 +1212,10 @@ async function runQuantizePreview() {
 
 function currentQuantizeParams() {
     return {
-        rareThreshold: Math.max(0, Number(document.getElementById('qfilterThreshold').value || 0)) / 100,
-        nTargets:      Math.max(1, Number(document.getElementById('qfilterN').value || 8)),
-        minTargetDist: Math.max(0, Number(document.getElementById('qfilterMinDist').value || 30)),
+        rareThreshold:   Math.max(0, Number(document.getElementById('qfilterThreshold').value || 0)) / 100,
+        nTargets:        Math.max(1, Number(document.getElementById('qfilterN').value || 8)),
+        minTargetDist:   Math.max(0, Number(document.getElementById('qfilterMinDist').value || 30)),
+        despeckleRadius: Math.max(0, Math.min(3, Math.floor(Number(document.getElementById('qfilterDespeckle').value || 1)))),
     };
 }
 
@@ -1251,6 +1254,7 @@ async function applyQuantizeFilter() {
                 rareThreshold: params.rareThreshold,
                 nTargets: params.nTargets,
                 minTargetDist: params.minTargetDist,
+                despeckleRadius: params.despeckleRadius,
                 preview: false,
             }),
         }).then(r => r.json());

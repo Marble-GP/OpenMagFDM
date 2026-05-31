@@ -1821,6 +1821,7 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
             rareThreshold = 0.005,
             nTargets = 8,
             minTargetDist = 30,
+            despeckleRadius = 1,
             preview = false,
             output_filename,
         } = req.body || {};
@@ -1832,6 +1833,7 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
         const RT = Math.max(0, Math.min(1, Number(rareThreshold)));
         const MTD = Math.max(0, Number(minTargetDist));     // RGB Euclidean
         const MTD2 = MTD * MTD;
+        const DSP = Math.max(0, Math.min(3, Math.floor(despeckleRadius)));
 
         const uploadsDir = getUserUploadsDir(userId);
         const srcPath = path.join(uploadsDir, filename);
@@ -1904,8 +1906,11 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
         const out = src.clone();
         const data = out.bitmap.data;
         const len = W * H * 4;
-        for (let i = 0; i < len; i += 4) {
-            if (data[i + 3] === 0) continue;
+        // Track each pixel's palette index so we can run a fast majority
+        // filter on the result. 0xFF marks "skipped" (fully transparent).
+        const idxMap = new Uint8Array(W * H);
+        for (let i = 0, p = 0; i < len; i += 4, p++) {
+            if (data[i + 3] === 0) { idxMap[p] = 0xFF; continue; }
             const r = data[i], g = data[i + 1], b = data[i + 2];
             let bestD = Infinity, bestI = 0;
             for (let k = 0; k < K; k++) {
@@ -1913,9 +1918,61 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
                 const d = dr * dr + dg * dg + db * db;
                 if (d < bestD) { bestD = d; bestI = k; }
             }
+            idxMap[p] = bestI;
             data[i]     = tR[bestI];
             data[i + 1] = tG[bestI];
             data[i + 2] = tB[bestI];
+        }
+
+        // Despeckle pass: a per-pixel majority filter over the palette
+        // indices. Suppresses "salt-and-pepper" misclassifications -- e.g.
+        // a JPEG-noised grey AA pixel whose RGB happens to land closer to
+        // a dark phase colour than to grey/white, but whose neighbours are
+        // all grey/white. The pixel is replaced only when the majority
+        // colour outvotes the pixel's own colour by > 1.5x (counting the
+        // pixel itself), so genuine thin features survive. Two passes are
+        // cheap and let radius-1 also clean up 2-3 pixel clusters.
+        if (DSP > 0) {
+            const ws = 2 * DSP + 1;        // window side
+            const counts = new Int32Array(K);
+            const passes = (DSP === 1) ? 2 : 1;
+            for (let pass = 0; pass < passes; pass++) {
+                const src2 = new Uint8Array(idxMap);
+                for (let y = 0; y < H; y++) {
+                    const y0 = Math.max(0, y - DSP);
+                    const y1 = Math.min(H - 1, y + DSP);
+                    for (let x = 0; x < W; x++) {
+                        const p = y * W + x;
+                        const my = src2[p];
+                        if (my === 0xFF) continue;
+                        const x0 = Math.max(0, x - DSP);
+                        const x1 = Math.min(W - 1, x + DSP);
+                        counts.fill(0);
+                        for (let yy = y0; yy <= y1; yy++) {
+                            const row = yy * W;
+                            for (let xx = x0; xx <= x1; xx++) {
+                                const v = src2[row + xx];
+                                if (v !== 0xFF) counts[v]++;
+                            }
+                        }
+                        const myCount = counts[my];
+                        let bestK = my, bestC = myCount;
+                        for (let k = 0; k < K; k++) {
+                            if (counts[k] > bestC) { bestC = counts[k]; bestK = k; }
+                        }
+                        // Replace only when the alternative is a strict
+                        // majority over the pixel's own colour -- keeps
+                        // true edges intact.
+                        if (bestK !== my && bestC > myCount * 1.5) {
+                            idxMap[p] = bestK;
+                            const i4 = p * 4;
+                            data[i4]     = tR[bestK];
+                            data[i4 + 1] = tG[bestK];
+                            data[i4 + 2] = tB[bestK];
+                        }
+                    }
+                }
+            }
         }
 
         // Filename: preview overwrites a deterministic file per source so we
