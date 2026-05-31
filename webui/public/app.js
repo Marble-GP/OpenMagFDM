@@ -1443,7 +1443,13 @@ AppState.polarPreprocess = {
     colorGroups: {},
     current: {
         center_x: 0, center_y: 0,
+        // r_inner_px is the *warp* inner radius. Defaults to 0 so the
+        // polar warp covers the entire machine; the detected air gap is
+        // tracked separately in air_gap_px and shown only as a yellow
+        // dashed visual marker (the user can copy it to r_inner via the
+        // dropdown button if they want to cut the inside off).
         r_inner_px: 0, r_outer_px: 0,
+        air_gap_px: 0,
         theta_start: 0, theta_end: 2 * Math.PI,
         is_sector: false,
         nr: 0, ntheta: 0,
@@ -1563,6 +1569,7 @@ function resetPolarPreprocessState() {
     Object.assign(pp.current, {
         center_x: 0, center_y: 0,
         r_inner_px: 0, r_outer_px: 0,
+        air_gap_px: 0,
         theta_start: 0, theta_end: 2 * Math.PI,
         is_sector: false,
         nr: 0, ntheta: 0,
@@ -1604,6 +1611,9 @@ async function openPolarPreprocessModal() {
         { indicatorEl: document.getElementById('polarZoomIndicator') }
     );
     if (zp) zp.reset();
+    // Reset the view to the Source tab on every open, since the warp
+    // output is regenerated for the freshly-loaded image.
+    switchPolarView('source');
     // Interactivity wiring (Phase 5d.1 / 5f). All idempotent.
     bindPolarInputs();
     attachPolarSvgDrag();
@@ -1636,6 +1646,10 @@ async function openPolarPreprocessModal() {
         syncPolarInputsFromState();
         renderPolarColorChips();
         renderPolarDipDropdown();
+        // Phase 5f.2: fire an initial warp so the "Warp output" tab has
+        // something to show without the user having to wait for the 1.5 s
+        // dirty debounce. Best-effort -- failures fall through silently.
+        triggerPolarPreviewWarp();
     } catch (err) {
         showStatus('solverStatus', `Polar detect failed: ${err.message}`, 'error');
         renderPolarStatusSummary(err.message);
@@ -1725,7 +1739,15 @@ function applyDetectionToCurrent(detection) {
     const cur = AppState.polarPreprocess.current;
     cur.center_x = detection.center_x;
     cur.center_y = detection.center_y;
-    cur.r_inner_px = detection.r_inner_px;
+    // Phase 5f.2: the backend's r_inner_px is the *air-gap dip* and that's
+    // a visual marker, not the start of the polar warp. Warping the whole
+    // machine means r_inner = 0; the rotor (or inner stator) is then
+    // preserved in the warp output. The user can still copy the air-gap
+    // marker into r_inner explicitly via the dip dropdown's "use as
+    // r_inner" button.
+    cur.r_inner_px = 0;
+    cur.air_gap_px = (detection.r_inner_px && detection.r_inner_px > 0)
+        ? detection.r_inner_px : 0;
     cur.r_outer_px = detection.r_outer_px;
     cur.theta_start = detection.theta_start;
     cur.theta_end = detection.theta_end;
@@ -1737,7 +1759,9 @@ function applyDetectionToCurrent(detection) {
     } else {
         cur.ntheta = Math.max(2, Math.round(2 * Math.PI * detection.r_outer_px));
     }
-    cur.nr = Math.max(2, detection.r_outer_px - detection.r_inner_px);
+    // nr covers the entire radial extent (r=0 to r_outer) since we no
+    // longer cut at the air gap.
+    cur.nr = Math.max(2, detection.r_outer_px);
 }
 
 function renderPolarStatusSummary(errMsg) {
@@ -1817,6 +1841,11 @@ function renderPolarOverlay() {
     }
     if (rOut > 0) {
         html += `<circle class="guide-outer" cx="${cx}" cy="${cy}" r="${rOut}"/>`;
+    }
+    // Air-gap visual marker (Phase 5f.2). Yellow dashed circle so the
+    // detected dip stays obvious without dictating the warp range.
+    if (cur.air_gap_px > 0 && cur.air_gap_px < rOut) {
+        html += `<circle class="guide-airgap" cx="${cx}" cy="${cy}" r="${cur.air_gap_px}"/>`;
     }
 
     // Sector boundary lines
@@ -1986,6 +2015,7 @@ async function triggerPolarPreviewWarp() {
         return;
     }
     pp.isWarping = true;
+    setPolarWarpLoading(true);
     try {
         const res = await fetch('/api/preprocess-polar/warp', {
             method: 'POST',
@@ -2021,30 +2051,77 @@ async function triggerPolarPreviewWarp() {
         showStatus('solverStatus', `Polar warp failed: ${err.message}`, 'error');
     } finally {
         pp.isWarping = false;
+        setPolarWarpLoading(false);
     }
 }
 
 function renderPolarPreviewThumb(path) {
     const canvas = document.getElementById('polarPreviewThumb');
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const img = new Image();
-    img.onload = () => {
-        const w = canvas.width;
-        const h = canvas.height;
-        ctx.fillStyle = '#222';
-        ctx.fillRect(0, 0, w, h);
-        const ratio = Math.min(w / img.naturalWidth, h / img.naturalHeight);
-        const dw = img.naturalWidth * ratio;
-        const dh = img.naturalHeight * ratio;
-        ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
-    };
-    img.onerror = () => {
-        ctx.fillStyle = '#222'; ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = '#888'; ctx.font = '12px sans-serif';
-        ctx.fillText('preview unavailable', 8, 80);
-    };
-    img.src = `${path}?t=${Date.now()}`;
+    if (canvas) {
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        img.onload = () => {
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.fillStyle = '#222';
+            ctx.fillRect(0, 0, w, h);
+            const ratio = Math.min(w / img.naturalWidth, h / img.naturalHeight);
+            const dw = img.naturalWidth * ratio;
+            const dh = img.naturalHeight * ratio;
+            ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+        };
+        img.onerror = () => {
+            ctx.fillStyle = '#222'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#888'; ctx.font = '12px sans-serif';
+            ctx.fillText('preview unavailable', 8, 80);
+        };
+        img.src = `${path}?t=${Date.now()}`;
+    }
+    // Phase 5f.2: the big <img> in the "Warp output" tab gets the same
+    // URL with a cache-busting query so the user sees the result of every
+    // warp at full size + zoom/pan.
+    const warpImg = document.getElementById('polarWarpImg');
+    if (warpImg) {
+        warpImg.src = `${path}?t=${Date.now()}`;
+    }
+    // Width x Height badge next to the tab.
+    const badge = document.getElementById('polarWarpDimsBadge');
+    const pp = AppState.polarPreprocess;
+    if (badge && pp.lastPreview && pp.lastPreview.width) {
+        badge.textContent = `${pp.lastPreview.width} × ${pp.lastPreview.height} px`;
+    }
+}
+
+// Tab switch in the preview pane. Each view has its own zoom/pan
+// instance so the source overlay stays at 100 % when the user is
+// inspecting the warp at 5x, and vice versa.
+function switchPolarView(mode) {
+    const srcWrap = document.getElementById('polarPreviewContainer');
+    const wrpWrap = document.getElementById('polarWarpContainer');
+    const srcTab  = document.getElementById('polarViewTabSource');
+    const wrpTab  = document.getElementById('polarViewTabWarp');
+    if (!srcWrap || !wrpWrap) return;
+    if (mode === 'warp') {
+        srcWrap.style.display = 'none';
+        wrpWrap.style.display = 'flex';
+        srcTab.classList.remove('polar-view-tab-active');
+        wrpTab.classList.add('polar-view-tab-active');
+        attachZoomPan(
+            wrpWrap,
+            document.getElementById('polarWarpZoomStage'),
+            { indicatorEl: document.getElementById('polarWarpZoomIndicator') }
+        );
+    } else {
+        wrpWrap.style.display = 'none';
+        srcWrap.style.display = 'flex';
+        srcTab.classList.add('polar-view-tab-active');
+        wrpTab.classList.remove('polar-view-tab-active');
+    }
+}
+
+function setPolarWarpLoading(on) {
+    const el = document.getElementById('polarWarpLoading');
+    if (el) el.classList.toggle('active', !!on);
 }
 
 // Dip-candidate dropdown (Phase 5d.2). Backend returns
@@ -2058,36 +2135,47 @@ function renderPolarDipDropdown() {
     if (!row || !sel) return;
     const det = AppState.polarPreprocess.detection;
     const list = (det && Array.isArray(det.dip_candidates)) ? det.dip_candidates : [];
-    if (list.length < 2) {
+    // Always show the row when there is at least one candidate so the
+    // marker can be turned off too.
+    if (list.length === 0) {
         row.style.display = 'none';
         sel.innerHTML = '';
         return;
     }
     row.style.display = 'flex';
-    sel.innerHTML = list.map((c, i) => {
-        const marker = (i === 0) ? '★' : ' ';
-        return `<option value="${c.r}">${marker} r=${c.r}  ratio=${c.ratio.toFixed(2)}  score=${c.score}</option>`;
-    }).join('');
-    // Reflect the current r_inner_px back into the selection so the user
-    // sees which candidate is active. If r_inner_px doesn't match any
-    // candidate (e.g. fallback / manual edit) the first option stays
-    // visually selected but the user can pick another.
+    const opts = ['<option value="0">— none (marker off) —</option>']
+        .concat(list.map((c, i) => {
+            const marker = (i === 0) ? '★' : ' ';
+            return `<option value="${c.r}">${marker} r=${c.r}  ratio=${c.ratio.toFixed(2)}  score=${c.score}</option>`;
+        }));
+    sel.innerHTML = opts.join('');
     const cur = AppState.polarPreprocess.current;
-    const match = list.findIndex(c => c.r === cur.r_inner_px);
-    if (match >= 0) sel.selectedIndex = match;
-    // (Re-)attach the change handler -- idempotent via the wrapper.
+    const match = list.findIndex(c => c.r === cur.air_gap_px);
+    sel.selectedIndex = (match >= 0) ? match + 1 : (cur.air_gap_px > 0 ? 1 : 0);
     if (!sel._ppBound) {
         sel.addEventListener('change', () => {
             const v = Number(sel.value);
-            if (Number.isFinite(v) && v > 0) {
-                AppState.polarPreprocess.current.r_inner_px = v;
-                renderPolarOverlay();
-                syncPolarInputsFromState();
-                markPolarDirty();
-            }
+            AppState.polarPreprocess.current.air_gap_px = Number.isFinite(v) && v > 0 ? v : 0;
+            renderPolarOverlay();
+            // No markPolarDirty -- air-gap marker is purely informational
+            // and doesn't affect the warp output.
         });
         sel._ppBound = true;
     }
+}
+
+// Copies the currently-selected air-gap marker into r_inner so the warp
+// excludes the inside region. Reverse direction from the new default
+// (full machine in the warp). The user can always reset r_inner to 0
+// by typing it in or by clicking the dip dropdown's "none" entry first.
+function useAirGapAsInner() {
+    const cur = AppState.polarPreprocess.current;
+    if (!(cur.air_gap_px > 0)) return;
+    cur.r_inner_px = cur.air_gap_px;
+    cur.nr = Math.max(2, cur.r_outer_px - cur.r_inner_px);
+    renderPolarOverlay();
+    syncPolarInputsFromState();
+    markPolarDirty();
 }
 
 function bindPolarInputs() {
