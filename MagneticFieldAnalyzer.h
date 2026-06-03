@@ -491,11 +491,35 @@ private:
     BoundaryCondition bc_inner, bc_outer;  // Polar (radial direction)
     BoundaryCondition bc_theta_min, bc_theta_max;  // Polar (angular direction)
 
+    // Phase B.2: a single sliding region. Multi-slide support is exposed
+    // through the `slides` vector on TransientConfig; for a single slide
+    // the loader fills both the vector and the legacy scalar fields from
+    // the same source so the polar transient code paths keep working
+    // unchanged while the cartesian image-domain slide loops over every
+    // entry in the vector.
+    struct SlideRegion {
+        std::string name = "slide";
+        std::string direction = "vertical";  // "vertical" | "horizontal"
+        int region_start = 0;
+        int region_end = 0;
+        int pixels_per_step = 0;
+    };
+
     // Transient analysis configuration
     struct TransientConfig {
         bool enabled;
         bool enable_sliding;          // Enable/disable image sliding
         int total_steps;
+
+        // Phase B.2: explicit list of sliding regions. The cartesian slide
+        // path iterates this vector, applying each region's shift
+        // independently to its [region_start, region_end] interval.
+        std::vector<SlideRegion> slides;
+
+        // Legacy single-slide fields. Populated from `slides[0]` (if any)
+        // during the loader pass and kept around because the polar
+        // permutation / Δb / Gaussian-smoothing code paths assume one
+        // sliding region. Polar multi-slide is left as a TODO for v1.6.
         std::string slide_direction;  // "vertical" or "horizontal"
         int slide_region_start;       // Pixel position (x for vertical, y for horizontal)
         int slide_region_end;         // Pixel position (x for vertical, y for horizontal)

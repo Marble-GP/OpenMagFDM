@@ -154,10 +154,50 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
             transient_config.enabled = trans["enabled"].as<bool>(false);
             transient_config.enable_sliding = trans["enable_sliding"].as<bool>(true);
             transient_config.total_steps = trans["total_steps"].as<int>(0);
-            transient_config.slide_direction = trans["slide_direction"].as<std::string>("vertical");
-            transient_config.slide_region_start = trans["slide_region_start"].as<int>(0);
-            transient_config.slide_region_end = trans["slide_region_end"].as<int>(0);
-            transient_config.slide_pixels_per_step = trans["slide_pixels_per_step"].as<int>(0);
+
+            // Phase B.2: prefer the explicit `transient.slides: [...]` list.
+            // Each entry is one independently-shifting region. When `slides`
+            // is omitted we fall back to the legacy single-slide keys and
+            // build a 1-element list, so old yamls keep working.
+            transient_config.slides.clear();
+            if (trans["slides"] && trans["slides"].IsSequence()) {
+                int idx = 0;
+                for (const auto& sn : trans["slides"]) {
+                    SlideRegion sr;
+                    sr.name = sn["name"].as<std::string>("slide_" + std::to_string(idx));
+                    sr.direction = sn["direction"].as<std::string>("vertical");
+                    sr.region_start = sn["region_start"].as<int>(0);
+                    sr.region_end = sn["region_end"].as<int>(0);
+                    sr.pixels_per_step = sn["pixels_per_step"].as<int>(0);
+                    transient_config.slides.push_back(sr);
+                    ++idx;
+                }
+            } else if (trans["slide_pixels_per_step"] || trans["slide_region_end"]
+                       || trans["slide_region_start"] || trans["slide_direction"]) {
+                SlideRegion sr;
+                sr.name = "slide";
+                sr.direction = trans["slide_direction"].as<std::string>("vertical");
+                sr.region_start = trans["slide_region_start"].as<int>(0);
+                sr.region_end = trans["slide_region_end"].as<int>(0);
+                sr.pixels_per_step = trans["slide_pixels_per_step"].as<int>(0);
+                transient_config.slides.push_back(sr);
+            }
+
+            // Mirror the FIRST slide into the legacy scalar fields so the
+            // polar transient code paths (which assume a single sliding
+            // region) keep referencing the same values they used to.
+            if (!transient_config.slides.empty()) {
+                const auto& s0 = transient_config.slides.front();
+                transient_config.slide_direction = s0.direction;
+                transient_config.slide_region_start = s0.region_start;
+                transient_config.slide_region_end = s0.region_end;
+                transient_config.slide_pixels_per_step = s0.pixels_per_step;
+            } else {
+                transient_config.slide_direction = trans["slide_direction"].as<std::string>("vertical");
+                transient_config.slide_region_start = trans["slide_region_start"].as<int>(0);
+                transient_config.slide_region_end = trans["slide_region_end"].as<int>(0);
+                transient_config.slide_pixels_per_step = trans["slide_pixels_per_step"].as<int>(0);
+            }
 
             // Optional output field selection (empty = export all)
             if (trans["export_fields"] && trans["export_fields"].IsSequence()) {
@@ -170,11 +210,21 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                 std::cout << "Transient analysis enabled: " << transient_config.total_steps << " steps" << std::endl;
                 std::cout << "  Sliding: " << (transient_config.enable_sliding ? "enabled" : "disabled") << std::endl;
                 if (transient_config.enable_sliding) {
-                    std::cout << "  Slide direction: " << transient_config.slide_direction << std::endl;
-                    std::string axis = (transient_config.slide_direction == "vertical") ? "x" : "y";
-                    std::cout << "  Slide region: " << axis << " in [" << transient_config.slide_region_start
-                              << ", " << transient_config.slide_region_end << "]" << std::endl;
-                    std::cout << "  Pixels per step: " << transient_config.slide_pixels_per_step << std::endl;
+                    std::cout << "  Slides: " << transient_config.slides.size() << " region(s)" << std::endl;
+                    for (const auto& s : transient_config.slides) {
+                        std::string axis = (s.direction == "vertical") ? "x" : "y";
+                        std::cout << "    [" << s.name << "] " << s.direction
+                                  << ", region " << axis << " in [" << s.region_start
+                                  << ", " << s.region_end << "], pixels/step=" << s.pixels_per_step << std::endl;
+                    }
+                    // coordinate_system member isn't set yet at this point
+                    // in the constructor; read the raw config so the warning
+                    // fires at load time when the user has a polar yaml.
+                    const std::string cs = config["coordinate_system"].as<std::string>("cartesian");
+                    if (cs == "polar" && transient_config.slides.size() > 1) {
+                        std::cout << "  WARNING: polar transient currently uses only slides[0]. "
+                                  << "Multi-slide polar is a v1.6 item." << std::endl;
+                    }
                 }
             }
         }
@@ -6501,96 +6551,75 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
         // Incremental update: slide cached boundaries + recompute border regions
         std::cout << "Boundaries: Incremental update (slide + border recompute)" << std::endl;
         boundaries = cached_boundaries.clone();
-        int shift = transient_config.slide_pixels_per_step;
 
-        if (transient_config.slide_direction == "vertical") {
-            // Vertical slide: shift rows (y direction)
-            int x_start = transient_config.slide_region_start;
-            int x_end = transient_config.slide_region_end;
+        cv::Mat gray;
+        cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
+        const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
 
-            // Slide the boundary detection results within the region
-            cv::Mat slide_region = boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)).clone();
-            cv::Mat shifted_region = cv::Mat::zeros(slide_region.size(), slide_region.type());
+        // Phase B.2: process every configured slide independently. Each
+        // region creates its own circular-shift seam at row/col=0 inside
+        // its own band; the seam recompute is therefore per-region too.
+        for (const auto& slide : transient_config.slides) {
+            const int shift = slide.pixels_per_step;
+            if (shift == 0) continue;
 
-            for (int row = 0; row < slide_region.rows; row++) {
-                int src_row = (row + slide_region.rows + shift) % slide_region.rows;
-                slide_region.row(src_row).copyTo(shifted_region.row(row));
-            }
+            if (slide.direction == "vertical") {
+                const int x_start = slide.region_start;
+                const int x_end   = slide.region_end;
 
-            shifted_region.copyTo(boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)));
+                // Slide the boundary detection results within the region
+                cv::Mat slide_region_mat = boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)).clone();
+                cv::Mat shifted_region = cv::Mat::zeros(slide_region_mat.size(), slide_region_mat.type());
 
-            // Recompute border region (±KERNEL_MARGIN around the circular shift seam)
-            // Circular shift creates ONE seam at row=0 where data wraps around
-            cv::Mat gray;
-            cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
+                for (int row = 0; row < slide_region_mat.rows; row++) {
+                    int src_row = (row + slide_region_mat.rows + shift) % slide_region_mat.rows;
+                    slide_region_mat.row(src_row).copyTo(shifted_region.row(row));
+                }
+                shifted_region.copyTo(boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)));
 
-            // std::cout << "[DEBUG] Recomputing seam at circular shift boundary (row=0)" << std::endl;
-            const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
-            int seam_row = 0;  // Circular shift seam is always at row=0
+                // Recompute border region around the seam at row=0
+                int seam_row = 0;
+                int y_min = std::max(0, seam_row + shift - KERNEL_MARGIN);
+                int y_max = std::min(boundaries.rows, seam_row + shift + KERNEL_MARGIN + 1);
 
-            // Recompute region around the seam with margin for kernel
-            int y_min = std::max(0, seam_row + shift - KERNEL_MARGIN);
-            int y_max = std::min(boundaries.rows, seam_row + shift + KERNEL_MARGIN + 1);
+                if (y_max > y_min) {
+                    cv::Rect roi(x_start, y_min, x_end - x_start, y_max - y_min);
+                    cv::Mat gray_roi = gray(roi);
+                    cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
+                    applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
+                    cv::convertScaleAbs(laplacian_s16, laplacian_abs);
+                    cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
+                    boundaries_roi.copyTo(boundaries(roi));
+                }
+            } else {  // horizontal
+                const int y_start = slide.region_start;
+                const int y_end   = slide.region_end;
 
-            if (y_max > y_min) {
-                cv::Rect roi(x_start, y_min, x_end - x_start, y_max - y_min);
-                cv::Mat gray_roi = gray(roi);
-                cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
+                cv::Mat slide_region_mat = boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)).clone();
+                cv::Mat shifted_region = cv::Mat::zeros(slide_region_mat.size(), slide_region_mat.type());
 
-                // Note: ROI processing doesn't fully respect periodic BC at ROI boundaries
-                // For full accuracy, consider recomputing the entire image
-                applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
-                cv::convertScaleAbs(laplacian_s16, laplacian_abs);
-                cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
+                for (int col = 0; col < slide_region_mat.cols; col++) {
+                    int src_col = (col + slide_region_mat.cols + shift) % slide_region_mat.cols;
+                    slide_region_mat.col(src_col).copyTo(shifted_region.col(col));
+                }
+                shifted_region.copyTo(boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)));
 
-                boundaries_roi.copyTo(boundaries(roi));
-                // std::cout << "[DEBUG] Seam recomputed: y_range=[" << y_min << ", " << y_max << ")" << std::endl;
-            }
-        } else {  // horizontal
-            // Horizontal slide: shift columns (x direction)
-            int y_start = transient_config.slide_region_start;
-            int y_end = transient_config.slide_region_end;
+                int seam_col = 0;
+                int x_min = std::max(0, seam_col + shift - KERNEL_MARGIN);
+                int x_max = std::min(boundaries.cols, seam_col + shift + KERNEL_MARGIN + 1);
 
-            // Slide the boundary detection results within the region
-            cv::Mat slide_region = boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)).clone();
-            cv::Mat shifted_region = cv::Mat::zeros(slide_region.size(), slide_region.type());
-
-            for (int col = 0; col < slide_region.cols; col++) {
-                int src_col = (col + slide_region.cols + shift) % slide_region.cols;
-                slide_region.col(src_col).copyTo(shifted_region.col(col));
-            }
-
-            shifted_region.copyTo(boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)));
-
-            // Recompute border region (±KERNEL_MARGIN around the circular shift seam)
-            // Circular shift creates ONE seam at col=0 where data wraps around
-            cv::Mat gray;
-            cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
-
-            // std::cout << "[DEBUG] Recomputing seam at circular shift boundary (col=0)" << std::endl;
-            const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
-            int seam_col = 0;  // Circular shift seam is always at col=0
-
-            // Recompute region around the seam with margin for kernel
-            int x_min = std::max(0, seam_col + shift - KERNEL_MARGIN);
-            int x_max = std::min(boundaries.cols, seam_col + shift + KERNEL_MARGIN + 1);
-
-            if (x_max > x_min) {
-                cv::Rect roi(x_min, y_start, x_max - x_min, y_end - y_start);
-                cv::Mat gray_roi = gray(roi);
-                cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
-
-                // Note: ROI processing doesn't fully respect periodic BC at ROI boundaries
-                applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
-                cv::convertScaleAbs(laplacian_s16, laplacian_abs);
-                cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
-
-                boundaries_roi.copyTo(boundaries(roi));
-                // std::cout << "[DEBUG] Seam recomputed: x_range=[" << x_min << ", " << x_max << ")" << std::endl;
+                if (x_max > x_min) {
+                    cv::Rect roi(x_min, y_start, x_max - x_min, y_end - y_start);
+                    cv::Mat gray_roi = gray(roi);
+                    cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
+                    applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
+                    cv::convertScaleAbs(laplacian_s16, laplacian_abs);
+                    cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
+                    boundaries_roi.copyTo(boundaries(roi));
+                }
             }
         }
 
-        // std::cout << "[DEBUG] Incremental boundary detection complete" << std::endl;
         // Update cache
         cached_boundaries = boundaries.clone();
     }
@@ -11537,54 +11566,44 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
 }
 
 void MagneticFieldAnalyzer::slideImageRegion() {
-    int shift = transient_config.slide_pixels_per_step;
+    // Phase B.2: every configured sliding region is applied
+    // independently per step. Disjoint [region_start, region_end] intervals
+    // on the SAME axis act as separate rotors with their own velocities;
+    // overlapping intervals are undefined and surface as a warning here.
+    if (transient_config.slides.empty()) return;
 
-    if (transient_config.slide_direction == "vertical") {
-        // vertical: slide_region_start <= x <= slide_region_end (column range)
-        // slides in y direction (rows)
-        int x_start = transient_config.slide_region_start;
-        int x_end = transient_config.slide_region_end;
+    for (std::size_t si = 0; si < transient_config.slides.size(); ++si) {
+        const auto& slide = transient_config.slides[si];
+        const int shift = slide.pixels_per_step;
+        if (shift == 0) continue;
 
-        // Validate region
-        if (x_start < 0 || x_end > image.cols || x_start >= x_end) {
-            throw std::runtime_error("Invalid slide region for vertical sliding (x range out of bounds)");
-        }
-
-        // For each column in the x range, circularly shift all rows
-        for (int col = x_start; col < x_end; col++) {
-            // Extract the column
-            cv::Mat column = image.col(col).clone();
-
-            // Circular shift in y direction (upward in FDM coordinates = positive y)
-            // In image coordinates: content moves toward smaller row numbers (top of image)
-            // In FDM coordinates (y-flipped): this corresponds to positive y direction
-            for (int row = 0; row < image.rows; row++) {
-                int src_row = (row + image.rows + shift) % image.rows;
-                image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+        if (slide.direction == "vertical") {
+            // vertical: region_start <= x <= region_end (column range), slides in y
+            const int x_start = slide.region_start;
+            const int x_end   = slide.region_end;
+            if (x_start < 0 || x_end > image.cols || x_start >= x_end) {
+                throw std::runtime_error("Invalid slide region for vertical sliding (x range out of bounds) in slide '" + slide.name + "'");
             }
-        }
-
-    } else {  // horizontal
-        // horizontal: slide_region_start <= y <= slide_region_end (row range)
-        // slides in x direction (columns)
-        int y_start = transient_config.slide_region_start;
-        int y_end = transient_config.slide_region_end;
-
-        // Validate region
-        if (y_start < 0 || y_end > image.rows || y_start >= y_end) {
-            throw std::runtime_error("Invalid slide region for horizontal sliding (y range out of bounds)");
-        }
-
-        // For each row in the y range, circularly shift all columns
-        for (int row = y_start; row < y_end; row++) {
-            // Extract the row
-            cv::Mat row_data = image.row(row).clone();
-
-            // Circular shift in x direction (rightward = positive x in physics coordinates)
-            // Positive shift moves content to the RIGHT (positive x direction)
-            for (int col = 0; col < image.cols; col++) {
-                int src_col = (col - shift + image.cols) % image.cols;
-                image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+            for (int col = x_start; col < x_end; col++) {
+                cv::Mat column = image.col(col).clone();
+                for (int row = 0; row < image.rows; row++) {
+                    int src_row = (row + image.rows + shift) % image.rows;
+                    image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+                }
+            }
+        } else {  // horizontal
+            // horizontal: region_start <= y <= region_end (row range), slides in x
+            const int y_start = slide.region_start;
+            const int y_end   = slide.region_end;
+            if (y_start < 0 || y_end > image.rows || y_start >= y_end) {
+                throw std::runtime_error("Invalid slide region for horizontal sliding (y range out of bounds) in slide '" + slide.name + "'");
+            }
+            for (int row = y_start; row < y_end; row++) {
+                cv::Mat row_data = image.row(row).clone();
+                for (int col = 0; col < image.cols; col++) {
+                    int src_col = (col - shift + image.cols) % image.cols;
+                    image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+                }
             }
         }
     }
