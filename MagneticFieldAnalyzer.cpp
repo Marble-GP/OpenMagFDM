@@ -1841,6 +1841,22 @@ void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
         return;  // No flux linkage paths defined
     }
 
+    // Phase B.3: build a material-name -> RGB key lookup from the
+    // materials section so material_a / material_b can be resolved
+    // up-front. The RGB key matches the encoding used by rgb_to_material
+    // and the image-pixel scan loop below: (R<<16)|(G<<8)|B.
+    std::map<std::string, int> name_to_rgb_key;
+    if (config["materials"]) {
+        for (const auto& mat : config["materials"]) {
+            const std::string mat_name = mat.first.as<std::string>();
+            YAML::Node props = mat.second;
+            if (!props["rgb"]) continue;
+            auto rgb = props["rgb"].as<std::vector<int>>();
+            if (rgb.size() < 3) continue;
+            name_to_rgb_key[mat_name] = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+        }
+    }
+
     std::cout << "Parsing flux linkage paths..." << std::endl;
 
     for (const auto& path_node : config["flux_linkage"]) {
@@ -1852,30 +1868,64 @@ void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
         }
         path.name = path_node["name"].as<std::string>();
 
-        if (!path_node["start"] || !path_node["end"]) {
-            std::cerr << "Warning: flux_linkage '" << path.name << "' missing start/end, skipping" << std::endl;
+        // Material variant: prefer material_a / material_b when present.
+        const bool has_material = path_node["material_a"] && path_node["material_b"];
+        const bool has_path = path_node["start"] && path_node["end"];
+
+        if (has_material) {
+            path.use_material = true;
+            path.material_a = path_node["material_a"].as<std::string>();
+            path.material_b = path_node["material_b"].as<std::string>();
+            auto it_a = name_to_rgb_key.find(path.material_a);
+            auto it_b = name_to_rgb_key.find(path.material_b);
+            if (it_a == name_to_rgb_key.end()) {
+                std::cerr << "Warning: flux_linkage '" << path.name
+                          << "' references unknown material_a '" << path.material_a
+                          << "', skipping" << std::endl;
+                continue;
+            }
+            if (it_b == name_to_rgb_key.end()) {
+                std::cerr << "Warning: flux_linkage '" << path.name
+                          << "' references unknown material_b '" << path.material_b
+                          << "', skipping" << std::endl;
+                continue;
+            }
+            path.rgb_key_a = it_a->second;
+            path.rgb_key_b = it_b->second;
+            if (coordinate_system == "polar") {
+                std::cerr << "Warning: flux_linkage '" << path.name
+                          << "' uses material_a/material_b but coordinate_system=polar; "
+                             "the material variant currently only supports cartesian. "
+                             "Falling back to writing zero flux for this entry." << std::endl;
+            }
+            std::cout << "  Flux linkage [material] '" << path.name
+                      << "': mean(Az over " << path.material_a
+                      << ") - mean(Az over " << path.material_b << ")" << std::endl;
+        } else if (has_path) {
+            auto start = path_node["start"].as<std::vector<double>>();
+            auto end = path_node["end"].as<std::vector<double>>();
+            if (start.size() < 2 || end.size() < 2) {
+                std::cerr << "Warning: flux_linkage '" << path.name
+                          << "' invalid start/end format, skipping" << std::endl;
+                continue;
+            }
+            path.use_material = false;
+            path.x_start = start[0];
+            path.y_start = start[1];
+            path.x_end = end[0];
+            path.y_end = end[1];
+            std::cout << "  Flux linkage [path] '" << path.name << "': ("
+                      << path.x_start << ", " << path.y_start << ") -> ("
+                      << path.x_end << ", " << path.y_end << ")" << std::endl;
+        } else {
+            std::cerr << "Warning: flux_linkage '" << path.name
+                      << "' missing both {start, end} and {material_a, material_b}, skipping"
+                      << std::endl;
             continue;
         }
-
-        auto start = path_node["start"].as<std::vector<double>>();
-        auto end = path_node["end"].as<std::vector<double>>();
-
-        if (start.size() < 2 || end.size() < 2) {
-            std::cerr << "Warning: flux_linkage '" << path.name << "' invalid start/end format, skipping" << std::endl;
-            continue;
-        }
-
-        path.x_start = start[0];
-        path.y_start = start[1];
-        path.x_end = end[0];
-        path.y_end = end[1];
 
         flux_linkage_paths.push_back(path);
-        flux_linkage_results[path.name] = std::vector<double>();  // Initialize empty results
-
-        std::cout << "  Flux linkage path '" << path.name << "': ("
-                  << path.x_start << ", " << path.y_start << ") -> ("
-                  << path.x_end << ", " << path.y_end << ")" << std::endl;
+        flux_linkage_results[path.name] = std::vector<double>();
     }
 
     std::cout << "Loaded " << flux_linkage_paths.size() << " flux linkage path(s)" << std::endl;
@@ -1921,13 +1971,45 @@ double MagneticFieldAnalyzer::interpolateAz(double x_phys, double y_phys) const 
 }
 
 double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) const {
-    // Flux linkage Φ = Az(end) - Az(start) [Wb/m]
-    // In 2D analysis, this gives flux per unit depth
+    // Path variant (existing): Φ = Az(end) - Az(start) [Wb/m].
+    if (!path.use_material) {
+        double Az_start = interpolateAz(path.x_start, path.y_start);
+        double Az_end   = interpolateAz(path.x_end,   path.y_end);
+        return Az_end - Az_start;
+    }
 
-    double Az_start = interpolateAz(path.x_start, path.y_start);
-    double Az_end = interpolateAz(path.x_end, path.y_end);
-
-    return Az_end - Az_start;
+    // Material-pair variant (Phase B.3):
+    //   Φ = (1/|A|) Σ_{p ∈ A} Az(p)  -  (1/|B|) Σ_{p ∈ B} Az(p)
+    // where A and B are the sets of grid cells whose RGB matches the
+    // resolved keys. Useful for thick coil legs where a single point
+    // sample misses the bulk; the per-pixel average of Az across the
+    // conductor cross-section is the right physical quantity.
+    if (coordinate_system == "polar") {
+        // The image-pixel <-> grid-cell map for polar is non-trivial
+        // (warpPolar resamples r/θ); skip for now and report zero so
+        // the CSV column still exists.
+        return 0.0;
+    }
+    double sum_a = 0.0, sum_b = 0.0;
+    long  cnt_a = 0,  cnt_b = 0;
+    const int rows = image.rows;
+    const int cols = image.cols;
+    // image stores BGR Y-down. mu_map / Az use the Y-up convention after
+    // the vertical flip in setupMaterialProperties, so we read image at
+    // (rows-1-j, i) to recover the RGB at the grid cell (j, i).
+    for (int j = 0; j < ny && j < rows; ++j) {
+        for (int i = 0; i < nx && i < cols; ++i) {
+            const cv::Vec3b& px = image.at<cv::Vec3b>(rows - 1 - j, i);
+            const int key = (static_cast<int>(px[2]) << 16)
+                          | (static_cast<int>(px[1]) << 8)
+                          |  static_cast<int>(px[0]);
+            if (key == path.rgb_key_a) { sum_a += Az(j, i); ++cnt_a; }
+            else if (key == path.rgb_key_b) { sum_b += Az(j, i); ++cnt_b; }
+        }
+    }
+    const double mean_a = (cnt_a > 0) ? (sum_a / static_cast<double>(cnt_a)) : 0.0;
+    const double mean_b = (cnt_b > 0) ? (sum_b / static_cast<double>(cnt_b)) : 0.0;
+    return mean_a - mean_b;
 }
 
 void MagneticFieldAnalyzer::calculateAllFluxLinkages(int step) {

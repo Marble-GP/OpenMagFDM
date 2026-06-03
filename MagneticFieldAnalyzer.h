@@ -440,11 +440,25 @@ private:
     cv::Mat boundary_image;  // Cached boundary detection visualization
     double system_total_energy;  // Total magnetic energy of the entire system [J/m]
 
-    // Flux linkage calculation path
+    // Flux linkage calculation path. Two variants, distinguished by
+    // `use_material`:
+    //   - use_material == false (default): the existing point-to-point
+    //     path. Φ = Az(end) - Az(start) with bilinear interpolation at
+    //     the two physical coordinates.
+    //   - use_material == true (Phase B.3, v1.5): pixel-region variant
+    //     for thick coils. Φ = mean(Az over material A pixels) -
+    //     mean(Az over material B pixels). The material name -> RGB key
+    //     is resolved at parse time so the per-step computation is just
+    //     an image scan.
     struct FluxLinkagePath {
-        std::string name;           // Path identifier (e.g., "coil_A")
-        double x_start, y_start;    // Start point [m] (physical coordinates)
-        double x_end, y_end;        // End point [m] (physical coordinates)
+        std::string name;           // Path identifier (e.g., "phase_U")
+        bool use_material = false;
+        // Path variant
+        double x_start = 0.0, y_start = 0.0;
+        double x_end   = 0.0, y_end   = 0.0;
+        // Material variant
+        std::string material_a, material_b;
+        int rgb_key_a = -1, rgb_key_b = -1;  // (R<<16)|(G<<8)|B, -1 = unresolved
     };
 
     // Flux linkage calculation

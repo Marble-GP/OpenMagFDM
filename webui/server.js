@@ -4324,6 +4324,59 @@ app.get('/api/load-field', async (req, res) => {
     }
 });
 
+// Phase B.3: flux-linkage time series. The solver writes one row per
+// transient step into `<result>/FluxLinkage/flux_linkage.csv` with a
+// "step,<name1>,<name2>,..." header (one column per flux_linkage entry,
+// whether path or material-pair). Returns { steps: [...], series: { name:
+// [values] } } so a Plotly trace can be drawn straight from the response.
+app.get('/api/get-flux-linkage', async (req, res) => {
+    try {
+        const resultPath = req.query.result;
+        if (!resultPath) {
+            return res.json({ success: false, error: 'Missing result parameter' });
+        }
+        const csvPath = path.join(BASE_DIR, resultPath, 'FluxLinkage', 'flux_linkage.csv');
+        if (!await fileExists(csvPath)) {
+            return res.json({
+                success: false,
+                error: `No flux_linkage.csv under ${resultPath}/FluxLinkage`,
+            });
+        }
+        const text = await fs.readFile(csvPath, 'utf8');
+        const lines = text.trim().split(/\r?\n/);
+        if (lines.length < 2) {
+            return res.json({
+                success: true, steps: [], series: {},
+                empty: true,
+            });
+        }
+        const header = lines[0].split(',').map(s => s.trim());
+        // Expect first column = "step"; everything after = series names.
+        const stepCol = header[0];
+        const seriesNames = header.slice(1);
+        const steps = [];
+        const series = {};
+        for (const name of seriesNames) series[name] = [];
+        for (let li = 1; li < lines.length; li++) {
+            const row = lines[li].split(',');
+            if (row.length < 2) continue;
+            steps.push(Number(row[0]));
+            for (let i = 0; i < seriesNames.length; i++) {
+                const v = parseFloat(row[i + 1]);
+                series[seriesNames[i]].push(Number.isFinite(v) ? v : null);
+            }
+        }
+        res.json({
+            success: true,
+            step_column: stepCol,
+            steps,
+            series,
+        });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
+});
+
 // 特定ステップのCSVファイル読み込み (deprecated; use /api/load-field).
 // Kept for backwards compatibility with external scripts and older bookmarks.
 let _loadCsvDeprecationWarned = false;
