@@ -478,6 +478,22 @@ private:
     // `image` (cv::Mat, rows × cols, BGR Y-down).
     cv::Mat slide_sign_map;
 
+    // Phase B.6: per-rectangle-slide cumulative displacement state.
+    // dx / dy can be tinyexpr formulas in $step, so we accumulate the
+    // float velocity into a float position and take the integer shift
+    // per step as the delta between consecutive rounded values. This
+    // way fractional velocities ("0.5") still produce coherent pixel
+    // motion (alternating 0 / 1 shifts) rather than being silently
+    // rounded to zero each step.
+    struct RectSlideState {
+        double cum_x = 0.0;
+        double cum_y = 0.0;
+        int    prev_int_x = 0;
+        int    prev_int_y = 0;
+    };
+    std::vector<RectSlideState> rect_slide_states;  // index aligned with transient_config.slides
+    int slide_step_counter = 0;  // increments at every slideImageRegion() call
+
     // Boundary conditions structure
     struct BoundaryCondition {
         std::string type;     // "dirichlet", "neumann", "periodic", or "robin"
@@ -540,12 +556,27 @@ private:
     //                      boundary. Default for new yamls.
     struct SlideRegion {
         std::string name = "slide";
+        // Phase B.6: "band" (existing — slides a vertical/horizontal strip with a
+        // fixed integer pixels_per_step) or "rectangle" (slides a 2-D rectangular
+        // cut-out by per-step (dx, dy), supporting tinyexpr formulas).
+        std::string kind = "band";
+        // Band variant
         std::string direction = "vertical";  // "vertical" | "horizontal"
         int region_start = 0;
         int region_end = 0;
         int pixels_per_step = 0;
+        // Common
         std::string wrap_mode = "auto";
         std::vector<int> vacuum_rgb = {255, 255, 255};  // air, used by vacuum mode
+        // Phase B.6 rectangle variant — image-coordinate (BGR Y-down) rect.
+        // The rectangle's content is cut from this position, vacuum-filled in
+        // place, and pasted at (rect + cumulative_displacement). The dx / dy
+        // formulas are evaluated PER STEP with $step bound; users can write
+        // either a constant ("5") or an expression ("$omega * cos(2*pi*$step/$N)").
+        int rect_x_start = 0, rect_x_end = 0;
+        int rect_y_start = 0, rect_y_end = 0;
+        std::string dx_formula = "0";
+        std::string dy_formula = "0";
     };
 
     // Transient analysis configuration
@@ -775,6 +806,10 @@ private:
     // the field BC perpendicular to the slide axis. Returns one of
     // "periodic", "antiperiodic", "vacuum".
     std::string resolveSlideWrapMode(const SlideRegion& slide) const;
+    // Phase B.6: evaluates a rectangle slide's dx / dy formula at the
+    // given step. The formula's $name tokens were globally substituted
+    // at load time, so only $step is bound here.
+    double evaluateSlideFormula(const std::string& formula, int step) const;
 
     // Dynamic Jz evaluation
     JzValue parseJzValue(const YAML::Node& jz_node);

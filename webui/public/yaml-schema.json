@@ -264,6 +264,30 @@
       "example": "vacuum_rgb: [255, 255, 255]",
       "validParents": ["slides"]
     },
+    "kind": {
+      "description": "v1.5/Phase B.6 — slide region shape. 'band' (default) slides a vertical or horizontal strip of the image (direction + region_start/end + pixels_per_step). 'rectangle' cuts a 2-D box (rect + dx + dy) and translates it; pixels that walk off the image edge are dropped, the vacated source region is filled with vacuum_rgb, and multiple rectangles overlay in slides-list order at any colliding destination.",
+      "values": ["band", "rectangle"],
+      "example": "kind: rectangle",
+      "validParents": ["slides"]
+    },
+    "rect": {
+      "description": "v1.5/Phase B.6 — rectangle slide initial position: [x_start, y_start, x_end, y_end] in image pixel coordinates (origin = top-left).",
+      "type": "array",
+      "example": "rect: [100, 50, 200, 150]",
+      "validParents": ["slides"]
+    },
+    "dx": {
+      "description": "v1.5/Phase B.6 — rectangle slide x-velocity per step. Either a numeric constant or a tinyexpr formula. $name tokens are globally substituted at load time; $step is bound per evaluation. Fractional values are accumulated in float space so e.g. 0.5 produces alternating 0 / 1 shifts rather than rounding to zero.",
+      "type": "string",
+      "example": "dx: $omega * cos(2*pi*$step/$N)",
+      "validParents": ["slides"]
+    },
+    "dy": {
+      "description": "v1.5/Phase B.6 — rectangle slide y-velocity per step. Same evaluation rules as dx.",
+      "type": "string",
+      "example": "dy: 1",
+      "validParents": ["slides"]
+    },
     "enabled": {
       "description": "Enable feature (true/false)",
       "type": "boolean",

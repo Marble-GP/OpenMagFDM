@@ -165,6 +165,9 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                 for (const auto& sn : trans["slides"]) {
                     SlideRegion sr;
                     sr.name = sn["name"].as<std::string>("slide_" + std::to_string(idx));
+                    // Phase B.6: kind discriminator. Default = band for
+                    // backwards compatibility with pre-B.6 yamls.
+                    sr.kind = sn["kind"].as<std::string>("band");
                     sr.direction = sn["direction"].as<std::string>("vertical");
                     sr.region_start = sn["region_start"].as<int>(0);
                     sr.region_end = sn["region_end"].as<int>(0);
@@ -175,8 +178,56 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                         auto v = sn["vacuum_rgb"].as<std::vector<int>>();
                         if (v.size() >= 3) sr.vacuum_rgb = {v[0], v[1], v[2]};
                     }
+                    // Phase B.6: rectangle variant fields
+                    if (sr.kind == "rectangle") {
+                        if (sn["rect"] && sn["rect"].IsSequence()) {
+                            auto r = sn["rect"].as<std::vector<int>>();
+                            if (r.size() >= 4) {
+                                sr.rect_x_start = r[0];
+                                sr.rect_y_start = r[1];
+                                sr.rect_x_end   = r[2];
+                                sr.rect_y_end   = r[3];
+                            }
+                        }
+                        // dx / dy accept either a scalar number or a tinyexpr
+                        // formula string. Both come through as_string() — the
+                        // global-$var pass has already rewritten $omega etc.,
+                        // so the only dynamic token left is $step.
+                        sr.dx_formula = sn["dx"].as<std::string>("0");
+                        sr.dy_formula = sn["dy"].as<std::string>("0");
+                        // Rectangle wrap_mode is implicitly "vacuum cut":
+                        // content that walks off the image edge is dropped
+                        // and the vacated source region is filled with
+                        // vacuum_rgb. Override wrap_mode (band semantics
+                        // doesn't apply here) so resolveSlideWrapMode is
+                        // never invoked for rectangle entries.
+                        sr.wrap_mode = "vacuum";
+                    }
                     transient_config.slides.push_back(sr);
                     ++idx;
+                }
+                // Phase B.6: warn about overlapping initial rectangles.
+                // A later-defined rect's content overlays an earlier one's
+                // when they collide during a transient step; this is the
+                // intended semantic and not an error, but flagging
+                // overlapping initial positions catches accidental
+                // double-definition at yaml-edit time.
+                for (std::size_t i = 0; i < transient_config.slides.size(); ++i) {
+                    const auto& a = transient_config.slides[i];
+                    if (a.kind != "rectangle") continue;
+                    for (std::size_t j = i + 1; j < transient_config.slides.size(); ++j) {
+                        const auto& b = transient_config.slides[j];
+                        if (b.kind != "rectangle") continue;
+                        const bool overlap_x = !(a.rect_x_end <= b.rect_x_start
+                                              || b.rect_x_end <= a.rect_x_start);
+                        const bool overlap_y = !(a.rect_y_end <= b.rect_y_start
+                                              || b.rect_y_end <= a.rect_y_start);
+                        if (overlap_x && overlap_y) {
+                            std::cerr << "WARNING: rectangle slides '" << a.name << "' and '" << b.name
+                                      << "' have overlapping initial regions; "
+                                         "later-defined slide will overlay the earlier one." << std::endl;
+                        }
+                    }
                 }
             } else if (trans["slide_pixels_per_step"] || trans["slide_region_end"]
                        || trans["slide_region_start"] || trans["slide_direction"]) {
@@ -11725,6 +11776,50 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
     }
 }
 
+double MagneticFieldAnalyzer::evaluateSlideFormula(const std::string& formula, int step) const {
+    if (formula.empty()) return 0.0;
+    // Fast path: pure numeric (very common for constant velocities).
+    try {
+        std::size_t consumed = 0;
+        const double v = std::stod(formula, &consumed);
+        // Allow trailing whitespace.
+        while (consumed < formula.size()
+               && std::isspace(static_cast<unsigned char>(formula[consumed]))) {
+            ++consumed;
+        }
+        if (consumed == formula.size()) return v;
+    } catch (...) { /* fall through to tinyexpr */ }
+
+    // tinyexpr path: replace the $step token (the only one that survives
+    // global $var expansion at load time) and evaluate.
+    std::string expr = formula;
+    std::size_t pos = 0;
+    while ((pos = expr.find("$step", pos)) != std::string::npos) {
+        expr.replace(pos, 5, "step");
+        pos += 4;  // advance past the substituted "step"
+    }
+    te_parser parser;
+    std::set<te_variable> vars;
+    {
+        te_variable step_var;
+        step_var.m_name  = "step";
+        step_var.m_value = static_cast<double>(step);
+        vars.insert(step_var);
+    }
+    {
+        te_variable mu0_var;
+        mu0_var.m_name  = "mu0";
+        mu0_var.m_value = MU_0;
+        vars.insert(mu0_var);
+    }
+    parser.set_variables_and_functions(vars);
+    const double result = parser.evaluate(expr);
+    if (!parser.success()) {
+        throw std::runtime_error("Failed to evaluate slide displacement formula: " + formula);
+    }
+    return result;
+}
+
 std::string MagneticFieldAnalyzer::resolveSlideWrapMode(const SlideRegion& slide) const {
     if (slide.wrap_mode != "auto") return slide.wrap_mode;
     // Inspect the field BC perpendicular to the slide axis.
@@ -11751,14 +11846,12 @@ std::string MagneticFieldAnalyzer::resolveSlideWrapMode(const SlideRegion& slide
 
 void MagneticFieldAnalyzer::slideImageRegion() {
     // Phase B.2: every configured sliding region is applied independently
-    // per step. Phase B.5: each region's wrap_mode controls what happens
-    // to content (and to the per-pixel sign factor that feeds back into
-    // jz_map / magnetisation) at the wrap seam:
-    //   - periodic     : pure circular shift.
-    //   - antiperiodic : circular shift + flip slide_sign_map on the
-    //                    band that wrapped this step.
-    //   - vacuum       : shift in one direction, fill the vacated band
-    //                    with vacuum_rgb (default white = air); no wrap.
+    // per step. Phase B.5: band slides honour wrap_mode (periodic /
+    // antiperiodic / vacuum / auto). Phase B.6: rectangle slides cut a
+    // 2-D region, vacuum-fill the source, and paste at a per-step
+    // (dx, dy) offset evaluated from a tinyexpr formula -- content that
+    // falls outside the image is dropped (no wrap), and multiple
+    // rectangles overlay in slides-list order at their destinations.
     if (transient_config.slides.empty()) return;
 
     // Lazy-init the sign map at the first slide call, before any wrap
@@ -11766,15 +11859,113 @@ void MagneticFieldAnalyzer::slideImageRegion() {
     if (slide_sign_map.empty()) {
         slide_sign_map = cv::Mat(image.rows, image.cols, CV_8S, cv::Scalar(1));
     }
+    // Phase B.6: per-rectangle cumulative-displacement state, lazy-init.
+    if (rect_slide_states.size() != transient_config.slides.size()) {
+        rect_slide_states.assign(transient_config.slides.size(), RectSlideState{});
+    }
+    const int rect_step = slide_step_counter++;  // current step for tinyexpr eval
 
-    for (const auto& slide : transient_config.slides) {
-        const int shift = slide.pixels_per_step;
-        if (shift == 0) continue;
-        const std::string mode = resolveSlideWrapMode(slide);
+    // Phase B.6: snapshot for rectangle reads. Rectangles read source
+    // content from this snapshot so the order of cuts doesn't change
+    // what each rectangle sees, only the order of pastes does. Band
+    // slides keep their pre-B.6 in-place semantics (they don't share
+    // the snapshot path).
+    cv::Mat rect_src_image, rect_src_sign;
+    bool snapshot_taken = false;
+    auto ensure_snapshot = [&]() {
+        if (snapshot_taken) return;
+        rect_src_image = image.clone();
+        rect_src_sign  = slide_sign_map.clone();
+        snapshot_taken = true;
+    };
+
+    for (std::size_t si = 0; si < transient_config.slides.size(); ++si) {
+        const auto& slide = transient_config.slides[si];
         const cv::Vec3b vac_rgb(
             static_cast<uchar>(slide.vacuum_rgb.size() > 0 ? slide.vacuum_rgb[0] : 255),
             static_cast<uchar>(slide.vacuum_rgb.size() > 1 ? slide.vacuum_rgb[1] : 255),
             static_cast<uchar>(slide.vacuum_rgb.size() > 2 ? slide.vacuum_rgb[2] : 255));
+
+        // ===============================================================
+        // Phase B.6: rectangle slide
+        // ===============================================================
+        if (slide.kind == "rectangle") {
+            ensure_snapshot();
+            auto& st = rect_slide_states[si];
+            // Evaluate this step's velocity and integrate into the float
+            // cumulative position. The discrete shift applied this step
+            // is the delta between consecutive rounded cumulative values.
+            const double v_dx = evaluateSlideFormula(slide.dx_formula, rect_step);
+            const double v_dy = evaluateSlideFormula(slide.dy_formula, rect_step);
+            st.cum_x += v_dx;
+            st.cum_y += v_dy;
+            const int new_int_x = static_cast<int>(std::lround(st.cum_x));
+            const int new_int_y = static_cast<int>(std::lround(st.cum_y));
+            // Source rect = initial rect + previous cumulative offset.
+            const int rect_w = slide.rect_x_end - slide.rect_x_start;
+            const int rect_h = slide.rect_y_end - slide.rect_y_start;
+            if (rect_w <= 0 || rect_h <= 0) {
+                st.prev_int_x = new_int_x;
+                st.prev_int_y = new_int_y;
+                continue;
+            }
+            const int rx0 = slide.rect_x_start + st.prev_int_x;
+            const int ry0 = slide.rect_y_start + st.prev_int_y;
+            // Clip source against the image.
+            const int src_x   = std::max(0, rx0);
+            const int src_y   = std::max(0, ry0);
+            const int src_xE  = std::min(image.cols, rx0 + rect_w);
+            const int src_yE  = std::min(image.rows, ry0 + rect_h);
+            // Read content from the SNAPSHOT so the order of cuts is
+            // independent of the order of pastes; fill the source on the
+            // LIVE image (idempotent), then paste at the new offset on
+            // the LIVE image (later rectangles overlay earlier ones).
+            cv::Mat content_img, content_sign;
+            int content_offset_x = 0, content_offset_y = 0;
+            if (src_xE > src_x && src_yE > src_y) {
+                const cv::Rect src_rect(src_x, src_y, src_xE - src_x, src_yE - src_y);
+                content_img      = rect_src_image(src_rect).clone();
+                content_sign     = rect_src_sign(src_rect).clone();
+                content_offset_x = src_x - rx0;
+                content_offset_y = src_y - ry0;
+                image(src_rect)          = vac_rgb;
+                slide_sign_map(src_rect) = cv::Scalar(1);
+            }
+            // Advance cumulative offset for the next step.
+            st.prev_int_x = new_int_x;
+            st.prev_int_y = new_int_y;
+            // Destination rect = initial rect + new cumulative offset.
+            // Paste the content there, clipped to image bounds. Pixels
+            // that fall outside are dropped (no wrap).
+            if (!content_img.empty()) {
+                const int new_rx0 = slide.rect_x_start + new_int_x;
+                const int new_ry0 = slide.rect_y_start + new_int_y;
+                const int abs_x   = new_rx0 + content_offset_x;
+                const int abs_y   = new_ry0 + content_offset_y;
+                const int paste_x  = std::max(0, abs_x);
+                const int paste_y  = std::max(0, abs_y);
+                const int paste_xE = std::min(image.cols, abs_x + content_img.cols);
+                const int paste_yE = std::min(image.rows, abs_y + content_img.rows);
+                if (paste_xE > paste_x && paste_yE > paste_y) {
+                    const int from_x = paste_x - abs_x;
+                    const int from_y = paste_y - abs_y;
+                    const cv::Rect cont_rect(from_x, from_y,
+                                             paste_xE - paste_x, paste_yE - paste_y);
+                    const cv::Rect dst_rect(paste_x, paste_y,
+                                            paste_xE - paste_x, paste_yE - paste_y);
+                    content_img(cont_rect).copyTo(image(dst_rect));
+                    content_sign(cont_rect).copyTo(slide_sign_map(dst_rect));
+                }
+            }
+            continue;  // rectangle case handled; skip the band logic below.
+        }
+
+        // ===============================================================
+        // Band slide (existing Phase B.2 / B.5 logic)
+        // ===============================================================
+        const int shift = slide.pixels_per_step;
+        if (shift == 0) continue;
+        const std::string mode = resolveSlideWrapMode(slide);
 
         if (slide.direction == "vertical") {
             const int x_start = slide.region_start;

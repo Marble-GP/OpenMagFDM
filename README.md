@@ -158,6 +158,37 @@ transient:
 
 実装は per-cell `slide_sign_map` (符号トラッカー) として常駐し、`jz_map` と `(Mx_map, My_map)` 更新時に符号を掛けます。
 
+**矩形領域スライド (Phase B.6)** — Band タイプ (縦/横の短冊) に加えて、2D 矩形領域を切り取って `(dx, dy)` 方向に毎ステップ平行移動させる `rectangle` タイプを追加しました。
+
+```yaml
+transient:
+  slides:
+    - name: linear_mover
+      kind: rectangle
+      rect: [100, 50, 200, 150]   # [x0, y0, x1, y1] 画像座標 (origin = 左上)
+      dx: 2                        # 数値リテラルまたは tinyexpr 数式
+      dy: "$omega * cos(2*pi*$step/$N_step)"
+      vacuum_rgb: [255, 255, 255]  # 空白部の色 (デフォルト白)
+
+    - name: counter_mover
+      kind: rectangle
+      rect: [300, 50, 400, 150]
+      dx: -1                       # 反対方向に移動
+      dy: 0
+```
+
+**特徴**:
+
+- **per-region 独立 `dx` / `dy`** — 各矩形が独自の速度を持つ
+- **tinyexpr 数式対応** — `$omega`, `$N_step` 等の `$name` は load 時に Phase B.1 で展開済、`$step` のみ実行時に評価
+- **画像外はカット** — 矩形が境界を跨いだ場合、超過分の content は破棄 (周期 wrap なし)
+- **カット元領域は vacuum** — `vacuum_rgb` (デフォルト [255,255,255] = air, jz=0, mu_r=1) で埋める
+- **マルチ矩形の重ね合わせ** — `slides:` リスト後方の矩形が前方の矩形を上書き (overlay)
+- **初期位置の重なり警告** — yaml load 時に初期 `rect` 同士が重なってると `WARNING:` で通知
+- **小数速度対応** — `dx: 0.5` 等の小数値は float 累積で内部管理し、毎ステップの離散シフトは累積値の round の差分。`0.5` なら 0, 1, 0, 1, ... と交互にシフト
+
+Band と rectangle は同一 `slides:` リスト内で混在可能 (それぞれ独立に処理)。
+
 **材料ペア flux linkage (Phase B.3)** — 各 `flux_linkage` エントリで `material_a` / `material_b` (材料名) を指定すると、`mean(Az over material A pixels) - mean(Az over material B pixels)` を計算します。太い導体や多数巻コイルで「点間の Az 差」が物理的に不適切なケース向け。既存の path variant (`start` + `end`) と同じリスト内で混在可。Cartesian 専用。
 
 ```yaml
