@@ -469,6 +469,15 @@ private:
     cv::Mat cached_boundaries;  // Cached boundary detection result (binary mask)
     bool boundary_cache_valid;  // Whether the cache is valid
 
+    // Phase B.5: per-pixel sign factor for antiperiodic slide wrap.
+    // Initialised to +1 on first slide; cells that cross the wrap seam
+    // in an antiperiodic-mode slide have their sign flipped, and
+    // setupMaterialPropertiesForStep multiplies jz_map (and the
+    // magnetisation grids) by this sign so the source term reflects the
+    // pole-pair polarity flip after the wrap. CV_8S, same dimensions as
+    // `image` (cv::Mat, rows × cols, BGR Y-down).
+    cv::Mat slide_sign_map;
+
     // Boundary conditions structure
     struct BoundaryCondition {
         std::string type;     // "dirichlet", "neumann", "periodic", or "robin"
@@ -511,12 +520,32 @@ private:
     // the same source so the polar transient code paths keep working
     // unchanged while the cartesian image-domain slide loops over every
     // entry in the vector.
+    //
+    // Phase B.5: each slide also picks a wrap_mode that controls what
+    // happens to content (and source terms) that crosses the seam:
+    //   - "periodic"     : circular shift (current behaviour). The
+    //                      material identity wraps unchanged.
+    //   - "antiperiodic" : circular shift, AND every pixel that crossed
+    //                      the seam gets jz / magnetisation sign-flipped.
+    //                      This matches the algebra of an anti-periodic
+    //                      theta BC -- the next pole is the opposite
+    //                      polarity.
+    //   - "vacuum"       : NO wrap. Cells vacated on the inlet side
+    //                      get filled with the configured vacuum_rgb
+    //                      (default white = air). Matches a Dirichlet
+    //                      BC on the wrap axis.
+    //   - "auto"         : inspect the corresponding BC type/value and
+    //                      pick periodic/antiperiodic/vacuum so the
+    //                      slide stays self-consistent with the field
+    //                      boundary. Default for new yamls.
     struct SlideRegion {
         std::string name = "slide";
         std::string direction = "vertical";  // "vertical" | "horizontal"
         int region_start = 0;
         int region_end = 0;
         int pixels_per_step = 0;
+        std::string wrap_mode = "auto";
+        std::vector<int> vacuum_rgb = {255, 255, 255};  // air, used by vacuum mode
     };
 
     // Transient analysis configuration
@@ -742,6 +771,10 @@ private:
 
     // Transient analysis methods
     void slideImageRegion();
+    // Phase B.5: resolves SlideRegion.wrap_mode for "auto" by inspecting
+    // the field BC perpendicular to the slide axis. Returns one of
+    // "periodic", "antiperiodic", "vacuum".
+    std::string resolveSlideWrapMode(const SlideRegion& slide) const;
 
     // Dynamic Jz evaluation
     JzValue parseJzValue(const YAML::Node& jz_node);

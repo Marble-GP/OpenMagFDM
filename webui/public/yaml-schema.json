@@ -252,6 +252,18 @@
       "example": "pixels_per_step: 5",
       "validParents": ["slides"]
     },
+    "wrap_mode": {
+      "description": "v1.5/Phase B.5 — what happens to content (and to per-cell source-term polarity) at the slide-wrap seam. 'periodic': circular shift, identity wraps unchanged. 'antiperiodic': circular shift + flip jz / magnetisation sign on cells that crossed the seam (consistent with anti-periodic theta BC). 'vacuum': no wrap; vacated cells get vacuum_rgb (consistent with Dirichlet BC). 'auto' (default): pick based on the perpendicular boundary's BC type.",
+      "values": ["auto", "periodic", "antiperiodic", "vacuum"],
+      "example": "wrap_mode: antiperiodic",
+      "validParents": ["slides"]
+    },
+    "vacuum_rgb": {
+      "description": "v1.5/Phase B.5 — RGB triple [R,G,B] used to fill vacated cells when wrap_mode is 'vacuum'. Default is [255,255,255] (white = air). Set to the RGB of whichever 'background' material you defined under materials:.",
+      "type": "array",
+      "example": "vacuum_rgb: [255, 255, 255]",
+      "validParents": ["slides"]
+    },
     "enabled": {
       "description": "Enable feature (true/false)",
       "type": "boolean",

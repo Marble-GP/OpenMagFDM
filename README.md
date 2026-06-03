@@ -134,6 +134,30 @@ transient:
 
 Cartesian は完全対応。Polar は `slides[0]` のみ (Multi-slide polar permutation は v1.6 予定、load 時に警告)。
 
+**スライド時の wrap モード (Phase B.5)** — スライドして反対側に出ていった領域の扱いを `wrap_mode` で 3 モードから選べます。デフォルトの `auto` は対応する境界条件タイプから物理的に自然なものを選択します:
+
+- `periodic`: 旧仕様。content を環状に巻き戻す。
+- `antiperiodic`: 反周期境界条件と一致。シームを跨いだ画素は `jz` と magnetisation の符号が反転 — 電気機械的に「次のポール」は反対極性、を再現。
+- `vacuum`: Dirichlet 境界条件と一致。巻き戻しせず、空白部に `vacuum_rgb` (デフォルト [255,255,255] = air) を埋める。
+
+例: 反周期 θ 境界 + 単一ポール解析
+
+```yaml
+polar_boundary_conditions:
+  theta_min: { type: periodic, value: -1.0 }   # anti-periodic
+  theta_max: { type: periodic, value: -1.0 }
+transient:
+  enabled: true
+  slides:
+    - direction: vertical
+      region_start: 0
+      region_end: 360
+      pixels_per_step: 5
+      wrap_mode: auto   # → "antiperiodic" が選ばれる
+```
+
+実装は per-cell `slide_sign_map` (符号トラッカー) として常駐し、`jz_map` と `(Mx_map, My_map)` 更新時に符号を掛けます。
+
 **材料ペア flux linkage (Phase B.3)** — 各 `flux_linkage` エントリで `material_a` / `material_b` (材料名) を指定すると、`mean(Az over material A pixels) - mean(Az over material B pixels)` を計算します。太い導体や多数巻コイルで「点間の Az 差」が物理的に不適切なケース向け。既存の path variant (`start` + `end`) と同じリスト内で混在可。Cartesian 専用。
 
 ```yaml

@@ -169,6 +169,12 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                     sr.region_start = sn["region_start"].as<int>(0);
                     sr.region_end = sn["region_end"].as<int>(0);
                     sr.pixels_per_step = sn["pixels_per_step"].as<int>(0);
+                    // Phase B.5: wrap_mode + vacuum_rgb
+                    sr.wrap_mode = sn["wrap_mode"].as<std::string>("auto");
+                    if (sn["vacuum_rgb"] && sn["vacuum_rgb"].IsSequence()) {
+                        auto v = sn["vacuum_rgb"].as<std::vector<int>>();
+                        if (v.size() >= 3) sr.vacuum_rgb = {v[0], v[1], v[2]};
+                    }
                     transient_config.slides.push_back(sr);
                     ++idx;
                 }
@@ -180,6 +186,9 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                 sr.region_start = trans["slide_region_start"].as<int>(0);
                 sr.region_end = trans["slide_region_end"].as<int>(0);
                 sr.pixels_per_step = trans["slide_pixels_per_step"].as<int>(0);
+                // Phase B.5: legacy single-slide yamls have always been
+                // periodic by construction; preserve that.
+                sr.wrap_mode = "periodic";
                 transient_config.slides.push_back(sr);
             }
 
@@ -215,7 +224,8 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                         std::string axis = (s.direction == "vertical") ? "x" : "y";
                         std::cout << "    [" << s.name << "] " << s.direction
                                   << ", region " << axis << " in [" << s.region_start
-                                  << ", " << s.region_end << "], pixels/step=" << s.pixels_per_step << std::endl;
+                                  << ", " << s.region_end << "], pixels/step=" << s.pixels_per_step
+                                  << ", wrap=" << s.wrap_mode << std::endl;
                     }
                     // coordinate_system member isn't set yet at this point
                     // in the constructor; read the raw config so the warning
@@ -1541,6 +1551,36 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
         }
 
         std::cout << "Magnetization computed for '" << mat_name << "' (" << mc.pattern << ")" << std::endl;
+    }
+
+    // Phase B.5: apply the antiperiodic-wrap sign tracker to the
+    // magnetisation vector. A magnet that has crossed an antiperiodic
+    // seam reverses its M direction, so both Mx and My flip sign.
+    // Jz_mag = curl(M) is computed AFTER this flip so the curl picks up
+    // the correct (negated) magnetisation gradient automatically.
+    if (!slide_sign_map.empty()
+        && slide_sign_map.rows == image.rows
+        && slide_sign_map.cols == image.cols) {
+        const int H = image.rows;
+        const int grid_rows = static_cast<int>(Mx_map.rows());
+        const int grid_cols = static_cast<int>(Mx_map.cols());
+        for (int j = 0; j < grid_rows; j++) {
+            for (int i = 0; i < grid_cols; i++) {
+                int img_i, img_j;
+                if (is_polar) {
+                    if (r_orientation == "horizontal") { img_i = i; img_j = j; }
+                    else                                { img_i = j; img_j = i; }
+                } else {
+                    img_i = i; img_j = j;
+                }
+                if (img_j < 0 || img_j >= H || img_i < 0 || img_i >= image.cols) continue;
+                const schar sgn = slide_sign_map.at<schar>(H - 1 - img_j, img_i);
+                if (sgn < 0) {
+                    Mx_map(j, i) = -Mx_map(j, i);
+                    My_map(j, i) = -My_map(j, i);
+                }
+            }
+        }
     }
 
     // Compute equivalent magnetization current Jz_mag = curl(M)
@@ -11631,6 +11671,42 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         }
     }
 
+    // Phase B.5: apply the antiperiodic-wrap sign tracker to jz_map. Cells
+    // whose slide_sign_map entry is -1 have wrapped an odd number of
+    // times through an antiperiodic seam, so their source current should
+    // flip polarity. The map lives in image coords (BGR Y-down); the
+    // field grids are Y-up after the vertical flip in setupMaterialProperties,
+    // so we read at (rows-1-j, i).
+    if (!slide_sign_map.empty()
+        && slide_sign_map.rows == image.rows
+        && slide_sign_map.cols == image.cols) {
+        const int H = image.rows;
+        if (coordinate_system == "polar") {
+            if (r_orientation == "horizontal") {
+                for (int j = 0; j < ntheta; j++) {
+                    for (int i = 0; i < nr; i++) {
+                        const schar sgn = slide_sign_map.at<schar>(H - 1 - j, i);
+                        if (sgn < 0) jz_map(j, i) = -jz_map(j, i);
+                    }
+                }
+            } else {
+                for (int j = 0; j < nr; j++) {
+                    for (int i = 0; i < ntheta; i++) {
+                        const schar sgn = slide_sign_map.at<schar>(H - 1 - j, i);
+                        if (sgn < 0) jz_map(j, i) = -jz_map(j, i);
+                    }
+                }
+            }
+        } else {
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    const schar sgn = slide_sign_map.at<schar>(H - 1 - j, i);
+                    if (sgn < 0) jz_map(j, i) = -jz_map(j, i);
+                }
+            }
+        }
+    }
+
     // Regenerate coarsening mask if sliding is enabled (material boundaries may have moved)
     if (coarsening_enabled && transient_config.enable_sliding && step > 0) {
         generateCoarseningMask();
@@ -11640,51 +11716,171 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         full_matrix_cache_valid = false;
     }
 
-    // Recompute magnetization grids (Mx_map, My_map, Jz_mag_map) for this step
-    // Required for transient/sliding cases where material positions change
+    // Recompute magnetization grids (Mx_map, My_map, Jz_mag_map) for this step.
+    // Required for transient/sliding cases where material positions change.
+    // The slide_sign_map antiperiodic flip is propagated into magnetisation
+    // inside computeMagnetizationGrids().
     if (!material_magnetization.empty()) {
         computeMagnetizationGrids();
     }
 }
 
+std::string MagneticFieldAnalyzer::resolveSlideWrapMode(const SlideRegion& slide) const {
+    if (slide.wrap_mode != "auto") return slide.wrap_mode;
+    // Inspect the field BC perpendicular to the slide axis.
+    //   polar (theta-only slide)        : theta_min / theta_max
+    //   cartesian + direction=vertical  : top / bottom
+    //   cartesian + direction=horizontal: left / right
+    const BoundaryCondition* bc = nullptr;
+    if (coordinate_system == "polar") {
+        bc = &bc_theta_min;
+    } else if (slide.direction == "vertical") {
+        bc = &bc_top;
+    } else {
+        bc = &bc_right;
+    }
+    if (!bc) return "periodic";
+    if (bc->type == "periodic") {
+        return (bc->value < 0.0) ? "antiperiodic" : "periodic";
+    }
+    if (bc->type == "dirichlet") return "vacuum";
+    // neumann / robin / unknown: default to vacuum so we don't manufacture
+    // bogus source terms on wrap.
+    return "vacuum";
+}
+
 void MagneticFieldAnalyzer::slideImageRegion() {
-    // Phase B.2: every configured sliding region is applied
-    // independently per step. Disjoint [region_start, region_end] intervals
-    // on the SAME axis act as separate rotors with their own velocities;
-    // overlapping intervals are undefined and surface as a warning here.
+    // Phase B.2: every configured sliding region is applied independently
+    // per step. Phase B.5: each region's wrap_mode controls what happens
+    // to content (and to the per-pixel sign factor that feeds back into
+    // jz_map / magnetisation) at the wrap seam:
+    //   - periodic     : pure circular shift.
+    //   - antiperiodic : circular shift + flip slide_sign_map on the
+    //                    band that wrapped this step.
+    //   - vacuum       : shift in one direction, fill the vacated band
+    //                    with vacuum_rgb (default white = air); no wrap.
     if (transient_config.slides.empty()) return;
 
-    for (std::size_t si = 0; si < transient_config.slides.size(); ++si) {
-        const auto& slide = transient_config.slides[si];
+    // Lazy-init the sign map at the first slide call, before any wrap
+    // could have happened.
+    if (slide_sign_map.empty()) {
+        slide_sign_map = cv::Mat(image.rows, image.cols, CV_8S, cv::Scalar(1));
+    }
+
+    for (const auto& slide : transient_config.slides) {
         const int shift = slide.pixels_per_step;
         if (shift == 0) continue;
+        const std::string mode = resolveSlideWrapMode(slide);
+        const cv::Vec3b vac_rgb(
+            static_cast<uchar>(slide.vacuum_rgb.size() > 0 ? slide.vacuum_rgb[0] : 255),
+            static_cast<uchar>(slide.vacuum_rgb.size() > 1 ? slide.vacuum_rgb[1] : 255),
+            static_cast<uchar>(slide.vacuum_rgb.size() > 2 ? slide.vacuum_rgb[2] : 255));
 
         if (slide.direction == "vertical") {
-            // vertical: region_start <= x <= region_end (column range), slides in y
             const int x_start = slide.region_start;
             const int x_end   = slide.region_end;
             if (x_start < 0 || x_end > image.cols || x_start >= x_end) {
                 throw std::runtime_error("Invalid slide region for vertical sliding (x range out of bounds) in slide '" + slide.name + "'");
             }
+            const int H = image.rows;
             for (int col = x_start; col < x_end; col++) {
-                cv::Mat column = image.col(col).clone();
-                for (int row = 0; row < image.rows; row++) {
-                    int src_row = (row + image.rows + shift) % image.rows;
-                    image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+                if (mode == "vacuum") {
+                    // No wrap: shift content by `shift` rows, vacated band
+                    // gets vacuum_rgb. shift > 0 = content moves toward
+                    // smaller row indices, top |shift| rows are vacated.
+                    cv::Mat column = image.col(col).clone();
+                    for (int row = 0; row < H; row++) {
+                        const int src_row = row + shift;
+                        if (src_row >= 0 && src_row < H) {
+                            image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+                        } else {
+                            image.at<cv::Vec3b>(row, col) = vac_rgb;
+                        }
+                    }
+                    // Sign map: vacated cells reset to +1 (no carry-over
+                    // polarity); shifted cells keep their previous sign.
+                    cv::Mat sign_col = slide_sign_map.col(col).clone();
+                    for (int row = 0; row < H; row++) {
+                        const int src_row = row + shift;
+                        if (src_row >= 0 && src_row < H) {
+                            slide_sign_map.at<schar>(row, col) = sign_col.at<schar>(src_row, 0);
+                        } else {
+                            slide_sign_map.at<schar>(row, col) = 1;
+                        }
+                    }
+                } else {  // periodic or antiperiodic
+                    cv::Mat column = image.col(col).clone();
+                    cv::Mat sign_col = slide_sign_map.col(col).clone();
+                    for (int row = 0; row < H; row++) {
+                        const int src_row = (row + H + shift) % H;
+                        image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+                        slide_sign_map.at<schar>(row, col) = sign_col.at<schar>(src_row, 0);
+                    }
+                    if (mode == "antiperiodic") {
+                        // Cells whose src_row went through the (H, 0) seam
+                        // get their sign flipped.
+                        if (shift > 0) {
+                            const int s = shift % H;
+                            for (int row = H - s; row < H; row++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        } else {
+                            const int s = (-shift) % H;
+                            for (int row = 0; row < s; row++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        }
+                    }
                 }
             }
         } else {  // horizontal
-            // horizontal: region_start <= y <= region_end (row range), slides in x
             const int y_start = slide.region_start;
             const int y_end   = slide.region_end;
             if (y_start < 0 || y_end > image.rows || y_start >= y_end) {
                 throw std::runtime_error("Invalid slide region for horizontal sliding (y range out of bounds) in slide '" + slide.name + "'");
             }
+            const int W = image.cols;
             for (int row = y_start; row < y_end; row++) {
-                cv::Mat row_data = image.row(row).clone();
-                for (int col = 0; col < image.cols; col++) {
-                    int src_col = (col - shift + image.cols) % image.cols;
-                    image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+                if (mode == "vacuum") {
+                    cv::Mat row_data = image.row(row).clone();
+                    for (int col = 0; col < W; col++) {
+                        const int src_col = col - shift;
+                        if (src_col >= 0 && src_col < W) {
+                            image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+                        } else {
+                            image.at<cv::Vec3b>(row, col) = vac_rgb;
+                        }
+                    }
+                    cv::Mat sign_row = slide_sign_map.row(row).clone();
+                    for (int col = 0; col < W; col++) {
+                        const int src_col = col - shift;
+                        if (src_col >= 0 && src_col < W) {
+                            slide_sign_map.at<schar>(row, col) = sign_row.at<schar>(0, src_col);
+                        } else {
+                            slide_sign_map.at<schar>(row, col) = 1;
+                        }
+                    }
+                } else {  // periodic or antiperiodic
+                    cv::Mat row_data = image.row(row).clone();
+                    cv::Mat sign_row = slide_sign_map.row(row).clone();
+                    for (int col = 0; col < W; col++) {
+                        const int src_col = (col - shift + W) % W;
+                        image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+                        slide_sign_map.at<schar>(row, col) = sign_row.at<schar>(0, src_col);
+                    }
+                    if (mode == "antiperiodic") {
+                        if (shift > 0) {
+                            const int s = shift % W;
+                            for (int col = 0; col < s; col++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        } else {
+                            const int s = (-shift) % W;
+                            for (int col = W - s; col < W; col++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        }
+                    }
                 }
             }
         }
