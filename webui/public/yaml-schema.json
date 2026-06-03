@@ -183,9 +183,9 @@
       "example": "material_presets:\n  my_steel:\n    mu_r: [[0, 100, 500], [5000, 4500, 3000]]\n  my_bh:\n    B-H: [[0, 100, 500, 2000], [0, 0.3, 1.0, 1.5]]"
     },
     "flux_linkage": {
-      "description": "Flux linkage calculation paths. Each path defines start/end points for Φ = Az(end) - Az(start)",
+      "description": "Flux linkage paths. Each entry is either a point-to-point path (Φ = Az(end) - Az(start)) OR a material pair (Φ = mean(Az over material_a) - mean(Az over material_b)). The material variant is the right shape for thick coil legs; v1.5 cartesian only (polar returns zero).",
       "type": "array",
-      "example": "flux_linkage:\n  - name: coil_A\n    start: [0.01, 0.05]\n    end: [0.01, 0.15]"
+      "example": "flux_linkage:\n  - name: phase_U          # material variant\n    material_a: coil_U_pos\n    material_b: coil_U_neg\n  - name: phase_V_path     # path variant\n    start: [0.01, 0.05]\n    end:   [0.01, 0.15]"
     },
     "name": {
       "description": "Name identifier for flux linkage path",
@@ -194,21 +194,63 @@
       "validParents": ["flux_linkage"]
     },
     "start": {
-      "description": "Start point coordinates [x, y] in physical units [m] for flux linkage calculation",
+      "description": "Start point coordinates [x, y] in physical units [m] for flux linkage path variant",
       "type": "array",
       "example": "start: [0.01, 0.05]",
       "validParents": ["flux_linkage"]
     },
     "end": {
-      "description": "End point coordinates [x, y] in physical units [m] for flux linkage calculation",
+      "description": "End point coordinates [x, y] in physical units [m] for flux linkage path variant",
       "type": "array",
       "example": "end: [0.01, 0.15]",
       "validParents": ["flux_linkage"]
     },
+    "material_a": {
+      "description": "v1.5/Phase B.3 — material name for the +Az side of a flux_linkage entry (cartesian only). Resolved to the material's RGB pixels at parse time.",
+      "type": "string",
+      "example": "material_a: coil_U_pos",
+      "validParents": ["flux_linkage"]
+    },
+    "material_b": {
+      "description": "v1.5/Phase B.3 — material name for the -Az side of a flux_linkage entry (cartesian only). Resolved to the material's RGB pixels at parse time.",
+      "type": "string",
+      "example": "material_b: coil_U_neg",
+      "validParents": ["flux_linkage"]
+    },
     "transient": {
-      "description": "Transient analysis configuration",
-      "children": ["enabled", "enable_sliding", "total_steps", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
-      "example": "transient:\n  enabled: true\n  total_steps: 100\n  enable_sliding: true\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n  slide_pixels_per_step: 1"
+      "description": "Transient analysis configuration. v1.5/Phase B.2: prefer transient.slides: [...] for multi-region sliding. The legacy single-slide keys still work and are auto-converted into a 1-element slides list.",
+      "children": ["enabled", "enable_sliding", "total_steps", "slides", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
+      "example": "transient:\n  enabled: true\n  total_steps: 100\n  enable_sliding: true\n  slides:\n    - name: rotor_outer\n      direction: vertical\n      region_start: 110\n      region_end: 390\n      pixels_per_step: 5\n    - name: rotor_inner\n      direction: vertical\n      region_start: 50\n      region_end: 100\n      pixels_per_step: -3"
+    },
+    "slides": {
+      "description": "v1.5/Phase B.2 — list of independent sliding regions for the transient solver. Each entry shifts its [region_start, region_end] band by pixels_per_step on every step. Cartesian fully supported; polar uses slides[0] only (multi-slide polar is v1.6).",
+      "type": "array",
+      "example": "slides:\n  - name: rotor\n    direction: vertical\n    region_start: 100\n    region_end: 400\n    pixels_per_step: 5",
+      "validParents": ["transient"]
+    },
+    "direction": {
+      "description": "v1.5/Phase B.2 — direction of a slide region: 'vertical' (slides rows) or 'horizontal' (slides cols)",
+      "values": ["vertical", "horizontal"],
+      "example": "direction: vertical",
+      "validParents": ["slides"]
+    },
+    "region_start": {
+      "description": "v1.5/Phase B.2 — first pixel index of the sliding band along the axis perpendicular to `direction`",
+      "type": "integer",
+      "example": "region_start: 110",
+      "validParents": ["slides"]
+    },
+    "region_end": {
+      "description": "v1.5/Phase B.2 — last pixel index (exclusive) of the sliding band",
+      "type": "integer",
+      "example": "region_end: 390",
+      "validParents": ["slides"]
+    },
+    "pixels_per_step": {
+      "description": "v1.5/Phase B.2 — circular-shift amount per step. Negative values reverse direction. Different slides in the same yaml can use different magnitudes / signs.",
+      "type": "integer",
+      "example": "pixels_per_step: 5",
+      "validParents": ["slides"]
     },
     "enabled": {
       "description": "Enable feature (true/false)",
