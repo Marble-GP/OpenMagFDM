@@ -47,6 +47,12 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
     // transient, flux_linkage, ...) sees the substituted numeric strings.
     parseUserVariables();
     expandUserVariablesGlobally();
+    // Phase N: now that every $name in the YAML tree has been replaced
+    // with its numeric value, the transient block can be parsed and its
+    // fields evaluated through tinyexpr. Anything that survives this
+    // pass (formulas with pi / e / mu0, plain numbers, post-substitution
+    // expressions like "100 * 2") resolves correctly.
+    parseTransientConfig();
 
     // Initialize flags BEFORE setup methods
     // Transient analysis optimization flags
@@ -148,147 +154,11 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
         config = YAML::LoadFile(config_path);
         std::cout << "Configuration loaded from: " << config_path << std::endl;
 
-        // Load transient analysis configuration
-        if (config["transient"]) {
-            auto trans = config["transient"];
-            transient_config.enabled = trans["enabled"].as<bool>(false);
-            transient_config.enable_sliding = trans["enable_sliding"].as<bool>(true);
-            transient_config.total_steps = trans["total_steps"].as<int>(0);
-
-            // Phase B.2: prefer the explicit `transient.slides: [...]` list.
-            // Each entry is one independently-shifting region. When `slides`
-            // is omitted we fall back to the legacy single-slide keys and
-            // build a 1-element list, so old yamls keep working.
-            transient_config.slides.clear();
-            if (trans["slides"] && trans["slides"].IsSequence()) {
-                int idx = 0;
-                for (const auto& sn : trans["slides"]) {
-                    SlideRegion sr;
-                    sr.name = sn["name"].as<std::string>("slide_" + std::to_string(idx));
-                    // Phase B.6: kind discriminator. Default = band for
-                    // backwards compatibility with pre-B.6 yamls.
-                    sr.kind = sn["kind"].as<std::string>("band");
-                    sr.direction = sn["direction"].as<std::string>("vertical");
-                    sr.region_start = sn["region_start"].as<int>(0);
-                    sr.region_end = sn["region_end"].as<int>(0);
-                    sr.pixels_per_step = sn["pixels_per_step"].as<int>(0);
-                    // Phase B.5: wrap_mode + vacuum_rgb
-                    sr.wrap_mode = sn["wrap_mode"].as<std::string>("auto");
-                    if (sn["vacuum_rgb"] && sn["vacuum_rgb"].IsSequence()) {
-                        auto v = sn["vacuum_rgb"].as<std::vector<int>>();
-                        if (v.size() >= 3) sr.vacuum_rgb = {v[0], v[1], v[2]};
-                    }
-                    // Phase B.6: rectangle variant fields
-                    if (sr.kind == "rectangle") {
-                        if (sn["rect"] && sn["rect"].IsSequence()) {
-                            auto r = sn["rect"].as<std::vector<int>>();
-                            if (r.size() >= 4) {
-                                sr.rect_x_start = r[0];
-                                sr.rect_y_start = r[1];
-                                sr.rect_x_end   = r[2];
-                                sr.rect_y_end   = r[3];
-                            }
-                        }
-                        // dx / dy accept either a scalar number or a tinyexpr
-                        // formula string. Both come through as_string() — the
-                        // global-$var pass has already rewritten $omega etc.,
-                        // so the only dynamic token left is $step.
-                        sr.dx_formula = sn["dx"].as<std::string>("0");
-                        sr.dy_formula = sn["dy"].as<std::string>("0");
-                        // Rectangle wrap_mode is implicitly "vacuum cut":
-                        // content that walks off the image edge is dropped
-                        // and the vacated source region is filled with
-                        // vacuum_rgb. Override wrap_mode (band semantics
-                        // doesn't apply here) so resolveSlideWrapMode is
-                        // never invoked for rectangle entries.
-                        sr.wrap_mode = "vacuum";
-                    }
-                    transient_config.slides.push_back(sr);
-                    ++idx;
-                }
-                // Phase B.6: warn about overlapping initial rectangles.
-                // A later-defined rect's content overlays an earlier one's
-                // when they collide during a transient step; this is the
-                // intended semantic and not an error, but flagging
-                // overlapping initial positions catches accidental
-                // double-definition at yaml-edit time.
-                for (std::size_t i = 0; i < transient_config.slides.size(); ++i) {
-                    const auto& a = transient_config.slides[i];
-                    if (a.kind != "rectangle") continue;
-                    for (std::size_t j = i + 1; j < transient_config.slides.size(); ++j) {
-                        const auto& b = transient_config.slides[j];
-                        if (b.kind != "rectangle") continue;
-                        const bool overlap_x = !(a.rect_x_end <= b.rect_x_start
-                                              || b.rect_x_end <= a.rect_x_start);
-                        const bool overlap_y = !(a.rect_y_end <= b.rect_y_start
-                                              || b.rect_y_end <= a.rect_y_start);
-                        if (overlap_x && overlap_y) {
-                            std::cerr << "WARNING: rectangle slides '" << a.name << "' and '" << b.name
-                                      << "' have overlapping initial regions; "
-                                         "later-defined slide will overlay the earlier one." << std::endl;
-                        }
-                    }
-                }
-            } else if (trans["slide_pixels_per_step"] || trans["slide_region_end"]
-                       || trans["slide_region_start"] || trans["slide_direction"]) {
-                SlideRegion sr;
-                sr.name = "slide";
-                sr.direction = trans["slide_direction"].as<std::string>("vertical");
-                sr.region_start = trans["slide_region_start"].as<int>(0);
-                sr.region_end = trans["slide_region_end"].as<int>(0);
-                sr.pixels_per_step = trans["slide_pixels_per_step"].as<int>(0);
-                // Phase B.5: legacy single-slide yamls have always been
-                // periodic by construction; preserve that.
-                sr.wrap_mode = "periodic";
-                transient_config.slides.push_back(sr);
-            }
-
-            // Mirror the FIRST slide into the legacy scalar fields so the
-            // polar transient code paths (which assume a single sliding
-            // region) keep referencing the same values they used to.
-            if (!transient_config.slides.empty()) {
-                const auto& s0 = transient_config.slides.front();
-                transient_config.slide_direction = s0.direction;
-                transient_config.slide_region_start = s0.region_start;
-                transient_config.slide_region_end = s0.region_end;
-                transient_config.slide_pixels_per_step = s0.pixels_per_step;
-            } else {
-                transient_config.slide_direction = trans["slide_direction"].as<std::string>("vertical");
-                transient_config.slide_region_start = trans["slide_region_start"].as<int>(0);
-                transient_config.slide_region_end = trans["slide_region_end"].as<int>(0);
-                transient_config.slide_pixels_per_step = trans["slide_pixels_per_step"].as<int>(0);
-            }
-
-            // Optional output field selection (empty = export all)
-            if (trans["export_fields"] && trans["export_fields"].IsSequence()) {
-                for (const auto& field : trans["export_fields"]) {
-                    transient_config.export_fields.push_back(field.as<std::string>());
-                }
-            }
-
-            if (transient_config.enabled) {
-                std::cout << "Transient analysis enabled: " << transient_config.total_steps << " steps" << std::endl;
-                std::cout << "  Sliding: " << (transient_config.enable_sliding ? "enabled" : "disabled") << std::endl;
-                if (transient_config.enable_sliding) {
-                    std::cout << "  Slides: " << transient_config.slides.size() << " region(s)" << std::endl;
-                    for (const auto& s : transient_config.slides) {
-                        std::string axis = (s.direction == "vertical") ? "x" : "y";
-                        std::cout << "    [" << s.name << "] " << s.direction
-                                  << ", region " << axis << " in [" << s.region_start
-                                  << ", " << s.region_end << "], pixels/step=" << s.pixels_per_step
-                                  << ", wrap=" << s.wrap_mode << std::endl;
-                    }
-                    // coordinate_system member isn't set yet at this point
-                    // in the constructor; read the raw config so the warning
-                    // fires at load time when the user has a polar yaml.
-                    const std::string cs = config["coordinate_system"].as<std::string>("cartesian");
-                    if (cs == "polar" && transient_config.slides.size() > 1) {
-                        std::cout << "  WARNING: polar transient currently uses only slides[0]. "
-                                  << "Multi-slide polar is a v1.6 item." << std::endl;
-                    }
-                }
-            }
-        }
+        // Phase N: the transient block is parsed in a deferred pass
+        // (parseTransientConfig, called from the constructor after
+        // expandUserVariablesGlobally). That lets tinyexpr formulas
+        // and $name references resolve in fields like total_steps and
+        // slide_pixels_per_step.
 
         // Load result export configuration. Phase 1 ships the schema + dispatch wiring;
         // only the CSV path is functional, so behavior is unchanged unless format=tiff
@@ -570,6 +440,166 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         // Matrices: (nr, ntheta) with indexing (r_idx, theta_idx)
         mu_map = Eigen::MatrixXd::Constant(nr, ntheta, MU_0);
         jz_map = Eigen::MatrixXd::Zero(nr, ntheta);
+    }
+}
+
+// Phase N: read a YAML scalar as a double, accepting either a plain
+// numeric literal (fast path) or a tinyexpr expression. Bare `pi`,
+// `e`, and `mu0` are available as identifiers; `$name` substitution
+// must already have happened (expandUserVariablesGlobally) so the
+// expression seen here only contains numeric tokens, operators, and
+// the three built-ins.
+double MagneticFieldAnalyzer::evaluateScalarAsDouble(const YAML::Node& node,
+                                                    double fallback) const {
+    if (!node || !node.IsScalar()) return fallback;
+    std::string s;
+    try { s = node.as<std::string>(); } catch (...) { return fallback; }
+    if (s.empty()) return fallback;
+    // Trim leading whitespace for the fast path.
+    std::size_t lead = 0;
+    while (lead < s.size() && std::isspace(static_cast<unsigned char>(s[lead]))) ++lead;
+    try {
+        std::size_t consumed = 0;
+        const double v = std::stod(s.substr(lead), &consumed);
+        std::size_t tail = lead + consumed;
+        while (tail < s.size() && std::isspace(static_cast<unsigned char>(s[tail]))) ++tail;
+        if (tail == s.size()) return v;
+    } catch (...) { /* fall through to tinyexpr */ }
+    te_parser parser;
+    {
+        te_variable mu0_var; mu0_var.m_name = "mu0"; mu0_var.m_value = MU_0;
+        parser.set_variables_and_functions({mu0_var});
+    }
+    const double v = parser.evaluate(s);
+    if (parser.success() && std::isfinite(v)) return v;
+    std::cerr << "Warning: failed to evaluate '" << s
+              << "' as a number, using fallback " << fallback << std::endl;
+    return fallback;
+}
+
+int MagneticFieldAnalyzer::evaluateScalarAsInt(const YAML::Node& node,
+                                               int fallback) const {
+    if (!node) return fallback;
+    return static_cast<int>(std::lround(
+        evaluateScalarAsDouble(node, static_cast<double>(fallback))));
+}
+
+void MagneticFieldAnalyzer::parseTransientConfig() {
+    if (!config["transient"]) return;
+    auto trans = config["transient"];
+    transient_config.enabled       = trans["enabled"].as<bool>(false);
+    transient_config.enable_sliding = trans["enable_sliding"].as<bool>(true);
+    transient_config.total_steps   = evaluateScalarAsInt(trans["total_steps"], 0);
+
+    transient_config.slides.clear();
+    if (trans["slides"] && trans["slides"].IsSequence()) {
+        int idx = 0;
+        for (const auto& sn : trans["slides"]) {
+            SlideRegion sr;
+            sr.name      = sn["name"].as<std::string>("slide_" + std::to_string(idx));
+            sr.kind      = sn["kind"].as<std::string>("band");
+            sr.direction = sn["direction"].as<std::string>("vertical");
+            sr.region_start    = evaluateScalarAsInt(sn["region_start"],    0);
+            sr.region_end      = evaluateScalarAsInt(sn["region_end"],      0);
+            sr.pixels_per_step = evaluateScalarAsInt(sn["pixels_per_step"], 0);
+            sr.wrap_mode = sn["wrap_mode"].as<std::string>("auto");
+            if (sn["vacuum_rgb"] && sn["vacuum_rgb"].IsSequence()) {
+                auto v = sn["vacuum_rgb"].as<std::vector<int>>();
+                if (v.size() >= 3) sr.vacuum_rgb = {v[0], v[1], v[2]};
+            }
+            if (sr.kind == "rectangle") {
+                if (sn["rect"] && sn["rect"].IsSequence()) {
+                    auto r = sn["rect"].as<std::vector<int>>();
+                    if (r.size() >= 4) {
+                        sr.rect_x_start = r[0];
+                        sr.rect_y_start = r[1];
+                        sr.rect_x_end   = r[2];
+                        sr.rect_y_end   = r[3];
+                    }
+                }
+                // dx / dy keep their string form: they are evaluated
+                // per-step with $step bound to the current step count,
+                // a quantity that doesn't exist at parse time.
+                sr.dx_formula = sn["dx"].as<std::string>("0");
+                sr.dy_formula = sn["dy"].as<std::string>("0");
+                sr.wrap_mode  = "vacuum";
+            }
+            transient_config.slides.push_back(sr);
+            ++idx;
+        }
+        // Warn about overlapping initial rectangles (Phase B.6).
+        for (std::size_t i = 0; i < transient_config.slides.size(); ++i) {
+            const auto& a = transient_config.slides[i];
+            if (a.kind != "rectangle") continue;
+            for (std::size_t j = i + 1; j < transient_config.slides.size(); ++j) {
+                const auto& b = transient_config.slides[j];
+                if (b.kind != "rectangle") continue;
+                const bool overlap_x = !(a.rect_x_end <= b.rect_x_start
+                                      || b.rect_x_end <= a.rect_x_start);
+                const bool overlap_y = !(a.rect_y_end <= b.rect_y_start
+                                      || b.rect_y_end <= a.rect_y_start);
+                if (overlap_x && overlap_y) {
+                    std::cerr << "WARNING: rectangle slides '" << a.name << "' and '" << b.name
+                              << "' have overlapping initial regions; "
+                                 "later-defined slide will overlay the earlier one." << std::endl;
+                }
+            }
+        }
+    } else if (trans["slide_pixels_per_step"] || trans["slide_region_end"]
+               || trans["slide_region_start"]  || trans["slide_direction"]) {
+        // Legacy single-slide form.
+        SlideRegion sr;
+        sr.name       = "slide";
+        sr.direction  = trans["slide_direction"].as<std::string>("vertical");
+        sr.region_start    = evaluateScalarAsInt(trans["slide_region_start"],    0);
+        sr.region_end      = evaluateScalarAsInt(trans["slide_region_end"],      0);
+        sr.pixels_per_step = evaluateScalarAsInt(trans["slide_pixels_per_step"], 0);
+        sr.wrap_mode  = "periodic";
+        transient_config.slides.push_back(sr);
+    }
+
+    // Mirror slides[0] into the legacy scalar fields the polar
+    // transient code paths still read from.
+    if (!transient_config.slides.empty()) {
+        const auto& s0 = transient_config.slides.front();
+        transient_config.slide_direction       = s0.direction;
+        transient_config.slide_region_start    = s0.region_start;
+        transient_config.slide_region_end      = s0.region_end;
+        transient_config.slide_pixels_per_step = s0.pixels_per_step;
+    } else {
+        transient_config.slide_direction       = trans["slide_direction"].as<std::string>("vertical");
+        transient_config.slide_region_start    = evaluateScalarAsInt(trans["slide_region_start"],    0);
+        transient_config.slide_region_end      = evaluateScalarAsInt(trans["slide_region_end"],      0);
+        transient_config.slide_pixels_per_step = evaluateScalarAsInt(trans["slide_pixels_per_step"], 0);
+    }
+
+    if (trans["export_fields"] && trans["export_fields"].IsSequence()) {
+        for (const auto& field : trans["export_fields"]) {
+            transient_config.export_fields.push_back(field.as<std::string>());
+        }
+    }
+
+    if (transient_config.enabled) {
+        std::cout << "Transient analysis enabled: "
+                  << transient_config.total_steps << " steps" << std::endl;
+        std::cout << "  Sliding: "
+                  << (transient_config.enable_sliding ? "enabled" : "disabled") << std::endl;
+        if (transient_config.enable_sliding) {
+            std::cout << "  Slides: " << transient_config.slides.size()
+                      << " region(s)" << std::endl;
+            for (const auto& s : transient_config.slides) {
+                std::string axis = (s.direction == "vertical") ? "x" : "y";
+                std::cout << "    [" << s.name << "] " << s.direction
+                          << ", region " << axis << " in [" << s.region_start
+                          << ", " << s.region_end << "], pixels/step=" << s.pixels_per_step
+                          << ", wrap=" << s.wrap_mode << std::endl;
+            }
+            const std::string cs = config["coordinate_system"].as<std::string>("cartesian");
+            if (cs == "polar" && transient_config.slides.size() > 1) {
+                std::cout << "  WARNING: polar transient currently uses only slides[0]. "
+                          << "Multi-slide polar is a v1.6 item." << std::endl;
+            }
+        }
     }
 }
 

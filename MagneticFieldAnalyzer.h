@@ -858,6 +858,16 @@ private:
     bool isPointOnLineSegment(const cv::Vec3b& pixel, const cv::Vec3b& a, const cv::Vec3b& b, double tolerance = 15.0) const;
     double interpolateAntialiasedMu(const cv::Vec3b& pixel, double& out_mu_r) const;
 
+    // Phase N: parse the transient: block after $name expansion so
+    // formulas (mu0 * 1000, ntheta / 2, pi/4, ...) and $variable
+    // references in fields like total_steps, slide_pixels_per_step,
+    // and the per-slide region / pixels_per_step entries resolve
+    // through tinyexpr instead of failing the strict .as<int>() path.
+    void parseTransientConfig();
+    // Tinyexpr-aware scalar evaluation helpers used by parseTransientConfig.
+    double evaluateScalarAsDouble(const YAML::Node& node, double fallback) const;
+    int    evaluateScalarAsInt   (const YAML::Node& node, int    fallback) const;
+
     // Flux linkage calculation methods
     void parseFluxLinkagePaths();           // Parse flux_linkage section from YAML
     double interpolateAz(double x_phys, double y_phys) const;  // Bilinear interpolation of Az

@@ -4047,26 +4047,25 @@ function getPolarSlideSchedule() {
     return computePolarSlideSchedule(T);
 }
 
-// Phase F.4: render a numeric theta_range value as a tinyexpr expression
-// in $pi when it matches a simple rational multiple of π. The solver
-// pre-populates $pi globally and tinyexpr handles the resulting
-// "2*3.141592653589793" arithmetic losslessly. Falls back to the raw
-// number for non-rational values (custom user sectors).
+// Phase F.4 / N: render a numeric theta_range value as a tinyexpr
+// expression using bare `pi` (tinyexpr built-in) when it matches a
+// simple rational multiple of π. `pi` works directly inside any field
+// that the solver routes through tinyexpr (Phase N moved transient
+// fields onto that path); $pi also works via the global substitution
+// pass, but `pi` is shorter and renders cleaner in the editor.
 function thetaToTinyExpr(theta_range) {
     if (!isFinite(theta_range) || theta_range <= 0) return String(theta_range);
     const r = theta_range / Math.PI;
     const tol = 1e-6;
-    // Try integer multiples first (full circle, half, etc.)
     const intMul = Math.round(r);
     if (Math.abs(r - intMul) < tol && intMul >= 1 && intMul <= 12) {
-        return (intMul === 1) ? '$pi' : `${intMul}*$pi`;
+        return (intMul === 1) ? 'pi' : `${intMul}*pi`;
     }
-    // Then simple p/q π for small q
     for (let den = 2; den <= 16; den++) {
         for (let num = 1; num < den * 4; num++) {
             if (Math.abs(r - num / den) < tol) {
-                if (num === 1) return `$pi/${den}`;
-                return `${num}*$pi/${den}`;
+                if (num === 1) return `pi/${den}`;
+                return `${num}*pi/${den}`;
             }
         }
     }
