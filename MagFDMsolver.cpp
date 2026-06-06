@@ -1,10 +1,15 @@
 #include "MagneticFieldAnalyzer.h"
+#include "tinyexpr/tinyexpr.h"
 #include <iostream>
 #include <fstream>
 #include <string>
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <cctype>
+#include <cmath>
+#include <map>
+#include <algorithm>
 #include <yaml-cpp/yaml.h>
 #include "json.hpp"
 
@@ -86,11 +91,90 @@ std::string getBaseFolderName(const std::string& output_path) {
  * @param config_path Path to YAML configuration file
  * @param image_path Path to material image file
  */
+// Phase Q: exportConditionsJSON runs BEFORE the analyzer is built, so
+// it can't lean on the analyzer's user-variable expansion pass. Resolve
+// the variables: block here ourselves and substitute $name in scalar
+// fields before evaluating them. The same helper is used for transient
+// fields that the WebUI's Insert YAML emits as `$N_step` / `$N_slide`
+// references; without this, .as<int>() trips on the literal string and
+// the solver aborts before the analyzer ever loads.
+static double evalScalarConditions(const YAML::Node& node,
+                                   const std::map<std::string, double>& user_vars,
+                                   double fallback) {
+    if (!node || !node.IsScalar()) return fallback;
+    std::string s;
+    try { s = node.as<std::string>(); } catch (...) { return fallback; }
+    if (s.empty()) return fallback;
+    // $name substitution, longest names first so $omega doesn't partial-
+    // match $o.
+    std::vector<std::pair<std::string, double>> sorted(user_vars.begin(), user_vars.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+    for (const auto& [name, value] : sorted) {
+        const std::string needle = "$" + name;
+        std::size_t pos = 0;
+        while ((pos = s.find(needle, pos)) != std::string::npos) {
+            std::ostringstream oss;
+            oss << std::setprecision(17) << value;
+            const std::string repl = oss.str();
+            s.replace(pos, needle.size(), repl);
+            pos += repl.size();
+        }
+    }
+    // Fast path: plain numeric literal.
+    try {
+        std::size_t consumed = 0;
+        const double v = std::stod(s, &consumed);
+        while (consumed < s.size()
+               && std::isspace(static_cast<unsigned char>(s[consumed]))) ++consumed;
+        if (consumed == s.size()) return v;
+    } catch (...) { /* fall through */ }
+    // tinyexpr: pi / e are built-in; mu0 is injected so users can write
+    // `mu0 * 1000`. $step survives — it's a per-step variable evaluated
+    // by the analyzer at runtime, not here.
+    te_parser parser;
+    {
+        te_variable mu0_var; mu0_var.m_name = "mu0";
+        constexpr double MU_0 = 4.0 * 3.14159265358979323846 * 1e-7;
+        mu0_var.m_value = MU_0;
+        parser.set_variables_and_functions({mu0_var});
+    }
+    const double v = parser.evaluate(s);
+    if (parser.success() && std::isfinite(v)) return v;
+    return fallback;
+}
+
+static int evalScalarConditionsAsInt(const YAML::Node& node,
+                                     const std::map<std::string, double>& user_vars,
+                                     int fallback) {
+    return static_cast<int>(std::lround(evalScalarConditions(
+        node, user_vars, static_cast<double>(fallback))));
+}
+
 void exportConditionsJSON(const std::string& output_path,
                           const std::string& config_path,
                           const std::string& image_path) {
     // Load YAML configuration
     YAML::Node config = YAML::LoadFile(config_path);
+
+    // Phase Q: resolve user variables up-front so transient and other
+    // formula-bearing fields can use $name references.
+    std::map<std::string, double> user_vars;
+    {
+        constexpr double MU_0 = 4.0 * 3.14159265358979323846 * 1e-7;
+        user_vars["pi"]  = 3.14159265358979323846;
+        user_vars["e"]   = 2.71828182845904523536;
+        user_vars["mu0"] = MU_0;
+        if (config["variables"] && config["variables"].IsMap()) {
+            for (const auto& var : config["variables"]) {
+                const std::string name = var.first.as<std::string>("");
+                if (name.empty()) continue;
+                // Recurse: evaluate each variable with the already-resolved
+                // ones so `omega: "2*pi*60"` and similar formulas resolve.
+                user_vars[name] = evalScalarConditions(var.second, user_vars, 0.0);
+            }
+        }
+    }
 
     // Load image to get dimensions
     cv::Mat image = cv::imread(image_path);
@@ -240,16 +324,22 @@ void exportConditionsJSON(const std::string& output_path,
         if (enabled) {
             bool enable_sliding = config["transient"]["enable_sliding"]
                 ? config["transient"]["enable_sliding"].as<bool>() : true;
-            int total_steps = config["transient"]["total_steps"].as<int>();
+            // Phase Q: tinyexpr-evaluated with $var substitution so
+            // `total_steps: $N_step` resolves correctly.
+            int total_steps = evalScalarConditionsAsInt(
+                config["transient"]["total_steps"], user_vars, 0);
 
             j["transient"]["enable_sliding"] = enable_sliding;
             j["transient"]["total_steps"] = total_steps;
 
             if (enable_sliding) {
-                std::string slide_direction = config["transient"]["slide_direction"].as<std::string>();
-                int slide_region_start = config["transient"]["slide_region_start"].as<int>();
-                int slide_region_end = config["transient"]["slide_region_end"].as<int>();
-                int slide_pixels_per_step = config["transient"]["slide_pixels_per_step"].as<int>();
+                std::string slide_direction = config["transient"]["slide_direction"].as<std::string>("vertical");
+                int slide_region_start    = evalScalarConditionsAsInt(
+                    config["transient"]["slide_region_start"],    user_vars, 0);
+                int slide_region_end      = evalScalarConditionsAsInt(
+                    config["transient"]["slide_region_end"],      user_vars, 0);
+                int slide_pixels_per_step = evalScalarConditionsAsInt(
+                    config["transient"]["slide_pixels_per_step"], user_vars, 0);
 
                 j["transient"]["slide_direction"] = slide_direction;
                 j["transient"]["slide_region_start"] = slide_region_start;
