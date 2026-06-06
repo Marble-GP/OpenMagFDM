@@ -2120,6 +2120,43 @@ function buildDetectYamlFromAssignments() {
         }
     }
 
+    // Phase L: auto-emit flux_linkage entries for every Coil group that
+    // has BOTH a +sign and a -sign chip assigned. The solver's
+    // material_a / material_b mode computes mean(Az over +) − mean(Az
+    // over −) per step, which is exactly the per-phase flux linkage
+    // Φ_X of a synchronous machine. The solver caveat: this mode is
+    // cartesian-only -- for polar coordinates the entries are still
+    // emitted (the user often switches coords later), but the solver
+    // will print a warning and the value stays zero. We surface that
+    // in an inline comment so the user is not surprised.
+    const coilByGroup = {};   // { 'A': { pos: '#hex', neg: '#hex' }, ... }
+    for (const c of colors) {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const a = assign[hex];
+        if (!a || a.kind !== 'Coil') continue;
+        const grp = a.coilGroup || 'A';
+        if (!coilByGroup[grp]) coilByGroup[grp] = { pos: null, neg: null };
+        if (a.coilSign === '-') coilByGroup[grp].neg = hex;
+        else                    coilByGroup[grp].pos = hex;
+    }
+    const groupsWithPair = Object.keys(coilByGroup)
+        .filter(g => coilByGroup[g].pos && coilByGroup[g].neg)
+        .sort();
+    if (groupsWithPair.length > 0) {
+        lines.push('');
+        lines.push('# Phase L: flux linkage Phi_Coil_X = mean(Az on +X pixels) - mean(Az on -X pixels).');
+        lines.push('# Material_a/material_b variant only works with coordinate_system: cartesian.');
+        lines.push('# For polar warps switch to {start, end} path integration variant.');
+        lines.push('flux_linkage:');
+        for (const g of groupsWithPair) {
+            const posHex = coilByGroup[g].pos.slice(1);
+            const negHex = coilByGroup[g].neg.slice(1);
+            lines.push(`  - name: Phi_Coil_${g}`);
+            lines.push(`    material_a: coil_${g}_pos_${posHex}`);
+            lines.push(`    material_b: coil_${g}_neg_${negHex}`);
+        }
+    }
+
     // Preserve the trailing AA-blends comment block from the stock
     // template so the user still has the AA diagnostic info.
     const aaIdx = stockYaml.indexOf('# Anti-aliasing blends detected');
@@ -2712,6 +2749,21 @@ function insertMaterialsSection() {
             for (const k of Object.keys(detectedDoc.variables)) {
                 if (currentDoc.variables[k] == null) {
                     currentDoc.variables[k] = detectedDoc.variables[k];
+                }
+            }
+        }
+        // Phase L: merge auto-generated Phi_Coil_X flux_linkage entries
+        // into the editor's existing array by name. Re-running Detect
+        // Colors after the user tuned an entry won't reset that entry,
+        // and the entries from new Coil chips get appended.
+        if (Array.isArray(detectedDoc.flux_linkage) && detectedDoc.flux_linkage.length > 0) {
+            if (!Array.isArray(currentDoc.flux_linkage)) currentDoc.flux_linkage = [];
+            const existing = new Set(
+                currentDoc.flux_linkage.map(e => (e && e.name) || '').filter(Boolean));
+            for (const entry of detectedDoc.flux_linkage) {
+                if (entry && entry.name && !existing.has(entry.name)) {
+                    currentDoc.flux_linkage.push(entry);
+                    existing.add(entry.name);
                 }
             }
         }
@@ -3960,6 +4012,41 @@ function pickThetaBoundary(theta_range, N) {
     };
 }
 
+// Phase K: split the theta-axis pixel count T into integer (N_step,
+// N_slide) such that N_step*N_slide simulates exactly one full rotor
+// revolution. Constraints, in order of priority:
+//   1. Both are integers (loop over divisors).
+//   2. N_step * N_slide = T (exact factorisation if possible).
+//   3. 32 ≤ N_step ≤ 256 (so the time resolution sits in a sensible
+//      band: not coarse, not absurdly fine).
+//   4. Prefer the SMALLEST N_slide so individual steps are smooth.
+//      With N_step = T fitting in range, N_slide = 1 (the natural
+//      "one pixel per step" cadence) is chosen.
+// Fallback when T has no suitable divisor: N_step = 100,
+// N_slide = round(T/100). N_step*N_slide then approximates T but
+// won't land exactly -- the user gets a reasonable schedule and can
+// retune in the editor.
+function computePolarSlideSchedule(theta_size) {
+    const T = Math.max(1, Math.round(theta_size));
+    const k_max = Math.max(1, Math.floor(T / 32));
+    for (let k = 1; k <= k_max; k++) {
+        if (T % k !== 0) continue;
+        const N_step = T / k;
+        if (N_step >= 32 && N_step <= 256) {
+            return { N_step, N_slide: k, exact: true };
+        }
+    }
+    return { N_step: 100, N_slide: Math.max(1, Math.round(T / 100)), exact: false };
+}
+
+// Phase K: return the slide schedule (N_step, N_slide) for the current
+// polar warp, based on the current ntheta pixel count.
+function getPolarSlideSchedule() {
+    const cur = AppState.polarPreprocess.current;
+    const T = Math.max(1, Math.round(Number(cur.ntheta) || 0));
+    return computePolarSlideSchedule(T);
+}
+
 // Phase F.4: render a numeric theta_range value as a tinyexpr expression
 // in $pi when it matches a simple rational multiple of π. The solver
 // pre-populates $pi globally and tinyexpr handles the resulting
@@ -4049,14 +4136,26 @@ function buildPolarYamlBlock(filename, polarDomain) {
         const rOuter = Math.max(1, cur.r_outer_px || 0);
         const region_start = inside ? 0   : rAG;
         const region_end   = inside ? rAG : Math.max(rAG + 1, rOuter);
-        const pps = Math.max(1, cur.air_gap_slide_pixels_per_step || 1);
+        // Phase K: derive N_step / N_slide from ntheta so the slide
+        // simulates one full rotation in N_step steps of N_slide pixels
+        // each (subject to 32 ≤ N_step ≤ 256). The values themselves
+        // live in the variables: block; this YAML only references the
+        // $N_step / $N_slide tokens so the user can retune by editing
+        // a single variable.
+        const sched = getPolarSlideSchedule();
+        const T = Math.max(1, Math.round(Number(cur.ntheta) || 0));
         // Slide direction = the warp axis perpendicular to r.
         const slideDir = (ro === 'horizontal') ? 'vertical' : 'horizontal';
         lines.push('');
         lines.push('# Slide region inferred from the air-gap marker (Polar Preprocess).');
         lines.push(`# Side: ${inside ? 'inside the air gap (rotor side)' : 'outside the air gap (stator side)'}`);
         lines.push('# region_start / region_end are radial-pixel indices in the warped image.');
-        lines.push('# total_steps uses $N_step (defined in variables); pixels_per_step is the per-step shift.');
+        if (sched.exact) {
+            lines.push(`# Schedule: N_step * N_slide = ${sched.N_step} * ${sched.N_slide} = ${T} (one full revolution over ntheta).`);
+        } else {
+            lines.push(`# Schedule: ntheta = ${T} has no clean factorisation in [32, 256], falling back to`);
+            lines.push(`#   N_step = 100, N_slide = ${sched.N_slide} (approximates one revolution).`);
+        }
         lines.push('transient:');
         lines.push('  enabled: true');
         lines.push('  enable_sliding: true');
@@ -4064,7 +4163,7 @@ function buildPolarYamlBlock(filename, polarDomain) {
         lines.push(`  slide_direction: ${slideDir}`);
         lines.push(`  slide_region_start: ${region_start}`);
         lines.push(`  slide_region_end: ${region_end}`);
-        lines.push(`  slide_pixels_per_step: ${pps}`);
+        lines.push('  slide_pixels_per_step: $N_slide');
     }
     return lines.join('\n') + '\n';
 }
@@ -4131,11 +4230,14 @@ async function insertPolarYaml() {
     delete doc.image_path;
     if (cur.save_as === 'polar' && cur.air_gap_as_slide && airGapEffectiveR() > 0) {
         delete doc.transient;
-        // Phase F.2: the transient block uses `total_steps: $N_step`,
-        // so make sure the editor has a variables: N_step entry. Don't
-        // overwrite if the user already set one.
+        // Phase F.2 / K: the transient block uses `total_steps: $N_step`
+        // and `slide_pixels_per_step: $N_slide`. Auto-fill both vars
+        // from the polar warp's ntheta (see computePolarSlideSchedule)
+        // without clobbering user-tuned values.
         if (!doc.variables || typeof doc.variables !== 'object') doc.variables = {};
-        if (doc.variables.N_step == null) doc.variables.N_step = 100;
+        const sched = getPolarSlideSchedule();
+        if (doc.variables.N_step == null)  doc.variables.N_step  = sched.N_step;
+        if (doc.variables.N_slide == null) doc.variables.N_slide = sched.N_slide;
     }
 
     let targetFilename;
