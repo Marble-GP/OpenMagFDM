@@ -1400,6 +1400,10 @@ function renderDetectChips() {
             if (magRow) magRow.style.display = becomingMagnet ? 'flex' : 'none';
             if (becomingMagnet) {
                 seedMagnetizationFromLibrary(assign, libProps);
+                // Phase G: also reseed orientation_offset to the
+                // cardinal-aligned default if the chip is sitting on a
+                // sector pattern and the user hasn't taken control yet.
+                reseedOffsetIfAuto(assign);
                 applyMagnetizationStateToControls(magRow.parentElement, hex, assign.magnetization);
             }
             regenerateDetectYamlPreview();
@@ -1505,6 +1509,34 @@ function bindMagnetizationControls(grid) {
         a.magnetization[key] = Number.isFinite(v) ? v : 0;
         regenerateDetectYamlPreview();
     };
+    // Phase G: dedicated p handler. After updating p, reseed the
+    // cardinal-aligned offset default so dragging p around keeps the
+    // sector boundaries cardinal-aligned until the user takes
+    // explicit control of the offset.
+    const updateP = (el) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        const v = Number(el.value);
+        a.magnetization.p = Number.isFinite(v) ? Math.max(1, Math.round(v)) : 1;
+        reseedOffsetIfAuto(a);
+        const item = el.closest('[data-magnet-row]') ?
+            el.closest('[data-magnet-row]').parentElement : el.parentElement;
+        applyMagnetizationStateToControls(item, hex, a.magnetization);
+        regenerateDetectYamlPreview();
+    };
+    // Phase G: dedicated offset handler. The very act of the user
+    // typing in any of the offset inputs sets _offset_explicit so
+    // subsequent pattern / p edits don't clobber their value.
+    const updateOffset = (el) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        const v = Number(el.value);
+        a.magnetization.orientation_offset = Number.isFinite(v) ? v : 0;
+        a.magnetization._offset_explicit = true;
+        regenerateDetectYamlPreview();
+    };
     const updateStr = (el, key) => {
         const hex = el.dataset.detectHex;
         const a = AppState.detectAssign[hex];
@@ -1518,9 +1550,14 @@ function bindMagnetizationControls(grid) {
             const a = AppState.detectAssign[hex];
             if (!a) return;
             a.magnetization.pattern = el.value;
+            // Phase G: switching INTO a sector pattern reseeds the
+            // orientation_offset to the cardinal default unless the
+            // user has explicitly typed a value.
+            reseedOffsetIfAuto(a);
             const item = el.closest('[data-magnet-row]') ?
                 el.closest('[data-magnet-row]').parentElement : el.parentElement;
             showMagPatternParams(item, hex, el.value);
+            applyMagnetizationStateToControls(item, hex, a.magnetization);
             regenerateDetectYamlPreview();
         });
     });
@@ -1534,20 +1571,20 @@ function bindMagnetizationControls(grid) {
         el.addEventListener('input', () => updateNum(el, 'cy')));
     // halbach: p / offset / cx / cy
     grid.querySelectorAll('input[data-role="magP"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'p')));
+        el.addEventListener('input', () => updateP(el)));
     grid.querySelectorAll('input[data-role="magOffset"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
+        el.addEventListener('input', () => updateOffset(el)));
     grid.querySelectorAll('input[data-role="magCx2"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'cx')));
     grid.querySelectorAll('input[data-role="magCy2"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'cy')));
     // polar_anisotropy: p / Kn / offset / cx / cy
     grid.querySelectorAll('input[data-role="magP3"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'p')));
+        el.addEventListener('input', () => updateP(el)));
     grid.querySelectorAll('input[data-role="magKn"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'Kn')));
     grid.querySelectorAll('input[data-role="magOffset3"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
+        el.addEventListener('input', () => updateOffset(el)));
     grid.querySelectorAll('input[data-role="magCx3"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'cx')));
     grid.querySelectorAll('input[data-role="magCy3"]').forEach(el =>
@@ -1580,15 +1617,15 @@ function bindMagnetizationControls(grid) {
     // bind to the same key — that's intentional, the UI just exposes
     // the parameter under whichever pattern is currently visible.
     grid.querySelectorAll('input[data-role="magPArr"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'p')));
+        el.addEventListener('input', () => updateP(el)));
     grid.querySelectorAll('input[data-role="magCxArr"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'cx')));
     grid.querySelectorAll('input[data-role="magCyArr"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'cy')));
     grid.querySelectorAll('input[data-role="magOffsetArr"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
+        el.addEventListener('input', () => updateOffset(el)));
     grid.querySelectorAll('input[data-role="magPParr"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'p')));
+        el.addEventListener('input', () => updateP(el)));
     grid.querySelectorAll('input[data-role="magAngleParr"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'angle')));
     grid.querySelectorAll('input[data-role="magCxParr"]').forEach(el =>
@@ -1596,7 +1633,7 @@ function bindMagnetizationControls(grid) {
     grid.querySelectorAll('input[data-role="magCyParr"]').forEach(el =>
         el.addEventListener('input', () => updateNum(el, 'cy')));
     grid.querySelectorAll('input[data-role="magOffsetParr"]').forEach(el =>
-        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
+        el.addEventListener('input', () => updateOffset(el)));
 }
 
 // Phase D.7: initial magnetization sub-state for a chip. Parameters are
@@ -1606,15 +1643,40 @@ function defaultMagnetizationState() {
     return {
         pattern: 'parallel',
         angle: 0,           // [deg]
-        p: 4,               // pole pairs
+        p: 2,               // pole pairs (= 4 poles, matches a 4-pole machine)
         Kn: 1.6,            // = R_pc / Rm
         cx: 0,              // [m]
         cy: 0,              // [m]
-        orientation_offset: 0,  // [deg]
-        direction: 'outward',   // Phase E.4: outward | inward
+        orientation_offset: 0,  // [deg] -- auto-seeded to -180/(2p) when a
+                                //         sector pattern is first picked
+        // Phase G: false until the user types in the offset input directly.
+        // When false, switching pattern / editing p re-applies the
+        // cardinal-aligned -180/(2p) default. Once the user has set an
+        // explicit offset we stop overwriting it.
+        _offset_explicit: false,
+        direction: 'outward',
         Mx: '',             // tinyexpr expression
         My: '',
     };
+}
+
+// Phase G: patterns whose magnetisation structure is defined in terms
+// of pole sectors. For these the natural cardinal-aligned default is
+// orientation_offset = -180°/(2p) (sector 0 centred on θ=0).
+const SECTOR_PATTERNS = new Set([
+    'halbach_continuous', 'polar_anisotropy', 'radial_array', 'parallel_array',
+]);
+
+// Phase G: recompute orientation_offset to its cardinal-aligned default
+// for the current pattern + p, unless the user has explicitly set the
+// offset (_offset_explicit = true). Called from the pattern dropdown
+// change handler and from every p input handler.
+function reseedOffsetIfAuto(assign) {
+    const m = assign && assign.magnetization;
+    if (!m || m._offset_explicit) return;
+    if (!SECTOR_PATTERNS.has(m.pattern)) return;
+    const p = Math.max(1, Math.round(Number(m.p) || 1));
+    m.orientation_offset = -180 / (2 * p);
 }
 
 // Phase D.7: classify whether a library entry (preset or material) is a
