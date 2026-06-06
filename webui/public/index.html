@@ -1114,6 +1114,12 @@
                             style="width: 100%; margin-top: 6px; display: none;">
                         Polarize Cross-Section
                     </button>
+                    <button class="btn-secondary" id="magPreviewBtn"
+                            onclick="openMagnetizationPreviewModal()"
+                            style="width: 100%; margin-top: 6px; display: none;"
+                            title="Overlay magnetisation vector arrows on the loaded image, computed from the current YAML's materials + magnetization blocks (active material library resolves any preset references).">
+                        Preview Magnetization
+                    </button>
                 </div>
 
                 <!-- Right Panel: Solver Control -->
@@ -1430,6 +1436,59 @@
             <div class="modal-footer">
                 <button class="btn-secondary" onclick="copyDetectedYaml()">Copy to Clipboard</button>
                 <button class="btn-primary" onclick="insertMaterialsSection()">Insert materials: section into Editor</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Phase I: Magnetisation vector preview overlay -->
+    <div id="magnetizationPreviewModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 1100px; width: 95%; height: 90vh; max-height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3>Magnetization Preview — vector overlay</h3>
+                <button onclick="closeMagnetizationPreviewModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
+            </div>
+            <div class="modal-body" style="display: flex; flex: 1; overflow: hidden; padding: 0;">
+                <!-- Preview pane (left). Reuses .polar-preview-container so the
+                     zoom-pan helper from Phase D.1 applies unchanged. -->
+                <div class="qfilter-pane" style="flex: 1; display: flex; flex-direction: column;">
+                    <div class="polar-preview-container" id="magPreviewContainer" tabindex="0"
+                         title="Wheel: zoom · Middle-button drag: pan · Double-click: reset"
+                         style="flex: 1; position: relative;">
+                        <div class="zoom-stage" id="magPreviewZoomStage">
+                            <img id="magPreviewImg" draggable="false" alt="magnetization-preview source"/>
+                            <svg id="magPreviewOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+                        </div>
+                        <div class="zoom-indicator" id="magPreviewZoomIndicator">100%</div>
+                    </div>
+                    <div id="magPreviewStatus" style="padding: 8px 12px; font-size: 0.83rem; color: #495057; border-top: 1px solid #e9ecef; min-height: 1.4em;"></div>
+                </div>
+                <!-- Sidebar (right) -->
+                <div style="width: 320px; padding: 14px; overflow-y: auto; border-left: 1px solid #e9ecef; background: #f8f9fa; font-size: 0.85rem;">
+                    <h4 style="margin: 0 0 6px 0; font-size: 0.9rem;">Detected magnet materials</h4>
+                    <div id="magPreviewMaterialList" style="margin-bottom: 12px;"></div>
+                    <h4 style="margin: 0 0 6px 0; font-size: 0.9rem;">Sampling</h4>
+                    <label style="display: block; margin-bottom: 6px;">
+                        Grid stride
+                        <input type="number" id="magPreviewStride" value="12" min="2" step="1"
+                               style="width: 60px; padding: 2px 4px; margin-left: 4px;"> px
+                    </label>
+                    <label style="display: block; margin-bottom: 6px;">
+                        Arrow scale
+                        <input type="number" id="magPreviewArrowScale" value="1.0" min="0.1" step="0.1"
+                               style="width: 60px; padding: 2px 4px; margin-left: 4px;">
+                    </label>
+                    <button class="btn-secondary" onclick="renderMagnetizationFieldOverlay()" style="width: 100%; padding: 6px;">Refresh overlay</button>
+                    <div style="margin-top: 12px; color: #6c757d; font-size: 0.78rem; line-height: 1.5;">
+                        Arrows are sampled on a regular grid in image-pixel coords.
+                        Red = sign +1 (N-out / outward / pole 0 with `direction`); blue = sign −1.
+                        The coordinate model is currently the cartesian save target
+                        (mesh.dx/dy from YAML). Polar warps render in r,θ image coords;
+                        the arrow direction is the M vector in the local rotor frame.
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-secondary" onclick="closeMagnetizationPreviewModal()">Close</button>
             </div>
         </div>
     </div>

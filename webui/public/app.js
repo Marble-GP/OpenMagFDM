@@ -962,6 +962,7 @@ async function handleImageUpload(event) {
         showStatus('solverStatus', `Image uploaded: ${result.filename}`, 'success');
         document.getElementById('detectColorsBtn').style.display = 'block';
         document.getElementById('polarizeBtn').style.display = 'block';
+        document.getElementById('magPreviewBtn').style.display = 'block';
 
         // Refresh image list
         await refreshImageList();
@@ -1043,6 +1044,7 @@ async function deleteSelectedImage() {
             document.getElementById('uploadedImage').classList.add('hidden');
             document.getElementById('detectColorsBtn').style.display = 'none';
             document.getElementById('polarizeBtn').style.display = 'none';
+            document.getElementById('magPreviewBtn').style.display = 'none';
             document.getElementById('quantizeFilterBtn').style.display = 'none';
             document.getElementById('inputImageNoiseBanner').style.display = 'none';
         }
@@ -2133,6 +2135,220 @@ async function rerunDetect() {
 
 function closeDetectColorsModal() {
     document.getElementById('detectColorsModal').style.display = 'none';
+}
+
+// ============================================================
+// Phase I: Magnetization full-image preview modal
+// ============================================================
+// Opens a side-by-side view of the loaded image with sampled M
+// vector arrows overlaid. The arrows come from parsing the current
+// editor YAML for materials that carry a magnetization block (preset
+// references are resolved through AppState.selectedLibrary the same
+// way the WebUI server does at analysis launch, so the preview
+// matches what the solver will see).
+
+AppState.magPreview = {
+    materials: [],   // resolved magnet entries [{ name, rgb:[r,g,b], magnetization }]
+    image: null,     // HTMLImageElement
+    pixels: null,    // ImageData
+    coordSystem: 'cartesian',
+    dx: 1e-3,
+    dy: 1e-3,
+};
+
+async function openMagnetizationPreviewModal() {
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'Select an image first', 'error');
+        return;
+    }
+    if (!AppState.aceEditor) {
+        showStatus('solverStatus', 'YAML editor not available', 'error');
+        return;
+    }
+    // Parse YAML
+    let doc;
+    try {
+        doc = jsyaml.load(AppState.aceEditor.getValue()) || {};
+    } catch (e) {
+        showStatus('solverStatus', `YAML parse error: ${e.message}`, 'error');
+        return;
+    }
+    // Resolve presets via the active library exactly like server.js
+    // mergeLibraryIntoConfig does at run time.
+    let presets = Object.assign({}, doc.material_presets || {});
+    if (AppState.selectedLibrary) {
+        try {
+            const r = await fetch(`/api/material-libraries/${encodeURIComponent(AppState.selectedLibrary)}?userId=${AppState.userId}`);
+            if (r.ok) {
+                const lib = jsyaml.load(await r.text()) || {};
+                const libPresets = Object.assign({}, lib.material_presets || {});
+                for (const [n, p] of Object.entries(lib.materials || {})) {
+                    const { rgb: _rgb, ...rest } = (p || {});
+                    libPresets[n] = rest;
+                }
+                presets = Object.assign({}, libPresets, presets);
+            }
+        } catch (_) { /* best effort */ }
+    }
+    // Find magnet materials (rgb + magnetization carrying Br/Hc or B-H remanence).
+    const magnetMaterials = [];
+    const materials = doc.materials || {};
+    for (const [name, raw] of Object.entries(materials)) {
+        let props = raw || {};
+        if (props.preset && presets[props.preset]) {
+            props = Object.assign({}, presets[props.preset], props);
+        }
+        if (!Array.isArray(props.rgb) || props.rgb.length < 3) continue;
+        const m = props.magnetization;
+        if (!m || typeof m !== 'object') continue;
+        if (m.Br == null && m.Hc == null && !isMagnetMaterial(props)) continue;
+        magnetMaterials.push({
+            name,
+            rgb: [Number(props.rgb[0]) | 0, Number(props.rgb[1]) | 0, Number(props.rgb[2]) | 0],
+            magnetization: m,
+        });
+    }
+    AppState.magPreview.materials = magnetMaterials;
+    AppState.magPreview.coordSystem = (doc.coordinate_system === 'polar') ? 'polar' : 'cartesian';
+    AppState.magPreview.dx = (doc.mesh && Number(doc.mesh.dx)) || 1e-3;
+    AppState.magPreview.dy = (doc.mesh && Number(doc.mesh.dy)) || AppState.magPreview.dx;
+    // Populate sidebar list
+    const matList = document.getElementById('magPreviewMaterialList');
+    if (magnetMaterials.length === 0) {
+        matList.innerHTML = '<div style="color:#856404; background:#fff3cd; padding:6px 8px; border-radius:3px;">No magnet materials found in the current YAML (need rgb + magnetization block).</div>';
+    } else {
+        matList.innerHTML = magnetMaterials.map(mm => {
+            const hex = '#' + mm.rgb.map(v => v.toString(16).padStart(2, '0')).join('');
+            const pat = (mm.magnetization && mm.magnetization.pattern) || '?';
+            return `<div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
+                <div style="width:14px; height:14px; background:${hex}; border:1px solid #aaa;"></div>
+                <span style="font-family:monospace; font-size:0.78rem;">${hex}</span>
+                <span style="color:#495057;">${mm.name}</span>
+                <span style="color:#6c757d;">(${pat})</span>
+            </div>`;
+        }).join('');
+    }
+    document.getElementById('magPreviewStatus').textContent =
+        `coord_system: ${AppState.magPreview.coordSystem}  ·  ${magnetMaterials.length} magnet material(s)`;
+    // Show modal + attach zoom-pan (idempotent)
+    document.getElementById('magnetizationPreviewModal').style.display = 'flex';
+    attachZoomPan(
+        document.getElementById('magPreviewContainer'),
+        document.getElementById('magPreviewZoomStage'),
+        {
+            indicatorEl: document.getElementById('magPreviewZoomIndicator'),
+            onScaleChange: () => { /* arrows are in image-coord space; no rescale needed */ },
+        }
+    );
+    // Load image into the preview + into a canvas for pixel sampling
+    const imgEl = document.getElementById('magPreviewImg');
+    await new Promise((resolve, reject) => {
+        imgEl.onload = () => {
+            // Mirror onto an off-screen canvas so we can read pixels.
+            const canvas = document.createElement('canvas');
+            canvas.width = imgEl.naturalWidth;
+            canvas.height = imgEl.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(imgEl, 0, 0);
+            AppState.magPreview.image = imgEl;
+            try {
+                AppState.magPreview.pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            } catch (e) {
+                AppState.magPreview.pixels = null;
+            }
+            const svg = document.getElementById('magPreviewOverlay');
+            svg.setAttribute('viewBox', `0 0 ${imgEl.naturalWidth} ${imgEl.naturalHeight}`);
+            resolve();
+        };
+        imgEl.onerror = () => reject(new Error('image load failed'));
+        imgEl.src = `/uploads/${AppState.userId}/${AppState.uploadedImageFilename}?t=${Date.now()}`;
+    });
+    renderMagnetizationFieldOverlay();
+}
+
+function closeMagnetizationPreviewModal() {
+    document.getElementById('magnetizationPreviewModal').style.display = 'none';
+    AppState.magPreview.image = null;
+    AppState.magPreview.pixels = null;
+}
+
+// Phase I: paint sampled M-vector arrows onto the modal's SVG overlay
+// based on AppState.magPreview state. Cheap to re-run, so the user
+// can tweak grid stride / arrow scale without reloading the image.
+function renderMagnetizationFieldOverlay() {
+    const pix = AppState.magPreview.pixels;
+    const mats = AppState.magPreview.materials || [];
+    const svg = document.getElementById('magPreviewOverlay');
+    if (!svg) return;
+    if (!pix || mats.length === 0) {
+        svg.innerHTML = '';
+        return;
+    }
+    const W = pix.width, H = pix.height;
+    const data = pix.data;
+    const stride = Math.max(2, parseInt(document.getElementById('magPreviewStride').value, 10) || 12);
+    const arrowScale = Math.max(0.1, parseFloat(document.getElementById('magPreviewArrowScale').value) || 1.0);
+    const arrowLen = stride * 0.6 * arrowScale;
+    const isPolar = (AppState.magPreview.coordSystem === 'polar');
+    const dx = AppState.magPreview.dx || 1e-3;
+    const dy = AppState.magPreview.dy || dx;
+    // Index the magnet materials by packed RGB for O(1) per-pixel lookup.
+    const matByRgb = new Map();
+    for (const mm of mats) {
+        const key = (mm.rgb[0] << 16) | (mm.rgb[1] << 8) | mm.rgb[2];
+        matByRgb.set(key, mm);
+    }
+    const parts = [];
+    let arrowCount = 0;
+    for (let j = Math.floor(stride / 2); j < H; j += stride) {
+        for (let i = Math.floor(stride / 2); i < W; i += stride) {
+            const p = (j * W + i) * 4;
+            const key = (data[p] << 16) | (data[p + 1] << 8) | data[p + 2];
+            const mm = matByRgb.get(key);
+            if (!mm) continue;
+            // Convert image pixel (i, j) to a physical (x, y) in
+            // metres. For cartesian: image y is down, analysis y is up
+            // (the solver does cv::flip), so flip j here too.
+            // For polar: the warped image's i,j IS the rotor frame (r
+            // along one axis, θ along the other); we treat them as
+            // direct (x_norm, y_norm) for vector evaluation since the
+            // magnetization block's cx,cy are also rotor-frame.
+            const x_phys = i * dx;
+            const y_phys = (H - 1 - j) * dy;
+            const m = mm.magnetization;
+            const cx = Number(m.cx) || 0;
+            const cy = Number(m.cy) || 0;
+            const r_local = Math.hypot(x_phys - cx, y_phys - cy);
+            const theta_local = Math.atan2(y_phys - cy, x_phys - cx);
+            // Use unit-circle-normalised r for polar_anisotropy so its
+            // Kn-based Biot-Savart computation works regardless of
+            // physical scale.
+            const Rm_estimate = Math.max(r_local, 1e-9);
+            const res = evalMagnetizationDirection(m, theta_local,
+                r_local / (Number(m.R_pc) || Rm_estimate));
+            if (!res) continue;
+            const angle = res.angle_rad + (res.sign < 0 ? Math.PI : 0);
+            // Render in IMAGE coords (y down) so the arrow visually
+            // matches the image. Physical +y is image -y.
+            const cos_a = Math.cos(angle);
+            const sin_a = Math.sin(angle);
+            const x_tip = i + arrowLen * cos_a;
+            const y_tip = j - arrowLen * sin_a;   // flip y for SVG
+            const colour = (res.sign >= 0) ? '#d63333' : '#3366cc';
+            parts.push(`<line x1="${i}" y1="${j}" x2="${x_tip.toFixed(2)}" y2="${y_tip.toFixed(2)}" stroke="${colour}" stroke-width="${(stride * 0.08).toFixed(2)}" stroke-linecap="round" opacity="0.9"/>`);
+            // Arrowhead triangle
+            const ah = arrowLen * 0.33;
+            const tail_x = x_tip - ah * cos_a;
+            const tail_y = y_tip + ah * sin_a;   // image-coord flip
+            const perp_x =  sin_a * ah * 0.5;
+            const perp_y =  cos_a * ah * 0.5;
+            parts.push(`<polygon points="${x_tip.toFixed(2)},${y_tip.toFixed(2)} ${(tail_x + perp_x).toFixed(2)},${(tail_y + perp_y).toFixed(2)} ${(tail_x - perp_x).toFixed(2)},${(tail_y - perp_y).toFixed(2)}" fill="${colour}" opacity="0.9"/>`);
+            arrowCount++;
+        }
+    }
+    svg.innerHTML = parts.join('');
+    document.getElementById('magPreviewStatus').textContent =
+        `coord_system: ${AppState.magPreview.coordSystem}  ·  ${mats.length} material(s)  ·  ${arrowCount} arrow(s) painted (stride=${stride}px${isPolar ? ', polar' : ''})`;
 }
 
 // ============================================================
