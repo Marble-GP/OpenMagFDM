@@ -802,7 +802,23 @@
             justify-content: center;
             transform-origin: 0 0;
             transform: translate(0px, 0px) scale(1);
-            will-change: transform;
+            /* Phase E.1: image-rendering MUST live on the transformed
+               element (Chromium reads the property from the layer that
+               carries the transform, not from the <img> child). Both
+               the image and its zoom-stage parent receive the hint so
+               cascading the high-quality keyword wins everywhere. */
+            image-rendering: auto;
+            image-rendering: smooth;
+            image-rendering: high-quality;
+            /* Phase E.1: `will-change: transform` promoted the stage to
+               its own GPU layer; the layer was then rasterised at the
+               base scale and the GPU sampler subsequently upscaled the
+               raster with what amounted to a nearest filter on the
+               user's display. Removing the hint lets Chromium re-paint
+               at the current scale on every wheel-zoom, producing a
+               proper bicubic result at the cost of marginally slower
+               redraws (well within an interactive budget for the size
+               of preview images involved). */
         }
         .zoom-indicator {
             position: absolute;

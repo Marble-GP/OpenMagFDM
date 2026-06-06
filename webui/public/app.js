@@ -1295,10 +1295,12 @@ function renderDetectChips() {
         }).join('');
         const patternOpts = [
             ['parallel',           'parallel (uniform angle)'],
-            ['radial',             'radial (outward from centre)'],
-            ['tangential',         'tangential (CCW around centre)'],
+            ['radial',             'radial (outward/inward from centre)'],
+            ['tangential',         'tangential (CCW/CW around centre)'],
             ['halbach_continuous', 'halbach_continuous (p, centre, offset)'],
             ['polar_anisotropy',   'polar_anisotropy (p, Kn=Fn/Rm, centre, offset)'],
+            ['radial_array',       'radial_array (NS alternating radial, p poles)'],
+            ['parallel_array',     'parallel_array (NS alternating sector-parallel, p poles)'],
             ['custom',             'custom (Mx, My expressions)'],
         ].map(([v, t]) => `<option value="${v}">${t}</option>`).join('');
         item.innerHTML = `
@@ -1324,6 +1326,25 @@ function renderDetectChips() {
             <span data-mag-params="radial-${hex}" style="display:none; gap:4px; align-items:center;">
                 <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCx" style="width:80px; padding:1px 3px;"> m</label>
                 <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCy" style="width:80px; padding:1px 3px;"> m</label>
+                <label><input type="radio" name="magDir-${hex}" data-detect-hex="${hex}" data-role="magDir" value="outward"> outward</label>
+                <label><input type="radio" name="magDir-${hex}" data-detect-hex="${hex}" data-role="magDir" value="inward"> inward</label>
+            </span>
+            <span data-mag-params="radialArray-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magPArr" style="width:48px; padding:1px 3px;"></label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCxArr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCyArr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffsetArr" style="width:64px; padding:1px 3px;"> deg</label>
+                <label><input type="radio" name="magDirArr-${hex}" data-detect-hex="${hex}" data-role="magDirArr" value="outward"> outward</label>
+                <label><input type="radio" name="magDirArr-${hex}" data-detect-hex="${hex}" data-role="magDirArr" value="inward"> inward</label>
+            </span>
+            <span data-mag-params="parallelArray-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magPParr" style="width:48px; padding:1px 3px;"></label>
+                <label title="extra rotation off the sector mid-axis">angle <input type="number" step="1" data-detect-hex="${hex}" data-role="magAngleParr" style="width:64px; padding:1px 3px;"> deg</label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCxParr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCyParr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffsetParr" style="width:64px; padding:1px 3px;"> deg</label>
+                <label><input type="radio" name="magDirParr-${hex}" data-detect-hex="${hex}" data-role="magDirParr" value="outward"> outward</label>
+                <label><input type="radio" name="magDirParr-${hex}" data-detect-hex="${hex}" data-role="magDirParr" value="inward"> inward</label>
             </span>
             <span data-mag-params="halbach-${hex}" style="display:none; gap:4px; align-items:center;">
                 <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magP" style="width:48px; padding:1px 3px;"></label>
@@ -1408,9 +1429,11 @@ function showMagPatternParams(item, hex, pattern) {
     const map = {
         parallel:           `parallel-${hex}`,
         radial:             `radial-${hex}`,
-        tangential:         `radial-${hex}`,   // shares cx/cy with radial
+        tangential:         `radial-${hex}`,   // shares cx/cy + direction with radial
         halbach_continuous: `halbach-${hex}`,
         polar_anisotropy:   `polar-${hex}`,
+        radial_array:       `radialArray-${hex}`,
+        parallel_array:     `parallelArray-${hex}`,
         custom:             `custom-${hex}`,
     };
     const target = map[pattern];
@@ -1448,6 +1471,26 @@ function applyMagnetizationStateToControls(item, hex, m) {
     setVal('magCy3', m.cy);
     setVal('magMx', m.Mx);
     setVal('magMy', m.My);
+    // Phase E.4: direction radios (shared radial/tangential) + array
+    // patterns.
+    item.querySelectorAll(`input[data-role="magDir"][data-detect-hex="${hex}"]`).forEach(r => {
+        r.checked = (r.value === (m.direction || 'outward'));
+    });
+    item.querySelectorAll(`input[data-role="magDirArr"][data-detect-hex="${hex}"]`).forEach(r => {
+        r.checked = (r.value === (m.direction || 'outward'));
+    });
+    item.querySelectorAll(`input[data-role="magDirParr"][data-detect-hex="${hex}"]`).forEach(r => {
+        r.checked = (r.value === (m.direction || 'outward'));
+    });
+    setVal('magPArr', m.p);
+    setVal('magCxArr', m.cx);
+    setVal('magCyArr', m.cy);
+    setVal('magOffsetArr', m.orientation_offset);
+    setVal('magPParr', m.p);
+    setVal('magAngleParr', m.angle);
+    setVal('magCxParr', m.cx);
+    setVal('magCyParr', m.cy);
+    setVal('magOffsetParr', m.orientation_offset);
 }
 
 // Phase D.7: wire all the magnetization controls in the chip grid.
@@ -1514,6 +1557,46 @@ function bindMagnetizationControls(grid) {
         el.addEventListener('input', () => updateStr(el, 'Mx')));
     grid.querySelectorAll('input[data-role="magMy"]').forEach(el =>
         el.addEventListener('input', () => updateStr(el, 'My')));
+    // Phase E.4: direction radios (radial / tangential share `magDir`,
+    // array patterns each have their own role since they're separate
+    // visible groups but write to the same state field).
+    const wireDirRadios = (role) => {
+        grid.querySelectorAll(`input[data-role="${role}"]`).forEach(el => {
+            el.addEventListener('change', () => {
+                if (!el.checked) return;
+                const a = AppState.detectAssign[el.dataset.detectHex];
+                if (!a || !a.magnetization) return;
+                a.magnetization.direction = el.value;
+                regenerateDetectYamlPreview();
+            });
+        });
+    };
+    wireDirRadios('magDir');
+    wireDirRadios('magDirArr');
+    wireDirRadios('magDirParr');
+    // Phase E.4: array-pattern-specific param inputs. They share the
+    // same magnetization state fields as the polar / halbach controls
+    // (p, cx, cy, orientation_offset, angle) so multiple inputs can
+    // bind to the same key — that's intentional, the UI just exposes
+    // the parameter under whichever pattern is currently visible.
+    grid.querySelectorAll('input[data-role="magPArr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'p')));
+    grid.querySelectorAll('input[data-role="magCxArr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCyArr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    grid.querySelectorAll('input[data-role="magOffsetArr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
+    grid.querySelectorAll('input[data-role="magPParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'p')));
+    grid.querySelectorAll('input[data-role="magAngleParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'angle')));
+    grid.querySelectorAll('input[data-role="magCxParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCyParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    grid.querySelectorAll('input[data-role="magOffsetParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
 }
 
 // Phase D.7: initial magnetization sub-state for a chip. Parameters are
@@ -1528,6 +1611,7 @@ function defaultMagnetizationState() {
         cx: 0,              // [m]
         cy: 0,              // [m]
         orientation_offset: 0,  // [deg]
+        direction: 'outward',   // Phase E.4: outward | inward
         Mx: '',             // tinyexpr expression
         My: '',
     };
@@ -1588,11 +1672,15 @@ function appendMagnetizationBlock(lines, indent, m) {
     lines.push(`${indent}magnetization:`);
     const sub = `${indent}  `;
     lines.push(`${sub}pattern: ${m.pattern}`);
+    const dir = (m.direction === 'inward') ? 'inward' : 'outward';
     if (m.pattern === 'parallel') {
         lines.push(`${sub}angle: ${Number(m.angle) || 0}`);
     } else if (m.pattern === 'radial' || m.pattern === 'tangential') {
         lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
         lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        // Phase E.4: emit direction only when non-default so backward-
+        // compatible YAML stays minimal for the common outward case.
+        if (dir !== 'outward') lines.push(`${sub}direction: ${dir}`);
     } else if (m.pattern === 'halbach_continuous') {
         lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
         lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
@@ -1610,6 +1698,23 @@ function appendMagnetizationBlock(lines, indent, m) {
         lines.push(`${sub}R_pc: ${R_pc}`);
         lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
         lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'radial_array') {
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        lines.push(`${sub}direction: ${dir}    # pole 0 is ${dir}-pointing; alternates per sector`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'parallel_array') {
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}angle: ${Number(m.angle) || 0}    # extra rotation off sector mid-axis`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        lines.push(`${sub}direction: ${dir}    # pole 0 sign; alternates per sector`);
         if (Number(m.orientation_offset) !== 0) {
             lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
         }
@@ -1685,27 +1790,29 @@ function buildDetectYamlFromAssignments() {
     }
     lines.push(...headerLines);
 
-    // Insert material_presets: for the presets the user actually used.
-    const presetsToEmit = [];
+    // Phase E.3: material_presets are NOT emitted inline. server.js
+    // already merges AppState.selectedLibrary into the config YAML at
+    // analysis launch via mergeLibraryIntoConfig (server.js ~L189), so
+    // copying the preset definitions here would just produce stale
+    // duplicates that drift from the library file the user edits in
+    // the Library Manager. We emit a one-line note instead pointing
+    // at which presets the materials: block depends on, and the
+    // active library that resolves them.
+    const referencedPresets = [];
     for (const c of colors) {
         const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
         const kind = assign[hex] && assign[hex].kind;
         if (kind && kind !== 'none' && kind !== 'Coil' && presetsAll[kind]) {
             if (!usedPresetNames.has(kind)) {
                 usedPresetNames.add(kind);
-                presetsToEmit.push(kind);
+                referencedPresets.push(kind);
             }
         }
     }
-    if (presetsToEmit.length > 0) {
-        lines.push('material_presets:');
-        for (const name of presetsToEmit) {
-            const block = jsyaml.dump({ [name]: presetsAll[name] }, { indent: 2, lineWidth: -1 });
-            // Indent the nested object content under material_presets:.
-            for (const ln of block.replace(/\n$/, '').split('\n')) {
-                lines.push('  ' + ln);
-            }
-        }
+    if (referencedPresets.length > 0) {
+        const lib = AppState.detectLibraryName || '(none)';
+        lines.push(`# Referenced presets (resolved at run time by merging the active`);
+        lines.push(`# material library "${lib}"): ${referencedPresets.join(', ')}.`);
         lines.push('');
     }
 
@@ -2127,16 +2234,11 @@ function insertMaterialsSection() {
 
         // Replace only the materials section
         currentDoc.materials = detectedDoc.materials;
-        // Phase D.4: merge any picked library presets so `preset: X`
-        // references resolve in the solver. We *merge* rather than
-        // overwrite so the user's pre-existing presets survive.
-        if (detectedDoc.material_presets && typeof detectedDoc.material_presets === 'object') {
-            currentDoc.material_presets = Object.assign(
-                {},
-                currentDoc.material_presets || {},
-                detectedDoc.material_presets
-            );
-        }
+        // Phase E.3: material_presets are intentionally NOT merged here
+        // — the server merges AppState.selectedLibrary at run time, so
+        // inlining the presets would create a stale copy of the library
+        // contents inside every config file. The user keeps the library
+        // YAML authoritative.
 
         const merged = jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 });
         AppState.aceEditor.setValue(merged, -1);
@@ -3424,6 +3526,14 @@ function buildPolarYamlBlock(filename, polarDomain) {
     lines.push('  outer:     { type: dirichlet, value: 0.0 }   # stator OD / r_outer — Az = 0');
     lines.push(`  theta_min: { ${bc.bcFlow} }`);
     lines.push(`  theta_max: { ${bc.bcFlow} }`);
+    // Phase E.2: image_path here is documentation only — the solver
+    // takes the image as argv[2] from the CLI (which the WebUI auto-
+    // sets to AppState.uploadedImageFilename = the saved warp output).
+    // We still write the filename so the YAML self-describes which
+    // image the polar_domain was authored for, and so re-importing the
+    // YAML elsewhere preserves that link.
+    lines.push(`# image_path: documentation only. The solver reads the image given on the`);
+    lines.push(`# command line; this field records which file the polar_domain was authored for.`);
     lines.push(`image_path: ${filename}`);
 
     // Phase D.3: optional transient.slides skeleton from the air-gap
@@ -3487,6 +3597,9 @@ function buildCartesianYamlBlock(filename) {
     lines.push('mesh:');
     lines.push(`  dx: ${dxdy}`);
     lines.push(`  dy: ${dxdy}`);
+    // Phase E.2: same documentation-only semantics as the polar block.
+    lines.push(`# image_path: documentation only. The solver reads the image given on the`);
+    lines.push(`# command line; this field records which file the mesh was authored for.`);
     lines.push(`image_path: ${filename}`);
     return lines.join('\n') + '\n';
 }
@@ -3528,28 +3641,39 @@ async function insertPolarYaml() {
     let toastMsg;
     let toastKind = 'success';
     if (cur.save_as === 'polar') {
-        let usingPreview = false;
         let polarDomain;
+        // Phase E.2: image_path is the path the C++ solver opens at
+        // analysis time to look up per-cell material RGB → mu_r / jz /
+        // magnetization. It MUST point at a persisted file in the user's
+        // uploads directory, NOT at the transient warp-preview file
+        // (which is deleted when the modal closes). If only a preview
+        // exists, auto-promote it to a saved file before inserting so
+        // the inserted image_path is always a stable reference.
+        if (!(pp.lastSaved && pp.lastSaved.filename) &&
+            pp.lastPreview && pp.lastPreview.filename) {
+            try {
+                await savePolarImage();
+            } catch (err) {
+                showStatus('solverStatus',
+                    `Auto-save before insert failed: ${err.message}. ` +
+                    `Press "Save image" then try Insert YAML again.`,
+                    'error');
+                return;
+            }
+        }
         if (pp.lastSaved && pp.lastSaved.filename) {
             targetFilename = pp.lastSaved.filename;
             polarDomain    = pp.lastSaved.polar_domain;
-        } else if (pp.lastPreview && pp.lastPreview.filename) {
-            targetFilename = pp.lastPreview.filename;
-            polarDomain    = pp.lastPreview.polar_domain;
-            usingPreview = true;
         } else {
             showStatus('solverStatus',
-                'No polar warp available. Press "Apply Transform" or "Save image" first.',
+                'No polar warp available. Press "Apply Transform" then "Save image" first.',
                 'error');
             return;
         }
         block = buildPolarYamlBlock(targetFilename, polarDomain);
-        toastMsg = usingPreview
-            ? `YAML updated to reference preview file ${targetFilename}. ` +
-              `This is a transient file and is removed when the modal closes -- press "Save image" to keep it.`
-            : `YAML updated: polar_domain + image_path = ${targetFilename}. ` +
-              `Tip: re-run Detect Colors on the warped image.`;
-        if (usingPreview) toastKind = 'info';
+        toastMsg = `YAML updated: polar_domain block + image_path note for ${targetFilename}. ` +
+                   `(The solver picks the image from the dropdown, which has been switched ` +
+                   `to the saved warp output. Re-run Detect Colors on the warped image to refresh materials.)`;
     } else {
         block = buildCartesianYamlBlock(pp.sourceFilename);
         targetFilename = pp.sourceFilename;

@@ -439,14 +439,21 @@
     },
     "magnetization": {
       "description": "Permanent magnet magnetization model. Implements equivalent magnetization current Jz_mag=∇×M. Specify Br (preferred) or Hc, then pattern and direction parameters",
-      "children": ["Br", "Hc", "pattern", "angle", "p", "cx", "cy", "R_pc", "orientation_offset", "Mx", "My"],
+      "children": ["Br", "Hc", "pattern", "angle", "p", "cx", "cy", "R_pc", "orientation_offset", "direction", "Mx", "My"],
       "validParents": ["materials"],
       "example": "magnetization:\n  Br: 1.27\n  pattern: parallel\n  angle: 0.0"
     },
     "pattern": {
-      "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward from center (cx, cy)\n  tangential — counter-clockwise from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy, orientation_offset)\n  polar_anisotropy — pole-following easy axis from 2p orientation centres OJ on a pitch circle (p, R_pc, cx, cy, orientation_offset); see Kano 2025 §3.2\n  custom — user expression (Mx, My)",
-      "values": ["parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "custom"],
+      "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward (or inward via direction) from center (cx, cy)\n  tangential — counter-clockwise (or clockwise via direction) from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy, orientation_offset)\n  polar_anisotropy — pole-following easy axis from 2p orientation centres OJ on a pitch circle (p, R_pc, cx, cy, orientation_offset); see Kano 2025 §3.2\n  radial_array — alternating radial-out / radial-in per pole sector (axially-magnetised SPM, p poles)\n  parallel_array — uniform parallel within each pole sector along the sector mid-axis, alternating per pole (axially-magnetised IPM with rectangular magnets, p poles)\n  custom — user expression (Mx, My)",
+      "values": ["parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "radial_array", "parallel_array", "custom"],
       "example": "pattern: parallel",
+      "validParents": ["magnetization"]
+    },
+    "direction": {
+      "description": "Sign / orientation flag for radial, tangential, radial_array, and parallel_array patterns. 'outward' (default) puts the first pole positive / radial pointing out; 'inward' flips the sign. Use to express the second half of an NS alternation when each side is its own colour, or to set the initial pole of an array pattern.",
+      "type": "string",
+      "values": ["outward", "inward"],
+      "example": "direction: outward",
       "validParents": ["magnetization"]
     },
     "Br": {
@@ -723,6 +730,16 @@
       "name": "Magnetization - Polar Anisotropy (Kano 2025 §3.2)",
       "trigger": "magnetization",
       "snippet": "Br: 1.2\npattern: polar_anisotropy\np: 4\nR_pc: 0.064    # Fn = Kn * Rm; Kn=1.6 → near-sinusoidal gap density\ncx: 0.0\ncy: 0.0\norientation_offset: 0"
+    },
+    "magnetization_radial_array": {
+      "name": "Magnetization - Radial Array (axially-magnetised SPM, NS alternating)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: radial_array\np: 4\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: 0"
+    },
+    "magnetization_parallel_array": {
+      "name": "Magnetization - Parallel Array (IPM rectangular magnets, NS alternating)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: parallel_array\np: 4\nangle: 0        # extra rotation [deg] off the sector mid-axis\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: 0"
     },
     "magnetization_custom": {
       "name": "Magnetization - Custom Expression",

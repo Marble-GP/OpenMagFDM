@@ -667,11 +667,17 @@ private:
     struct MagnetizationConfig {
         bool enabled = false;
         double Hc = 0.0;          // Effective magnetization magnitude [A/m] (resolved from Br or Hc in YAML)
-        std::string pattern;       // "parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "custom"
-        double angle_deg = 0.0;    // Magnetization angle [deg] (parallel)
-        int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy)
+        std::string pattern;       // "parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "radial_array", "parallel_array", "custom"
+        double angle_deg = 0.0;    // Magnetization angle [deg] (parallel, parallel_array)
+        int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy, radial_array, parallel_array)
         double cx = 0.0, cy = 0.0; // Rotation center [m]
         double R_pc = 0.0;         // Pitch circle radius [m] (polar_anisotropy)
+        // Phase E.4: per-pattern direction sign. +1 = outward / first
+        // pole positive (default, backward compat); -1 = inward / first
+        // pole negative. Applies to radial / tangential (uniform flip)
+        // and radial_array / parallel_array (sets pole 0's sign before
+        // alternation).
+        double direction_sign = 1.0;
         // Phase D.7: orientation offset for halbach_continuous and
         // polar_anisotropy. Rotates the first pole's orientation centre
         // (OJ in Kano 2025) by this angle around the rotor centre,

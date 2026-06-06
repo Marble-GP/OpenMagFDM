@@ -1264,28 +1264,73 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                           << ", orientation_offset=" << mc.orientation_offset_deg
                           << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "radial") {
-                // Radial magnetization: M points outward along r̂ from (cx, cy)
-                // Mx = Hc * cos(theta),  My = Hc * sin(theta)
-                // where theta = atan2(y - cy, x - cx)
+                // Radial magnetization: M points outward (direction=outward,
+                // default) or inward (direction=inward) along r̂ from
+                // (cx, cy). Mx = sign*Hc * cos(theta), My = sign*Hc * sin(theta).
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                double Hc_signed = mc.direction_sign * mc.Hc;
                 std::ostringstream sx, sy;
-                sx << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
-                sy << std::setprecision(17) << mc.Hc << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sx << std::setprecision(17) << Hc_signed << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << Hc_signed << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
                 mc.Mx_expr = sx.str();
                 mc.My_expr = sy.str();
-                std::cout << "  [" << name << "] magnetization: radial (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: radial dir=" << dir
+                          << " (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "tangential") {
-                // Tangential magnetization: M points counter-clockwise along θ̂ from (cx, cy)
-                // Mx = -Hc * sin(theta),  My = Hc * cos(theta)
+                // Tangential magnetization: M points counter-clockwise (default)
+                // or clockwise (direction=inward) along θ̂ from (cx, cy).
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                double Hc_signed = mc.direction_sign * mc.Hc;
                 std::ostringstream sx, sy;
-                sx << std::setprecision(17) << (-mc.Hc) << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
-                sy << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sx << std::setprecision(17) << (-Hc_signed) << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << Hc_signed << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
                 mc.Mx_expr = sx.str();
                 mc.My_expr = sy.str();
-                std::cout << "  [" << name << "] magnetization: tangential (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: tangential dir=" << dir
+                          << " (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "radial_array") {
+                // Phase E.4: alternating radial-out / radial-in per pole
+                // sector (axially-magnetized SPM with NS NS pattern).
+                // Sector k spans θ ∈ [k·π/p, (k+1)·π/p] + offset; sign
+                // alternates from `direction` (pole 0).
+                mc.p = mag["p"].as<int>(1);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                // Dedicated loop (not tinyexpr): the floor() / mod handling
+                // is awkward to express as a single algebraic formula and
+                // would not vectorise inside tinyexpr anyway.
+                mc.Mx_expr = "";
+                mc.My_expr = "";
+                std::cout << "  [" << name << "] magnetization: radial_array p=" << mc.p
+                          << ", dir=" << dir << ", orientation_offset="
+                          << mc.orientation_offset_deg << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "parallel_array") {
+                // Phase E.4: per pole sector, M is uniform within the
+                // sector and aligned with the sector mid-axis (rotor d-axis)
+                // with sign alternating per pole. Models IPM with
+                // axially-magnetised rectangular magnet blocks.
+                mc.p = mag["p"].as<int>(1);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                mc.angle_deg = mag["angle"].as<double>(0.0);  // offset from sector mid-axis
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                mc.Mx_expr = "";
+                mc.My_expr = "";
+                std::cout << "  [" << name << "] magnetization: parallel_array p=" << mc.p
+                          << ", dir=" << dir << ", angle=" << mc.angle_deg
+                          << " deg, orientation_offset=" << mc.orientation_offset_deg
+                          << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "polar_anisotropy") {
                 mc.p = mag["p"].as<int>(1);
                 mc.R_pc = mag["R_pc"].as<double>(0.05);
@@ -1501,10 +1546,11 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
         }
         cv::Vec3b rgb(rgb_vec[0], rgb_vec[1], rgb_vec[2]);
 
-        if (mc.pattern == "polar_anisotropy") {
-            // 2p concentrated wire currents on pitch circle → superposed B direction.
-            // Phase D.7: orientation_offset_deg rotates the OJ positions
-            // around the rotor centre (Kano 2025 §3.2: theta_k = πk/p + offset).
+        const bool is_array_pattern = (mc.pattern == "radial_array" || mc.pattern == "parallel_array");
+        if (mc.pattern == "polar_anisotropy" || is_array_pattern) {
+            // Dedicated loop for polar_anisotropy (Phase D.7) and the two
+            // Phase E.4 array patterns. They all need per-cell pole-sector
+            // bookkeeping that doesn't fit the tinyexpr fast path.
             int grid_rows = is_polar ? (int)Mx_map.rows() : ny;
             int grid_cols = is_polar ? (int)Mx_map.cols() : nx;
             const double orient_rad = mc.orientation_offset_deg * M_PI / 180.0;
@@ -1536,22 +1582,55 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
                         y_phys = j * dy;
                     }
 
-                    // Superpose field of 2p wire currents at R_pc
-                    double Bx_sum = 0.0, By_sum = 0.0;
-                    for (int k = 0; k < 2 * mc.p; k++) {
-                        double theta_k = M_PI * k / mc.p + orient_rad;
-                        double sign = (k % 2 == 0) ? 1.0 : -1.0;
-                        double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
-                        double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
-                        double r2 = dx_w * dx_w + dy_w * dy_w;
-                        if (r2 < 1e-20) continue;
-                        // μ₀I/2π factor omitted — only direction matters
-                        Bx_sum += sign * (-dy_w) / r2;
-                        By_sum += sign * ( dx_w) / r2;
+                    if (mc.pattern == "polar_anisotropy") {
+                        // Superpose field of 2p wire currents at R_pc
+                        double Bx_sum = 0.0, By_sum = 0.0;
+                        for (int k = 0; k < 2 * mc.p; k++) {
+                            double theta_k = M_PI * k / mc.p + orient_rad;
+                            double sign = (k % 2 == 0) ? 1.0 : -1.0;
+                            double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
+                            double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
+                            double r2 = dx_w * dx_w + dy_w * dy_w;
+                            if (r2 < 1e-20) continue;
+                            // μ₀I/2π factor omitted — only direction matters
+                            Bx_sum += sign * (-dy_w) / r2;
+                            By_sum += sign * ( dx_w) / r2;
+                        }
+                        double B_norm = std::sqrt(Bx_sum * Bx_sum + By_sum * By_sum);
+                        Mx_map(j, i) = mc.Hc * Bx_sum / (B_norm + 1e-20);
+                        My_map(j, i) = mc.Hc * By_sum / (B_norm + 1e-20);
+                    } else {
+                        // Phase E.4: radial_array / parallel_array. Determine
+                        // the pole sector index k (0 .. 2p-1) at this cell's
+                        // position angle, then choose the alternating sign and
+                        // the per-pole direction.
+                        double theta_pos = std::atan2(y_phys - mc.cy, x_phys - mc.cx) - orient_rad;
+                        // Map to [0, 2π) so the floor() is well-defined.
+                        double twopi = 2.0 * M_PI;
+                        theta_pos = std::fmod(theta_pos, twopi);
+                        if (theta_pos < 0.0) theta_pos += twopi;
+                        double pole_span = M_PI / mc.p;  // 2π / (2p)
+                        int k_pole = (int)std::floor(theta_pos / pole_span);
+                        if (k_pole < 0) k_pole = 0;
+                        if (k_pole >= 2 * mc.p) k_pole = 2 * mc.p - 1;
+                        double sign = ((k_pole % 2) == 0) ? mc.direction_sign : -mc.direction_sign;
+                        if (mc.pattern == "radial_array") {
+                            // M direction at this cell = radial direction
+                            // (cos/sin of local angle), scaled by sign.
+                            double theta_local = std::atan2(y_phys - mc.cy, x_phys - mc.cx);
+                            Mx_map(j, i) = sign * mc.Hc * std::cos(theta_local);
+                            My_map(j, i) = sign * mc.Hc * std::sin(theta_local);
+                        } else {  // parallel_array
+                            // M within sector k is uniform along the sector
+                            // mid-axis: angle_mid = (k + 0.5)·π/p + orient
+                            // plus the user's `angle` rotation offset
+                            // (degrees) relative to that mid-axis.
+                            double angle_mid = (k_pole + 0.5) * pole_span + orient_rad
+                                             + mc.angle_deg * M_PI / 180.0;
+                            Mx_map(j, i) = sign * mc.Hc * std::cos(angle_mid);
+                            My_map(j, i) = sign * mc.Hc * std::sin(angle_mid);
+                        }
                     }
-                    double B_norm = std::sqrt(Bx_sum * Bx_sum + By_sum * By_sum);
-                    Mx_map(j, i) = mc.Hc * Bx_sum / (B_norm + 1e-20);
-                    My_map(j, i) = mc.Hc * By_sum / (B_norm + 1e-20);
                 }
             }
         } else {
