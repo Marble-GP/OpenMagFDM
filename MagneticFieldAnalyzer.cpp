@@ -11840,8 +11840,31 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
 
-        // Get relative permeability
-        double mu_r = props["mu_r"].as<double>(1.0);
+        // Phase P: resolve the per-cell initial mu_r through the parsed
+        // material_mu cache, NOT via props["mu_r"].as<double>(). For a
+        // STATIC mu_r this is identical to the old .as<double>() read,
+        // but for a TABLE (e.g. `mu_r: [[H...], [mu_r...]]` inherited
+        // from a soft-iron preset) or a FORMULA the old call silently
+        // failed to 1.0, leaving every iron pixel at vacuum until the
+        // nonlinear solver had a chance to update it. Worse, in a
+        // transient run this reset happened at the start of every step,
+        // so the nonlinear solver was effectively cold-starting from
+        // vacuum on the second step onward. Going through evaluateMu at
+        // H=0 gives the correct initial-differential-permeability seed
+        // for tables / formulas; STATIC materials still get their
+        // exact constant value. Falls back to .as<double>() only when
+        // material_mu has no entry for this material (genuinely
+        // missing from the setup pass).
+        double mu_r = 1.0;
+        {
+            auto mu_it = material_mu.find(name);
+            if (mu_it != material_mu.end()) {
+                mu_r = evaluateMu(mu_it->second, 0.0);
+            } else if (props["mu_r"]) {
+                try { mu_r = props["mu_r"].as<double>(1.0); }
+                catch (...) { mu_r = 1.0; }
+            }
+        }
 
         // Evaluate Jz for this step (0.0 if not defined)
         double jz = 0.0;
