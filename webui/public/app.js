@@ -4210,48 +4210,12 @@ async function insertPolarYaml() {
         showStatus('solverStatus', 'YAML editor not available', 'error');
         return;
     }
-    let doc;
-    try {
-        doc = jsyaml.load(AppState.aceEditor.getValue()) || {};
-        if (typeof doc !== 'object') doc = {};
-    } catch (e) {
-        doc = {};
-    }
-    // Strip all keys we manage so the rest of the user's editor content
-    // (materials, nonlinear_solver, ...) is preserved verbatim while we
-    // splice the auto-generated block on top. Phase D.3: transient: is
-    // also stripped *iff* we're about to emit a new one, so the slide-
-    // region override is clean and doesn't merge stale fields.
-    delete doc.coordinate_system;
-    delete doc.polar_domain;
-    delete doc.polar_boundary_conditions;
-    delete doc.mesh;
-    delete doc.image_path;
-    if (cur.save_as === 'polar' && cur.air_gap_as_slide && airGapEffectiveR() > 0) {
-        delete doc.transient;
-        // Phase F.2 / K: the transient block uses `total_steps: $N_step`
-        // and `slide_pixels_per_step: $N_slide`. Auto-fill both vars
-        // from the polar warp's ntheta (see computePolarSlideSchedule)
-        // without clobbering user-tuned values.
-        if (!doc.variables || typeof doc.variables !== 'object') doc.variables = {};
-        const sched = getPolarSlideSchedule();
-        if (doc.variables.N_step == null)  doc.variables.N_step  = sched.N_step;
-        if (doc.variables.N_slide == null) doc.variables.N_slide = sched.N_slide;
-    }
-
     let targetFilename;
     let block;
-    let toastMsg;
-    let toastKind = 'success';
     if (cur.save_as === 'polar') {
         let polarDomain;
-        // Phase E.2: image_path is the path the C++ solver opens at
-        // analysis time to look up per-cell material RGB → mu_r / jz /
-        // magnetization. It MUST point at a persisted file in the user's
-        // uploads directory, NOT at the transient warp-preview file
-        // (which is deleted when the modal closes). If only a preview
-        // exists, auto-promote it to a saved file before inserting so
-        // the inserted image_path is always a stable reference.
+        // Phase E.2: ensure the polar warp lives on disk before
+        // referencing it from image_path.
         if (!(pp.lastSaved && pp.lastSaved.filename) &&
             pp.lastPreview && pp.lastPreview.filename) {
             try {
@@ -4274,21 +4238,69 @@ async function insertPolarYaml() {
             return;
         }
         block = buildPolarYamlBlock(targetFilename, polarDomain);
-        toastMsg = `YAML updated: polar_domain block + image_path note for ${targetFilename}. ` +
-                   `(The solver picks the image from the dropdown, which has been switched ` +
-                   `to the saved warp output. Re-run Detect Colors on the warped image to refresh materials.)`;
     } else {
         block = buildCartesianYamlBlock(pp.sourceFilename);
         targetFilename = pp.sourceFilename;
-        toastMsg = `YAML updated: coordinate_system: cartesian, image_path = ${targetFilename}. ` +
-                   `Verify mesh.dx / mesh.dy in the editor.`;
     }
-    const remainder = (Object.keys(doc).length > 0)
-        ? jsyaml.dump(doc, { indent: 2, lineWidth: -1 })
-        : '';
-    AppState.aceEditor.setValue(block + (remainder ? '\n' + remainder : ''), -1);
+
+    // Phase S: build a complete, self-contained YAML from scratch and
+    // persist it as a new config file rather than merging into the
+    // editor's existing content. Rationale: when the user warps an
+    // image and runs Detect Colors against the warped image, any
+    // materials / variables / transient blocks left over from the
+    // pre-warp config are stale (colours and pixel indices changed).
+    // Starting from a fresh YAML file makes the workflow
+    //   1) Polar Preprocess → 2) Detect Colors → 3) Run
+    // produce a clean, image-specific config every time. The new file
+    // is named after the warped image so the user can tell which YAML
+    // matches which image at a glance.
+    let yamlText = block;
+    if (cur.save_as === 'polar' && cur.air_gap_as_slide && airGapEffectiveR() > 0) {
+        // Phase F.2 / K: emit the variables: block alongside the
+        // transient: section so $N_step / $N_slide resolve. The values
+        // come from the polar warp's ntheta schedule.
+        const sched = getPolarSlideSchedule();
+        yamlText += `\nvariables:\n`;
+        yamlText += `  N_step: ${sched.N_step}\n`;
+        yamlText += `  N_slide: ${sched.N_slide}\n`;
+    }
+
+    // Compose the new config filename from the image base name.
+    const baseName = String(targetFilename).replace(/\.[^./\\]+$/, '');
+    const newConfigName = `${baseName}.yaml`;
+
+    try {
+        const res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                file: newConfigName,
+                content: yamlText,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'save failed');
+    } catch (err) {
+        showStatus('solverStatus',
+            `Failed to save new config "${newConfigName}": ${err.message}`,
+            'error');
+        return;
+    }
+
+    // Refresh the config dropdown, switch to the new file, load it.
+    try { await refreshConfigList(); } catch (_) { /* best effort */ }
+    const select = document.getElementById('configFileSelect');
+    if (select) {
+        select.value = newConfigName;
+        try { await loadConfig(); } catch (_) { /* best effort */ }
+    } else if (AppState.aceEditor) {
+        AppState.aceEditor.setValue(yamlText, -1);
+    }
     if (typeof switchTab === 'function') switchTab('config');
-    showStatus('solverStatus', toastMsg, toastKind);
+    showStatus('solverStatus',
+        `New config "${newConfigName}" created and loaded. ` +
+        `Run Detect Colors on the warped image to fill in materials.`,
+        'success');
 }
 
 // Legacy entry point preserved so anything still calling
