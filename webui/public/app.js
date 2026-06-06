@@ -1318,6 +1318,9 @@ function renderDetectChips() {
             </span>
           </div>
           <div data-magnet-row="${hex}" style="display:none; padding-left:28px; gap:8px; align-items:center; flex-wrap:wrap; font-size:0.78rem;">
+            <svg class="mag-preview" data-detect-hex="${hex}" width="80" height="80"
+                 viewBox="0 0 80 80"
+                 style="border:1px solid #c8c8c8; border-radius:4px; background:#fff; flex-shrink:0;"></svg>
             <span style="color:#6c757d; font-weight:600;">Magnetization</span>
             <select data-detect-hex="${hex}" data-role="magPattern" style="padding:2px 4px; font-size:0.78rem;">${patternOpts}</select>
             <span data-mag-params="parallel-${hex}" style="display:none; gap:4px; align-items:center;">
@@ -1379,6 +1382,11 @@ function renderDetectChips() {
         const magRow = item.querySelector(`[data-magnet-row="${hex}"]`);
         if (magRow) magRow.style.display = isMagnet ? 'flex' : 'none';
         applyMagnetizationStateToControls(item, hex, assign.magnetization);
+        // Phase H: paint the per-chip vector preview on initial render.
+        if (isMagnet) {
+            const svgPrev = item.querySelector(`svg.mag-preview[data-detect-hex="${hex}"]`);
+            if (svgPrev) renderMagnetizationPreview(svgPrev, assign.magnetization);
+        }
     });
     // Wire kind / coil controls (Phase D.4)
     // Wire all per-chip controls to update AppState.detectAssign and
@@ -1724,6 +1732,154 @@ function detectMagnetizationContext() {
     return { dx_per_px, cx_phys, cy_phys, Rm_phys: r_outer_m, polar_origin };
 }
 
+// Phase H: evaluate the magnetisation direction at a normalised polar
+// position (theta_rad, r_norm) in the magnet's reference frame. The
+// preview SVG works on a unit-circle schematic so cx/cy are implicitly
+// (0,0) and r_norm is normalised to the magnet outer radius. Returns
+// { angle_rad, sign } — `sign` is the alternating-pole sign factor and
+// the renderer translates it into either an arrow flip (180°) or a
+// colour change so the user can visually trace the N/S layout.
+function evalMagnetizationDirection(m, theta_rad, r_norm) {
+    if (!m || !m.pattern) return { angle_rad: 0, sign: 1 };
+    const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
+    const dirSign = (m.direction === 'inward') ? -1 : 1;
+    if (m.pattern === 'parallel') {
+        return { angle_rad: (Number(m.angle) || 0) * Math.PI / 180, sign: 1 };
+    }
+    if (m.pattern === 'radial') {
+        return { angle_rad: theta_rad, sign: dirSign };
+    }
+    if (m.pattern === 'tangential') {
+        return { angle_rad: theta_rad + Math.PI / 2, sign: dirSign };
+    }
+    if (m.pattern === 'halbach_continuous') {
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        return { angle_rad: p * (theta_rad - orient_rad), sign: 1 };
+    }
+    if (m.pattern === 'radial_array' || m.pattern === 'parallel_array') {
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        const twopi = 2 * Math.PI;
+        let theta_pos = theta_rad - orient_rad;
+        theta_pos = ((theta_pos % twopi) + twopi) % twopi;
+        const pole_span = Math.PI / p;
+        let k_pole = Math.floor(theta_pos / pole_span);
+        if (k_pole < 0) k_pole = 0;
+        if (k_pole >= 2 * p) k_pole = 2 * p - 1;
+        const sign = ((k_pole % 2) === 0) ? dirSign : -dirSign;
+        if (m.pattern === 'radial_array') {
+            return { angle_rad: theta_rad, sign };
+        }
+        const angle_mid = (k_pole + 0.5) * pole_span + orient_rad
+                        + (Number(m.angle) || 0) * Math.PI / 180;
+        return { angle_rad: angle_mid, sign };
+    }
+    if (m.pattern === 'polar_anisotropy') {
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        // Kn = R_pc / Rm; in the unit-circle schematic Rm = 1.
+        const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
+        const x = r_norm * Math.cos(theta_rad);
+        const y = r_norm * Math.sin(theta_rad);
+        let Bx = 0, By = 0;
+        for (let k = 0; k < 2 * p; k++) {
+            const theta_k = Math.PI * k / p + orient_rad;
+            const sgn = (k % 2 === 0) ? 1 : -1;
+            const dx_w = x - Kn * Math.cos(theta_k);
+            const dy_w = y - Kn * Math.sin(theta_k);
+            const r2 = dx_w * dx_w + dy_w * dy_w;
+            if (r2 < 1e-20) continue;
+            Bx += sgn * (-dy_w) / r2;
+            By += sgn * dx_w / r2;
+        }
+        const norm = Math.hypot(Bx, By);
+        return {
+            angle_rad: norm > 1e-12 ? Math.atan2(By, Bx) : 0,
+            sign: 1,
+        };
+    }
+    // custom: cannot eval without a tinyexpr runtime in browser — flat
+    // schematic so the preview at least shows something.
+    return { angle_rad: 0, sign: 1 };
+}
+
+// Phase H: draw a compact schematic of the magnetisation vector field
+// into the chip's `<svg class="mag-preview">`. Red arrows mark sign=+1
+// (N-out / outward / pole 0 + direction), blue arrows sign=-1
+// (S-out / inward / alternating poles). Sector boundary dotted lines
+// are drawn for the discrete array patterns so the user can read off
+// the pole geometry at a glance.
+function renderMagnetizationPreview(svg, m) {
+    if (!svg) return;
+    const W = 80, H = 80;
+    const r_view = 1.18;
+    const scale = W / (2 * r_view);
+    // SVG y-axis is down; mathematical θ=90° should appear UP. The
+    // outer <g> applies scale(1, -1) on y so cos/sin renders match the
+    // standard polar convention.
+    const parts = [];
+    parts.push(`<g transform="translate(${W/2},${H/2}) scale(${scale},${-scale})">`);
+    parts.push('<circle cx="0" cy="0" r="1" fill="#fafafa" stroke="#aaa" stroke-width="0.02"/>');
+    if (!m || !m.pattern) {
+        parts.push('</g>');
+        svg.innerHTML = parts.join('');
+        return;
+    }
+    // Sector boundaries for the discrete patterns.
+    if (m.pattern === 'radial_array' || m.pattern === 'parallel_array') {
+        const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        for (let k = 0; k < 2 * p; k++) {
+            const theta_k = Math.PI * k / p + orient_rad;
+            const x = 1.05 * Math.cos(theta_k);
+            const y = 1.05 * Math.sin(theta_k);
+            parts.push(`<line x1="0" y1="0" x2="${x.toFixed(3)}" y2="${y.toFixed(3)}" stroke="#c8c8c8" stroke-width="0.015" stroke-dasharray="0.05,0.04"/>`);
+        }
+    }
+    // For polar_anisotropy, also show the 2p OJ centres so the user
+    // can see the pitch circle geometry.
+    if (m.pattern === 'polar_anisotropy') {
+        const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
+        for (let k = 0; k < 2 * p; k++) {
+            const theta_k = Math.PI * k / p + orient_rad;
+            const cx = Kn * Math.cos(theta_k);
+            const cy = Kn * Math.sin(theta_k);
+            // Clip OJ markers to inside the viewbox so large Kn still renders.
+            if (Math.hypot(cx, cy) < r_view * 1.5) {
+                const fill = (k % 2 === 0) ? '#d63333' : '#3366cc';
+                parts.push(`<circle cx="${cx.toFixed(3)}" cy="${cy.toFixed(3)}" r="0.05" fill="${fill}"/>`);
+            }
+        }
+    }
+    // Sample arrows around the unit circle.
+    const r_sample = 0.62;
+    const arrowLen = 0.24;
+    const useDense = (m.pattern === 'halbach_continuous' || m.pattern === 'polar_anisotropy');
+    const nSamples = useDense ? 16 : 12;
+    for (let i = 0; i < nSamples; i++) {
+        const theta_deg = i * 360 / nSamples;
+        const theta_rad = theta_deg * Math.PI / 180;
+        const px = r_sample * Math.cos(theta_rad);
+        const py = r_sample * Math.sin(theta_rad);
+        const res = evalMagnetizationDirection(m, theta_rad, r_sample);
+        const angle = res.angle_rad + (res.sign < 0 ? Math.PI : 0);
+        const x2 = px + arrowLen * Math.cos(angle);
+        const y2 = py + arrowLen * Math.sin(angle);
+        const colour = (res.sign >= 0) ? '#d63333' : '#3366cc';
+        parts.push(`<line x1="${px.toFixed(3)}" y1="${py.toFixed(3)}" x2="${x2.toFixed(3)}" y2="${y2.toFixed(3)}" stroke="${colour}" stroke-width="0.035"/>`);
+        // Arrowhead — small triangle at the tip.
+        const ah = 0.08;
+        const cosA = Math.cos(angle), sinA = Math.sin(angle);
+        const tailX = x2 - ah * cosA;
+        const tailY = y2 - ah * sinA;
+        const perpX = -sinA * (ah * 0.5);
+        const perpY =  cosA * (ah * 0.5);
+        parts.push(`<polygon points="${x2.toFixed(3)},${y2.toFixed(3)} ${(tailX + perpX).toFixed(3)},${(tailY + perpY).toFixed(3)} ${(tailX - perpX).toFixed(3)},${(tailY - perpY).toFixed(3)}" fill="${colour}"/>`);
+    }
+    parts.push('</g>');
+    svg.innerHTML = parts.join('');
+}
+
 // Phase D.7: emit a magnetization: block at the given indent for the
 // per-chip state. Pattern-specific fields are emitted; Kn is converted
 // to R_pc using the Polar Preprocess context (Rm). Inline comments
@@ -1824,6 +1980,12 @@ function regenerateDetectYamlPreview() {
     const yaml = buildDetectYamlFromAssignments();
     AppState.lastDetectResult.generatedYaml = yaml;
     document.getElementById('detectYamlPreview').textContent = yaml;
+    // Phase H: refresh every per-chip magnetisation vector preview.
+    document.querySelectorAll('svg.mag-preview[data-detect-hex]').forEach(svg => {
+        const hex = svg.dataset.detectHex;
+        const a = AppState.detectAssign && AppState.detectAssign[hex];
+        if (a && a.magnetization) renderMagnetizationPreview(svg, a.magnetization);
+    });
 }
 
 // Phase D.4: emit material_presets + materials blocks. Library presets
