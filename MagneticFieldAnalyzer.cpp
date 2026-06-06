@@ -585,8 +585,19 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         "mu0"              // Predefined physical constant: vacuum permeability (4π×10⁻⁷ H/m)
     };
 
+    // Phase F.4: pre-populate "system" variables so $pi / $e / $mu0
+    // expand globally everywhere $name substitution runs (polar_domain,
+    // mesh, transient, magnetization, ...). Users still cannot define
+    // a variable named pi / e / mu0 (reserved_vars check below). This
+    // also guarantees expandUserVariablesGlobally() runs even when no
+    // user "variables:" block is present, since user_variables is
+    // non-empty after this.
+    user_variables["pi"]  = M_PI;
+    user_variables["e"]   = std::exp(1.0);
+    user_variables["mu0"] = MU_0;
+
     if (!config["variables"]) {
-        return;  // No user-defined variables
+        return;  // No user-defined variables -- $pi/$e/$mu0 are still available globally
     }
 
     std::cout << "Parsing user-defined variables:" << std::endl;
