@@ -4147,7 +4147,7 @@ function buildPolarYamlBlock(filename, polarDomain) {
         const slideDir = (ro === 'horizontal') ? 'vertical' : 'horizontal';
         lines.push('');
         lines.push('# Slide region inferred from the air-gap marker (Polar Preprocess).');
-        lines.push(`# Side: ${inside ? 'inside the air gap (rotor side)' : 'outside the air gap (stator side)'}`);
+        lines.push(`# Side: ${inside ? 'inside the air gap' : 'outside the air gap'}`);
         lines.push('# region_start / region_end are radial-pixel indices in the warped image.');
         if (sched.exact) {
             lines.push(`# Schedule: N_step * N_slide = ${sched.N_step} * ${sched.N_slide} = ${T} (one full revolution over ntheta).`);
