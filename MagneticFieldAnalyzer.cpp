@@ -2078,15 +2078,14 @@ void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
             }
             path.rgb_key_a = it_a->second;
             path.rgb_key_b = it_b->second;
-            if (coordinate_system == "polar") {
-                std::cerr << "Warning: flux_linkage '" << path.name
-                          << "' uses material_a/material_b but coordinate_system=polar; "
-                             "the material variant currently only supports cartesian. "
-                             "Falling back to writing zero flux for this entry." << std::endl;
-            }
+            // Phase M: polar is supported with r-weighted (Jacobian)
+            // averaging in calculateFluxLinkage.
             std::cout << "  Flux linkage [material] '" << path.name
-                      << "': mean(Az over " << path.material_a
-                      << ") - mean(Az over " << path.material_b << ")" << std::endl;
+                      << "': ⟨Az⟩(" << path.material_a
+                      << ") - ⟨Az⟩(" << path.material_b
+                      << ")  [" << coordinate_system
+                      << (coordinate_system == "polar" ? "; r-weighted" : "; uniform")
+                      << "]" << std::endl;
         } else if (has_path) {
             auto start = path_node["start"].as<std::vector<double>>();
             auto end = path_node["end"].as<std::vector<double>>();
@@ -2164,37 +2163,69 @@ double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) 
         return Az_end - Az_start;
     }
 
-    // Material-pair variant (Phase B.3):
-    //   Φ = (1/|A|) Σ_{p ∈ A} Az(p)  -  (1/|B|) Σ_{p ∈ B} Az(p)
-    // where A and B are the sets of grid cells whose RGB matches the
-    // resolved keys. Useful for thick coil legs where a single point
-    // sample misses the bulk; the per-pixel average of Az across the
-    // conductor cross-section is the right physical quantity.
-    if (coordinate_system == "polar") {
-        // The image-pixel <-> grid-cell map for polar is non-trivial
-        // (warpPolar resamples r/θ); skip for now and report zero so
-        // the CSV column still exists.
-        return 0.0;
-    }
+    // Material-pair variant (Phase B.3 / Phase M):
+    //   Φ = ⟨Az⟩_A − ⟨Az⟩_B
+    // where ⟨·⟩ is the area-weighted mean over the cells whose pixel
+    // RGB matches the resolved key. Useful for thick coil legs where a
+    // single point sample misses the bulk; the average of Az across
+    // the conductor cross-section is the per-phase flux linkage.
+    //
+    // In Cartesian the cell area is dx·dy = constant, so the weighted
+    // mean reduces to the arithmetic mean.
+    //
+    // In polar the cell area is r·dr·dθ, so the dr·dθ factor cancels
+    // in the ratio and the weighting is just r at the cell. Phase M
+    // adds the polar branch which honours that Jacobian; the Cartesian
+    // branch is unchanged.
     double sum_a = 0.0, sum_b = 0.0;
-    long  cnt_a = 0,  cnt_b = 0;
-    const int rows = image.rows;
-    const int cols = image.cols;
-    // image stores BGR Y-down. mu_map / Az use the Y-up convention after
-    // the vertical flip in setupMaterialProperties, so we read image at
-    // (rows-1-j, i) to recover the RGB at the grid cell (j, i).
-    for (int j = 0; j < ny && j < rows; ++j) {
-        for (int i = 0; i < nx && i < cols; ++i) {
-            const cv::Vec3b& px = image.at<cv::Vec3b>(rows - 1 - j, i);
-            const int key = (static_cast<int>(px[2]) << 16)
-                          | (static_cast<int>(px[1]) << 8)
-                          |  static_cast<int>(px[0]);
-            if (key == path.rgb_key_a) { sum_a += Az(j, i); ++cnt_a; }
-            else if (key == path.rgb_key_b) { sum_b += Az(j, i); ++cnt_b; }
+    double w_a = 0.0, w_b = 0.0;
+    const int img_rows = image.rows;
+    const int img_cols = image.cols;
+    if (coordinate_system == "polar") {
+        // Az matrix shape mirrors the warp orientation:
+        //   horizontal: (ntheta rows × nr cols) → row j is θ, col i is r
+        //   vertical  : (nr rows × ntheta cols) → row j is r, col i is θ
+        const bool horiz = (r_orientation == "horizontal");
+        const int grid_rows = horiz ? ntheta : nr;
+        const int grid_cols = horiz ? nr : ntheta;
+        for (int j = 0; j < grid_rows && j < img_rows; ++j) {
+            for (int i = 0; i < grid_cols && i < img_cols; ++i) {
+                const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
+                const int key = (static_cast<int>(px[2]) << 16)
+                              | (static_cast<int>(px[1]) << 8)
+                              |  static_cast<int>(px[0]);
+                const int i_r = horiz ? i : j;
+                const double r_phys = r_start + i_r * dr;
+                // Weight = r (the Jacobian). dr·dθ cancels in the
+                // numerator / denominator ratio so we omit it here.
+                // Cells at the rotor axis (r=0) carry zero weight,
+                // which is the geometrically correct contribution
+                // from a degenerate point cell.
+                if (key == path.rgb_key_a) {
+                    sum_a += Az(j, i) * r_phys;
+                    w_a   += r_phys;
+                } else if (key == path.rgb_key_b) {
+                    sum_b += Az(j, i) * r_phys;
+                    w_b   += r_phys;
+                }
+            }
+        }
+    } else {
+        // Cartesian: every cell has area dx·dy = const, so the weight
+        // collapses to 1 and the ratio is the plain count.
+        for (int j = 0; j < ny && j < img_rows; ++j) {
+            for (int i = 0; i < nx && i < img_cols; ++i) {
+                const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
+                const int key = (static_cast<int>(px[2]) << 16)
+                              | (static_cast<int>(px[1]) << 8)
+                              |  static_cast<int>(px[0]);
+                if (key == path.rgb_key_a) { sum_a += Az(j, i); w_a += 1.0; }
+                else if (key == path.rgb_key_b) { sum_b += Az(j, i); w_b += 1.0; }
+            }
         }
     }
-    const double mean_a = (cnt_a > 0) ? (sum_a / static_cast<double>(cnt_a)) : 0.0;
-    const double mean_b = (cnt_b > 0) ? (sum_b / static_cast<double>(cnt_b)) : 0.0;
+    const double mean_a = (w_a > 0.0) ? (sum_a / w_a) : 0.0;
+    const double mean_b = (w_b > 0.0) ? (sum_b / w_b) : 0.0;
     return mean_a - mean_b;
 }
 

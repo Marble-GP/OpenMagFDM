@@ -2144,9 +2144,9 @@ function buildDetectYamlFromAssignments() {
         .sort();
     if (groupsWithPair.length > 0) {
         lines.push('');
-        lines.push('# Phase L: flux linkage Phi_Coil_X = mean(Az on +X pixels) - mean(Az on -X pixels).');
-        lines.push('# Material_a/material_b variant only works with coordinate_system: cartesian.');
-        lines.push('# For polar warps switch to {start, end} path integration variant.');
+        lines.push('# Flux linkage Phi_Coil_X = ⟨Az⟩(+X pixels) - ⟨Az⟩(-X pixels).');
+        lines.push('# Cartesian uses uniform per-cell weight; polar uses the r·dr·dθ');
+        lines.push('# Jacobian, so the average is area-weighted in either coord system.');
         lines.push('flux_linkage:');
         for (const g of groupsWithPair) {
             const posHex = coilByGroup[g].pos.slice(1);
