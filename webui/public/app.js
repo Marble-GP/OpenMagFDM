@@ -34,6 +34,17 @@ const AppState = {
     plotConfigs: {},  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
     // Detect Colors result cache
     lastDetectResult: null,  // Last result from /api/materials/detect
+    // Phase D.4: Detect Colors per-chip library / Coil assignments.
+    // detectAssign[hex] = { kind: 'none'|'Coil'|<preset name>,
+    //                       coilGroup: 'A'..'Z', coilSign: '+'|'-' }
+    detectAssign: {},
+    // Phase D.4: active library used by the Detect Colors modal.
+    // Falls back to AppState.selectedLibrary on every open. The header
+    // dropdown overrides it for the duration of the modal.
+    detectLibraryName: null,
+    detectLibraryPresets: {},    // { presetName: { mu_r, jz, ... }, ... }
+    detectLibraryMaterials: {},  // { matName: { rgb, mu_r, jz, ... }, ... }
+    detectLibraryRaw: '',        // raw library YAML text (for verbatim splicing)
     // Material Library
     selectedLibrary: null,       // Active library filename (null = none)
     libraryAceEditor: null,      // Ace Editor instance inside Library modal
@@ -992,10 +1003,85 @@ async function detectColors() {
     try {
         const result = await detectColorsInternal();
         AppState.lastDetectResult = result;
+        // Phase D.4: reset assignments to 'none' for every freshly-
+        // detected colour. The user can pick library presets / Coil
+        // per chip after the modal opens.
+        AppState.detectAssign = {};
+        (result.colors || []).forEach(c => {
+            const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            AppState.detectAssign[hex] = { kind: 'none', coilGroup: 'A', coilSign: '+' };
+        });
+        // Phase D.4: default the modal's library picker to the globally
+        // active library (if any). The dropdown lets the user override.
+        AppState.detectLibraryName = AppState.selectedLibrary || null;
+        await detectRefreshLibraryList();
+        await detectLoadLibraryByName(AppState.detectLibraryName);
         renderDetectModal(result);
         document.getElementById('detectColorsModal').style.display = 'flex';
     } catch (error) {
         showStatus('solverStatus', `Detect error: ${error.message}`, 'error');
+    }
+}
+
+// Phase D.4: populate the library picker dropdown from
+// /api/material-libraries. Idempotent; preserves the current
+// selection across reloads.
+async function detectRefreshLibraryList() {
+    const sel = document.getElementById('detectActiveLibrary');
+    if (!sel) return;
+    const previous = sel.value || AppState.detectLibraryName || '';
+    try {
+        const r = await fetch(`/api/material-libraries?userId=${AppState.userId}`).then(r => r.json());
+        const libs = (r && Array.isArray(r.libraries)) ? r.libraries : [];
+        sel.innerHTML = '<option value="">(none — preset references will fail)</option>';
+        for (const lib of libs) {
+            const opt = document.createElement('option');
+            opt.value = lib.filename;
+            opt.textContent = lib.filename;
+            sel.appendChild(opt);
+        }
+        // Restore prior selection if it still exists in the list.
+        const stillThere = Array.from(sel.options).some(o => o.value === previous);
+        sel.value = stillThere ? previous : '';
+        if (!sel._ppBound) {
+            sel.addEventListener('change', async () => {
+                AppState.detectLibraryName = sel.value || null;
+                await detectLoadLibraryByName(AppState.detectLibraryName);
+                renderDetectChips();
+                regenerateDetectYamlPreview();
+            });
+            sel._ppBound = true;
+        }
+    } catch (e) {
+        // Leave the dropdown with the single (none) option so the modal
+        // still works without a library.
+    }
+}
+
+// Phase D.4: fetch + parse the chosen library YAML. Populates
+// AppState.detectLibraryPresets / Materials / Raw. Passing null
+// clears them so the per-chip dropdowns fall back to (none) / Coil.
+async function detectLoadLibraryByName(name) {
+    AppState.detectLibraryPresets = {};
+    AppState.detectLibraryMaterials = {};
+    AppState.detectLibraryRaw = '';
+    if (!name) return;
+    try {
+        const r = await fetch(`/api/material-libraries/${encodeURIComponent(name)}?userId=${AppState.userId}`);
+        if (!r.ok) return;
+        const text = await r.text();
+        AppState.detectLibraryRaw = text;
+        const doc = jsyaml.load(text) || {};
+        if (doc && typeof doc === 'object') {
+            if (doc.material_presets && typeof doc.material_presets === 'object') {
+                AppState.detectLibraryPresets = doc.material_presets;
+            }
+            if (doc.materials && typeof doc.materials === 'object') {
+                AppState.detectLibraryMaterials = doc.materials;
+            }
+        }
+    } catch (e) {
+        // Silent: the picker is a convenience, not load-critical.
     }
 }
 
@@ -1016,22 +1102,13 @@ function renderDetectModal(result) {
         banner.style.display = 'none';
     }
 
-    // Render dominant color grid
-    const grid = document.getElementById('detectColorGrid');
-    grid.innerHTML = '';
-    (result.colors || []).forEach(c => {
-        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
-        const isAA = c.antialias === true;
-        const item = document.createElement('div');
-        item.style.cssText = 'display:flex; align-items:center; gap:6px; background:#f8f9fa; border-radius:4px; padding:5px 8px; font-size:0.8rem;';
-        item.innerHTML = `
-            <div style="width:20px; height:20px; background:${hex}; border:1px solid #ccc; border-radius:2px; flex-shrink:0;"></div>
-            <span style="font-family:monospace;">${hex}</span>
-            <span style="color:#6c757d;">${(c.ratio * 100).toFixed(1)}%</span>
-            ${isAA ? '<span style="background:#fff3cd; color:#856404; border-radius:10px; padding:1px 6px; font-size:0.75rem;">AA base</span>' : ''}
-        `;
-        grid.appendChild(item);
-    });
+    // Sync the picker dropdown to whatever detectColors() set up.
+    const libSel = document.getElementById('detectActiveLibrary');
+    if (libSel) libSel.value = AppState.detectLibraryName || '';
+
+    // Render dominant color grid (delegated so the chip block can be
+    // re-rendered on library change without recomputing the banner).
+    renderDetectChips();
 
     // Render AA blends section
     const aaSection = document.getElementById('detectAASection');
@@ -1064,8 +1141,204 @@ function renderDetectModal(result) {
         aaSection.style.display = 'none';
     }
 
-    // Render YAML template
-    document.getElementById('detectYamlPreview').textContent = result.yamlTemplate || '';
+    // Phase D.4: YAML preview is regenerated from the per-chip
+    // assignments rather than echoing the server's stock template.
+    regenerateDetectYamlPreview();
+}
+
+// Phase D.4: render the dominant colour grid with per-chip kind /
+// Coil-group / Coil-sign dropdowns. Splits out of renderDetectModal so
+// that picking a different library can re-render only the chips.
+function renderDetectChips() {
+    const result = AppState.lastDetectResult;
+    const grid = document.getElementById('detectColorGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    const presetNames = Object.keys(AppState.detectLibraryPresets || {});
+    const materialNames = Object.keys(AppState.detectLibraryMaterials || {});
+    const libNames = [...presetNames, ...materialNames];
+    (result && result.colors || []).forEach(c => {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const isAA = c.antialias === true;
+        const assign = AppState.detectAssign[hex] ||
+            (AppState.detectAssign[hex] = { kind: 'none', coilGroup: 'A', coilSign: '+' });
+        // If the prior selection is no longer in the active library,
+        // fall back to (none) so the dropdown stays consistent.
+        if (assign.kind !== 'none' && assign.kind !== 'Coil' && !libNames.includes(assign.kind)) {
+            assign.kind = 'none';
+        }
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex; align-items:center; gap:6px; background:#f8f9fa; border-radius:4px; padding:5px 8px; font-size:0.8rem; flex-wrap:wrap;';
+        const optsKind = ['<option value="none">(none)</option>',
+                          '<option value="Coil">Coil</option>']
+            .concat(libNames.map(n => `<option value="${n}">${n}</option>`))
+            .join('');
+        const groupOpts = Array.from({ length: 26 }, (_, i) => {
+            const L = String.fromCharCode(65 + i);
+            return `<option value="${L}">${L}</option>`;
+        }).join('');
+        item.innerHTML = `
+            <div style="width:20px; height:20px; background:${hex}; border:1px solid #ccc; border-radius:2px; flex-shrink:0;"></div>
+            <span style="font-family:monospace;">${hex}</span>
+            <span style="color:#6c757d;">${(c.ratio * 100).toFixed(1)}%</span>
+            ${isAA ? '<span style="background:#fff3cd; color:#856404; border-radius:10px; padding:1px 6px; font-size:0.75rem;">AA base</span>' : ''}
+            <select data-detect-hex="${hex}" data-role="kind" style="padding:2px 4px; font-size:0.78rem;">${optsKind}</select>
+            <span data-coil-extras="${hex}" style="display:none; gap:4px; align-items:center;">
+                <span style="color:#6c757d;">group</span>
+                <select data-detect-hex="${hex}" data-role="coilGroup" style="padding:2px 4px; font-size:0.78rem;">${groupOpts}</select>
+                <label style="display:inline-flex; align-items:center; gap:2px;"><input type="radio" name="coilSign-${hex}" data-detect-hex="${hex}" data-role="coilSign" value="+"> +</label>
+                <label style="display:inline-flex; align-items:center; gap:2px;"><input type="radio" name="coilSign-${hex}" data-detect-hex="${hex}" data-role="coilSign" value="-"> −</label>
+            </span>
+        `;
+        grid.appendChild(item);
+        // Apply persisted state to the freshly-built controls
+        item.querySelector('select[data-role="kind"]').value = assign.kind;
+        item.querySelector('select[data-role="coilGroup"]').value = assign.coilGroup || 'A';
+        item.querySelectorAll('input[data-role="coilSign"]').forEach(r => {
+            r.checked = (r.value === (assign.coilSign || '+'));
+        });
+        const extras = item.querySelector(`span[data-coil-extras="${hex}"]`);
+        if (extras) extras.style.display = (assign.kind === 'Coil') ? 'inline-flex' : 'none';
+    });
+    // Wire all per-chip controls to update AppState.detectAssign and
+    // regenerate the YAML preview.
+    grid.querySelectorAll('select[data-role="kind"]').forEach(el => {
+        el.addEventListener('change', () => {
+            const hex = el.dataset.detectHex;
+            AppState.detectAssign[hex].kind = el.value;
+            const extras = grid.querySelector(`span[data-coil-extras="${hex}"]`);
+            if (extras) extras.style.display = (el.value === 'Coil') ? 'inline-flex' : 'none';
+            regenerateDetectYamlPreview();
+        });
+    });
+    grid.querySelectorAll('select[data-role="coilGroup"]').forEach(el => {
+        el.addEventListener('change', () => {
+            AppState.detectAssign[el.dataset.detectHex].coilGroup = el.value;
+            regenerateDetectYamlPreview();
+        });
+    });
+    grid.querySelectorAll('input[data-role="coilSign"]').forEach(el => {
+        el.addEventListener('change', () => {
+            if (!el.checked) return;
+            AppState.detectAssign[el.dataset.detectHex].coilSign = el.value;
+            regenerateDetectYamlPreview();
+        });
+    });
+}
+
+// Phase D.4: regenerate the YAML preview based on the current per-chip
+// assignments + the picked library presets. The result is stashed back
+// onto AppState.lastDetectResult.generatedYaml so insertMaterialsSection
+// uses it instead of the server's stock template.
+function regenerateDetectYamlPreview() {
+    const yaml = buildDetectYamlFromAssignments();
+    AppState.lastDetectResult.generatedYaml = yaml;
+    document.getElementById('detectYamlPreview').textContent = yaml;
+}
+
+// Phase D.4: emit material_presets + materials blocks. Library presets
+// referenced by any chip are copied in verbatim; the rest of the
+// library's content is left untouched. Coil chips emit
+// `jz: ${sign}$J_Coil_${group}` plus a one-line comment so users can
+// trace each entry back to its group/sign decision.
+function buildDetectYamlFromAssignments() {
+    const result = AppState.lastDetectResult;
+    if (!result) return '';
+    const colors = result.colors || [];
+    const assign = AppState.detectAssign || {};
+    const presetsAll = AppState.detectLibraryPresets || {};
+    const materialsAll = AppState.detectLibraryMaterials || {};
+
+    const usedPresetNames = new Set();
+    const lines = [];
+
+    // Preserve the existing header lines from the server's template
+    // (coordinate_system + comments) so users still see the framing.
+    const stockYaml = result.yamlTemplate || '';
+    const headerLines = [];
+    for (const raw of stockYaml.split('\n')) {
+        if (raw.startsWith('materials:')) break;
+        headerLines.push(raw);
+    }
+    lines.push(...headerLines);
+
+    // Insert material_presets: for the presets the user actually used.
+    const presetsToEmit = [];
+    for (const c of colors) {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const kind = assign[hex] && assign[hex].kind;
+        if (kind && kind !== 'none' && kind !== 'Coil' && presetsAll[kind]) {
+            if (!usedPresetNames.has(kind)) {
+                usedPresetNames.add(kind);
+                presetsToEmit.push(kind);
+            }
+        }
+    }
+    if (presetsToEmit.length > 0) {
+        lines.push('material_presets:');
+        for (const name of presetsToEmit) {
+            const block = jsyaml.dump({ [name]: presetsAll[name] }, { indent: 2, lineWidth: -1 });
+            // Indent the nested object content under material_presets:.
+            for (const ln of block.replace(/\n$/, '').split('\n')) {
+                lines.push('  ' + ln);
+            }
+        }
+        lines.push('');
+    }
+
+    // Now the materials: block. For each detected colour we either copy
+    // the library material verbatim (kind in materialsAll) with rgb
+    // overridden to the detected value, reference a preset (kind in
+    // presetsAll), emit a Coil expression, or fall back to the default.
+    lines.push('materials:');
+    for (const c of colors) {
+        const [r, g, b] = c.rgb;
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const a = assign[hex] || { kind: 'none' };
+        const ratio = (c.ratio * 100).toFixed(1);
+        if (a.kind === 'Coil') {
+            const grp = a.coilGroup || 'A';
+            const sign = (a.coilSign === '-') ? '-' : '';
+            const dir = (a.coilSign === '-') ? '-' : '+';
+            lines.push(`  coil_${grp}_${sign === '-' ? 'neg' : 'pos'}_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # coverage: ${ratio}%`);
+            lines.push(`    jz: ${sign}$J_Coil_${grp}    # Coil-${grp}, J direction: ${dir}Z`);
+            if (c.antialias === true) lines.push(`    antialias: true`);
+        } else if (a.kind && a.kind !== 'none' && presetsAll[a.kind]) {
+            lines.push(`  material_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    preset: ${a.kind}    # coverage: ${ratio}%`);
+            if (c.antialias === true) lines.push(`    antialias: true`);
+        } else if (a.kind && a.kind !== 'none' && materialsAll[a.kind]) {
+            // Library material picked directly (no preset): copy props
+            // verbatim but override rgb to the detected colour.
+            lines.push(`  material_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            const props = materialsAll[a.kind] || {};
+            for (const k of Object.keys(props)) {
+                if (k === 'rgb') continue;
+                const sub = jsyaml.dump({ [k]: props[k] }, { indent: 2, lineWidth: -1 }).replace(/\n$/, '');
+                for (const ln of sub.split('\n')) lines.push('    ' + ln);
+            }
+            if (c.antialias === true) lines.push(`    antialias: true`);
+        } else {
+            lines.push(`  material_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${ratio}%)`);
+            lines.push(`    jz: 0.0`);
+            if (c.antialias === true) lines.push(`    antialias: true`);
+        }
+    }
+
+    // Preserve the trailing AA-blends comment block from the stock
+    // template so the user still has the AA diagnostic info.
+    const aaIdx = stockYaml.indexOf('# Anti-aliasing blends detected');
+    if (aaIdx >= 0) {
+        lines.push('');
+        lines.push(stockYaml.slice(aaIdx).replace(/\n$/, ''));
+    }
+    return lines.join('\n');
 }
 
 async function rerunDetect() {
@@ -1374,11 +1647,14 @@ async function runAutoTune() {
 }
 
 async function copyDetectedYaml() {
-    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
-        return;
-    }
+    if (!AppState.lastDetectResult) return;
+    // Phase D.4: copy the regenerated YAML (assignments + presets) when
+    // available so the clipboard matches the preview.
+    const text = AppState.lastDetectResult.generatedYaml ||
+                 AppState.lastDetectResult.yamlTemplate || '';
+    if (!text) return;
     try {
-        await navigator.clipboard.writeText(AppState.lastDetectResult.yamlTemplate);
+        await navigator.clipboard.writeText(text);
         showStatus('solverStatus', 'YAML template copied to clipboard', 'success');
     } catch (e) {
         showStatus('solverStatus', 'Clipboard write failed', 'error');
@@ -1386,9 +1662,12 @@ async function copyDetectedYaml() {
 }
 
 function insertMaterialsSection() {
-    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
-        return;
-    }
+    if (!AppState.lastDetectResult) return;
+    // Phase D.4: prefer the regenerated YAML (carries the per-chip
+    // assignments + library presets) over the server's stock template.
+    const sourceYaml = AppState.lastDetectResult.generatedYaml ||
+                       AppState.lastDetectResult.yamlTemplate || '';
+    if (!sourceYaml) return;
     if (!AppState.aceEditor) {
         showStatus('solverStatus', 'Config editor not initialized', 'error');
         return;
@@ -1396,7 +1675,7 @@ function insertMaterialsSection() {
 
     try {
         // Parse detected materials
-        const detectedDoc = jsyaml.load(AppState.lastDetectResult.yamlTemplate);
+        const detectedDoc = jsyaml.load(sourceYaml);
         if (!detectedDoc || !detectedDoc.materials) {
             showStatus('solverStatus', 'No materials found in detected template', 'error');
             return;
@@ -1413,6 +1692,16 @@ function insertMaterialsSection() {
 
         // Replace only the materials section
         currentDoc.materials = detectedDoc.materials;
+        // Phase D.4: merge any picked library presets so `preset: X`
+        // references resolve in the solver. We *merge* rather than
+        // overwrite so the user's pre-existing presets survive.
+        if (detectedDoc.material_presets && typeof detectedDoc.material_presets === 'object') {
+            currentDoc.material_presets = Object.assign(
+                {},
+                currentDoc.material_presets || {},
+                detectedDoc.material_presets
+            );
+        }
 
         const merged = jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 });
         AppState.aceEditor.setValue(merged, -1);

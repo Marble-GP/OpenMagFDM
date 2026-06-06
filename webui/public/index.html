@@ -1351,6 +1351,21 @@
                     </label>
                     <button class="btn-secondary" onclick="rerunDetect()" style="padding: 4px 12px; font-size: 0.85rem;">Re-detect</button>
                 </div>
+                <!-- Phase D.4: active material library picker. Drives the
+                     per-chip dropdowns below so that detected colors can be
+                     assigned to library presets or to the Coil pseudo-
+                     material. Defaults to AppState.selectedLibrary on
+                     open; per-detection override does not change the
+                     global active library setting. -->
+                <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: 0.85rem;">
+                    <label for="detectActiveLibrary" style="white-space: nowrap;">Active material library:</label>
+                    <select id="detectActiveLibrary" style="flex: 1; padding: 3px 6px; font-size: 0.85rem;">
+                        <option value="">(none — preset references will fail)</option>
+                    </select>
+                    <button class="btn-secondary" onclick="detectRefreshLibraryList()"
+                            style="padding: 3px 10px; font-size: 0.85rem;"
+                            title="Reload the library list from the server.">↻</button>
+                </div>
                 <!-- AA-heavy / JPEG-noise warning banner. Shown by JS when
                      the detected response carries uniqueColors > 1000.    -->
                 <div id="detectNoisyBanner" class="noisy-banner" style="display: none;">
