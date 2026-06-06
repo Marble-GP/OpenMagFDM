@@ -672,6 +672,15 @@ private:
         int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy)
         double cx = 0.0, cy = 0.0; // Rotation center [m]
         double R_pc = 0.0;         // Pitch circle radius [m] (polar_anisotropy)
+        // Phase D.7: orientation offset for halbach_continuous and
+        // polar_anisotropy. Rotates the first pole's orientation centre
+        // (OJ in Kano 2025) by this angle around the rotor centre,
+        // letting the user align the pole structure with an arbitrary
+        // rotor initial angle. Defaults to 0.0 for backward compat.
+        // NOTE: distinct from the *transient* theta_offset in
+        // applyMaterials() which tracks cumulative sliding rotation
+        // between steps.
+        double orientation_offset_deg = 0.0;
         std::string Mx_expr, My_expr;  // tinyexpr expressions for Mx, My (parallel/halbach/custom)
     };
     std::map<std::string, MagnetizationConfig> material_magnetization;

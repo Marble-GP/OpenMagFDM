@@ -1104,7 +1104,16 @@ async function detectColors() {
         AppState.detectAssign = {};
         (result.colors || []).forEach(c => {
             const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
-            AppState.detectAssign[hex] = { kind: 'none', coilGroup: 'A', coilSign: '+' };
+            AppState.detectAssign[hex] = {
+                kind: 'none',
+                coilGroup: 'A',
+                coilSign: '+',
+                // Phase D.7: per-chip magnetization sub-state. Shown only
+                // when kind references a magnet preset (isMagnetMaterial).
+                // Parameters are kept across pattern switches so the user
+                // doesn't lose typed values when toggling.
+                magnetization: defaultMagnetizationState(),
+            };
         });
         // Phase D.4: default the modal's library picker to the globally
         // active library (if any). The dropdown lets the user override.
@@ -1252,18 +1261,30 @@ function renderDetectChips() {
     const presetNames = Object.keys(AppState.detectLibraryPresets || {});
     const materialNames = Object.keys(AppState.detectLibraryMaterials || {});
     const libNames = [...presetNames, ...materialNames];
+    const presetsAll = AppState.detectLibraryPresets || {};
+    const materialsAll = AppState.detectLibraryMaterials || {};
     (result && result.colors || []).forEach(c => {
         const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
         const isAA = c.antialias === true;
         const assign = AppState.detectAssign[hex] ||
-            (AppState.detectAssign[hex] = { kind: 'none', coilGroup: 'A', coilSign: '+' });
+            (AppState.detectAssign[hex] = {
+                kind: 'none', coilGroup: 'A', coilSign: '+',
+                magnetization: defaultMagnetizationState(),
+            });
+        // Older chip records may pre-date Phase D.7 — backfill the
+        // magnetization sub-state if it is missing.
+        if (!assign.magnetization) assign.magnetization = defaultMagnetizationState();
         // If the prior selection is no longer in the active library,
         // fall back to (none) so the dropdown stays consistent.
         if (assign.kind !== 'none' && assign.kind !== 'Coil' && !libNames.includes(assign.kind)) {
             assign.kind = 'none';
         }
+        // Phase D.7: classify whether this kind is a magnet preset to
+        // decide whether the magnetization sub-row should be rendered.
+        const libProps = presetsAll[assign.kind] || materialsAll[assign.kind] || null;
+        const isMagnet = (assign.kind !== 'none' && assign.kind !== 'Coil' && isMagnetMaterial(libProps));
         const item = document.createElement('div');
-        item.style.cssText = 'display:flex; align-items:center; gap:6px; background:#f8f9fa; border-radius:4px; padding:5px 8px; font-size:0.8rem; flex-wrap:wrap;';
+        item.style.cssText = 'display:flex; flex-direction:column; gap:6px; background:#f8f9fa; border-radius:4px; padding:6px 8px; font-size:0.8rem;';
         const optsKind = ['<option value="none">(none)</option>',
                           '<option value="Coil">Coil</option>']
             .concat(libNames.map(n => `<option value="${n}">${n}</option>`))
@@ -1272,7 +1293,16 @@ function renderDetectChips() {
             const L = String.fromCharCode(65 + i);
             return `<option value="${L}">${L}</option>`;
         }).join('');
+        const patternOpts = [
+            ['parallel',           'parallel (uniform angle)'],
+            ['radial',             'radial (outward from centre)'],
+            ['tangential',         'tangential (CCW around centre)'],
+            ['halbach_continuous', 'halbach_continuous (p, centre, offset)'],
+            ['polar_anisotropy',   'polar_anisotropy (p, Kn=Fn/Rm, centre, offset)'],
+            ['custom',             'custom (Mx, My expressions)'],
+        ].map(([v, t]) => `<option value="${v}">${t}</option>`).join('');
         item.innerHTML = `
+          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
             <div style="width:20px; height:20px; background:${hex}; border:1px solid #ccc; border-radius:2px; flex-shrink:0;"></div>
             <span style="font-family:monospace;">${hex}</span>
             <span style="color:#6c757d;">${(c.ratio * 100).toFixed(1)}%</span>
@@ -1284,6 +1314,35 @@ function renderDetectChips() {
                 <label style="display:inline-flex; align-items:center; gap:2px;"><input type="radio" name="coilSign-${hex}" data-detect-hex="${hex}" data-role="coilSign" value="+"> +</label>
                 <label style="display:inline-flex; align-items:center; gap:2px;"><input type="radio" name="coilSign-${hex}" data-detect-hex="${hex}" data-role="coilSign" value="-"> −</label>
             </span>
+          </div>
+          <div data-magnet-row="${hex}" style="display:none; padding-left:28px; gap:8px; align-items:center; flex-wrap:wrap; font-size:0.78rem;">
+            <span style="color:#6c757d; font-weight:600;">Magnetization</span>
+            <select data-detect-hex="${hex}" data-role="magPattern" style="padding:2px 4px; font-size:0.78rem;">${patternOpts}</select>
+            <span data-mag-params="parallel-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>angle <input type="number" step="1" data-detect-hex="${hex}" data-role="magAngle" style="width:64px; padding:1px 3px;"> deg</label>
+            </span>
+            <span data-mag-params="radial-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCx" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCy" style="width:80px; padding:1px 3px;"> m</label>
+            </span>
+            <span data-mag-params="halbach-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magP" style="width:48px; padding:1px 3px;"></label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffset" style="width:64px; padding:1px 3px;"> deg</label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCx2" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCy2" style="width:80px; padding:1px 3px;"> m</label>
+            </span>
+            <span data-mag-params="polar-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magP3" style="width:48px; padding:1px 3px;"></label>
+                <label title="Kn = Fn/Rm (Kano 2025 §3.2). 1.6 ≈ sinusoidal gap density">Kn <input type="number" min="0.1" step="0.1" data-detect-hex="${hex}" data-role="magKn" style="width:60px; padding:1px 3px;"></label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffset3" style="width:64px; padding:1px 3px;"> deg</label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCx3" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCy3" style="width:80px; padding:1px 3px;"> m</label>
+            </span>
+            <span data-mag-params="custom-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>Mx <input type="text" data-detect-hex="${hex}" data-role="magMx" style="width:160px; padding:1px 3px;" placeholder="Hc * cos(2*theta)"></label>
+                <label>My <input type="text" data-detect-hex="${hex}" data-role="magMy" style="width:160px; padding:1px 3px;" placeholder="Hc * sin(2*theta)"></label>
+            </span>
+          </div>
         `;
         grid.appendChild(item);
         // Apply persisted state to the freshly-built controls
@@ -1294,15 +1353,34 @@ function renderDetectChips() {
         });
         const extras = item.querySelector(`span[data-coil-extras="${hex}"]`);
         if (extras) extras.style.display = (assign.kind === 'Coil') ? 'inline-flex' : 'none';
+        // Phase D.7: hydrate the magnetization sub-row visibility and
+        // input values from the current state.
+        const magRow = item.querySelector(`[data-magnet-row="${hex}"]`);
+        if (magRow) magRow.style.display = isMagnet ? 'flex' : 'none';
+        applyMagnetizationStateToControls(item, hex, assign.magnetization);
     });
+    // Wire kind / coil controls (Phase D.4)
     // Wire all per-chip controls to update AppState.detectAssign and
     // regenerate the YAML preview.
     grid.querySelectorAll('select[data-role="kind"]').forEach(el => {
         el.addEventListener('change', () => {
             const hex = el.dataset.detectHex;
-            AppState.detectAssign[hex].kind = el.value;
+            const assign = AppState.detectAssign[hex];
+            assign.kind = el.value;
             const extras = grid.querySelector(`span[data-coil-extras="${hex}"]`);
             if (extras) extras.style.display = (el.value === 'Coil') ? 'inline-flex' : 'none';
+            // Phase D.7: surface / hide the magnetization sub-row and
+            // seed defaults from the library preset on first transition
+            // to a magnet kind.
+            const libProps = presetsAll[assign.kind] || materialsAll[assign.kind] || null;
+            const becomingMagnet = (assign.kind !== 'none' && assign.kind !== 'Coil'
+                                    && isMagnetMaterial(libProps));
+            const magRow = grid.querySelector(`[data-magnet-row="${hex}"]`);
+            if (magRow) magRow.style.display = becomingMagnet ? 'flex' : 'none';
+            if (becomingMagnet) {
+                seedMagnetizationFromLibrary(assign, libProps);
+                applyMagnetizationStateToControls(magRow.parentElement, hex, assign.magnetization);
+            }
             regenerateDetectYamlPreview();
         });
     });
@@ -1319,6 +1397,256 @@ function renderDetectChips() {
             regenerateDetectYamlPreview();
         });
     });
+    // Phase D.7: wire the per-chip magnetization controls.
+    bindMagnetizationControls(grid);
+}
+
+// Phase D.7: visibility of the per-pattern parameter group within a
+// chip's magnetization row. Called on render and whenever the user
+// changes the pattern dropdown.
+function showMagPatternParams(item, hex, pattern) {
+    const map = {
+        parallel:           `parallel-${hex}`,
+        radial:             `radial-${hex}`,
+        tangential:         `radial-${hex}`,   // shares cx/cy with radial
+        halbach_continuous: `halbach-${hex}`,
+        polar_anisotropy:   `polar-${hex}`,
+        custom:             `custom-${hex}`,
+    };
+    const target = map[pattern];
+    item.querySelectorAll('[data-mag-params]').forEach(el => {
+        el.style.display = (el.dataset.magParams === target) ? 'inline-flex' : 'none';
+    });
+}
+
+// Phase D.7: push the current magnetization sub-state into the visible
+// inputs. Called after a render so freshly-created controls show the
+// persisted values.
+function applyMagnetizationStateToControls(item, hex, m) {
+    if (!item || !m) return;
+    showMagPatternParams(item, hex, m.pattern);
+    const setVal = (role, v) => {
+        const el = item.querySelector(`[data-role="${role}"][data-detect-hex="${hex}"]`);
+        if (el) el.value = (v == null) ? '' : v;
+    };
+    const setSel = (role, v) => {
+        const el = item.querySelector(`[data-role="${role}"][data-detect-hex="${hex}"]`);
+        if (el) el.value = v;
+    };
+    setSel('magPattern', m.pattern);
+    setVal('magAngle', m.angle);
+    setVal('magCx', m.cx);
+    setVal('magCy', m.cy);
+    setVal('magP',  m.p);
+    setVal('magOffset', m.orientation_offset);
+    setVal('magCx2', m.cx);
+    setVal('magCy2', m.cy);
+    setVal('magP3', m.p);
+    setVal('magKn', m.Kn);
+    setVal('magOffset3', m.orientation_offset);
+    setVal('magCx3', m.cx);
+    setVal('magCy3', m.cy);
+    setVal('magMx', m.Mx);
+    setVal('magMy', m.My);
+}
+
+// Phase D.7: wire all the magnetization controls in the chip grid.
+// One listener per data-role; updates the per-chip magnetization
+// sub-state and re-renders the YAML preview.
+function bindMagnetizationControls(grid) {
+    const updateNum = (el, key) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        const v = Number(el.value);
+        a.magnetization[key] = Number.isFinite(v) ? v : 0;
+        regenerateDetectYamlPreview();
+    };
+    const updateStr = (el, key) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        a.magnetization[key] = el.value;
+        regenerateDetectYamlPreview();
+    };
+    grid.querySelectorAll('select[data-role="magPattern"]').forEach(el => {
+        el.addEventListener('change', () => {
+            const hex = el.dataset.detectHex;
+            const a = AppState.detectAssign[hex];
+            if (!a) return;
+            a.magnetization.pattern = el.value;
+            const item = el.closest('[data-magnet-row]') ?
+                el.closest('[data-magnet-row]').parentElement : el.parentElement;
+            showMagPatternParams(item, hex, el.value);
+            regenerateDetectYamlPreview();
+        });
+    });
+    // angle (parallel)
+    grid.querySelectorAll('input[data-role="magAngle"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'angle')));
+    // cx, cy (radial / tangential — shared inputs)
+    grid.querySelectorAll('input[data-role="magCx"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCy"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    // halbach: p / offset / cx / cy
+    grid.querySelectorAll('input[data-role="magP"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'p')));
+    grid.querySelectorAll('input[data-role="magOffset"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
+    grid.querySelectorAll('input[data-role="magCx2"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCy2"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    // polar_anisotropy: p / Kn / offset / cx / cy
+    grid.querySelectorAll('input[data-role="magP3"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'p')));
+    grid.querySelectorAll('input[data-role="magKn"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'Kn')));
+    grid.querySelectorAll('input[data-role="magOffset3"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'orientation_offset')));
+    grid.querySelectorAll('input[data-role="magCx3"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCy3"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    // custom expressions
+    grid.querySelectorAll('input[data-role="magMx"]').forEach(el =>
+        el.addEventListener('input', () => updateStr(el, 'Mx')));
+    grid.querySelectorAll('input[data-role="magMy"]').forEach(el =>
+        el.addEventListener('input', () => updateStr(el, 'My')));
+}
+
+// Phase D.7: initial magnetization sub-state for a chip. Parameters are
+// kept so toggling pattern doesn't lose values. Defaults follow
+// Kano 2025 §3.2 (Kn=1.6 → near-sinusoidal gap density, THD<1%).
+function defaultMagnetizationState() {
+    return {
+        pattern: 'parallel',
+        angle: 0,           // [deg]
+        p: 4,               // pole pairs
+        Kn: 1.6,            // = R_pc / Rm
+        cx: 0,              // [m]
+        cy: 0,              // [m]
+        orientation_offset: 0,  // [deg]
+        Mx: '',             // tinyexpr expression
+        My: '',
+    };
+}
+
+// Phase D.7: classify whether a library entry (preset or material) is a
+// permanent magnet, i.e., whether the per-chip magnetization UI should
+// be shown when this entry is the kind selection. Checks:
+//   1. an explicit magnetization block with Br or Hc
+//   2. a B-H array containing a non-zero B at H=0 (any format)
+function isMagnetMaterial(props) {
+    if (!props || typeof props !== 'object') return false;
+    const m = props.magnetization;
+    if (m && typeof m === 'object' && (m.Br != null || m.Hc != null)) return true;
+    const bh = props['B-H'];
+    if (Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]) && Array.isArray(bh[1])) {
+        const H = bh[0], B = bh[1];
+        for (let i = 0; i < H.length && i < B.length; i++) {
+            if (Math.abs(Number(H[i]) || 0) < 1e-6 && Math.abs(Number(B[i]) || 0) > 1e-9) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Phase D.7: physical-coordinate context from Polar Preprocess (if any
+// detection has been run) used to suggest cx/cy and R_pc defaults.
+// Returns { dx_per_px, cx_phys, cy_phys, Rm_phys, polar_origin } or
+// nulls when the modal hasn't been run.
+function detectMagnetizationContext() {
+    const pp = AppState.polarPreprocess;
+    if (!pp || !pp.detection) {
+        return { dx_per_px: 0, cx_phys: 0, cy_phys: 0, Rm_phys: 0, polar_origin: false };
+    }
+    const cur = pp.current || {};
+    const det = pp.detection || {};
+    const r_outer_px = (cur.r_outer_px > 0) ? cur.r_outer_px : (det.r_outer_px || 0);
+    const r_outer_m  = (cur.r_outer_physical > 0) ? cur.r_outer_physical : 1.0;
+    const dx_per_px = (r_outer_px > 0) ? (r_outer_m / r_outer_px) : 0;
+    // For polar save target the warp re-centres on the rotor axis so
+    // (cx, cy) = (0, 0) is the physically correct default. For
+    // cartesian save the rotor centre stays at its image-px position
+    // multiplied by the auto-derived dx.
+    const polar_origin = (cur.save_as === 'polar');
+    const cx_phys = polar_origin ? 0 : (cur.center_x || det.center_x || 0) * dx_per_px;
+    const cy_phys = polar_origin ? 0 : (cur.center_y || det.center_y || 0) * dx_per_px;
+    return { dx_per_px, cx_phys, cy_phys, Rm_phys: r_outer_m, polar_origin };
+}
+
+// Phase D.7: emit a magnetization: block at the given indent for the
+// per-chip state. Pattern-specific fields are emitted; Kn is converted
+// to R_pc using the Polar Preprocess context (Rm). Inline comments
+// reference the Kano 2025 §3.2 framing where relevant so users can
+// trace the parameter meaning back to the paper.
+function appendMagnetizationBlock(lines, indent, m) {
+    if (!m || !m.pattern) return;
+    lines.push(`${indent}magnetization:`);
+    const sub = `${indent}  `;
+    lines.push(`${sub}pattern: ${m.pattern}`);
+    if (m.pattern === 'parallel') {
+        lines.push(`${sub}angle: ${Number(m.angle) || 0}`);
+    } else if (m.pattern === 'radial' || m.pattern === 'tangential') {
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+    } else if (m.pattern === 'halbach_continuous') {
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'polar_anisotropy') {
+        const ctx = detectMagnetizationContext();
+        const Rm = ctx.Rm_phys || 1.0;
+        const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
+        const R_pc = Kn * Rm;
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}# R_pc = Kn * Rm  with Kn = ${Kn}, Rm = ${Rm} m  (Kano 2025 §3.2; Kn≈1.6 → THD<1%)`);
+        lines.push(`${sub}R_pc: ${R_pc}`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'custom') {
+        if (m.Mx) lines.push(`${sub}Mx: "${String(m.Mx).replace(/"/g, '\\"')}"`);
+        if (m.My) lines.push(`${sub}My: "${String(m.My).replace(/"/g, '\\"')}"`);
+    }
+}
+
+// Phase D.7: pull library magnetization defaults (if any) into the
+// per-chip state when a magnet preset is freshly picked. Non-destructive:
+// keeps any field the user already edited.
+function seedMagnetizationFromLibrary(assign, libProps) {
+    const m = assign.magnetization;
+    if (!m) return;
+    // Apply Polar Preprocess context defaults first so library values can
+    // still override them (the user's library is the authoritative
+    // source, the Polar Preprocess is just a sensible fallback for the
+    // rotor centre when the library didn't say).
+    const ctx = detectMagnetizationContext();
+    if (m.cx === 0) m.cx = ctx.cx_phys;
+    if (m.cy === 0) m.cy = ctx.cy_phys;
+    const lm = libProps && libProps.magnetization;
+    if (!lm) return;
+    if (lm.pattern && m.pattern === 'parallel' && lm.pattern !== 'parallel') {
+        m.pattern = lm.pattern;
+    }
+    if (lm.angle != null && m.angle === 0) m.angle = Number(lm.angle) || 0;
+    if (lm.p != null && m.p === 4) m.p = Math.max(1, Math.round(Number(lm.p) || 4));
+    if (lm.cx != null) m.cx = Number(lm.cx) || 0;
+    if (lm.cy != null) m.cy = Number(lm.cy) || 0;
+    if (lm.orientation_offset != null && m.orientation_offset === 0) {
+        m.orientation_offset = Number(lm.orientation_offset) || 0;
+    }
+    if (lm.R_pc != null && ctx.Rm_phys > 0) {
+        m.Kn = Number(lm.R_pc) / ctx.Rm_phys;
+    }
 }
 
 // Phase D.4: regenerate the YAML preview based on the current per-chip
@@ -1405,18 +1733,30 @@ function buildDetectYamlFromAssignments() {
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
             lines.push(`    preset: ${a.kind}    # coverage: ${ratio}%`);
             if (c.antialias === true) lines.push(`    antialias: true`);
+            // Phase D.7: append per-chip magnetization block when the
+            // selected preset is a magnet. This overrides the preset's
+            // own magnetization direction with the user's choice while
+            // keeping Br / mu_r etc. inherited from the preset.
+            if (isMagnetMaterial(presetsAll[a.kind])) {
+                appendMagnetizationBlock(lines, '    ', a.magnetization);
+            }
         } else if (a.kind && a.kind !== 'none' && materialsAll[a.kind]) {
             // Library material picked directly (no preset): copy props
             // verbatim but override rgb to the detected colour.
             lines.push(`  material_${hex.slice(1)}:`);
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
             const props = materialsAll[a.kind] || {};
+            const skipMag = isMagnetMaterial(props);
             for (const k of Object.keys(props)) {
                 if (k === 'rgb') continue;
+                // Phase D.7: skip the library's magnetization block; we
+                // emit the user-edited one explicitly below.
+                if (skipMag && k === 'magnetization') continue;
                 const sub = jsyaml.dump({ [k]: props[k] }, { indent: 2, lineWidth: -1 }).replace(/\n$/, '');
                 for (const ln of sub.split('\n')) lines.push('    ' + ln);
             }
             if (c.antialias === true) lines.push(`    antialias: true`);
+            if (skipMag) appendMagnetizationBlock(lines, '    ', a.magnetization);
         } else {
             lines.push(`  material_${hex.slice(1)}:`);
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);

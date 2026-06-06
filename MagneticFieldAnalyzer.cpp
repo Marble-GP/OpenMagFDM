@@ -1248,14 +1248,21 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                 mc.p = mag["p"].as<int>(1);
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
-                // Build tinyexpr formulas with numeric p, cx, cy substituted
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
+                double orient_rad = mc.orientation_offset_deg * M_PI / 180.0;
+                // Build tinyexpr formulas with numeric p, cx, cy, offset substituted
+                // Mx = Hc * cos(p * (atan2(y - cy, x - cx) - offset))
+                // Subtracting offset from the position angle rotates the
+                // entire pole structure by +offset (so the first pole's
+                // OJ sits at angle offset instead of 0).
                 std::ostringstream sx, sy;
-                // Mx = Hc * cos(p * atan2(y - cy, x - cx))
-                sx << std::setprecision(17) << mc.Hc << "*cos(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
-                sy << std::setprecision(17) << mc.Hc << "*sin(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sx << std::setprecision(17) << mc.Hc << "*cos(" << mc.p << "*(atan2(y-(" << mc.cy << "),x-(" << mc.cx << "))-(" << orient_rad << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*sin(" << mc.p << "*(atan2(y-(" << mc.cy << "),x-(" << mc.cx << "))-(" << orient_rad << ")))";
                 mc.Mx_expr = sx.str();
                 mc.My_expr = sy.str();
-                std::cout << "  [" << name << "] magnetization: halbach_continuous p=" << mc.p << ", Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: halbach_continuous p=" << mc.p
+                          << ", orientation_offset=" << mc.orientation_offset_deg
+                          << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "radial") {
                 // Radial magnetization: M points outward along r̂ from (cx, cy)
                 // Mx = Hc * cos(theta),  My = Hc * sin(theta)
@@ -1284,10 +1291,13 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                 mc.R_pc = mag["R_pc"].as<double>(0.05);
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
                 // polar_anisotropy uses dedicated C++ loop (not tinyexpr)
                 mc.Mx_expr = "";
                 mc.My_expr = "";
-                std::cout << "  [" << name << "] magnetization: polar_anisotropy p=" << mc.p << ", R_pc=" << mc.R_pc << " m, Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: polar_anisotropy p=" << mc.p
+                          << ", R_pc=" << mc.R_pc << " m, orientation_offset="
+                          << mc.orientation_offset_deg << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "custom") {
                 mc.Mx_expr = mag["Mx"].as<std::string>("");
                 mc.My_expr = mag["My"].as<std::string>("");
@@ -1492,9 +1502,12 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
         cv::Vec3b rgb(rgb_vec[0], rgb_vec[1], rgb_vec[2]);
 
         if (mc.pattern == "polar_anisotropy") {
-            // 2p concentrated wire currents on pitch circle → superposed B direction
+            // 2p concentrated wire currents on pitch circle → superposed B direction.
+            // Phase D.7: orientation_offset_deg rotates the OJ positions
+            // around the rotor centre (Kano 2025 §3.2: theta_k = πk/p + offset).
             int grid_rows = is_polar ? (int)Mx_map.rows() : ny;
             int grid_cols = is_polar ? (int)Mx_map.cols() : nx;
+            const double orient_rad = mc.orientation_offset_deg * M_PI / 180.0;
 
             for (int j = 0; j < grid_rows; j++) {
                 for (int i = 0; i < grid_cols; i++) {
@@ -1526,7 +1539,7 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
                     // Superpose field of 2p wire currents at R_pc
                     double Bx_sum = 0.0, By_sum = 0.0;
                     for (int k = 0; k < 2 * mc.p; k++) {
-                        double theta_k = M_PI * k / mc.p;
+                        double theta_k = M_PI * k / mc.p + orient_rad;
                         double sign = (k % 2 == 0) ? 1.0 : -1.0;
                         double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
                         double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
