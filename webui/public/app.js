@@ -1480,6 +1480,10 @@ function attachZoomPan(containerEl, stageEl, opts = {}) {
     const minScale = opts.minScale ?? 0.25;
     const maxScale = opts.maxScale ?? 16;
     const zoomFactor = opts.zoomFactor ?? 1.15;
+    // Phase D.1: optional callback fired after every transform update so
+    // consumers (e.g. the Polar Preprocess overlay) can re-render their
+    // SVG content at sizes inversely proportional to the zoom level.
+    const onScaleChange = typeof opts.onScaleChange === 'function' ? opts.onScaleChange : null;
     const state = { scale: 1, tx: 0, ty: 0, panning: false, panStart: null };
     let indicatorTimer = null;
 
@@ -1493,6 +1497,7 @@ function attachZoomPan(containerEl, stageEl, opts = {}) {
             indicatorTimer = setTimeout(
                 () => indicatorEl.classList.remove('visible'), 1200);
         }
+        if (onScaleChange) onScaleChange(state.scale);
     }
     function reset() {
         state.scale = 1; state.tx = 0; state.ty = 0;
@@ -1601,10 +1606,16 @@ async function openPolarPreprocessModal() {
 
     // Wire up wheel-zoom / middle-drag-pan / dbl-click-reset on the preview
     // (idempotent: attachZoomPan returns the existing handle if already set).
+    // Phase D.1: re-render the SVG overlay whenever the zoom changes so
+    // handle dots / dashed circles stay roughly constant-on-screen instead
+    // of inflating into pixel blobs at 5-10x zoom.
     const zp = attachZoomPan(
         document.getElementById('polarPreviewContainer'),
         document.getElementById('polarZoomStage'),
-        { indicatorEl: document.getElementById('polarZoomIndicator') }
+        {
+            indicatorEl: document.getElementById('polarZoomIndicator'),
+            onScaleChange: () => renderPolarOverlay(),
+        }
     );
     if (zp) zp.reset();
     // Reset the view to the Source tab on every open, since the warp
@@ -1834,6 +1845,28 @@ function renderPolarOverlay() {
     const rIn = cur.r_inner_px, rOut = cur.r_outer_px;
     const crossArm = Math.max(8, Math.min(W, H) * 0.02);
 
+    // Phase D.1: at zoom = s, an SVG element with image-coord dimension d
+    // appears on screen as d * s pixels. Dividing every literal size by s
+    // keeps handles / dashed strokes a constant on-screen size while the
+    // background image itself zooms. Floor at 0.25 so very-zoomed-out
+    // overlays don't render at zero stroke width.
+    const zp = document.getElementById('polarPreviewContainer') &&
+               document.getElementById('polarPreviewContainer')._zoomPan;
+    const scale = (zp && zp.scale) ? zp.scale : 1;
+    const sigma = (base) => base / Math.max(0.25, scale);
+    const HANDLE_R       = sigma(6);
+    const HANDLE_RXL     = sigma(7);
+    const STROKE_GUIDE   = sigma(1.8);
+    const STROKE_OUTER   = sigma(2);
+    const STROKE_AIRGAP  = sigma(2.2);
+    const STROKE_THETA   = sigma(1.8);
+    const STROKE_PERIOD  = sigma(1);
+    const STROKE_CROSS   = sigma(1.5);
+    const STROKE_HANDLE  = sigma(1.5);
+    const DASH_GUIDE_IN  = `${sigma(6)},${sigma(4)}`;
+    const DASH_AIRGAP    = `${sigma(9)},${sigma(5)}`;
+    const DASH_PERIOD    = `${sigma(2)},${sigma(3)}`;
+
     let html = '';
 
     // Period guides (drawn first so they sit behind the rings)
@@ -1844,21 +1877,21 @@ function renderPolarOverlay() {
             const ang = 2 * Math.PI * k / N + (cur.theta_start || 0);
             const x2 = cx + (rOut + 10) * Math.cos(ang);
             const y2 = cy + (rOut + 10) * Math.sin(ang);
-            html += `<line class="guide-period" x1="${cx}" y1="${cy}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}"/>`;
+            html += `<line class="guide-period" x1="${cx}" y1="${cy}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" stroke-width="${STROKE_PERIOD}" stroke-dasharray="${DASH_PERIOD}"/>`;
         }
     }
 
     // Inner / outer radius circles (or arcs for sector mode)
     if (rIn > 0) {
-        html += `<circle class="guide-inner" cx="${cx}" cy="${cy}" r="${rIn}"/>`;
+        html += `<circle class="guide-inner" cx="${cx}" cy="${cy}" r="${rIn}" stroke-width="${STROKE_GUIDE}" stroke-dasharray="${DASH_GUIDE_IN}"/>`;
     }
     if (rOut > 0) {
-        html += `<circle class="guide-outer" cx="${cx}" cy="${cy}" r="${rOut}"/>`;
+        html += `<circle class="guide-outer" cx="${cx}" cy="${cy}" r="${rOut}" stroke-width="${STROKE_OUTER}"/>`;
     }
     // Air-gap visual marker (Phase 5f.2). Yellow dashed circle so the
     // detected dip stays obvious without dictating the warp range.
     if (cur.air_gap_px > 0 && cur.air_gap_px < rOut) {
-        html += `<circle class="guide-airgap" cx="${cx}" cy="${cy}" r="${cur.air_gap_px}"/>`;
+        html += `<circle class="guide-airgap" cx="${cx}" cy="${cy}" r="${cur.air_gap_px}" stroke-width="${STROKE_AIRGAP}" stroke-dasharray="${DASH_AIRGAP}"/>`;
     }
 
     // Sector boundary lines
@@ -1868,21 +1901,21 @@ function renderPolarOverlay() {
         const ys = cy + r * Math.sin(cur.theta_start);
         const xe = cx + r * Math.cos(cur.theta_end);
         const ye = cy + r * Math.sin(cur.theta_end);
-        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xs.toFixed(2)}" y2="${ys.toFixed(2)}"/>`;
-        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xe.toFixed(2)}" y2="${ye.toFixed(2)}"/>`;
+        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xs.toFixed(2)}" y2="${ys.toFixed(2)}" stroke-width="${STROKE_THETA}"/>`;
+        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xe.toFixed(2)}" y2="${ye.toFixed(2)}" stroke-width="${STROKE_THETA}"/>`;
     }
 
     // Center cross + handle (drawn last so it sits on top)
-    html += `<line class="center-cross" x1="${cx - crossArm}" y1="${cy}" x2="${cx + crossArm}" y2="${cy}"/>`;
-    html += `<line class="center-cross" x1="${cx}" y1="${cy - crossArm}" x2="${cx}" y2="${cy + crossArm}"/>`;
-    html += `<circle class="handle handle-center" data-handle="center" cx="${cx}" cy="${cy}" r="6"/>`;
+    html += `<line class="center-cross" x1="${cx - crossArm}" y1="${cy}" x2="${cx + crossArm}" y2="${cy}" stroke-width="${STROKE_CROSS}"/>`;
+    html += `<line class="center-cross" x1="${cx}" y1="${cy - crossArm}" x2="${cx}" y2="${cy + crossArm}" stroke-width="${STROKE_CROSS}"/>`;
+    html += `<circle class="handle handle-center" data-handle="center" cx="${cx}" cy="${cy}" r="${HANDLE_R}" stroke-width="${STROKE_HANDLE}"/>`;
 
     // Radius handles at 0 rad (right side)
     if (rIn > 0) {
-        html += `<circle class="handle handle-inner" data-handle="inner" cx="${cx + rIn}" cy="${cy}" r="7"/>`;
+        html += `<circle class="handle handle-inner" data-handle="inner" cx="${cx + rIn}" cy="${cy}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
     }
     if (rOut > 0) {
-        html += `<circle class="handle handle-outer" data-handle="outer" cx="${cx + rOut}" cy="${cy}" r="7"/>`;
+        html += `<circle class="handle handle-outer" data-handle="outer" cx="${cx + rOut}" cy="${cy}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
     }
     // Sector theta handles at the ring outer edge
     if (cur.is_sector && rOut > 0) {
@@ -1890,8 +1923,8 @@ function renderPolarOverlay() {
         const ys = cy + rOut * Math.sin(cur.theta_start);
         const xe = cx + rOut * Math.cos(cur.theta_end);
         const ye = cy + rOut * Math.sin(cur.theta_end);
-        html += `<circle class="handle handle-theta" data-handle="theta_start" cx="${xs.toFixed(2)}" cy="${ys.toFixed(2)}" r="7"/>`;
-        html += `<circle class="handle handle-theta" data-handle="theta_end"   cx="${xe.toFixed(2)}" cy="${ye.toFixed(2)}" r="7"/>`;
+        html += `<circle class="handle handle-theta" data-handle="theta_start" cx="${xs.toFixed(2)}" cy="${ys.toFixed(2)}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
+        html += `<circle class="handle handle-theta" data-handle="theta_end"   cx="${xe.toFixed(2)}" cy="${ye.toFixed(2)}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
     }
 
     svg.innerHTML = html;
