@@ -36,6 +36,36 @@ static void createDirectory(const std::string& path) {
 
 constexpr double MU_0 = 4.0 * M_PI * 1e-7;  // Vacuum permeability [H/m]
 
+// Phase O: deep-merge a material's overrides on top of a referenced
+// preset. Top-level scalar / sequence keys still override outright,
+// but for nested maps (notably `magnetization`) the override's keys
+// are merged INTO the preset's map -- so writing
+//     magnetization: { pattern: parallel_array, p: 4, ... }
+// on top of a NdFeB preset that supplied Br: 1.27 no longer drops Br
+// and silently turns every magnet pixel into vacuum (the pre-Phase-O
+// behaviour). Anything not redeclared in the override keeps the
+// preset's value; anything redeclared (e.g. pattern, angle) wins.
+static YAML::Node mergeMaterialPreset(const YAML::Node& preset_props,
+                                     const YAML::Node& override_props) {
+    YAML::Node merged = YAML::Clone(preset_props);
+    for (auto it = override_props.begin(); it != override_props.end(); ++it) {
+        const std::string key = it->first.as<std::string>("");
+        if (key.empty() || key == "preset") continue;
+        const YAML::Node child = it->second;
+        if (child.IsMap() && merged[key] && merged[key].IsMap()) {
+            YAML::Node merged_child = YAML::Clone(merged[key]);
+            for (auto cit = child.begin(); cit != child.end(); ++cit) {
+                const std::string ck = cit->first.as<std::string>("");
+                if (!ck.empty()) merged_child[ck] = cit->second;
+            }
+            merged[key] = merged_child;
+        } else {
+            merged[key] = child;
+        }
+    }
+    return merged;
+}
+
 MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
                                              const std::string& image_path) {
     loadConfig(config_path);
@@ -860,23 +890,16 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         std::string name = material.first.as<std::string>();
         YAML::Node props = material.second;
 
-        // Resolve preset if specified (preset properties are merged, material-specific overrides)
+        // Resolve preset if specified. Phase O: deep-merge nested
+        // maps (magnetization etc.) so override blocks don't have to
+        // re-declare every preset field they want to keep.
         if (props["preset"]) {
             std::string preset_name = props["preset"].as<std::string>();
             auto preset_it = material_presets.find(preset_name);
             if (preset_it == material_presets.end()) {
                 throw std::runtime_error("Material '" + name + "' references unknown preset: " + preset_name);
             }
-
-            // Start with preset properties, then override with material-specific properties
-            YAML::Node merged = YAML::Clone(preset_it->second);
-            for (auto it = props.begin(); it != props.end(); ++it) {
-                std::string key = it->first.as<std::string>();
-                if (key != "preset") {  // Don't copy the preset reference itself
-                    merged[key] = it->second;
-                }
-            }
-            props = merged;
+            props = mergeMaterialPreset(preset_it->second, props);
             std::cout << "Material '" << name << "' using preset '" << preset_name << "'" << std::endl;
         }
 
@@ -11803,19 +11826,14 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         std::string name = material.first.as<std::string>();
         YAML::Node props = material.second;
 
-        // Resolve preset if specified (preset properties are merged, material-specific overrides)
+        // Resolve preset if specified. Phase O: deep-merge nested
+        // maps (see mergeMaterialPreset for the rationale -- shallow
+        // merge silently dropped Br on magnetization overrides).
         if (props["preset"]) {
             std::string preset_name = props["preset"].as<std::string>();
             auto preset_it = material_presets.find(preset_name);
             if (preset_it != material_presets.end()) {
-                YAML::Node merged = YAML::Clone(preset_it->second);
-                for (auto it = props.begin(); it != props.end(); ++it) {
-                    std::string key = it->first.as<std::string>();
-                    if (key != "preset") {
-                        merged[key] = it->second;
-                    }
-                }
-                props = merged;
+                props = mergeMaterialPreset(preset_it->second, props);
             }
         }
 
