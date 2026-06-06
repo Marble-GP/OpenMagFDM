@@ -898,6 +898,24 @@
             -webkit-user-drag: none;
             display: block;
             background: #2a2a2a;
+            /* Phase D.6: at >2x CSS transform scale Chromium otherwise
+               falls back to a low-quality (nearest-neighbour-ish) sampler
+               when the stage is GPU-composited via will-change: transform,
+               producing a chunky pixelated look on CAD screenshots. The
+               progressive fallback chain pins us to bicubic / bilinear
+               instead, in priority order: high-quality (L4), smooth (L4),
+               auto (legacy). The last keyword that the engine recognises
+               wins, so older Chrome / Safari fall through to auto. */
+            image-rendering: auto;
+            image-rendering: smooth;
+            image-rendering: high-quality;
+        }
+        /* Phase D.6: same high-quality interpolation for the uniform-
+           colour filter preview which shares the same zoom-stage pattern. */
+        #qfilterPreviewImg {
+            image-rendering: auto;
+            image-rendering: smooth;
+            image-rendering: high-quality;
         }
         #polarOverlay {
             position: absolute;
