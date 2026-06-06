@@ -1653,11 +1653,11 @@ function defaultMagnetizationState() {
     return {
         pattern: 'parallel',
         angle: 0,           // [deg]
-        p: 2,               // pole pairs (= 4 poles, matches a 4-pole machine)
+        p: 4,               // Phase J: number of poles (4-pole machine default)
         Kn: 1.6,            // = R_pc / Rm
         cx: 0,              // [m]
         cy: 0,              // [m]
-        orientation_offset: 0,  // [deg] -- auto-seeded to -180/(2p) when a
+        orientation_offset: 0,  // [deg] -- auto-seeded to -180/p when a
                                 //         sector pattern is first picked
         // Phase G: false until the user types in the offset input directly.
         // When false, switching pattern / editing p re-applies the
@@ -1685,8 +1685,9 @@ function reseedOffsetIfAuto(assign) {
     const m = assign && assign.magnetization;
     if (!m || m._offset_explicit) return;
     if (!SECTOR_PATTERNS.has(m.pattern)) return;
+    // Phase J: p = poles; sector 0 centred on θ=0 wants -180/p.
     const p = Math.max(1, Math.round(Number(m.p) || 1));
-    m.orientation_offset = -180 / (2 * p);
+    m.orientation_offset = -180 / p;
 }
 
 // Phase D.7: classify whether a library entry (preset or material) is a
@@ -1755,18 +1756,20 @@ function evalMagnetizationDirection(m, theta_rad, r_norm) {
         return { angle_rad: theta_rad + Math.PI / 2, sign: dirSign };
     }
     if (m.pattern === 'halbach_continuous') {
+        // Phase J: p = poles; the rotation rate is p/2.
         const p = Math.max(1, Math.round(Number(m.p) || 1));
-        return { angle_rad: p * (theta_rad - orient_rad), sign: 1 };
+        return { angle_rad: (p / 2) * (theta_rad - orient_rad), sign: 1 };
     }
     if (m.pattern === 'radial_array' || m.pattern === 'parallel_array') {
+        // Phase J: p sectors of 2π/p each.
         const p = Math.max(1, Math.round(Number(m.p) || 1));
         const twopi = 2 * Math.PI;
         let theta_pos = theta_rad - orient_rad;
         theta_pos = ((theta_pos % twopi) + twopi) % twopi;
-        const pole_span = Math.PI / p;
+        const pole_span = twopi / p;
         let k_pole = Math.floor(theta_pos / pole_span);
         if (k_pole < 0) k_pole = 0;
-        if (k_pole >= 2 * p) k_pole = 2 * p - 1;
+        if (k_pole >= p) k_pole = p - 1;
         const sign = ((k_pole % 2) === 0) ? dirSign : -dirSign;
         if (m.pattern === 'radial_array') {
             return { angle_rad: theta_rad, sign };
@@ -1776,14 +1779,14 @@ function evalMagnetizationDirection(m, theta_rad, r_norm) {
         return { angle_rad: angle_mid, sign };
     }
     if (m.pattern === 'polar_anisotropy') {
+        // Phase J: p OJ centres on the pitch circle.
         const p = Math.max(1, Math.round(Number(m.p) || 1));
-        // Kn = R_pc / Rm; in the unit-circle schematic Rm = 1.
         const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
         const x = r_norm * Math.cos(theta_rad);
         const y = r_norm * Math.sin(theta_rad);
         let Bx = 0, By = 0;
-        for (let k = 0; k < 2 * p; k++) {
-            const theta_k = Math.PI * k / p + orient_rad;
+        for (let k = 0; k < p; k++) {
+            const theta_k = 2 * Math.PI * k / p + orient_rad;
             const sgn = (k % 2 === 0) ? 1 : -1;
             const dx_w = x - Kn * Math.cos(theta_k);
             const dy_w = y - Kn * Math.sin(theta_k);
@@ -1825,28 +1828,26 @@ function renderMagnetizationPreview(svg, m) {
         svg.innerHTML = parts.join('');
         return;
     }
-    // Sector boundaries for the discrete patterns.
+    // Sector boundaries for the discrete patterns. Phase J: p sectors.
     if (m.pattern === 'radial_array' || m.pattern === 'parallel_array') {
         const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
         const p = Math.max(1, Math.round(Number(m.p) || 1));
-        for (let k = 0; k < 2 * p; k++) {
-            const theta_k = Math.PI * k / p + orient_rad;
+        for (let k = 0; k < p; k++) {
+            const theta_k = 2 * Math.PI * k / p + orient_rad;
             const x = 1.05 * Math.cos(theta_k);
             const y = 1.05 * Math.sin(theta_k);
             parts.push(`<line x1="0" y1="0" x2="${x.toFixed(3)}" y2="${y.toFixed(3)}" stroke="#c8c8c8" stroke-width="0.015" stroke-dasharray="0.05,0.04"/>`);
         }
     }
-    // For polar_anisotropy, also show the 2p OJ centres so the user
-    // can see the pitch circle geometry.
+    // For polar_anisotropy, show the p OJ centres. Phase J.
     if (m.pattern === 'polar_anisotropy') {
         const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
         const p = Math.max(1, Math.round(Number(m.p) || 1));
         const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
-        for (let k = 0; k < 2 * p; k++) {
-            const theta_k = Math.PI * k / p + orient_rad;
+        for (let k = 0; k < p; k++) {
+            const theta_k = 2 * Math.PI * k / p + orient_rad;
             const cx = Kn * Math.cos(theta_k);
             const cy = Kn * Math.sin(theta_k);
-            // Clip OJ markers to inside the viewbox so large Kn still renders.
             if (Math.hypot(cx, cy) < r_view * 1.5) {
                 const fill = (k % 2 === 0) ? '#d63333' : '#3366cc';
                 parts.push(`<circle cx="${cx.toFixed(3)}" cy="${cy.toFixed(3)}" r="0.05" fill="${fill}"/>`);

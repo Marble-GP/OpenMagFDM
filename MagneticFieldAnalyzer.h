@@ -669,7 +669,13 @@ private:
         double Hc = 0.0;          // Effective magnetization magnitude [A/m] (resolved from Br or Hc in YAML)
         std::string pattern;       // "parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "radial_array", "parallel_array", "custom"
         double angle_deg = 0.0;    // Magnetization angle [deg] (parallel, parallel_array)
-        int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy, radial_array, parallel_array)
+        // Phase J: p is the number of POLES (not pole pairs). A 4-pole
+        // machine uses p=4. Should be even for a closed NS alternation
+        // (odd values are accepted but the M field doesn't close at
+        // θ=2π and the user typically wants p even). The halbach
+        // formula uses p/2 internally; the array / polar_anisotropy
+        // patterns use p sectors / p OJ centres directly.
+        int p = 4;
         double cx = 0.0, cy = 0.0; // Rotation center [m]
         double R_pc = 0.0;         // Pitch circle radius [m] (polar_anisotropy)
         // Phase E.4: per-pattern direction sign. +1 = outward / first

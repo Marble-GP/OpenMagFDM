@@ -444,7 +444,7 @@
       "example": "magnetization:\n  Br: 1.27\n  pattern: parallel\n  angle: 0.0"
     },
     "pattern": {
-      "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward (or inward via direction) from center (cx, cy)\n  tangential — counter-clockwise (or clockwise via direction) from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy, orientation_offset)\n  polar_anisotropy — pole-following easy axis from 2p orientation centres OJ on a pitch circle (p, R_pc, cx, cy, orientation_offset); see Kano 2025 §3.2\n  radial_array — alternating radial-out / radial-in per pole sector (axially-magnetised SPM, p poles)\n  parallel_array — uniform parallel within each pole sector along the sector mid-axis, alternating per pole (axially-magnetised IPM with rectangular magnets, p poles)\n  custom — user expression (Mx, My)",
+      "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward (or inward via direction) from center (cx, cy)\n  tangential — counter-clockwise (or clockwise via direction) from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy, orientation_offset); M ∝ cos((p/2)·θ)\n  polar_anisotropy — pole-following easy axis from p orientation centres OJ on a pitch circle (p, R_pc, cx, cy, orientation_offset); see Kano 2025 §3.2\n  radial_array — alternating radial-out / radial-in per pole sector (axially-magnetised SPM, p sectors)\n  parallel_array — uniform parallel within each pole sector along the sector mid-axis, alternating per pole (axially-magnetised IPM with rectangular magnets, p sectors)\n  custom — user expression (Mx, My)",
       "values": ["parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "radial_array", "parallel_array", "custom"],
       "example": "pattern: parallel",
       "validParents": ["magnetization"]
@@ -475,9 +475,9 @@
       "validParents": ["magnetization"]
     },
     "p": {
-      "description": "Number of POLE PAIRS for 'halbach_continuous', 'polar_anisotropy', 'radial_array', and 'parallel_array' patterns. Total physical pole count is 2p (so a 4-pole machine uses p=2, an 8-pole machine uses p=4). For sector-based patterns the number of sectors is also 2p with each spanning π/p radians (180/p degrees). This matches the established halbach M=Hc·cos(p·θ) convention.",
+      "description": "Number of POLES for 'halbach_continuous', 'polar_anisotropy', 'radial_array', and 'parallel_array' patterns. A 4-pole machine uses p=4. Even values give a closed NS alternation (odd values are accepted but the M field does not close at θ=2π). For sector-based patterns the number of sectors equals p with each spanning 2π/p radians (360/p degrees). halbach_continuous internally uses p/2 in its M ∝ cos((p/2)·θ) formula. polar_anisotropy uses p OJ centres on the pitch circle.",
       "type": "integer",
-      "example": "p: 2     # 4-pole machine",
+      "example": "p: 4     # 4-pole machine",
       "validParents": ["magnetization"]
     },
     "cx": {
@@ -499,9 +499,9 @@
       "validParents": ["magnetization"]
     },
     "orientation_offset": {
-      "description": "Pole-structure rotation offset [deg] for 'halbach_continuous', 'polar_anisotropy', 'radial_array', and 'parallel_array' patterns. Rotates the first pole / OJ around (cx, cy). Solver default is 0 (sector 0 spans [0°, 180°/p]); the WebUI Detect Colors UI seeds -180/(2p) (sector 0 centred on θ=0, i.e. cardinal-aligned) when the user first picks a sector pattern. Distinct from the transient slide rotation tracked by the solver between time steps.",
+      "description": "Pole-structure rotation offset [deg] for 'halbach_continuous', 'polar_anisotropy', 'radial_array', and 'parallel_array' patterns. Rotates the first pole / OJ around (cx, cy). Solver default is 0 (sector 0 spans [0°, 360°/p]); the WebUI Detect Colors UI seeds -180/p (sector 0 centred on θ=0, i.e. cardinal-aligned) when the user first picks a sector pattern. Distinct from the transient slide rotation tracked by the solver between time steps.",
       "type": "number",
-      "example": "orientation_offset: -45    # p=2, sector 0 centred on θ=0",
+      "example": "orientation_offset: -45    # p=4, sector 0 centred on θ=0",
       "validParents": ["magnetization"]
     },
     "Mx": {
@@ -724,22 +724,22 @@
     "magnetization_halbach": {
       "name": "Magnetization - Halbach Array (continuous)",
       "trigger": "magnetization",
-      "snippet": "Br: 1.2\npattern: halbach_continuous\np: 2          # pole pairs (4 poles)\ncx: 0.0\ncy: 0.0\norientation_offset: -45    # sector 0 centred on θ=0"
+      "snippet": "Br: 1.2\npattern: halbach_continuous\np: 4          # poles (4-pole machine)\ncx: 0.0\ncy: 0.0\norientation_offset: -45    # sector 0 centred on θ=0"
     },
     "magnetization_polar_anisotropy": {
       "name": "Magnetization - Polar Anisotropy (Kano 2025 §3.2)",
       "trigger": "magnetization",
-      "snippet": "Br: 1.2\npattern: polar_anisotropy\np: 2          # pole pairs (4 poles)\nR_pc: 0.064    # Fn = Kn * Rm; Kn=1.6 → near-sinusoidal gap density\ncx: 0.0\ncy: 0.0\norientation_offset: -45    # sector 0 centred on θ=0"
+      "snippet": "Br: 1.2\npattern: polar_anisotropy\np: 4          # poles (4-pole machine)\nR_pc: 0.064    # Fn = Kn * Rm; Kn=1.6 → near-sinusoidal gap density\ncx: 0.0\ncy: 0.0\norientation_offset: -45    # sector 0 centred on θ=0"
     },
     "magnetization_radial_array": {
       "name": "Magnetization - Radial Array (axially-magnetised SPM, NS alternating)",
       "trigger": "magnetization",
-      "snippet": "Br: 1.2\npattern: radial_array\np: 2          # pole pairs (4 poles)\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: -45    # sector 0 centred on θ=0"
+      "snippet": "Br: 1.2\npattern: radial_array\np: 4          # poles (4-pole machine)\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: -45    # sector 0 centred on θ=0"
     },
     "magnetization_parallel_array": {
       "name": "Magnetization - Parallel Array (IPM rectangular magnets, NS alternating)",
       "trigger": "magnetization",
-      "snippet": "Br: 1.2\npattern: parallel_array\np: 2          # pole pairs (4 poles)\nangle: 0        # extra rotation [deg] off the sector mid-axis\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: -45    # sector 0 centred on θ=0"
+      "snippet": "Br: 1.2\npattern: parallel_array\np: 4          # poles (4-pole machine)\nangle: 0        # extra rotation [deg] off the sector mid-axis\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: -45    # sector 0 centred on θ=0"
     },
     "magnetization_custom": {
       "name": "Magnetization - Custom Expression",
