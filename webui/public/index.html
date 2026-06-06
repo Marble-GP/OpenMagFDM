@@ -1635,6 +1635,29 @@
                                 → r_inner
                             </button>
                         </div>
+                        <!-- Phase D.3: offset / drag / slide-insertion controls
+                             for the air-gap marker. Visible only when at least
+                             one dip candidate exists AND save target is polar
+                             (slide-region emission is meaningful only in the
+                             polar coordinate system). -->
+                        <div id="polarAirGapTuneRow" style="display: none; margin-top: 6px; font-size: 0.83rem; align-items: center; gap: 10px; flex-wrap: wrap;">
+                            <label style="display: inline-flex; align-items: center; gap: 4px;">
+                                offset
+                                <input type="number" id="polarAirGapOffset" step="1" value="0"
+                                       style="width: 70px; padding: 2px 4px; font-size: 0.82rem;"
+                                       title="Pixels added to the selected dip radius. May be negative. Drag the yellow handle for a visual adjustment.">
+                                <span class="polar-unit">px</span>
+                            </label>
+                            <label style="display: inline-flex; align-items: center; gap: 4px;">
+                                <input type="checkbox" id="polarAirGapAddSlide"
+                                       title="When checked, Insert YAML appends a transient.slides skeleton anchored at this marker.">
+                                Add as slide region
+                            </label>
+                            <span id="polarAirGapSideRow" style="display: none; gap: 6px;">
+                                <label><input type="radio" name="polarAirGapSide" value="inside"> inside (rotor side)</label>
+                                <label><input type="radio" name="polarAirGapSide" value="outside" checked> outside (stator side)</label>
+                            </span>
+                        </div>
                     </div>
 
                     <!-- Section 3: Theta range -->

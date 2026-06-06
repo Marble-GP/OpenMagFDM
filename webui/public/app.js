@@ -1448,6 +1448,16 @@ AppState.polarPreprocess = {
         // dropdown button if they want to cut the inside off).
         r_inner_px: 0, r_outer_px: 0,
         air_gap_px: 0,
+        // Phase D.3: user-adjustable offset on top of the dropdown-selected
+        // dip radius. The yellow dashed marker is rendered at
+        // (air_gap_px + air_gap_offset_px). Reset to 0 on dropdown change
+        // or re-detect. Can be negative.
+        air_gap_offset_px: 0,
+        // Phase D.3: when true and save_as === 'polar', Insert YAML emits
+        // a transient.slides: skeleton anchored at the effective air gap.
+        air_gap_as_slide: false,
+        air_gap_slide_side: 'outside',     // 'inside' | 'outside'
+        air_gap_slide_pixels_per_step: 1,
         theta_start: 0, theta_end: 2 * Math.PI,
         is_sector: false,
         nr: 0, ntheta: 0,
@@ -1571,6 +1581,10 @@ function resetPolarPreprocessState() {
         center_x: 0, center_y: 0,
         r_inner_px: 0, r_outer_px: 0,
         air_gap_px: 0,
+        air_gap_offset_px: 0,
+        air_gap_as_slide: false,
+        air_gap_slide_side: 'outside',
+        air_gap_slide_pixels_per_step: 1,
         theta_start: 0, theta_end: 2 * Math.PI,
         is_sector: false,
         nr: 0, ntheta: 0,
@@ -1623,6 +1637,7 @@ async function openPolarPreprocessModal() {
     switchPolarView('source');
     // Interactivity wiring (Phase 5d.1 / 5f). All idempotent.
     bindPolarInputs();
+    bindPolarAirGapTuneInputs();
     attachPolarSvgDrag();
     attachPolarKeyboard();
     attachPolarEscKey();
@@ -1773,6 +1788,10 @@ function applyDetectionToCurrent(detection) {
     cur.r_inner_px = 0;
     cur.air_gap_px = (detection.r_inner_px && detection.r_inner_px > 0)
         ? detection.r_inner_px : 0;
+    // Phase D.3: a re-detect invalidates any prior offset / slide choice.
+    cur.air_gap_offset_px = 0;
+    cur.air_gap_as_slide = false;
+    cur.air_gap_slide_side = 'outside';
     cur.r_outer_px = detection.r_outer_px;
     cur.theta_start = detection.theta_start;
     cur.theta_end = detection.theta_end;
@@ -1786,6 +1805,14 @@ function applyDetectionToCurrent(detection) {
     // nr covers the entire radial extent (r=0 to r_outer) since we no
     // longer cut at the air gap.
     cur.nr = Math.max(2, detection.r_outer_px);
+}
+
+// Phase D.3: yellow-dashed marker radius is the detected dip plus the
+// user's offset; clamped at >= 0. Reused by the overlay, the slide-region
+// emission in buildPolarYamlBlock, and the airgap-handle drag math.
+function airGapEffectiveR() {
+    const cur = AppState.polarPreprocess.current;
+    return Math.max(0, (cur.air_gap_px || 0) + (cur.air_gap_offset_px || 0));
 }
 
 function renderPolarStatusSummary(errMsg) {
@@ -1889,9 +1916,13 @@ function renderPolarOverlay() {
         html += `<circle class="guide-outer" cx="${cx}" cy="${cy}" r="${rOut}" stroke-width="${STROKE_OUTER}"/>`;
     }
     // Air-gap visual marker (Phase 5f.2). Yellow dashed circle so the
-    // detected dip stays obvious without dictating the warp range.
-    if (cur.air_gap_px > 0 && cur.air_gap_px < rOut) {
-        html += `<circle class="guide-airgap" cx="${cx}" cy="${cy}" r="${cur.air_gap_px}" stroke-width="${STROKE_AIRGAP}" stroke-dasharray="${DASH_AIRGAP}"/>`;
+    // detected dip stays obvious without dictating the warp range. Phase
+    // D.3 extends this to render at the *effective* radius (detected dip
+    // + user offset) and to expose a drag handle on the right side so the
+    // marker can be nudged interactively.
+    const rAG = airGapEffectiveR();
+    if (cur.air_gap_px > 0 && rAG > 0 && rAG < rOut) {
+        html += `<circle class="guide-airgap" cx="${cx}" cy="${cy}" r="${rAG}" stroke-width="${STROKE_AIRGAP}" stroke-dasharray="${DASH_AIRGAP}"/>`;
     }
 
     // Sector boundary lines
@@ -1916,6 +1947,12 @@ function renderPolarOverlay() {
     }
     if (rOut > 0) {
         html += `<circle class="handle handle-outer" data-handle="outer" cx="${cx + rOut}" cy="${cy}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
+    }
+    // Phase D.3: airgap drag handle on the right side of the yellow
+    // dashed circle. Drag updates air_gap_offset_px so the visual marker
+    // moves but the detected dip radius itself stays intact.
+    if (cur.air_gap_px > 0 && rAG > 0 && rAG < rOut) {
+        html += `<circle class="handle handle-airgap" data-handle="airgap" cx="${cx + rAG}" cy="${cy}" r="${HANDLE_R}" stroke-width="${STROKE_HANDLE}"/>`;
     }
     // Sector theta handles at the ring outer edge
     if (cur.is_sector && rOut > 0) {
@@ -1960,6 +1997,13 @@ function syncPolarInputsFromState() {
     // save target
     document.querySelectorAll('input[name="polarSaveAs"]').forEach(r => {
         r.checked = (r.value === cur.save_as);
+    });
+    // Phase D.3: air-gap tune controls
+    setVal('polarAirGapOffset', cur.air_gap_offset_px || 0);
+    const slideEl = document.getElementById('polarAirGapAddSlide');
+    if (slideEl) slideEl.checked = !!cur.air_gap_as_slide;
+    document.querySelectorAll('input[name="polarAirGapSide"]').forEach(r => {
+        r.checked = (r.value === (cur.air_gap_slide_side || 'outside'));
     });
 }
 
@@ -2123,6 +2167,7 @@ function setPolarWarpLoading(on) {
 function renderPolarDipDropdown() {
     const row = document.getElementById('polarDipRow');
     const sel = document.getElementById('polarDipSelect');
+    const tuneRow = document.getElementById('polarAirGapTuneRow');
     if (!row || !sel) return;
     const det = AppState.polarPreprocess.detection;
     const list = (det && Array.isArray(det.dip_candidates)) ? det.dip_candidates : [];
@@ -2131,6 +2176,7 @@ function renderPolarDipDropdown() {
     if (list.length === 0) {
         row.style.display = 'none';
         sel.innerHTML = '';
+        if (tuneRow) tuneRow.style.display = 'none';
         return;
     }
     row.style.display = 'flex';
@@ -2147,12 +2193,76 @@ function renderPolarDipDropdown() {
         sel.addEventListener('change', () => {
             const v = Number(sel.value);
             AppState.polarPreprocess.current.air_gap_px = Number.isFinite(v) && v > 0 ? v : 0;
+            // Phase D.3: a different dip resets the offset (offset is
+            // relative to the selected dip, not absolute).
+            AppState.polarPreprocess.current.air_gap_offset_px = 0;
+            updatePolarAirGapTuneRow();
             renderPolarOverlay();
+            syncPolarInputsFromState();
             // No markPolarDirty -- air-gap marker is purely informational
             // and doesn't affect the warp output.
         });
         sel._ppBound = true;
     }
+    updatePolarAirGapTuneRow();
+}
+
+// Phase D.3: tune-row visibility is gated on (a) at least one dip
+// candidate being available and (b) save target being 'polar' (slide
+// regions belong to the polar warp pipeline). Called from
+// renderPolarDipDropdown and from the save_as radio handler.
+function updatePolarAirGapTuneRow() {
+    const tuneRow = document.getElementById('polarAirGapTuneRow');
+    const sideRow = document.getElementById('polarAirGapSideRow');
+    if (!tuneRow) return;
+    const det = AppState.polarPreprocess.detection;
+    const list = (det && Array.isArray(det.dip_candidates)) ? det.dip_candidates : [];
+    const cur = AppState.polarPreprocess.current;
+    const visible = list.length > 0 && cur.save_as === 'polar';
+    tuneRow.style.display = visible ? 'flex' : 'none';
+    if (sideRow) {
+        sideRow.style.display = (visible && cur.air_gap_as_slide) ? 'inline-flex' : 'none';
+    }
+}
+
+// Phase D.3: tune-row listeners are bound once per modal lifetime.
+// Called from openPolarPreprocessModal alongside the other bindings.
+function bindPolarAirGapTuneInputs() {
+    const offsetEl = document.getElementById('polarAirGapOffset');
+    const slideEl  = document.getElementById('polarAirGapAddSlide');
+    const sideEls  = document.querySelectorAll('input[name="polarAirGapSide"]');
+    if (offsetEl && !offsetEl._ppBound) {
+        offsetEl.addEventListener('input', () => {
+            const v = Number(offsetEl.value);
+            AppState.polarPreprocess.current.air_gap_offset_px =
+                Number.isFinite(v) ? Math.round(v) : 0;
+            renderPolarOverlay();
+        });
+        offsetEl.addEventListener('wheel', e => {
+            e.preventDefault();
+            const step = e.shiftKey ? 10 : 1;
+            const dir = e.deltaY < 0 ? 1 : -1;
+            offsetEl.value = Number(offsetEl.value || 0) + step * dir;
+            offsetEl.dispatchEvent(new Event('input', { bubbles: true }));
+        }, { passive: false });
+        offsetEl._ppBound = true;
+    }
+    if (slideEl && !slideEl._ppBound) {
+        slideEl.addEventListener('change', () => {
+            AppState.polarPreprocess.current.air_gap_as_slide = slideEl.checked;
+            updatePolarAirGapTuneRow();
+        });
+        slideEl._ppBound = true;
+    }
+    sideEls.forEach(r => {
+        if (r._ppBound) return;
+        r.addEventListener('change', () => {
+            if (r.checked) {
+                AppState.polarPreprocess.current.air_gap_slide_side = r.value;
+            }
+        });
+        r._ppBound = true;
+    });
 }
 
 // Copies the currently-selected air-gap marker into r_inner so the warp
@@ -2162,7 +2272,11 @@ function renderPolarDipDropdown() {
 function useAirGapAsInner() {
     const cur = AppState.polarPreprocess.current;
     if (!(cur.air_gap_px > 0)) return;
-    cur.r_inner_px = cur.air_gap_px;
+    // Phase D.3: copy the *effective* radius (dip + offset) so a manually
+    // nudged marker still snaps to r_inner. Then zero the offset so the
+    // dropdown choice stays the visible anchor.
+    cur.r_inner_px = airGapEffectiveR();
+    cur.air_gap_offset_px = 0;
     cur.nr = Math.max(2, cur.r_outer_px - cur.r_inner_px);
     renderPolarOverlay();
     syncPolarInputsFromState();
@@ -2242,7 +2356,11 @@ function bindPolarInputs() {
     });
     root.querySelectorAll('input[name=polarSaveAs]').forEach(r => {
         r.addEventListener('change', () => {
-            if (r.checked) cur().save_as = r.value;
+            if (r.checked) {
+                cur().save_as = r.value;
+                // Phase D.3: slide-region tuning UI is polar-only.
+                updatePolarAirGapTuneRow();
+            }
         });
     });
     root._ppInputsBound = true;
@@ -2306,6 +2424,15 @@ function attachPolarSvgDrag() {
             case 'theta_end':
                 cur.theta_end   = Math.atan2(p.y - drag.start.cy, p.x - drag.start.cx);
                 break;
+            case 'airgap': {
+                // Phase D.3: adjust the offset relative to the detected
+                // dip so the dropdown choice stays the anchor and re-
+                // selecting a different dip drops the offset cleanly.
+                const dx = p.x - drag.start.cx, dy = p.y - drag.start.cy;
+                const rTotal = Math.max(0, Math.round(Math.hypot(dx, dy)));
+                cur.air_gap_offset_px = rTotal - (cur.air_gap_px || 0);
+                break;
+            }
         }
         renderPolarOverlay();
         syncPolarInputsFromState();
@@ -2574,6 +2701,36 @@ function buildPolarYamlBlock(filename, polarDomain) {
     lines.push(`  theta_min: { ${bc.bcFlow} }`);
     lines.push(`  theta_max: { ${bc.bcFlow} }`);
     lines.push(`image_path: ${filename}`);
+
+    // Phase D.3: optional transient.slides skeleton from the air-gap
+    // marker. Polar save target only; the cartesian path emits nothing
+    // here (the slide region wouldn't map cleanly without a per-row
+    // angular axis). insertPolarYaml strips existing transient: when
+    // this block is emitted so the override is clean.
+    const cur = AppState.polarPreprocess.current;
+    const rAG = airGapEffectiveR();
+    if (cur.air_gap_as_slide && rAG > 0) {
+        const inside = (cur.air_gap_slide_side === 'inside');
+        const rOuter = Math.max(1, cur.r_outer_px || 0);
+        const region_start = inside ? 0   : rAG;
+        const region_end   = inside ? rAG : Math.max(rAG + 1, rOuter);
+        const pps = Math.max(1, cur.air_gap_slide_pixels_per_step || 1);
+        lines.push('');
+        lines.push('# Slide region inferred from the air-gap marker (Polar Preprocess).');
+        lines.push(`# Side: ${inside ? 'inside the air gap (rotor side)' : 'outside the air gap (stator side)'}`);
+        lines.push('# region_start / region_end are in original-image radial pixels.');
+        lines.push('# Adjust transient.total_steps and slides[0].pixels_per_step to match your run.');
+        lines.push('transient:');
+        lines.push('  enabled: true');
+        lines.push('  total_steps: 100');
+        lines.push('  slides:');
+        lines.push('    - name: airgap_slide');
+        lines.push('      direction: vertical');
+        lines.push(`      region_start: ${region_start}`);
+        lines.push(`      region_end: ${region_end}`);
+        lines.push(`      pixels_per_step: ${pps}`);
+        lines.push('      wrap_mode: auto');
+    }
     return lines.join('\n') + '\n';
 }
 
@@ -2629,13 +2786,18 @@ async function insertPolarYaml() {
         doc = {};
     }
     // Strip all keys we manage so the rest of the user's editor content
-    // (materials, transient, nonlinear_solver, ...) is preserved verbatim
-    // while we splice the auto-generated block on top.
+    // (materials, nonlinear_solver, ...) is preserved verbatim while we
+    // splice the auto-generated block on top. Phase D.3: transient: is
+    // also stripped *iff* we're about to emit a new one, so the slide-
+    // region override is clean and doesn't merge stale fields.
     delete doc.coordinate_system;
     delete doc.polar_domain;
     delete doc.polar_boundary_conditions;
     delete doc.mesh;
     delete doc.image_path;
+    if (cur.save_as === 'polar' && cur.air_gap_as_slide && airGapEffectiveR() > 0) {
+        delete doc.transient;
+    }
 
     let targetFilename;
     let block;
