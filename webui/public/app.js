@@ -313,6 +313,101 @@ async function initializeConfigEditor() {
 
     // Initial validation
     validateYAML(editor);
+
+    // Phase D.5: inline colour swatches next to material-name lines.
+    initMaterialSwatches(editor);
+}
+
+// ============================================================
+// Phase D.5: inline material-colour swatches in the Ace editor.
+// ============================================================
+// Strategy: maintain a single position-absolute overlay <div> stacked
+// over the editor container. On every YAML change (debounced 200 ms)
+// we re-parse the doc, walk doc.materials, and for each entry with an
+// rgb: [r,g,b] property we look up the row where its name is defined
+// and append a 12 x 12 swatch to the overlay positioned via
+// renderer.textToScreenCoordinates(). The overlay is re-positioned
+// (cheap path) on every renderer afterRender so the swatches track the
+// editor when scrolling / folding / resizing without a YAML re-parse.
+
+function initMaterialSwatches(editor) {
+    if (editor._swatchInit) return;
+    editor._swatchInit = true;
+    editor._swatchEntries = [];   // [{ name, row, color }, ...]
+    let parseTimer = null;
+    const reparse = () => {
+        clearTimeout(parseTimer);
+        parseTimer = setTimeout(() => {
+            editor._swatchEntries = computeMaterialSwatchEntries(editor);
+            positionMaterialSwatches(editor);
+        }, 200);
+    };
+    editor.session.on('change', reparse);
+    editor.renderer.on('afterRender', () => positionMaterialSwatches(editor));
+    window.addEventListener('resize', () => positionMaterialSwatches(editor));
+    editor._swatchEntries = computeMaterialSwatchEntries(editor);
+    positionMaterialSwatches(editor);
+}
+
+function computeMaterialSwatchEntries(editor) {
+    let doc;
+    try { doc = jsyaml.load(editor.getValue()) || {}; }
+    catch (_) { return []; }
+    if (!doc || typeof doc !== 'object') return [];
+    const materials = (doc.materials && typeof doc.materials === 'object') ? doc.materials : {};
+    const names = Object.keys(materials);
+    if (names.length === 0) return [];
+    const lines = editor.session.getDocument().getAllLines();
+    // The materials: block starts at some row; the keys are nested one
+    // indent level under it. We scan for the keys with a regex so the
+    // search is robust to varying indentation widths.
+    const entries = [];
+    for (const name of names) {
+        const m = materials[name];
+        if (!m || typeof m !== 'object' || !Array.isArray(m.rgb) || m.rgb.length < 3) continue;
+        const r = Math.max(0, Math.min(255, Math.round(Number(m.rgb[0]) || 0)));
+        const g = Math.max(0, Math.min(255, Math.round(Number(m.rgb[1]) || 0)));
+        const b = Math.max(0, Math.min(255, Math.round(Number(m.rgb[2]) || 0)));
+        const namePattern = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(`^\\s+${namePattern}\\s*:\\s*$`);
+        const row = lines.findIndex(ln => re.test(ln));
+        if (row < 0) continue;
+        entries.push({ name, row, color: `rgb(${r}, ${g}, ${b})`, lineLen: lines[row].length });
+    }
+    return entries;
+}
+
+function positionMaterialSwatches(editor) {
+    const entries = editor._swatchEntries || [];
+    const container = editor.container;
+    let overlay = container.querySelector('.mat-swatch-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'mat-swatch-overlay';
+        overlay.style.cssText = 'position:absolute; inset:0; pointer-events:none; z-index:5; overflow:hidden;';
+        container.appendChild(overlay);
+    }
+    overlay.innerHTML = '';
+    if (entries.length === 0) return;
+    const containerRect = container.getBoundingClientRect();
+    const visibleTop    = editor.renderer.getFirstVisibleRow();
+    const visibleBottom = editor.renderer.getLastVisibleRow();
+    for (const e of entries) {
+        // Skip rows outside the visible viewport for cheaper layout.
+        if (e.row < visibleTop - 1 || e.row > visibleBottom + 1) continue;
+        const screen = editor.renderer.textToScreenCoordinates(e.row, e.lineLen);
+        const left = screen.pageX - containerRect.left - window.scrollX + 6;
+        const top  = screen.pageY - containerRect.top  - window.scrollY + 2;
+        const swatch = document.createElement('div');
+        swatch.style.cssText =
+            'position:absolute; width:12px; height:12px; border:1px solid rgba(0,0,0,0.45); ' +
+            'border-radius:2px; box-shadow:0 0 0 1px rgba(255,255,255,0.25);';
+        swatch.style.background = e.color;
+        swatch.style.left = `${left}px`;
+        swatch.style.top  = `${top}px`;
+        swatch.title = `${e.name} — ${e.color}`;
+        overlay.appendChild(swatch);
+    }
 }
 
 // Add context-aware snippets
