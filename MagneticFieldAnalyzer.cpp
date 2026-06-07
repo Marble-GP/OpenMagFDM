@@ -1200,8 +1200,16 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         // Evaluate mu_r for initial state (H=0)
         double mu_r = evaluateMu(mu_value, 0.0);
 
-        // Parse antialias flag and add to antialias_materials if enabled
-        bool antialias_enabled = props["anti_aliasing"].as<bool>(false);
+        // Parse anti_aliasing flag and add to antialias_materials if enabled.
+        // Phase T: accept the legacy short key `antialias:` too -- the
+        // WebUI's Detect Colors used to emit that form, which the solver
+        // silently ignored. Any YAML with `antialias: true` was skipping
+        // edge-pixel mu interpolation and behaving as if AA was off,
+        // leaving large fractions of iron-coloured cells at vacuum mu
+        // when the input image had been processed by warpPolar (which
+        // produces heavily anti-aliased boundaries).
+        bool antialias_enabled = props["anti_aliasing"].as<bool>(false)
+                              || props["antialias"].as<bool>(false);
         if (antialias_enabled) {
             AntialiasableMaterial aa_mat;
             aa_mat.name = name;

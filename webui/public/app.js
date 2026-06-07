@@ -2081,12 +2081,12 @@ function buildDetectYamlFromAssignments() {
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
             lines.push(`    mu_r: 1.0       # coverage: ${ratio}%`);
             lines.push(`    jz: ${sign}$J_Coil_${grp}    # Coil-${grp}, J direction: ${dir}Z`);
-            if (c.antialias === true) lines.push(`    antialias: true`);
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
         } else if (a.kind && a.kind !== 'none' && presetsAll[a.kind]) {
             lines.push(`  material_${hex.slice(1)}:`);
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
             lines.push(`    preset: ${a.kind}    # coverage: ${ratio}%`);
-            if (c.antialias === true) lines.push(`    antialias: true`);
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
             // Phase D.7: append per-chip magnetization block when the
             // selected preset is a magnet. This overrides the preset's
             // own magnetization direction with the user's choice while
@@ -2109,14 +2109,14 @@ function buildDetectYamlFromAssignments() {
                 const sub = jsyaml.dump({ [k]: props[k] }, { indent: 2, lineWidth: -1 }).replace(/\n$/, '');
                 for (const ln of sub.split('\n')) lines.push('    ' + ln);
             }
-            if (c.antialias === true) lines.push(`    antialias: true`);
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
             if (skipMag) appendMagnetizationBlock(lines, '    ', a.magnetization);
         } else {
             lines.push(`  material_${hex.slice(1)}:`);
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
             lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${ratio}%)`);
             lines.push(`    jz: 0.0`);
-            if (c.antialias === true) lines.push(`    antialias: true`);
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
         }
     }
 

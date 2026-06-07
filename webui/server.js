@@ -750,7 +750,7 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             lines.push(`    rgb: [${r}, ${g}, ${b}]`);
             lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${(ratio * 100).toFixed(1)}%)`);
             lines.push(`    jz: 0.0`);
-            if (antialiasBaseIdx.has(i)) lines.push(`    antialias: true`);
+            if (antialiasBaseIdx.has(i)) lines.push(`    anti_aliasing: true`);
         }
         // Rare-unique colors: small coverage but not AA blends → genuine materials
         for (const ru of rareUnique) {
