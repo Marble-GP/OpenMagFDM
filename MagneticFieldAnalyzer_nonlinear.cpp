@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
+#include <cmath>
+#include <limits>
 #include <Eigen/Dense>
 #include <Eigen/Cholesky>
 
@@ -944,44 +946,68 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
     long long n_changed = 0;
 
     // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
-    // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
-    #pragma omp parallel for schedule(static) \
-        reduction(min:H_min, mu_r_min) reduction(max:H_max, mu_r_max) \
-        reduction(+:H_sum, mu_r_sum, n_nl, n_changed)
-    for (int k = 0; k < n_rows * n_cols; k++) {
-        int j = k / n_cols, i = k % n_cols;
-        cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+    // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility.
+    // MSVC OpenMP 2.0 doesn't support reduction(min:) / reduction(max:); use
+    // per-thread accumulators merged via #pragma omp critical instead.
+    #pragma omp parallel
+    {
+        double H_min_local = std::numeric_limits<double>::infinity();
+        double H_max_local = -std::numeric_limits<double>::infinity();
+        double H_sum_local = 0.0;
+        double mu_r_min_local = std::numeric_limits<double>::infinity();
+        double mu_r_max_local = -std::numeric_limits<double>::infinity();
+        double mu_r_sum_local = 0.0;
+        long long n_nl_local = 0;
+        long long n_changed_local = 0;
 
-        auto lut_it = rgb_to_material.find(rgb_key);
-        if (lut_it != rgb_to_material.end()) {
-            const std::string& name = lut_it->second.name;
-            auto it = material_mu.find(name);
+        #pragma omp for schedule(static)
+        for (int k = 0; k < n_rows * n_cols; k++) {
+            int j = k / n_cols, i = k % n_cols;
+            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
+            int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
 
-            // Skip linear (STATIC) materials — μ is constant, already set
-            if (it != material_mu.end() && it->second.type == MuType::STATIC) {
-                continue;
+            auto lut_it = rgb_to_material.find(rgb_key);
+            if (lut_it != rgb_to_material.end()) {
+                const std::string& name = lut_it->second.name;
+                auto it = material_mu.find(name);
+
+                // Skip linear (STATIC) materials — μ is constant, already set
+                if (it != material_mu.end() && it->second.type == MuType::STATIC) {
+                    continue;
+                }
+
+                double H_mag = H_map(j, i);
+                double mu_r = 1.0;
+
+                if (it != material_mu.end()) {
+                    mu_r = evaluateMu(it->second, H_mag);
+                }
+
+                const double mu_new = mu_r * MU_0;
+                const double mu_old = mu_map(j, i);
+                mu_map(j, i) = mu_new;
+
+                n_nl_local++;
+                if (std::abs(mu_new - mu_old) > 1e-15 * std::abs(mu_old)) n_changed_local++;
+                if (H_mag < H_min_local) H_min_local = H_mag;
+                if (H_mag > H_max_local) H_max_local = H_mag;
+                H_sum_local += H_mag;
+                if (mu_r < mu_r_min_local) mu_r_min_local = mu_r;
+                if (mu_r > mu_r_max_local) mu_r_max_local = mu_r;
+                mu_r_sum_local += mu_r;
             }
+        }
 
-            double H_mag = H_map(j, i);
-            double mu_r = 1.0;
-
-            if (it != material_mu.end()) {
-                mu_r = evaluateMu(it->second, H_mag);
-            }
-
-            const double mu_new = mu_r * MU_0;
-            const double mu_old = mu_map(j, i);
-            mu_map(j, i) = mu_new;
-
-            n_nl++;
-            if (std::abs(mu_new - mu_old) > 1e-15 * std::abs(mu_old)) n_changed++;
-            H_min = std::min(H_min, H_mag);
-            H_max = std::max(H_max, H_mag);
-            H_sum += H_mag;
-            mu_r_min = std::min(mu_r_min, mu_r);
-            mu_r_max = std::max(mu_r_max, mu_r);
-            mu_r_sum += mu_r;
+        #pragma omp critical
+        {
+            if (H_min_local < H_min) H_min = H_min_local;
+            if (H_max_local > H_max) H_max = H_max_local;
+            H_sum += H_sum_local;
+            if (mu_r_min_local < mu_r_min) mu_r_min = mu_r_min_local;
+            if (mu_r_max_local > mu_r_max) mu_r_max = mu_r_max_local;
+            mu_r_sum += mu_r_sum_local;
+            n_nl     += n_nl_local;
+            n_changed += n_changed_local;
         }
     }
 
