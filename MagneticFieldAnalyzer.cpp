@@ -2264,9 +2264,20 @@ double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) 
         for (int j = 0; j < grid_rows && j < img_rows; ++j) {
             for (int i = 0; i < grid_cols && i < img_cols; ++i) {
                 const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
-                const int key = (static_cast<int>(px[2]) << 16)
+                // Phase Y: image is RGB (loadImage cvtColor'd BGR→RGB at
+                // line 276), so px[0]=R, px[1]=G, px[2]=B. The matching
+                // rgb_key_a / rgb_key_b stored on the FluxLinkagePath were
+                // built as (rgb[0]<<16)|(rgb[1]<<8)|rgb[2] = R<<16|G<<8|B
+                // (see parseFluxLinkagePaths line 2115), so pack the
+                // pixel in the same order. The original code packed
+                // (px[2]<<16)|(px[1]<<8)|px[0] = B<<16|G<<8|R which
+                // never matched on R≠B colours and silently produced
+                // sum_a = sum_b = 0 → Φ = 0 for every step (same
+                // R/B-swap pattern that Phase W fixed in the LUT path,
+                // just hidden behind the px alias).
+                const int key = (static_cast<int>(px[0]) << 16)
                               | (static_cast<int>(px[1]) << 8)
-                              |  static_cast<int>(px[0]);
+                              |  static_cast<int>(px[2]);
                 const int i_r = horiz ? i : j;
                 const double r_phys = r_start + i_r * dr;
                 // Weight = r (the Jacobian). dr·dθ cancels in the
@@ -2289,9 +2300,10 @@ double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) 
         for (int j = 0; j < ny && j < img_rows; ++j) {
             for (int i = 0; i < nx && i < img_cols; ++i) {
                 const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
-                const int key = (static_cast<int>(px[2]) << 16)
+                // Phase Y: same R/B swap fix as the polar branch above.
+                const int key = (static_cast<int>(px[0]) << 16)
                               | (static_cast<int>(px[1]) << 8)
-                              |  static_cast<int>(px[0]);
+                              |  static_cast<int>(px[2]);
                 if (key == path.rgb_key_a) { sum_a += Az(j, i); w_a += 1.0; }
                 else if (key == path.rgb_key_b) { sum_b += Az(j, i); w_b += 1.0; }
             }
@@ -2307,13 +2319,29 @@ void MagneticFieldAnalyzer::calculateAllFluxLinkages(int step) {
         return;
     }
 
+    // Snapshot the current cout formatting so the high-precision flux
+    // print doesn't leak into the next thing the solver writes (Force
+    // / Energy banners, etc.). Phase Y bumped this from default
+    // formatting to %.6e so a 1e-5 Wb/m phase flux doesn't display as
+    // "0.000e+00" and get misread as a bug.
+    std::ios_base::fmtflags cout_flags(std::cout.flags());
+    std::streamsize cout_prec = std::cout.precision();
+
     for (const auto& path : flux_linkage_paths) {
         double phi = calculateFluxLinkage(path);
         flux_linkage_results[path.name].push_back(phi);
 
         std::cout << "Flux linkage [" << path.name << "] step " << step
-                  << ": " << phi << " Wb/m" << std::endl;
+                  << ": " << std::scientific << std::setprecision(6) << phi << " Wb/m";
+        if (phi == 0.0) {
+            std::cout << "  [WARNING: exactly zero -- check that material_a / material_b"
+                         " rgb_key resolved and that some image pixels matched]";
+        }
+        std::cout << std::endl;
     }
+
+    std::cout.flags(cout_flags);
+    std::cout.precision(cout_prec);
 }
 
 void MagneticFieldAnalyzer::exportFluxLinkageCSV(const std::string& output_dir) const {
