@@ -929,9 +929,25 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
     int n_rows = image_to_use.rows;
     int n_cols = image_to_use.cols;
 
+    // Phase V: diagnostic — accumulate per-call stats over nonlinear
+    // material cells so the verbose log can confirm whether updateMu
+    // actually changed the μ distribution between iterations. The cost
+    // is one double-precision min/max/mean reduction per call (~5 ms
+    // for a 2976×450 grid), negligible vs. AMGCL.
+    double H_min = std::numeric_limits<double>::infinity();
+    double H_max = -std::numeric_limits<double>::infinity();
+    double H_sum = 0.0;
+    double mu_r_min = std::numeric_limits<double>::infinity();
+    double mu_r_max = -std::numeric_limits<double>::infinity();
+    double mu_r_sum = 0.0;
+    long long n_nl = 0;
+    long long n_changed = 0;
+
     // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
     // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) \
+        reduction(min:H_min, mu_r_min) reduction(max:H_max, mu_r_max) \
+        reduction(+:H_sum, mu_r_sum, n_nl, n_changed)
     for (int k = 0; k < n_rows * n_cols; k++) {
         int j = k / n_cols, i = k % n_cols;
         cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
@@ -954,8 +970,31 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
                 mu_r = evaluateMu(it->second, H_mag);
             }
 
-            mu_map(j, i) = mu_r * MU_0;
+            const double mu_new = mu_r * MU_0;
+            const double mu_old = mu_map(j, i);
+            mu_map(j, i) = mu_new;
+
+            n_nl++;
+            if (std::abs(mu_new - mu_old) > 1e-15 * std::abs(mu_old)) n_changed++;
+            H_min = std::min(H_min, H_mag);
+            H_max = std::max(H_max, H_mag);
+            H_sum += H_mag;
+            mu_r_min = std::min(mu_r_min, mu_r);
+            mu_r_max = std::max(mu_r_max, mu_r);
+            mu_r_sum += mu_r;
         }
+    }
+
+    if (nonlinear_config.verbose && n_nl > 0) {
+        std::cout << " [updateMu: NL_cells=" << n_nl
+                  << " (changed=" << n_changed << ")"
+                  << " H=[" << std::scientific << std::setprecision(2)
+                  << H_min << ", " << (H_sum / static_cast<double>(n_nl))
+                  << ", " << H_max << "]"
+                  << " mu_r=[" << mu_r_min
+                  << ", " << (mu_r_sum / static_cast<double>(n_nl))
+                  << ", " << mu_r_max << "]]"
+                  << std::flush;
     }
 }
 

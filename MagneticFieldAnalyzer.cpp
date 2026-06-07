@@ -12350,11 +12350,54 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // 2. Solve FDM system
         auto solve_start = std::chrono::high_resolution_clock::now();
 
+        // Phase V diagnostic: μ stats AT START of step (after Phase U seed).
+        if (nonlinear_config.verbose && nonlinear_config.enabled && has_nonlinear_materials) {
+            double mu_min = 1e300, mu_max = -1e300, mu_sum = 0.0; long long nc = 0;
+            for (int j = 0; j < mu_map.rows(); j++) {
+                for (int i = 0; i < mu_map.cols(); i++) {
+                    const double m = mu_map(j, i);
+                    if (m > 2.0 * 4.0e-7 * M_PI) {  // Skip air (μ ≈ μ₀)
+                        mu_min = std::min(mu_min, m);
+                        mu_max = std::max(mu_max, m);
+                        mu_sum += m; nc++;
+                    }
+                }
+            }
+            if (nc > 0) {
+                std::cout << "[Phase V] step " << step << " START mu_map (NL cells): "
+                          << "min=" << std::scientific << std::setprecision(3) << mu_min
+                          << " mean=" << (mu_sum / nc)
+                          << " max=" << mu_max
+                          << " n=" << nc << std::endl;
+            }
+        }
+
         // Check if nonlinear solver is needed for this step
         if (has_nonlinear_materials && nonlinear_config.enabled) {
             // For nonlinear materials, use standard solve() which includes nonlinear iteration
             // This ensures mu_map is updated based on actual H-field at each transient step
             solve();
+            // Phase V diagnostic: μ stats AT END of solve (= what gets exported).
+            if (nonlinear_config.verbose) {
+                double mu_min = 1e300, mu_max = -1e300, mu_sum = 0.0; long long nc = 0;
+                for (int j = 0; j < mu_map.rows(); j++) {
+                    for (int i = 0; i < mu_map.cols(); i++) {
+                        const double m = mu_map(j, i);
+                        if (m > 2.0 * 4.0e-7 * M_PI) {  // Skip air
+                            mu_min = std::min(mu_min, m);
+                            mu_max = std::max(mu_max, m);
+                            mu_sum += m; nc++;
+                        }
+                    }
+                }
+                if (nc > 0) {
+                    std::cout << "[Phase V] step " << step << " END   mu_map (NL cells): "
+                              << "min=" << std::scientific << std::setprecision(3) << mu_min
+                              << " mean=" << (mu_sum / nc)
+                              << " max=" << mu_max
+                              << " n=" << nc << std::endl;
+                }
+            }
 
             // Update solution history for warm start in next step.
             // Shift history k-1 → k-2 BEFORE overwriting k-1.
