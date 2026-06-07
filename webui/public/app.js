@@ -5399,7 +5399,9 @@ const plotDefinitions = {
     force_y_time: { name: 'Force Y-axis', render: renderForceYTime },
     torque_time: { name: 'Torque', render: renderTorqueTime },
     energy_time: { name: 'Magnetic Energy', render: renderEnergyTime },
-    virtual_work: { name: 'Virtual Work (dW/dx)', render: renderVirtualWork }
+    virtual_work: { name: 'Virtual Work (dW/dx)', render: renderVirtualWork },
+    flux_linkage_time: { name: 'Flux Linkage Timeline', render: renderFluxLinkageTime },
+    back_emf_time: { name: 'Back-EMF Timeline', render: renderBackEMFTime }
 };
 
 let plotIdCounter = 0;
@@ -8884,6 +8886,216 @@ async function renderTorqueTime(containerId) {
         await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Torque time plot error:', error);
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
+    }
+}
+
+// =====================================================================
+// Phase Z: Flux Linkage / Back-EMF timeline (CSV-driven)
+// =====================================================================
+//
+// Source: <resultPath>/FluxLinkage/flux_linkage.csv written by the solver's
+// exportFluxLinkageCSV() (MagneticFieldAnalyzer.cpp:2347+). Header row is
+//   step,<Phi_name_1>,<Phi_name_2>,...
+// Each subsequent row is a step index and one Φ value per defined path.
+//
+// One fetch+parse per result path is cached on AppState.fluxLinkageCache.
+// Two palette items consume this:
+//   - flux_linkage_time  → Φ(step)
+//   - back_emf_time      → -dΦ/dstep (back-EMF convention, proportional to
+//                          the per-phase induced voltage when the rotor
+//                          advances uniformly per step)
+//
+// Plotly's built-in legend click hides/shows traces, so the user can
+// inspect one phase at a time without us writing a custom legend.
+async function loadFluxLinkageData() {
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) return null;
+
+    if (!AppState.fluxLinkageCache) AppState.fluxLinkageCache = {};
+    if (AppState.fluxLinkageCache[resultPath]) return AppState.fluxLinkageCache[resultPath];
+
+    try {
+        const response = await fetch(
+            `/api/load-csv-raw?result=${encodeURIComponent(resultPath)}`
+            + `&file=FluxLinkage/flux_linkage.csv`);
+        if (!response.ok) return null;
+        const text = await response.text();
+        if (!text || !text.trim()) return null;
+
+        const lines = text.trim().split(/\r?\n/);
+        if (lines.length < 2) return null;
+        const headers = lines[0].split(',').map(s => s.trim());
+        if (headers[0].toLowerCase() !== 'step' || headers.length < 2) return null;
+        const phiNames = headers.slice(1);
+        const steps = [];
+        const phiSeries = {};
+        phiNames.forEach(n => { phiSeries[n] = []; });
+        for (let i = 1; i < lines.length; i++) {
+            const parts = lines[i].split(',');
+            if (parts.length < 1) continue;
+            const step = Number(parts[0]);
+            if (!Number.isFinite(step)) continue;
+            steps.push(step);
+            for (let k = 0; k < phiNames.length; k++) {
+                const v = Number(parts[k + 1]);
+                phiSeries[phiNames[k]].push(Number.isFinite(v) ? v : null);
+            }
+        }
+        if (steps.length === 0) return null;
+
+        const data = { headers, phiNames, steps, phiSeries };
+        AppState.fluxLinkageCache[resultPath] = data;
+        return data;
+    } catch (e) {
+        console.error('loadFluxLinkageData failed:', e);
+        return null;
+    }
+}
+
+// Map "Phi_Coil_A" / "Phi_A" / "PhiA" → red, B → green, C → blue.
+// IPMSM / electrical-engineering convention. Falls back to Plotly auto
+// for anything that doesn't pattern-match.
+function fluxPhaseColor(name) {
+    const u = name.toUpperCase();
+    if (/(^|[_-])A$|COIL[_-]?A|PHI[_-]?A|_PHASEA/.test(u)) return '#d62728';
+    if (/(^|[_-])B$|COIL[_-]?B|PHI[_-]?B|_PHASEB/.test(u)) return '#2ca02c';
+    if (/(^|[_-])C$|COIL[_-]?C|PHI[_-]?C|_PHASEC/.test(u)) return '#1f77b4';
+    return null;
+}
+
+async function renderFluxLinkageTime(containerId) {
+    try {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        const data = await loadFluxLinkageData();
+        if (!data || data.steps.length === 0) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">'
+                + 'No flux_linkage.csv in this result.<br>'
+                + 'Define <code>flux_linkage:</code> in the YAML and rerun the transient analysis.'
+                + '</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // CSV step column is 0-based to match the solver's `step 0:` print;
+        // display as 1-based so it lines up with "Step 1/N" elsewhere in the UI.
+        const xSteps = data.steps.map(s => s + 1);
+        const traces = data.phiNames.map(name => {
+            const color = fluxPhaseColor(name);
+            const trace = {
+                x: xSteps,
+                y: data.phiSeries[name],
+                type: 'scatter',
+                mode: 'lines+markers',
+                name,
+                line: { width: 2 },
+                marker: { size: 6 }
+            };
+            if (color) { trace.line.color = color; trace.marker.color = color; }
+            return trace;
+        });
+
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 60, r: 10, t: 10, b: 35 },
+            xaxis: { title: 'Step', zeroline: false },
+            yaxis: { title: 'Φ [Wb/m]', zeroline: true, tickformat: '.2e' },
+            legend: legendConfig,
+            showlegend: true,
+            hovermode: 'closest'
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+    } catch (error) {
+        console.error('Flux linkage time plot error:', error);
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
+    }
+}
+
+async function renderBackEMFTime(containerId) {
+    try {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        const data = await loadFluxLinkageData();
+        if (!data || data.steps.length < 2) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">'
+                + 'Need at least 2 transient steps to compute dΦ/dstep.<br>'
+                + 'Define <code>flux_linkage:</code> and run a transient analysis (total_steps ≥ 2).'
+                + '</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // Forward-difference EMF ∝ -ΔΦ/Δstep, plotted at the midpoint
+        // between adjacent steps. We don't divide by physical Δt here —
+        // the solver doesn't write it to the CSV — so this is "EMF in
+        // Wb/m per step". For a uniformly-rotating rotor (Δstep ↔
+        // constant electrical angle), the shape and amplitude of this
+        // curve is exactly the back-EMF up to a known (RPM, pole-pair)
+        // scale factor the user can apply downstream.
+        const xCenters = [];
+        const dPhi = {};
+        data.phiNames.forEach(n => { dPhi[n] = []; });
+        for (let i = 1; i < data.steps.length; i++) {
+            // midpoint, in 1-based display coords
+            xCenters.push(data.steps[i - 1] + 1.5);
+            for (const name of data.phiNames) {
+                const a = data.phiSeries[name][i - 1];
+                const b = data.phiSeries[name][i];
+                dPhi[name].push((a == null || b == null) ? null : -(b - a));
+            }
+        }
+
+        const traces = data.phiNames.map(name => {
+            const color = fluxPhaseColor(name);
+            // Rename Φ_* → EMF_* in the legend so the user can tell at a
+            // glance which palette item produced this trace.
+            const legendName = name.replace(/^Phi/i, 'EMF').replace(/^Φ/i, 'EMF');
+            const trace = {
+                x: xCenters,
+                y: dPhi[name],
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: legendName,
+                line: { width: 2 },
+                marker: { size: 6 }
+            };
+            if (color) { trace.line.color = color; trace.marker.color = color; }
+            return trace;
+        });
+
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 60, r: 10, t: 10, b: 35 },
+            xaxis: { title: 'Step', zeroline: false },
+            yaxis: { title: '-dΦ/dstep [Wb/m per step]', zeroline: true, tickformat: '.2e' },
+            legend: legendConfig,
+            showlegend: true,
+            hovermode: 'closest'
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+    } catch (error) {
+        console.error('Back-EMF time plot error:', error);
         const container = document.getElementById(containerId);
         if (container) {
             container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
