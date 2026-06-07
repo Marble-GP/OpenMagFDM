@@ -82,6 +82,7 @@ user*
 
 # Build directories
 build/
+build_*/
 CMakeCache.txt
 CMakeFiles/
 compile_commands.json
@@ -97,10 +98,15 @@ output_*/
 # prototype scripts
 scripts/
 
-# Test files
-uploads/*.png
-uploads/*.jpg
-!uploads/test_core.png
+# Test files and uploaded artifacts. Never ship per-user uploads in a
+# release; the WebUI re-creates the upload root per session.
+uploads/
+
+# Anti-periodic BC benchmark: README / yaml / py / sh are tracked, but
+# generated artifacts (PNGs, solver output, logs) are local only.
+nonlinear_benchmark/anti_periodic_test/*.png
+nonlinear_benchmark/anti_periodic_test/output_*/
+nonlinear_benchmark/anti_periodic_test/*.log
 
 # Node modules
 webui/node_modules/
