@@ -351,31 +351,62 @@ void exportConditionsJSON(const std::string& output_path,
         j["transient"]["enabled"] = false;
     }
 
-    // Nonlinear materials detection
+    // Nonlinear materials detection. Phase T: previously this only
+    // looked at mu_r, ignored B-H entirely, and never resolved preset
+    // references -- so a config that referenced pure_iron_model via
+    // `preset: pure_iron_model` (where the preset carries a B-H formula
+    // and no mu_r override) reported has_nonlinear_materials = false
+    // in conditions.json, even though the analyzer's own classification
+    // in setupMaterialProperties correctly detected the B-H formula and
+    // ran the nonlinear solver.
     bool has_nonlinear_materials = false;
     if (config["materials"]) {
+        // Build a quick map of presets so we can read inherited fields.
+        std::map<std::string, YAML::Node> presets;
+        if (config["material_presets"]) {
+            for (const auto& p : config["material_presets"]) {
+                presets[p.first.as<std::string>("")] = p.second;
+            }
+        }
+        auto fieldOf = [&](const YAML::Node& props, const std::string& key) -> YAML::Node {
+            if (props[key]) return props[key];
+            if (props["preset"]) {
+                const std::string pn = props["preset"].as<std::string>("");
+                auto it = presets.find(pn);
+                if (it != presets.end() && it->second[key]) return it->second[key];
+            }
+            return YAML::Node();
+        };
+        auto looksLikeFormula = [](const std::string& s) {
+            return s.find('$') != std::string::npos
+                || s.find('*') != std::string::npos
+                || s.find('/') != std::string::npos
+                || s.find('+') != std::string::npos
+                || s.find('(') != std::string::npos
+                || s.find("exp") != std::string::npos
+                || s.find("tanh") != std::string::npos;
+        };
         for (const auto& material : config["materials"]) {
             const auto& props = material.second;
-            if (!props["mu_r"]) continue;
-
-            // Check if mu_r is nonlinear (formula or table)
-            if (props["mu_r"].IsScalar()) {
-                std::string mu_str = props["mu_r"].as<std::string>();
-                // Check for formula characters
-                if (mu_str.find('$') != std::string::npos ||
-                    mu_str.find('*') != std::string::npos ||
-                    mu_str.find('/') != std::string::npos ||
-                    mu_str.find('+') != std::string::npos ||
-                    mu_str.find('(') != std::string::npos ||
-                    mu_str.find("exp") != std::string::npos ||
-                    mu_str.find("tanh") != std::string::npos) {
-                    has_nonlinear_materials = true;
-                    break;
+            // B-H trumps mu_r: any defined B-H (string formula or 2-array
+            // table) is nonlinear.
+            YAML::Node bh = fieldOf(props, "B-H");
+            if (bh && bh.IsScalar()) {
+                has_nonlinear_materials = true; break;
+            }
+            if (bh && bh.IsSequence() && bh.size() == 2
+                && bh[0].IsSequence() && bh[1].IsSequence()) {
+                has_nonlinear_materials = true; break;
+            }
+            YAML::Node mu = fieldOf(props, "mu_r");
+            if (!mu) continue;
+            if (mu.IsScalar()) {
+                std::string mu_str = mu.as<std::string>("");
+                if (looksLikeFormula(mu_str)) {
+                    has_nonlinear_materials = true; break;
                 }
-            } else if (props["mu_r"].IsSequence() && props["mu_r"].size() == 2) {
-                // B-H table format
-                has_nonlinear_materials = true;
-                break;
+            } else if (mu.IsSequence() && mu.size() == 2) {
+                has_nonlinear_materials = true; break;
             }
         }
     }
