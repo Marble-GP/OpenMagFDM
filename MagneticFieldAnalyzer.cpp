@@ -1197,8 +1197,20 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             generateBHTable(name, mu_value);
         }
 
-        // Evaluate mu_r for initial state (H=0)
-        double mu_r = evaluateMu(mu_value, 0.0);
+        // Phase U: initial mu_r seed for the linear pre-solve.
+        // For TABLE materials we use the PEAK mu_r so the first solve
+        // sees the iron at its most permeable, drives B into the
+        // saturating regime, and the nonlinear iteration then descends
+        // to the operating-point mu via interpolateH_from_B. Using
+        // mu_table[0] for B-H formulas with a sigmoidal onset can trap
+        // the iteration in a vacuum-like fixed point (see Phase U
+        // commit message for details).
+        double mu_r;
+        if (mu_value.type == MuType::TABLE && !mu_value.mu_table.empty()) {
+            mu_r = *std::max_element(mu_value.mu_table.begin(), mu_value.mu_table.end());
+        } else {
+            mu_r = evaluateMu(mu_value, 0.0);
+        }
 
         // Parse anti_aliasing flag and add to antialias_materials if enabled.
         // Phase T: accept the legacy short key `antialias:` too -- the
@@ -11848,26 +11860,36 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
 
-        // Phase P: resolve the per-cell initial mu_r through the parsed
-        // material_mu cache, NOT via props["mu_r"].as<double>(). For a
-        // STATIC mu_r this is identical to the old .as<double>() read,
-        // but for a TABLE (e.g. `mu_r: [[H...], [mu_r...]]` inherited
-        // from a soft-iron preset) or a FORMULA the old call silently
-        // failed to 1.0, leaving every iron pixel at vacuum until the
-        // nonlinear solver had a chance to update it. Worse, in a
-        // transient run this reset happened at the start of every step,
-        // so the nonlinear solver was effectively cold-starting from
-        // vacuum on the second step onward. Going through evaluateMu at
-        // H=0 gives the correct initial-differential-permeability seed
-        // for tables / formulas; STATIC materials still get their
-        // exact constant value. Falls back to .as<double>() only when
-        // material_mu has no entry for this material (genuinely
-        // missing from the setup pass).
+        // Phase P + U: resolve the per-cell initial mu_r through the
+        // parsed material_mu cache instead of props["mu_r"].as<double>().
+        //   - STATIC mu_r: the constant value (unchanged from the
+        //     pre-Phase-P read).
+        //   - TABLE  mu_r: the PEAK mu_r in the table, not mu_table[0].
+        //     Some B-H formulas (e.g. ones with a sigmoidal onset near
+        //     H ≈ H_knee) report mu(H=0) far below the working-point
+        //     mu, which traps the Newton-Krylov iteration in a
+        //     "self-consistent vacuum" solution: low initial mu →
+        //     small B in the iron → small H → mu stays low → converged
+        //     in 2 iters on a pure_iron model. Seeding from the peak
+        //     instead lets the linear solve drive B up the iron-leg of
+        //     the curve, the next iteration then descends to the true
+        //     saturated mu via the BH table lookup. Standard FE/FDM
+        //     codes (FEMM, JMAG, Ansys Maxwell) use the same "high mu
+        //     initial guess + iterate down" strategy for nonlinear
+        //     soft magnetics.
+        //   - FORMULA mu_r: evaluated at H=0 (we don't sample the
+        //     formula for a peak; FORMULAs are rare in practice and
+        //     usually monotone-decreasing with H).
         double mu_r = 1.0;
         {
             auto mu_it = material_mu.find(name);
             if (mu_it != material_mu.end()) {
-                mu_r = evaluateMu(mu_it->second, 0.0);
+                const MuValue& mv = mu_it->second;
+                if (mv.type == MuType::TABLE && !mv.mu_table.empty()) {
+                    mu_r = *std::max_element(mv.mu_table.begin(), mv.mu_table.end());
+                } else {
+                    mu_r = evaluateMu(mv, 0.0);
+                }
             } else if (props["mu_r"]) {
                 try { mu_r = props["mu_r"].as<double>(1.0); }
                 catch (...) { mu_r = 1.0; }
