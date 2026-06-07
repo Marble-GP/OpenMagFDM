@@ -894,7 +894,7 @@ void MagneticFieldAnalyzer::calculateHField() {
         double B_mag = std::sqrt(Bx_val * Bx_val + By_val * By_val);
 
         cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB; LUT keys are R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -964,7 +964,7 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
         for (int k = 0; k < n_rows * n_cols; k++) {
             int j = k / n_cols, i = k % n_cols;
             cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-            int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+            int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB; LUT keys are R<<16|G<<8|B
 
             auto lut_it = rgb_to_material.find(rgb_key);
             if (lut_it != rgb_to_material.end()) {

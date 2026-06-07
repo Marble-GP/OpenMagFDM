@@ -3994,7 +3994,7 @@ void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
 
             cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
             // Note: image_flipped stores BGR, pixel[0]=B, pixel[1]=G, pixel[2]=R
-            int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+            int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
             auto lut_it = rgb_to_material.find(rgb_key);
             if (lut_it != rgb_to_material.end()) {
@@ -4360,7 +4360,7 @@ void MagneticFieldAnalyzer::calculateHFieldAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         // O(1) material lookup via LUT
         bool found = false;
@@ -4423,7 +4423,7 @@ void MagneticFieldAnalyzer::updateMuAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -4474,7 +4474,7 @@ void MagneticFieldAnalyzer::updateMuDiffAtActiveCells(const Eigen::VectorXd& H_a
             img_i < 0 || img_i >= image_flipped.cols) continue;
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -4518,7 +4518,7 @@ void MagneticFieldAnalyzer::updateMuDiffDistribution() {
     for (int k = 0; k < n_rows * n_cols; k++) {
         int j = k / n_cols, i = k % n_cols;
         cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -10107,7 +10107,7 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
                 double w;
                 if (need_image_lookup) {
                     cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
-                    int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                    int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
                     auto lut_it = rgb_to_material.find(rgb_key);
                     const BHTable* bh = nullptr;
                     if (lut_it != rgb_to_material.end()) {
@@ -10166,7 +10166,7 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
             double w;
             if (need_image_lookup) {
                 cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
-                int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
                 auto lut_it = rgb_to_material.find(rgb_key);
                 const BHTable* bh = nullptr;
                 if (lut_it != rgb_to_material.end()) {
@@ -10443,7 +10443,7 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
         auto co_energy_at = [&](int j, int i, double B_mag) -> double {
             if (need_image_lookup_ed) {
                 cv::Vec3b pixel = image_flipped_ed.at<cv::Vec3b>(j, i);
-                int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
                 auto lut_it = rgb_to_material.find(rgb_key);
                 if (lut_it != rgb_to_material.end()) {
                     auto bh_it = material_bh_tables.find(lut_it->second.name);
