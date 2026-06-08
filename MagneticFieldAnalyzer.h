@@ -849,7 +849,7 @@ private:
     void updateMuDistribution();  // Update mu_map based on current H_map
 
     // Permanent magnet magnetization model
-    void computeMagnetizationGrids();        // Build Mx_map, My_map from material_magnetization configs
+    void computeMagnetizationGrids(int step = 0);  // Build Mx_map, My_map. Phase AA: step lets transient sliding rotate the magnetisation pattern with the rotor.
     void computeMagnetizationCurl();         // Cartesian: Jz_mag = ∂My/∂x - ∂Mx/∂y
     void computeMagnetizationCurlPolar();    // Polar: Jz_mag = (1/r)∂(r·Mθ)/∂r - (1/r)∂Mr/∂θ
 

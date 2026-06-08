@@ -1590,7 +1590,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 // Permanent magnet magnetization model
 // ============================================================================
 
-void MagneticFieldAnalyzer::computeMagnetizationGrids() {
+void MagneticFieldAnalyzer::computeMagnetizationGrids(int step) {
     // Builds Mx_map, My_map from per-material MagnetizationConfig, then calls curl.
     //
     // For parallel/halbach_continuous/custom patterns: uses tinyexpr compile-once/
@@ -1599,6 +1599,45 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
     // For polar_anisotropy: uses 2p wire-current superposition model where
     // wires at radius R_pc create a p-pole field whose direction defines the
     // easy axis of magnetization.
+    //
+    // Phase AA: when transient sliding rotates the rotor in theta, the
+    // magnetisation pattern must rotate WITH the rotor (the magnet domains
+    // are physically glued to the iron core and rotate as a rigid body).
+    // The pre-AA code computed the pattern from the absolute lab-frame
+    // theta of each cell, which is equivalent to "the pole boundaries are
+    // welded to the lab frame and the rotor iron passes through them" --
+    // every time a magnet crossed a lab-frame pole boundary, its M flipped.
+    // For a 4-pole rotor sliding 90° per pole pitch, this manufactured a
+    // spurious 6-step periodic discontinuity in the no-load flux linkages
+    // (see the user-supplied ISEEJ-D plot — Phi_C swung by ±2e-2 Wb/m on
+    // every pole crossing while a balanced 3-phase signal should have
+    // had zero mean and equal amplitudes 120° apart).
+    //
+    // Fix: compute the rotor's cumulative angular displacement from the
+    // slide config, then evaluate the pattern in the ROTOR frame
+    // (theta_rotor = theta_lab - rotor_angle - orient) and rotate the
+    // resulting magnetisation vector BACK into the lab frame
+    // (angle_mid_lab = angle_mid_rotor + rotor_angle). This is
+    // mathematically identical to "slide M alongside the image and rotate
+    // each vector by Δθ per step", but avoids any cumulative slide-drift
+    // and naturally handles multi-region slides + antiperiodic seams.
+    //
+    // rotor_angle = 0 at step 0 (and whenever sliding is disabled), so
+    // the static / single-shot path is unchanged.
+    double rotor_angle = 0.0;
+    if (step > 0 && transient_config.enable_sliding && coordinate_system == "polar") {
+        for (const auto& slide : transient_config.slides) {
+            if (slide.kind == "rectangle") continue;
+            const bool is_theta_slide =
+                (r_orientation == "horizontal" && slide.direction == "vertical") ||
+                (r_orientation == "vertical"   && slide.direction == "horizontal");
+            if (is_theta_slide) {
+                rotor_angle += static_cast<double>(step)
+                             * static_cast<double>(slide.pixels_per_step)
+                             * dtheta;
+            }
+        }
+    }
 
     bool is_polar = (coordinate_system == "polar");
 
@@ -1668,9 +1707,15 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
                         // Phase J: superpose field of p wire currents at
                         // R_pc, one per pole. Adjacent currents alternate
                         // sign for the NS layout. theta_k = 2π·k/p.
+                        //
+                        // Phase AA: the virtual wire sources are anchored
+                        // to the rotor, so their lab-frame angular
+                        // positions advance by rotor_angle as the rotor
+                        // turns. Adding rotor_angle to theta_k rotates
+                        // the whole pole pattern with the slide.
                         double Bx_sum = 0.0, By_sum = 0.0;
                         for (int k = 0; k < mc.p; k++) {
-                            double theta_k = 2.0 * M_PI * k / mc.p + orient_rad;
+                            double theta_k = 2.0 * M_PI * k / mc.p + orient_rad + rotor_angle;
                             double sign = (k % 2 == 0) ? 1.0 : -1.0;
                             double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
                             double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
@@ -1687,7 +1732,19 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
                         // Phase E.4 / Phase J: radial_array / parallel_array.
                         // Determine pole sector index k (0 .. p-1) and apply
                         // alternating sign + per-pole direction.
-                        double theta_pos = std::atan2(y_phys - mc.cy, x_phys - mc.cx) - orient_rad;
+                        //
+                        // Phase AA: subtract rotor_angle before determining
+                        // pole_k so the magnet's identity (which pole it
+                        // is on the rotor) is preserved across slides --
+                        // i.e. pole_k is computed in the ROTOR frame, not
+                        // the lab frame. For parallel_array the direction
+                        // we emit (angle_mid) then needs rotor_angle
+                        // added back so the vector is expressed in the
+                        // lab frame Mx/My grid. radial_array's "outward
+                        // radial" direction is intrinsically lab-frame
+                        // (defined by where the pixel is right now), so
+                        // theta_local stays untouched.
+                        double theta_pos = std::atan2(y_phys - mc.cy, x_phys - mc.cx) - orient_rad - rotor_angle;
                         double twopi = 2.0 * M_PI;
                         theta_pos = std::fmod(theta_pos, twopi);
                         if (theta_pos < 0.0) theta_pos += twopi;
@@ -1701,7 +1758,7 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
                             Mx_map(j, i) = sign * mc.Hc * std::cos(theta_local);
                             My_map(j, i) = sign * mc.Hc * std::sin(theta_local);
                         } else {  // parallel_array
-                            double angle_mid = (k_pole + 0.5) * pole_span + orient_rad
+                            double angle_mid = (k_pole + 0.5) * pole_span + orient_rad + rotor_angle
                                              + mc.angle_deg * M_PI / 180.0;
                             Mx_map(j, i) = sign * mc.Hc * std::cos(angle_mid);
                             My_map(j, i) = sign * mc.Hc * std::sin(angle_mid);
@@ -11864,6 +11921,37 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         return;
     }
 
+    // Phase AB: warm-start non-linear μ from the previously converged
+    // distribution.
+    //
+    // Before AB, every step reset mu_map to vacuum, then seeded every
+    // non-linear (TABLE) cell at the peak permeability via Phase U. That
+    // gave a clean cold-start for step 0 but a huge initial residual on
+    // every subsequent step: solving step N-1 had just descended the
+    // iron from peak (~9967·μ₀) to its operating-point μ (~6500·μ₀ in
+    // the user's IPMSM yoke, much lower in the saturated bridges), only
+    // for step N's reset to push it back to peak before the warm-started
+    // Az was applied — producing ||R|| jumps from ~5e-3 at the end of
+    // step 1 to ~2e+02 at the start of step 2 in the user's log, then
+    // having to slowly descend again across the 50-iter cap.
+    //
+    // AB snapshots the converged mu_map first; in the per-material loop
+    // below, NL cells that are still NL after the slide reuse their
+    // snapshotted value instead of the peak seed. STATIC (linear)
+    // materials still get their constant μ written verbatim because
+    // their value is exact and cheap. Cells whose material changed due
+    // to the slide (rotor magnet now sitting where iron yoke used to
+    // be, etc.) get the peak seed, since the snapshot's value reflects
+    // the OLD material there and would be wrong as a warm-start.
+    //
+    // Cost: one matrix-copy (one mu_map'th of memory) per step. Saves
+    // tens of NK iterations in practice.
+    const bool warm_start_mu = (step > 0) && has_nonlinear_materials;
+    Eigen::MatrixXd mu_map_prev;
+    if (warm_start_mu) {
+        mu_map_prev = mu_map;  // snapshot pre-reset
+    }
+
     // IMPORTANT: Reset mu_map and jz_map to default values (air) before applying materials
     // This ensures that pixels that changed material due to sliding get updated correctly
     // Without this reset, old material values would persist even after the image slides
@@ -11909,10 +11997,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         //     formula for a peak; FORMULAs are rare in practice and
         //     usually monotone-decreasing with H).
         double mu_r = 1.0;
+        bool is_nl_material = false;  // Phase AB: TABLE / FORMULA → warm-start eligible
         {
             auto mu_it = material_mu.find(name);
             if (mu_it != material_mu.end()) {
                 const MuValue& mv = mu_it->second;
+                is_nl_material = (mv.type != MuType::STATIC);
                 if (mv.type == MuType::TABLE && !mv.mu_table.empty()) {
                     mu_r = *std::max_element(mv.mu_table.begin(), mv.mu_table.end());
                 } else {
@@ -11923,6 +12013,19 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                 catch (...) { mu_r = 1.0; }
             }
         }
+        const double mu_cold = mu_r * MU_0;
+        // Phase AB: if this material is non-linear AND we have a
+        // previous-step μ snapshot, prefer the snapshot's value at each
+        // matching cell. Cells that were already this material at
+        // step-1 will hold the converged μ ≈ operating-point value,
+        // which is a vastly better warm-start than the peak seed. Cells
+        // whose material identity flipped at this step (the slide just
+        // brought a new color here) won't have anything sensible in
+        // the snapshot, so they fall back to the peak seed via the
+        // `mu_prev > 2·MU_0` gate -- "above air" means whatever was
+        // there was a permeable material, so reuse it; otherwise cold-start.
+        const bool use_warm_for_this_mat = warm_start_mu && is_nl_material;
+        const double mu_warm_floor = 2.0 * MU_0;
 
         // Evaluate Jz for this step (0.0 if not defined)
         double jz = 0.0;
@@ -11943,7 +12046,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                             jz_map(j, i) = jz;
-                            mu_map(j, i) = mu_r * MU_0;
+                            if (use_warm_for_this_mat) {
+                                const double mu_prev = mu_map_prev(j, i);
+                                mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                            } else {
+                                mu_map(j, i) = mu_cold;
+                            }
                         }
                     }
                 }
@@ -11954,7 +12062,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                             jz_map(j, i) = jz;
-                            mu_map(j, i) = mu_r * MU_0;
+                            if (use_warm_for_this_mat) {
+                                const double mu_prev = mu_map_prev(j, i);
+                                mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                            } else {
+                                mu_map(j, i) = mu_cold;
+                            }
                         }
                     }
                 }
@@ -11970,7 +12083,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                     cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                     if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                         jz_map(j, i) = jz;
-                        mu_map(j, i) = mu_r * MU_0;
+                        if (use_warm_for_this_mat) {
+                            const double mu_prev = mu_map_prev(j, i);
+                            mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                        } else {
+                            mu_map(j, i) = mu_cold;
+                        }
                     }
                 }
             }
@@ -12026,8 +12144,17 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
     // Required for transient/sliding cases where material positions change.
     // The slide_sign_map antiperiodic flip is propagated into magnetisation
     // inside computeMagnetizationGrids().
+    //
+    // Phase AA: pass the step index so computeMagnetizationGrids can
+    // accumulate the rotor's slide-driven angular displacement and
+    // rotate the pattern with the rotor (parallel_array / radial_array /
+    // polar_anisotropy). Without this the magnetisation is recomputed
+    // from absolute lab-frame theta and gets period-of-pole-pitch
+    // discontinuities every time the rotor crosses a pole boundary,
+    // visible as a non-balanced 3-phase flux linkage with spurious
+    // 6-step spikes in a 4-pole / 24-step rotation.
     if (!material_magnetization.empty()) {
-        computeMagnetizationGrids();
+        computeMagnetizationGrids(step);
     }
 }
 
