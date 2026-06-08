@@ -13283,6 +13283,17 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // 3.2. Calculate flux linkage for all defined paths
         calculateAllFluxLinkages(step);
 
+        // Phase AC: rewrite the flux_linkage.csv after every step so the
+        // WebUI dashboard timeline can plot a partial run while the
+        // analysis is still grinding through the remaining steps. The
+        // export is overwrite-style (single file, single header, N rows
+        // where N = steps completed so far), so it stays correct after
+        // every call -- no append / no race with the async writer.
+        // Cost: writing a tiny CSV (one row per step × ~3 phases) is
+        // O(milliseconds) vs the multi-second NK solve, well below any
+        // user-visible budget.
+        exportFluxLinkageCSV(output_dir);
+
         // <<PROFILING_TIMER_BEGIN>>
         prof_d_flux = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now() - prof_t_flux).count();
