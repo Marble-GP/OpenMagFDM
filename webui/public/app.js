@@ -34,6 +34,17 @@ const AppState = {
     plotConfigs: {},  // { plotId: { xRange: 'auto'|[min,max], yRange: 'auto'|[min,max], zRange: 'auto'|[min,max], colorscale: 'Viridis' } }
     // Detect Colors result cache
     lastDetectResult: null,  // Last result from /api/materials/detect
+    // Phase D.4: Detect Colors per-chip library / Coil assignments.
+    // detectAssign[hex] = { kind: 'none'|'Coil'|<preset name>,
+    //                       coilGroup: 'A'..'Z', coilSign: '+'|'-' }
+    detectAssign: {},
+    // Phase D.4: active library used by the Detect Colors modal.
+    // Falls back to AppState.selectedLibrary on every open. The header
+    // dropdown overrides it for the duration of the modal.
+    detectLibraryName: null,
+    detectLibraryPresets: {},    // { presetName: { mu_r, jz, ... }, ... }
+    detectLibraryMaterials: {},  // { matName: { rgb, mu_r, jz, ... }, ... }
+    detectLibraryRaw: '',        // raw library YAML text (for verbatim splicing)
     // Material Library
     selectedLibrary: null,       // Active library filename (null = none)
     libraryAceEditor: null,      // Ace Editor instance inside Library modal
@@ -302,6 +313,101 @@ async function initializeConfigEditor() {
 
     // Initial validation
     validateYAML(editor);
+
+    // Phase D.5: inline colour swatches next to material-name lines.
+    initMaterialSwatches(editor);
+}
+
+// ============================================================
+// Phase D.5: inline material-colour swatches in the Ace editor.
+// ============================================================
+// Strategy: maintain a single position-absolute overlay <div> stacked
+// over the editor container. On every YAML change (debounced 200 ms)
+// we re-parse the doc, walk doc.materials, and for each entry with an
+// rgb: [r,g,b] property we look up the row where its name is defined
+// and append a 12 x 12 swatch to the overlay positioned via
+// renderer.textToScreenCoordinates(). The overlay is re-positioned
+// (cheap path) on every renderer afterRender so the swatches track the
+// editor when scrolling / folding / resizing without a YAML re-parse.
+
+function initMaterialSwatches(editor) {
+    if (editor._swatchInit) return;
+    editor._swatchInit = true;
+    editor._swatchEntries = [];   // [{ name, row, color }, ...]
+    let parseTimer = null;
+    const reparse = () => {
+        clearTimeout(parseTimer);
+        parseTimer = setTimeout(() => {
+            editor._swatchEntries = computeMaterialSwatchEntries(editor);
+            positionMaterialSwatches(editor);
+        }, 200);
+    };
+    editor.session.on('change', reparse);
+    editor.renderer.on('afterRender', () => positionMaterialSwatches(editor));
+    window.addEventListener('resize', () => positionMaterialSwatches(editor));
+    editor._swatchEntries = computeMaterialSwatchEntries(editor);
+    positionMaterialSwatches(editor);
+}
+
+function computeMaterialSwatchEntries(editor) {
+    let doc;
+    try { doc = jsyaml.load(editor.getValue()) || {}; }
+    catch (_) { return []; }
+    if (!doc || typeof doc !== 'object') return [];
+    const materials = (doc.materials && typeof doc.materials === 'object') ? doc.materials : {};
+    const names = Object.keys(materials);
+    if (names.length === 0) return [];
+    const lines = editor.session.getDocument().getAllLines();
+    // The materials: block starts at some row; the keys are nested one
+    // indent level under it. We scan for the keys with a regex so the
+    // search is robust to varying indentation widths.
+    const entries = [];
+    for (const name of names) {
+        const m = materials[name];
+        if (!m || typeof m !== 'object' || !Array.isArray(m.rgb) || m.rgb.length < 3) continue;
+        const r = Math.max(0, Math.min(255, Math.round(Number(m.rgb[0]) || 0)));
+        const g = Math.max(0, Math.min(255, Math.round(Number(m.rgb[1]) || 0)));
+        const b = Math.max(0, Math.min(255, Math.round(Number(m.rgb[2]) || 0)));
+        const namePattern = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(`^\\s+${namePattern}\\s*:\\s*$`);
+        const row = lines.findIndex(ln => re.test(ln));
+        if (row < 0) continue;
+        entries.push({ name, row, color: `rgb(${r}, ${g}, ${b})`, lineLen: lines[row].length });
+    }
+    return entries;
+}
+
+function positionMaterialSwatches(editor) {
+    const entries = editor._swatchEntries || [];
+    const container = editor.container;
+    let overlay = container.querySelector('.mat-swatch-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.className = 'mat-swatch-overlay';
+        overlay.style.cssText = 'position:absolute; inset:0; pointer-events:none; z-index:5; overflow:hidden;';
+        container.appendChild(overlay);
+    }
+    overlay.innerHTML = '';
+    if (entries.length === 0) return;
+    const containerRect = container.getBoundingClientRect();
+    const visibleTop    = editor.renderer.getFirstVisibleRow();
+    const visibleBottom = editor.renderer.getLastVisibleRow();
+    for (const e of entries) {
+        // Skip rows outside the visible viewport for cheaper layout.
+        if (e.row < visibleTop - 1 || e.row > visibleBottom + 1) continue;
+        const screen = editor.renderer.textToScreenCoordinates(e.row, e.lineLen);
+        const left = screen.pageX - containerRect.left - window.scrollX + 6;
+        const top  = screen.pageY - containerRect.top  - window.scrollY + 2;
+        const swatch = document.createElement('div');
+        swatch.style.cssText =
+            'position:absolute; width:12px; height:12px; border:1px solid rgba(0,0,0,0.45); ' +
+            'border-radius:2px; box-shadow:0 0 0 1px rgba(255,255,255,0.25);';
+        swatch.style.background = e.color;
+        swatch.style.left = `${left}px`;
+        swatch.style.top  = `${top}px`;
+        swatch.title = `${e.name} — ${e.color}`;
+        overlay.appendChild(swatch);
+    }
 }
 
 // Add context-aware snippets
@@ -855,9 +961,15 @@ async function handleImageUpload(event) {
         AppState.uploadedImageFilename = result.filename;
         showStatus('solverStatus', `Image uploaded: ${result.filename}`, 'success');
         document.getElementById('detectColorsBtn').style.display = 'block';
+        document.getElementById('polarizeBtn').style.display = 'block';
+        document.getElementById('magPreviewBtn').style.display = 'block';
 
         // Refresh image list
         await refreshImageList();
+        // Probe for AA-noise so the warning banner + filter button can
+        // surface in the Input Image panel without the user having to
+        // open Detect Colors or Polar Preprocess first.
+        checkInputImageNoise(result.filename);
     } catch (error) {
         showStatus('solverStatus', `Upload error: ${error.message}`, 'error');
     }
@@ -901,7 +1013,9 @@ function loadSelectedImage() {
     img.src = `/uploads/${AppState.userId}/${filename}`;
     img.classList.remove('hidden');
     document.getElementById('detectColorsBtn').style.display = 'block';
+    document.getElementById('polarizeBtn').style.display = 'block';
     showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
+    checkInputImageNoise(filename);
 }
 
 async function deleteSelectedImage() {
@@ -929,6 +1043,10 @@ async function deleteSelectedImage() {
             AppState.uploadedImageFilename = null;
             document.getElementById('uploadedImage').classList.add('hidden');
             document.getElementById('detectColorsBtn').style.display = 'none';
+            document.getElementById('polarizeBtn').style.display = 'none';
+            document.getElementById('magPreviewBtn').style.display = 'none';
+            document.getElementById('quantizeFilterBtn').style.display = 'none';
+            document.getElementById('inputImageNoiseBanner').style.display = 'none';
         }
     } catch (error) {
         showStatus('solverStatus', `Delete error: ${error.message}`, 'error');
@@ -939,68 +1057,164 @@ async function deleteSelectedImage() {
 // Detect Colors Feature
 // =====================================================
 
-async function detectColors() {
+// Internal color detection: POSTs /api/materials/detect with the currently
+// selected image. Returns the parsed result or throws. Separated from the
+// modal opener so the Polar Preprocess Modal (v1.5) can request the same
+// detection in parallel with /api/preprocess-polar/detect without opening
+// the Detect Colors modal.
+async function detectColorsInternal(opts = {}) {
     if (!AppState.uploadedImageFilename) {
-        showStatus('solverStatus', 'Please upload or select an image first', 'error');
-        return;
+        throw new Error('No image selected');
     }
+    const rareThreshold = opts.rareThreshold != null
+        ? opts.rareThreshold
+        : (parseFloat(document.getElementById('detectRareThreshold').value || '5') / 100);
+    const blendTolerance = opts.blendTolerance != null
+        ? opts.blendTolerance
+        : parseInt(document.getElementById('detectBlendTolerance').value || '8', 10);
 
-    const rareThreshold = parseFloat(document.getElementById('detectRareThreshold').value || '5') / 100;
-    const blendTolerance = parseInt(document.getElementById('detectBlendTolerance').value || '8', 10);
+    const imgResponse = await fetch(`/uploads/${AppState.userId}/${AppState.uploadedImageFilename}`);
+    if (!imgResponse.ok) throw new Error('Failed to fetch image');
+    const blob = await imgResponse.blob();
 
+    const formData = new FormData();
+    formData.append('image', blob, AppState.uploadedImageFilename);
+    formData.append('userId', AppState.userId);
+
+    const params = new URLSearchParams({
+        rareThreshold: String(rareThreshold),
+        blendTolerance: String(blendTolerance),
+    });
+    const response = await fetch(`/api/materials/detect?${params}`, {
+        method: 'POST',
+        body: formData,
+    });
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: response.statusText }));
+        throw new Error(err.error || 'Detection failed');
+    }
+    return await response.json();
+}
+
+async function detectColors() {
     try {
-        // Fetch the image file as a blob
-        const imgResponse = await fetch(`/uploads/${AppState.userId}/${AppState.uploadedImageFilename}`);
-        if (!imgResponse.ok) throw new Error('Failed to fetch image');
-        const blob = await imgResponse.blob();
-
-        // Post to detect endpoint
-        const formData = new FormData();
-        formData.append('image', blob, AppState.uploadedImageFilename);
-        formData.append('userId', AppState.userId);
-
-        const params = new URLSearchParams({
-            rareThreshold: rareThreshold.toString(),
-            blendTolerance: blendTolerance.toString()
-        });
-
-        const response = await fetch(`/api/materials/detect?${params}`, {
-            method: 'POST',
-            body: formData
-        });
-
-        if (!response.ok) {
-            const err = await response.json();
-            throw new Error(err.error || 'Detection failed');
-        }
-
-        const result = await response.json();
+        const result = await detectColorsInternal();
         AppState.lastDetectResult = result;
+        // Phase D.4: reset assignments to 'none' for every freshly-
+        // detected colour. The user can pick library presets / Coil
+        // per chip after the modal opens.
+        AppState.detectAssign = {};
+        (result.colors || []).forEach(c => {
+            const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+            AppState.detectAssign[hex] = {
+                kind: 'none',
+                coilGroup: 'A',
+                coilSign: '+',
+                // Phase D.7: per-chip magnetization sub-state. Shown only
+                // when kind references a magnet preset (isMagnetMaterial).
+                // Parameters are kept across pattern switches so the user
+                // doesn't lose typed values when toggling.
+                magnetization: defaultMagnetizationState(),
+            };
+        });
+        // Phase D.4: default the modal's library picker to the globally
+        // active library (if any). The dropdown lets the user override.
+        AppState.detectLibraryName = AppState.selectedLibrary || null;
+        await detectRefreshLibraryList();
+        await detectLoadLibraryByName(AppState.detectLibraryName);
         renderDetectModal(result);
         document.getElementById('detectColorsModal').style.display = 'flex';
-
     } catch (error) {
         showStatus('solverStatus', `Detect error: ${error.message}`, 'error');
     }
 }
 
+// Phase D.4: populate the library picker dropdown from
+// /api/material-libraries. Idempotent; preserves the current
+// selection across reloads.
+async function detectRefreshLibraryList() {
+    const sel = document.getElementById('detectActiveLibrary');
+    if (!sel) return;
+    const previous = sel.value || AppState.detectLibraryName || '';
+    try {
+        const r = await fetch(`/api/material-libraries?userId=${AppState.userId}`).then(r => r.json());
+        const libs = (r && Array.isArray(r.libraries)) ? r.libraries : [];
+        sel.innerHTML = '<option value="">(none — preset references will fail)</option>';
+        for (const lib of libs) {
+            const opt = document.createElement('option');
+            opt.value = lib.filename;
+            opt.textContent = lib.filename;
+            sel.appendChild(opt);
+        }
+        // Restore prior selection if it still exists in the list.
+        const stillThere = Array.from(sel.options).some(o => o.value === previous);
+        sel.value = stillThere ? previous : '';
+        if (!sel._ppBound) {
+            sel.addEventListener('change', async () => {
+                AppState.detectLibraryName = sel.value || null;
+                await detectLoadLibraryByName(AppState.detectLibraryName);
+                renderDetectChips();
+                regenerateDetectYamlPreview();
+            });
+            sel._ppBound = true;
+        }
+    } catch (e) {
+        // Leave the dropdown with the single (none) option so the modal
+        // still works without a library.
+    }
+}
+
+// Phase D.4: fetch + parse the chosen library YAML. Populates
+// AppState.detectLibraryPresets / Materials / Raw. Passing null
+// clears them so the per-chip dropdowns fall back to (none) / Coil.
+async function detectLoadLibraryByName(name) {
+    AppState.detectLibraryPresets = {};
+    AppState.detectLibraryMaterials = {};
+    AppState.detectLibraryRaw = '';
+    if (!name) return;
+    try {
+        const r = await fetch(`/api/material-libraries/${encodeURIComponent(name)}?userId=${AppState.userId}`);
+        if (!r.ok) return;
+        const text = await r.text();
+        AppState.detectLibraryRaw = text;
+        const doc = jsyaml.load(text) || {};
+        if (doc && typeof doc === 'object') {
+            if (doc.material_presets && typeof doc.material_presets === 'object') {
+                AppState.detectLibraryPresets = doc.material_presets;
+            }
+            if (doc.materials && typeof doc.materials === 'object') {
+                AppState.detectLibraryMaterials = doc.materials;
+            }
+        }
+    } catch (e) {
+        // Silent: the picker is a convenience, not load-critical.
+    }
+}
+
 function renderDetectModal(result) {
-    // Render dominant color grid
-    const grid = document.getElementById('detectColorGrid');
-    grid.innerHTML = '';
-    (result.colors || []).forEach(c => {
-        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
-        const isAA = c.antialias === true;
-        const item = document.createElement('div');
-        item.style.cssText = 'display:flex; align-items:center; gap:6px; background:#f8f9fa; border-radius:4px; padding:5px 8px; font-size:0.8rem;';
-        item.innerHTML = `
-            <div style="width:20px; height:20px; background:${hex}; border:1px solid #ccc; border-radius:2px; flex-shrink:0;"></div>
-            <span style="font-family:monospace;">${hex}</span>
-            <span style="color:#6c757d;">${(c.ratio * 100).toFixed(1)}%</span>
-            ${isAA ? '<span style="background:#fff3cd; color:#856404; border-radius:10px; padding:1px 6px; font-size:0.75rem;">AA base</span>' : ''}
-        `;
-        grid.appendChild(item);
-    });
+    // Noise / AA-heavy warning banner. Heuristic: a CAD image typically
+    // has 5-50 unique RGB values; if we see thousands the image is
+    // either JPEG-derived or aggressively anti-aliased and the uniform-
+    // colour filter is the recommended cleanup before downstream use.
+    const banner = document.getElementById('detectNoisyBanner');
+    const detail = document.getElementById('detectNoisyBannerDetail');
+    const unique = Number(result.uniqueColors) || 0;
+    const aaTotal = Number(result.aaBlendsTotal) || 0;
+    if (unique > 1000) {
+        detail.textContent =
+            `(Number of unique colors: ${unique.toLocaleString()} / AA blends: ${aaTotal.toLocaleString()}).`;
+        banner.style.display = 'flex';
+    } else {
+        banner.style.display = 'none';
+    }
+
+    // Sync the picker dropdown to whatever detectColors() set up.
+    const libSel = document.getElementById('detectActiveLibrary');
+    if (libSel) libSel.value = AppState.detectLibraryName || '';
+
+    // Render dominant color grid (delegated so the chip block can be
+    // re-rendered on library change without recomputing the banner).
+    renderDetectChips();
 
     // Render AA blends section
     const aaSection = document.getElementById('detectAASection');
@@ -1033,8 +1247,924 @@ function renderDetectModal(result) {
         aaSection.style.display = 'none';
     }
 
-    // Render YAML template
-    document.getElementById('detectYamlPreview').textContent = result.yamlTemplate || '';
+    // Phase D.4: YAML preview is regenerated from the per-chip
+    // assignments rather than echoing the server's stock template.
+    regenerateDetectYamlPreview();
+}
+
+// Phase D.4: render the dominant colour grid with per-chip kind /
+// Coil-group / Coil-sign dropdowns. Splits out of renderDetectModal so
+// that picking a different library can re-render only the chips.
+function renderDetectChips() {
+    const result = AppState.lastDetectResult;
+    const grid = document.getElementById('detectColorGrid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    const presetNames = Object.keys(AppState.detectLibraryPresets || {});
+    const materialNames = Object.keys(AppState.detectLibraryMaterials || {});
+    const libNames = [...presetNames, ...materialNames];
+    const presetsAll = AppState.detectLibraryPresets || {};
+    const materialsAll = AppState.detectLibraryMaterials || {};
+    (result && result.colors || []).forEach(c => {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const isAA = c.antialias === true;
+        const assign = AppState.detectAssign[hex] ||
+            (AppState.detectAssign[hex] = {
+                kind: 'none', coilGroup: 'A', coilSign: '+',
+                magnetization: defaultMagnetizationState(),
+            });
+        // Older chip records may pre-date Phase D.7 — backfill the
+        // magnetization sub-state if it is missing.
+        if (!assign.magnetization) assign.magnetization = defaultMagnetizationState();
+        // If the prior selection is no longer in the active library,
+        // fall back to (none) so the dropdown stays consistent.
+        if (assign.kind !== 'none' && assign.kind !== 'Coil' && !libNames.includes(assign.kind)) {
+            assign.kind = 'none';
+        }
+        // Phase D.7: classify whether this kind is a magnet preset to
+        // decide whether the magnetization sub-row should be rendered.
+        const libProps = presetsAll[assign.kind] || materialsAll[assign.kind] || null;
+        const isMagnet = (assign.kind !== 'none' && assign.kind !== 'Coil' && isMagnetMaterial(libProps));
+        const item = document.createElement('div');
+        item.style.cssText = 'display:flex; flex-direction:column; gap:6px; background:#f8f9fa; border-radius:4px; padding:6px 8px; font-size:0.8rem;';
+        const optsKind = ['<option value="none">(none)</option>',
+                          '<option value="Coil">Coil</option>']
+            .concat(libNames.map(n => `<option value="${n}">${n}</option>`))
+            .join('');
+        const groupOpts = Array.from({ length: 26 }, (_, i) => {
+            const L = String.fromCharCode(65 + i);
+            return `<option value="${L}">${L}</option>`;
+        }).join('');
+        const patternOpts = [
+            ['parallel',           'parallel (uniform angle)'],
+            ['radial',             'radial (outward/inward from centre)'],
+            ['tangential',         'tangential (CCW/CW around centre)'],
+            ['halbach_continuous', 'halbach_continuous (p, centre, offset)'],
+            ['polar_anisotropy',   'polar_anisotropy (p, Kn=Fn/Rm, centre, offset)'],
+            ['radial_array',       'radial_array (NS alternating radial, p poles)'],
+            ['parallel_array',     'parallel_array (NS alternating sector-parallel, p poles)'],
+            ['custom',             'custom (Mx, My expressions)'],
+        ].map(([v, t]) => `<option value="${v}">${t}</option>`).join('');
+        item.innerHTML = `
+          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+            <div style="width:20px; height:20px; background:${hex}; border:1px solid #ccc; border-radius:2px; flex-shrink:0;"></div>
+            <span style="font-family:monospace;">${hex}</span>
+            <span style="color:#6c757d;">${(c.ratio * 100).toFixed(1)}%</span>
+            ${isAA ? '<span style="background:#fff3cd; color:#856404; border-radius:10px; padding:1px 6px; font-size:0.75rem;">AA base</span>' : ''}
+            <select data-detect-hex="${hex}" data-role="kind" style="padding:2px 4px; font-size:0.78rem;">${optsKind}</select>
+            <span data-coil-extras="${hex}" style="display:none; gap:4px; align-items:center;">
+                <span style="color:#6c757d;">group</span>
+                <select data-detect-hex="${hex}" data-role="coilGroup" style="padding:2px 4px; font-size:0.78rem;">${groupOpts}</select>
+                <label style="display:inline-flex; align-items:center; gap:2px;"><input type="radio" name="coilSign-${hex}" data-detect-hex="${hex}" data-role="coilSign" value="+"> +</label>
+                <label style="display:inline-flex; align-items:center; gap:2px;"><input type="radio" name="coilSign-${hex}" data-detect-hex="${hex}" data-role="coilSign" value="-"> −</label>
+            </span>
+          </div>
+          <div data-magnet-row="${hex}" style="display:none; padding-left:28px; gap:8px; align-items:center; flex-wrap:wrap; font-size:0.78rem;">
+            <svg class="mag-preview" data-detect-hex="${hex}" width="80" height="80"
+                 viewBox="0 0 80 80"
+                 style="border:1px solid #c8c8c8; border-radius:4px; background:#fff; flex-shrink:0;"></svg>
+            <span style="color:#6c757d; font-weight:600;">Magnetization</span>
+            <select data-detect-hex="${hex}" data-role="magPattern" style="padding:2px 4px; font-size:0.78rem;">${patternOpts}</select>
+            <span data-mag-params="parallel-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>angle <input type="number" step="1" data-detect-hex="${hex}" data-role="magAngle" style="width:64px; padding:1px 3px;"> deg</label>
+            </span>
+            <span data-mag-params="radial-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCx" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCy" style="width:80px; padding:1px 3px;"> m</label>
+                <label><input type="radio" name="magDir-${hex}" data-detect-hex="${hex}" data-role="magDir" value="outward"> outward</label>
+                <label><input type="radio" name="magDir-${hex}" data-detect-hex="${hex}" data-role="magDir" value="inward"> inward</label>
+            </span>
+            <span data-mag-params="radialArray-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magPArr" style="width:48px; padding:1px 3px;"></label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCxArr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCyArr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffsetArr" style="width:64px; padding:1px 3px;"> deg</label>
+                <label><input type="radio" name="magDirArr-${hex}" data-detect-hex="${hex}" data-role="magDirArr" value="outward"> outward</label>
+                <label><input type="radio" name="magDirArr-${hex}" data-detect-hex="${hex}" data-role="magDirArr" value="inward"> inward</label>
+            </span>
+            <span data-mag-params="parallelArray-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magPParr" style="width:48px; padding:1px 3px;"></label>
+                <label title="extra rotation off the sector mid-axis">angle <input type="number" step="1" data-detect-hex="${hex}" data-role="magAngleParr" style="width:64px; padding:1px 3px;"> deg</label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCxParr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCyParr" style="width:80px; padding:1px 3px;"> m</label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffsetParr" style="width:64px; padding:1px 3px;"> deg</label>
+                <label><input type="radio" name="magDirParr-${hex}" data-detect-hex="${hex}" data-role="magDirParr" value="outward"> outward</label>
+                <label><input type="radio" name="magDirParr-${hex}" data-detect-hex="${hex}" data-role="magDirParr" value="inward"> inward</label>
+            </span>
+            <span data-mag-params="halbach-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magP" style="width:48px; padding:1px 3px;"></label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffset" style="width:64px; padding:1px 3px;"> deg</label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCx2" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCy2" style="width:80px; padding:1px 3px;"> m</label>
+            </span>
+            <span data-mag-params="polar-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>p <input type="number" min="1" step="1" data-detect-hex="${hex}" data-role="magP3" style="width:48px; padding:1px 3px;"></label>
+                <label title="Kn = Fn/Rm (Kano 2025 §3.2). 1.6 ≈ sinusoidal gap density">Kn <input type="number" min="0.1" step="0.1" data-detect-hex="${hex}" data-role="magKn" style="width:60px; padding:1px 3px;"></label>
+                <label>offset <input type="number" step="1" data-detect-hex="${hex}" data-role="magOffset3" style="width:64px; padding:1px 3px;"> deg</label>
+                <label>cx <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCx3" style="width:80px; padding:1px 3px;"> m</label>
+                <label>cy <input type="number" step="0.001" data-detect-hex="${hex}" data-role="magCy3" style="width:80px; padding:1px 3px;"> m</label>
+            </span>
+            <span data-mag-params="custom-${hex}" style="display:none; gap:4px; align-items:center;">
+                <label>Mx <input type="text" data-detect-hex="${hex}" data-role="magMx" style="width:160px; padding:1px 3px;" placeholder="Hc * cos(2*theta)"></label>
+                <label>My <input type="text" data-detect-hex="${hex}" data-role="magMy" style="width:160px; padding:1px 3px;" placeholder="Hc * sin(2*theta)"></label>
+            </span>
+          </div>
+        `;
+        grid.appendChild(item);
+        // Apply persisted state to the freshly-built controls
+        item.querySelector('select[data-role="kind"]').value = assign.kind;
+        item.querySelector('select[data-role="coilGroup"]').value = assign.coilGroup || 'A';
+        item.querySelectorAll('input[data-role="coilSign"]').forEach(r => {
+            r.checked = (r.value === (assign.coilSign || '+'));
+        });
+        const extras = item.querySelector(`span[data-coil-extras="${hex}"]`);
+        if (extras) extras.style.display = (assign.kind === 'Coil') ? 'inline-flex' : 'none';
+        // Phase D.7: hydrate the magnetization sub-row visibility and
+        // input values from the current state.
+        const magRow = item.querySelector(`[data-magnet-row="${hex}"]`);
+        if (magRow) magRow.style.display = isMagnet ? 'flex' : 'none';
+        applyMagnetizationStateToControls(item, hex, assign.magnetization);
+        // Phase H: paint the per-chip vector preview on initial render.
+        if (isMagnet) {
+            const svgPrev = item.querySelector(`svg.mag-preview[data-detect-hex="${hex}"]`);
+            if (svgPrev) renderMagnetizationPreview(svgPrev, assign.magnetization);
+        }
+    });
+    // Wire kind / coil controls (Phase D.4)
+    // Wire all per-chip controls to update AppState.detectAssign and
+    // regenerate the YAML preview.
+    grid.querySelectorAll('select[data-role="kind"]').forEach(el => {
+        el.addEventListener('change', () => {
+            const hex = el.dataset.detectHex;
+            const assign = AppState.detectAssign[hex];
+            assign.kind = el.value;
+            const extras = grid.querySelector(`span[data-coil-extras="${hex}"]`);
+            if (extras) extras.style.display = (el.value === 'Coil') ? 'inline-flex' : 'none';
+            // Phase D.7: surface / hide the magnetization sub-row and
+            // seed defaults from the library preset on first transition
+            // to a magnet kind.
+            const libProps = presetsAll[assign.kind] || materialsAll[assign.kind] || null;
+            const becomingMagnet = (assign.kind !== 'none' && assign.kind !== 'Coil'
+                                    && isMagnetMaterial(libProps));
+            const magRow = grid.querySelector(`[data-magnet-row="${hex}"]`);
+            if (magRow) magRow.style.display = becomingMagnet ? 'flex' : 'none';
+            if (becomingMagnet) {
+                seedMagnetizationFromLibrary(assign, libProps);
+                // Phase G: also reseed orientation_offset to the
+                // cardinal-aligned default if the chip is sitting on a
+                // sector pattern and the user hasn't taken control yet.
+                reseedOffsetIfAuto(assign);
+                applyMagnetizationStateToControls(magRow.parentElement, hex, assign.magnetization);
+            }
+            regenerateDetectYamlPreview();
+        });
+    });
+    grid.querySelectorAll('select[data-role="coilGroup"]').forEach(el => {
+        el.addEventListener('change', () => {
+            AppState.detectAssign[el.dataset.detectHex].coilGroup = el.value;
+            regenerateDetectYamlPreview();
+        });
+    });
+    grid.querySelectorAll('input[data-role="coilSign"]').forEach(el => {
+        el.addEventListener('change', () => {
+            if (!el.checked) return;
+            AppState.detectAssign[el.dataset.detectHex].coilSign = el.value;
+            regenerateDetectYamlPreview();
+        });
+    });
+    // Phase D.7: wire the per-chip magnetization controls.
+    bindMagnetizationControls(grid);
+}
+
+// Phase D.7: visibility of the per-pattern parameter group within a
+// chip's magnetization row. Called on render and whenever the user
+// changes the pattern dropdown.
+function showMagPatternParams(item, hex, pattern) {
+    const map = {
+        parallel:           `parallel-${hex}`,
+        radial:             `radial-${hex}`,
+        tangential:         `radial-${hex}`,   // shares cx/cy + direction with radial
+        halbach_continuous: `halbach-${hex}`,
+        polar_anisotropy:   `polar-${hex}`,
+        radial_array:       `radialArray-${hex}`,
+        parallel_array:     `parallelArray-${hex}`,
+        custom:             `custom-${hex}`,
+    };
+    const target = map[pattern];
+    item.querySelectorAll('[data-mag-params]').forEach(el => {
+        el.style.display = (el.dataset.magParams === target) ? 'inline-flex' : 'none';
+    });
+}
+
+// Phase D.7: push the current magnetization sub-state into the visible
+// inputs. Called after a render so freshly-created controls show the
+// persisted values.
+function applyMagnetizationStateToControls(item, hex, m) {
+    if (!item || !m) return;
+    showMagPatternParams(item, hex, m.pattern);
+    const setVal = (role, v) => {
+        const el = item.querySelector(`[data-role="${role}"][data-detect-hex="${hex}"]`);
+        if (el) el.value = (v == null) ? '' : v;
+    };
+    const setSel = (role, v) => {
+        const el = item.querySelector(`[data-role="${role}"][data-detect-hex="${hex}"]`);
+        if (el) el.value = v;
+    };
+    setSel('magPattern', m.pattern);
+    setVal('magAngle', m.angle);
+    setVal('magCx', m.cx);
+    setVal('magCy', m.cy);
+    setVal('magP',  m.p);
+    setVal('magOffset', m.orientation_offset);
+    setVal('magCx2', m.cx);
+    setVal('magCy2', m.cy);
+    setVal('magP3', m.p);
+    setVal('magKn', m.Kn);
+    setVal('magOffset3', m.orientation_offset);
+    setVal('magCx3', m.cx);
+    setVal('magCy3', m.cy);
+    setVal('magMx', m.Mx);
+    setVal('magMy', m.My);
+    // Phase E.4: direction radios (shared radial/tangential) + array
+    // patterns.
+    item.querySelectorAll(`input[data-role="magDir"][data-detect-hex="${hex}"]`).forEach(r => {
+        r.checked = (r.value === (m.direction || 'outward'));
+    });
+    item.querySelectorAll(`input[data-role="magDirArr"][data-detect-hex="${hex}"]`).forEach(r => {
+        r.checked = (r.value === (m.direction || 'outward'));
+    });
+    item.querySelectorAll(`input[data-role="magDirParr"][data-detect-hex="${hex}"]`).forEach(r => {
+        r.checked = (r.value === (m.direction || 'outward'));
+    });
+    setVal('magPArr', m.p);
+    setVal('magCxArr', m.cx);
+    setVal('magCyArr', m.cy);
+    setVal('magOffsetArr', m.orientation_offset);
+    setVal('magPParr', m.p);
+    setVal('magAngleParr', m.angle);
+    setVal('magCxParr', m.cx);
+    setVal('magCyParr', m.cy);
+    setVal('magOffsetParr', m.orientation_offset);
+}
+
+// Phase D.7: wire all the magnetization controls in the chip grid.
+// One listener per data-role; updates the per-chip magnetization
+// sub-state and re-renders the YAML preview.
+function bindMagnetizationControls(grid) {
+    const updateNum = (el, key) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        const v = Number(el.value);
+        a.magnetization[key] = Number.isFinite(v) ? v : 0;
+        regenerateDetectYamlPreview();
+    };
+    // Phase G: dedicated p handler. After updating p, reseed the
+    // cardinal-aligned offset default so dragging p around keeps the
+    // sector boundaries cardinal-aligned until the user takes
+    // explicit control of the offset.
+    const updateP = (el) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        const v = Number(el.value);
+        a.magnetization.p = Number.isFinite(v) ? Math.max(1, Math.round(v)) : 1;
+        reseedOffsetIfAuto(a);
+        const item = el.closest('[data-magnet-row]') ?
+            el.closest('[data-magnet-row]').parentElement : el.parentElement;
+        applyMagnetizationStateToControls(item, hex, a.magnetization);
+        regenerateDetectYamlPreview();
+    };
+    // Phase G: dedicated offset handler. The very act of the user
+    // typing in any of the offset inputs sets _offset_explicit so
+    // subsequent pattern / p edits don't clobber their value.
+    const updateOffset = (el) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        const v = Number(el.value);
+        a.magnetization.orientation_offset = Number.isFinite(v) ? v : 0;
+        a.magnetization._offset_explicit = true;
+        regenerateDetectYamlPreview();
+    };
+    const updateStr = (el, key) => {
+        const hex = el.dataset.detectHex;
+        const a = AppState.detectAssign[hex];
+        if (!a || !a.magnetization) return;
+        a.magnetization[key] = el.value;
+        regenerateDetectYamlPreview();
+    };
+    grid.querySelectorAll('select[data-role="magPattern"]').forEach(el => {
+        el.addEventListener('change', () => {
+            const hex = el.dataset.detectHex;
+            const a = AppState.detectAssign[hex];
+            if (!a) return;
+            a.magnetization.pattern = el.value;
+            // Phase G: switching INTO a sector pattern reseeds the
+            // orientation_offset to the cardinal default unless the
+            // user has explicitly typed a value.
+            reseedOffsetIfAuto(a);
+            const item = el.closest('[data-magnet-row]') ?
+                el.closest('[data-magnet-row]').parentElement : el.parentElement;
+            showMagPatternParams(item, hex, el.value);
+            applyMagnetizationStateToControls(item, hex, a.magnetization);
+            regenerateDetectYamlPreview();
+        });
+    });
+    // angle (parallel)
+    grid.querySelectorAll('input[data-role="magAngle"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'angle')));
+    // cx, cy (radial / tangential — shared inputs)
+    grid.querySelectorAll('input[data-role="magCx"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCy"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    // halbach: p / offset / cx / cy
+    grid.querySelectorAll('input[data-role="magP"]').forEach(el =>
+        el.addEventListener('input', () => updateP(el)));
+    grid.querySelectorAll('input[data-role="magOffset"]').forEach(el =>
+        el.addEventListener('input', () => updateOffset(el)));
+    grid.querySelectorAll('input[data-role="magCx2"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCy2"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    // polar_anisotropy: p / Kn / offset / cx / cy
+    grid.querySelectorAll('input[data-role="magP3"]').forEach(el =>
+        el.addEventListener('input', () => updateP(el)));
+    grid.querySelectorAll('input[data-role="magKn"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'Kn')));
+    grid.querySelectorAll('input[data-role="magOffset3"]').forEach(el =>
+        el.addEventListener('input', () => updateOffset(el)));
+    grid.querySelectorAll('input[data-role="magCx3"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCy3"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    // custom expressions
+    grid.querySelectorAll('input[data-role="magMx"]').forEach(el =>
+        el.addEventListener('input', () => updateStr(el, 'Mx')));
+    grid.querySelectorAll('input[data-role="magMy"]').forEach(el =>
+        el.addEventListener('input', () => updateStr(el, 'My')));
+    // Phase E.4: direction radios (radial / tangential share `magDir`,
+    // array patterns each have their own role since they're separate
+    // visible groups but write to the same state field).
+    const wireDirRadios = (role) => {
+        grid.querySelectorAll(`input[data-role="${role}"]`).forEach(el => {
+            el.addEventListener('change', () => {
+                if (!el.checked) return;
+                const a = AppState.detectAssign[el.dataset.detectHex];
+                if (!a || !a.magnetization) return;
+                a.magnetization.direction = el.value;
+                regenerateDetectYamlPreview();
+            });
+        });
+    };
+    wireDirRadios('magDir');
+    wireDirRadios('magDirArr');
+    wireDirRadios('magDirParr');
+    // Phase E.4: array-pattern-specific param inputs. They share the
+    // same magnetization state fields as the polar / halbach controls
+    // (p, cx, cy, orientation_offset, angle) so multiple inputs can
+    // bind to the same key — that's intentional, the UI just exposes
+    // the parameter under whichever pattern is currently visible.
+    grid.querySelectorAll('input[data-role="magPArr"]').forEach(el =>
+        el.addEventListener('input', () => updateP(el)));
+    grid.querySelectorAll('input[data-role="magCxArr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCyArr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    grid.querySelectorAll('input[data-role="magOffsetArr"]').forEach(el =>
+        el.addEventListener('input', () => updateOffset(el)));
+    grid.querySelectorAll('input[data-role="magPParr"]').forEach(el =>
+        el.addEventListener('input', () => updateP(el)));
+    grid.querySelectorAll('input[data-role="magAngleParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'angle')));
+    grid.querySelectorAll('input[data-role="magCxParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cx')));
+    grid.querySelectorAll('input[data-role="magCyParr"]').forEach(el =>
+        el.addEventListener('input', () => updateNum(el, 'cy')));
+    grid.querySelectorAll('input[data-role="magOffsetParr"]').forEach(el =>
+        el.addEventListener('input', () => updateOffset(el)));
+}
+
+// Phase D.7: initial magnetization sub-state for a chip. Parameters are
+// kept so toggling pattern doesn't lose values. Defaults follow
+// Kano 2025 §3.2 (Kn=1.6 → near-sinusoidal gap density, THD<1%).
+function defaultMagnetizationState() {
+    return {
+        pattern: 'parallel',
+        angle: 0,           // [deg]
+        p: 4,               // Phase J: number of poles (4-pole machine default)
+        Kn: 1.6,            // = R_pc / Rm
+        cx: 0,              // [m]
+        cy: 0,              // [m]
+        orientation_offset: 0,  // [deg] -- auto-seeded to -180/p when a
+                                //         sector pattern is first picked
+        // Phase G: false until the user types in the offset input directly.
+        // When false, switching pattern / editing p re-applies the
+        // cardinal-aligned -180/(2p) default. Once the user has set an
+        // explicit offset we stop overwriting it.
+        _offset_explicit: false,
+        direction: 'outward',
+        Mx: '',             // tinyexpr expression
+        My: '',
+    };
+}
+
+// Phase G: patterns whose magnetisation structure is defined in terms
+// of pole sectors. For these the natural cardinal-aligned default is
+// orientation_offset = -180°/(2p) (sector 0 centred on θ=0).
+const SECTOR_PATTERNS = new Set([
+    'halbach_continuous', 'polar_anisotropy', 'radial_array', 'parallel_array',
+]);
+
+// Phase G: recompute orientation_offset to its cardinal-aligned default
+// for the current pattern + p, unless the user has explicitly set the
+// offset (_offset_explicit = true). Called from the pattern dropdown
+// change handler and from every p input handler.
+function reseedOffsetIfAuto(assign) {
+    const m = assign && assign.magnetization;
+    if (!m || m._offset_explicit) return;
+    if (!SECTOR_PATTERNS.has(m.pattern)) return;
+    // Phase J: p = poles; sector 0 centred on θ=0 wants -180/p.
+    const p = Math.max(1, Math.round(Number(m.p) || 1));
+    m.orientation_offset = -180 / p;
+}
+
+// Phase D.7: classify whether a library entry (preset or material) is a
+// permanent magnet, i.e., whether the per-chip magnetization UI should
+// be shown when this entry is the kind selection. Checks:
+//   1. an explicit magnetization block with Br or Hc
+//   2. a B-H array containing a non-zero B at H=0 (any format)
+function isMagnetMaterial(props) {
+    if (!props || typeof props !== 'object') return false;
+    const m = props.magnetization;
+    if (m && typeof m === 'object' && (m.Br != null || m.Hc != null)) return true;
+    const bh = props['B-H'];
+    if (Array.isArray(bh) && bh.length === 2 && Array.isArray(bh[0]) && Array.isArray(bh[1])) {
+        const H = bh[0], B = bh[1];
+        for (let i = 0; i < H.length && i < B.length; i++) {
+            if (Math.abs(Number(H[i]) || 0) < 1e-6 && Math.abs(Number(B[i]) || 0) > 1e-9) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Phase D.7: physical-coordinate context from Polar Preprocess (if any
+// detection has been run) used to suggest cx/cy and R_pc defaults.
+// Returns { dx_per_px, cx_phys, cy_phys, Rm_phys, polar_origin } or
+// nulls when the modal hasn't been run.
+function detectMagnetizationContext() {
+    const pp = AppState.polarPreprocess;
+    if (!pp || !pp.detection) {
+        return { dx_per_px: 0, cx_phys: 0, cy_phys: 0, Rm_phys: 0, polar_origin: false };
+    }
+    const cur = pp.current || {};
+    const det = pp.detection || {};
+    const r_outer_px = (cur.r_outer_px > 0) ? cur.r_outer_px : (det.r_outer_px || 0);
+    const r_outer_m  = (cur.r_outer_physical > 0) ? cur.r_outer_physical : 1.0;
+    const dx_per_px = (r_outer_px > 0) ? (r_outer_m / r_outer_px) : 0;
+    // For polar save target the warp re-centres on the rotor axis so
+    // (cx, cy) = (0, 0) is the physically correct default. For
+    // cartesian save the rotor centre stays at its image-px position
+    // multiplied by the auto-derived dx.
+    const polar_origin = (cur.save_as === 'polar');
+    const cx_phys = polar_origin ? 0 : (cur.center_x || det.center_x || 0) * dx_per_px;
+    const cy_phys = polar_origin ? 0 : (cur.center_y || det.center_y || 0) * dx_per_px;
+    return { dx_per_px, cx_phys, cy_phys, Rm_phys: r_outer_m, polar_origin };
+}
+
+// Phase H: evaluate the magnetisation direction at a normalised polar
+// position (theta_rad, r_norm) in the magnet's reference frame. The
+// preview SVG works on a unit-circle schematic so cx/cy are implicitly
+// (0,0) and r_norm is normalised to the magnet outer radius. Returns
+// { angle_rad, sign } — `sign` is the alternating-pole sign factor and
+// the renderer translates it into either an arrow flip (180°) or a
+// colour change so the user can visually trace the N/S layout.
+function evalMagnetizationDirection(m, theta_rad, r_norm) {
+    if (!m || !m.pattern) return { angle_rad: 0, sign: 1 };
+    const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
+    const dirSign = (m.direction === 'inward') ? -1 : 1;
+    if (m.pattern === 'parallel') {
+        return { angle_rad: (Number(m.angle) || 0) * Math.PI / 180, sign: 1 };
+    }
+    if (m.pattern === 'radial') {
+        return { angle_rad: theta_rad, sign: dirSign };
+    }
+    if (m.pattern === 'tangential') {
+        return { angle_rad: theta_rad + Math.PI / 2, sign: dirSign };
+    }
+    if (m.pattern === 'halbach_continuous') {
+        // Phase J: p = poles; the rotation rate is p/2.
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        return { angle_rad: (p / 2) * (theta_rad - orient_rad), sign: 1 };
+    }
+    if (m.pattern === 'radial_array' || m.pattern === 'parallel_array') {
+        // Phase J: p sectors of 2π/p each.
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        const twopi = 2 * Math.PI;
+        let theta_pos = theta_rad - orient_rad;
+        theta_pos = ((theta_pos % twopi) + twopi) % twopi;
+        const pole_span = twopi / p;
+        let k_pole = Math.floor(theta_pos / pole_span);
+        if (k_pole < 0) k_pole = 0;
+        if (k_pole >= p) k_pole = p - 1;
+        const sign = ((k_pole % 2) === 0) ? dirSign : -dirSign;
+        if (m.pattern === 'radial_array') {
+            return { angle_rad: theta_rad, sign };
+        }
+        const angle_mid = (k_pole + 0.5) * pole_span + orient_rad
+                        + (Number(m.angle) || 0) * Math.PI / 180;
+        return { angle_rad: angle_mid, sign };
+    }
+    if (m.pattern === 'polar_anisotropy') {
+        // Phase J: p OJ centres on the pitch circle.
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
+        const x = r_norm * Math.cos(theta_rad);
+        const y = r_norm * Math.sin(theta_rad);
+        let Bx = 0, By = 0;
+        for (let k = 0; k < p; k++) {
+            const theta_k = 2 * Math.PI * k / p + orient_rad;
+            const sgn = (k % 2 === 0) ? 1 : -1;
+            const dx_w = x - Kn * Math.cos(theta_k);
+            const dy_w = y - Kn * Math.sin(theta_k);
+            const r2 = dx_w * dx_w + dy_w * dy_w;
+            if (r2 < 1e-20) continue;
+            Bx += sgn * (-dy_w) / r2;
+            By += sgn * dx_w / r2;
+        }
+        const norm = Math.hypot(Bx, By);
+        return {
+            angle_rad: norm > 1e-12 ? Math.atan2(By, Bx) : 0,
+            sign: 1,
+        };
+    }
+    // custom: cannot eval without a tinyexpr runtime in browser — flat
+    // schematic so the preview at least shows something.
+    return { angle_rad: 0, sign: 1 };
+}
+
+// Phase H: draw a compact schematic of the magnetisation vector field
+// into the chip's `<svg class="mag-preview">`. Red arrows mark sign=+1
+// (N-out / outward / pole 0 + direction), blue arrows sign=-1
+// (S-out / inward / alternating poles). Sector boundary dotted lines
+// are drawn for the discrete array patterns so the user can read off
+// the pole geometry at a glance.
+function renderMagnetizationPreview(svg, m) {
+    if (!svg) return;
+    const W = 80, H = 80;
+    const r_view = 1.18;
+    const scale = W / (2 * r_view);
+    // SVG y-axis is down; mathematical θ=90° should appear UP. The
+    // outer <g> applies scale(1, -1) on y so cos/sin renders match the
+    // standard polar convention.
+    const parts = [];
+    parts.push(`<g transform="translate(${W/2},${H/2}) scale(${scale},${-scale})">`);
+    parts.push('<circle cx="0" cy="0" r="1" fill="#fafafa" stroke="#aaa" stroke-width="0.02"/>');
+    if (!m || !m.pattern) {
+        parts.push('</g>');
+        svg.innerHTML = parts.join('');
+        return;
+    }
+    // Sector boundaries for the discrete patterns. Phase J: p sectors.
+    if (m.pattern === 'radial_array' || m.pattern === 'parallel_array') {
+        const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        for (let k = 0; k < p; k++) {
+            const theta_k = 2 * Math.PI * k / p + orient_rad;
+            const x = 1.05 * Math.cos(theta_k);
+            const y = 1.05 * Math.sin(theta_k);
+            parts.push(`<line x1="0" y1="0" x2="${x.toFixed(3)}" y2="${y.toFixed(3)}" stroke="#c8c8c8" stroke-width="0.015" stroke-dasharray="0.05,0.04"/>`);
+        }
+    }
+    // For polar_anisotropy, show the p OJ centres. Phase J.
+    if (m.pattern === 'polar_anisotropy') {
+        const orient_rad = (Number(m.orientation_offset) || 0) * Math.PI / 180;
+        const p = Math.max(1, Math.round(Number(m.p) || 1));
+        const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
+        for (let k = 0; k < p; k++) {
+            const theta_k = 2 * Math.PI * k / p + orient_rad;
+            const cx = Kn * Math.cos(theta_k);
+            const cy = Kn * Math.sin(theta_k);
+            if (Math.hypot(cx, cy) < r_view * 1.5) {
+                const fill = (k % 2 === 0) ? '#d63333' : '#3366cc';
+                parts.push(`<circle cx="${cx.toFixed(3)}" cy="${cy.toFixed(3)}" r="0.05" fill="${fill}"/>`);
+            }
+        }
+    }
+    // Sample arrows around the unit circle.
+    const r_sample = 0.62;
+    const arrowLen = 0.24;
+    const useDense = (m.pattern === 'halbach_continuous' || m.pattern === 'polar_anisotropy');
+    const nSamples = useDense ? 16 : 12;
+    for (let i = 0; i < nSamples; i++) {
+        const theta_deg = i * 360 / nSamples;
+        const theta_rad = theta_deg * Math.PI / 180;
+        const px = r_sample * Math.cos(theta_rad);
+        const py = r_sample * Math.sin(theta_rad);
+        const res = evalMagnetizationDirection(m, theta_rad, r_sample);
+        const angle = res.angle_rad + (res.sign < 0 ? Math.PI : 0);
+        const x2 = px + arrowLen * Math.cos(angle);
+        const y2 = py + arrowLen * Math.sin(angle);
+        const colour = (res.sign >= 0) ? '#d63333' : '#3366cc';
+        parts.push(`<line x1="${px.toFixed(3)}" y1="${py.toFixed(3)}" x2="${x2.toFixed(3)}" y2="${y2.toFixed(3)}" stroke="${colour}" stroke-width="0.035"/>`);
+        // Arrowhead — small triangle at the tip.
+        const ah = 0.08;
+        const cosA = Math.cos(angle), sinA = Math.sin(angle);
+        const tailX = x2 - ah * cosA;
+        const tailY = y2 - ah * sinA;
+        const perpX = -sinA * (ah * 0.5);
+        const perpY =  cosA * (ah * 0.5);
+        parts.push(`<polygon points="${x2.toFixed(3)},${y2.toFixed(3)} ${(tailX + perpX).toFixed(3)},${(tailY + perpY).toFixed(3)} ${(tailX - perpX).toFixed(3)},${(tailY - perpY).toFixed(3)}" fill="${colour}"/>`);
+    }
+    parts.push('</g>');
+    svg.innerHTML = parts.join('');
+}
+
+// Phase D.7: emit a magnetization: block at the given indent for the
+// per-chip state. Pattern-specific fields are emitted; Kn is converted
+// to R_pc using the Polar Preprocess context (Rm). Inline comments
+// reference the Kano 2025 §3.2 framing where relevant so users can
+// trace the parameter meaning back to the paper.
+function appendMagnetizationBlock(lines, indent, m) {
+    if (!m || !m.pattern) return;
+    lines.push(`${indent}magnetization:`);
+    const sub = `${indent}  `;
+    lines.push(`${sub}pattern: ${m.pattern}`);
+    const dir = (m.direction === 'inward') ? 'inward' : 'outward';
+    if (m.pattern === 'parallel') {
+        lines.push(`${sub}angle: ${Number(m.angle) || 0}`);
+    } else if (m.pattern === 'radial' || m.pattern === 'tangential') {
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        // Phase E.4: emit direction only when non-default so backward-
+        // compatible YAML stays minimal for the common outward case.
+        if (dir !== 'outward') lines.push(`${sub}direction: ${dir}`);
+    } else if (m.pattern === 'halbach_continuous') {
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'polar_anisotropy') {
+        const ctx = detectMagnetizationContext();
+        const Rm = ctx.Rm_phys || 1.0;
+        const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
+        const R_pc = Kn * Rm;
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}# R_pc = Kn * Rm  with Kn = ${Kn}, Rm = ${Rm} m  (Kano 2025 §3.2; Kn≈1.6 → THD<1%)`);
+        lines.push(`${sub}R_pc: ${R_pc}`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'radial_array') {
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        lines.push(`${sub}direction: ${dir}    # pole 0 is ${dir}-pointing; alternates per sector`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'parallel_array') {
+        lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
+        lines.push(`${sub}angle: ${Number(m.angle) || 0}    # extra rotation off sector mid-axis`);
+        lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
+        lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
+        lines.push(`${sub}direction: ${dir}    # pole 0 sign; alternates per sector`);
+        if (Number(m.orientation_offset) !== 0) {
+            lines.push(`${sub}orientation_offset: ${Number(m.orientation_offset)}`);
+        }
+    } else if (m.pattern === 'custom') {
+        if (m.Mx) lines.push(`${sub}Mx: "${String(m.Mx).replace(/"/g, '\\"')}"`);
+        if (m.My) lines.push(`${sub}My: "${String(m.My).replace(/"/g, '\\"')}"`);
+    }
+}
+
+// Phase D.7: pull library magnetization defaults (if any) into the
+// per-chip state when a magnet preset is freshly picked. Non-destructive:
+// keeps any field the user already edited.
+function seedMagnetizationFromLibrary(assign, libProps) {
+    const m = assign.magnetization;
+    if (!m) return;
+    // Apply Polar Preprocess context defaults first so library values can
+    // still override them (the user's library is the authoritative
+    // source, the Polar Preprocess is just a sensible fallback for the
+    // rotor centre when the library didn't say).
+    const ctx = detectMagnetizationContext();
+    if (m.cx === 0) m.cx = ctx.cx_phys;
+    if (m.cy === 0) m.cy = ctx.cy_phys;
+    const lm = libProps && libProps.magnetization;
+    if (!lm) return;
+    if (lm.pattern && m.pattern === 'parallel' && lm.pattern !== 'parallel') {
+        m.pattern = lm.pattern;
+    }
+    if (lm.angle != null && m.angle === 0) m.angle = Number(lm.angle) || 0;
+    if (lm.p != null && m.p === 4) m.p = Math.max(1, Math.round(Number(lm.p) || 4));
+    if (lm.cx != null) m.cx = Number(lm.cx) || 0;
+    if (lm.cy != null) m.cy = Number(lm.cy) || 0;
+    if (lm.orientation_offset != null && m.orientation_offset === 0) {
+        m.orientation_offset = Number(lm.orientation_offset) || 0;
+    }
+    if (lm.R_pc != null && ctx.Rm_phys > 0) {
+        m.Kn = Number(lm.R_pc) / ctx.Rm_phys;
+    }
+}
+
+// Phase D.4: regenerate the YAML preview based on the current per-chip
+// assignments + the picked library presets. The result is stashed back
+// onto AppState.lastDetectResult.generatedYaml so insertMaterialsSection
+// uses it instead of the server's stock template.
+function regenerateDetectYamlPreview() {
+    const yaml = buildDetectYamlFromAssignments();
+    AppState.lastDetectResult.generatedYaml = yaml;
+    document.getElementById('detectYamlPreview').textContent = yaml;
+    // Phase H: refresh every per-chip magnetisation vector preview.
+    document.querySelectorAll('svg.mag-preview[data-detect-hex]').forEach(svg => {
+        const hex = svg.dataset.detectHex;
+        const a = AppState.detectAssign && AppState.detectAssign[hex];
+        if (a && a.magnetization) renderMagnetizationPreview(svg, a.magnetization);
+    });
+}
+
+// Phase D.4: emit material_presets + materials blocks. Library presets
+// referenced by any chip are copied in verbatim; the rest of the
+// library's content is left untouched. Coil chips emit
+// `jz: ${sign}$J_Coil_${group}` plus a one-line comment so users can
+// trace each entry back to its group/sign decision.
+function buildDetectYamlFromAssignments() {
+    const result = AppState.lastDetectResult;
+    if (!result) return '';
+    const colors = result.colors || [];
+    const assign = AppState.detectAssign || {};
+    const presetsAll = AppState.detectLibraryPresets || {};
+    const materialsAll = AppState.detectLibraryMaterials || {};
+
+    const usedPresetNames = new Set();
+    const lines = [];
+
+    // Preserve the existing header lines from the server's template
+    // (coordinate_system + comments) so users still see the framing.
+    const stockYaml = result.yamlTemplate || '';
+    const headerLines = [];
+    for (const raw of stockYaml.split('\n')) {
+        if (raw.startsWith('materials:')) break;
+        headerLines.push(raw);
+    }
+    lines.push(...headerLines);
+
+    // Phase F.3: scan the assignments for every Coil group letter used.
+    // Each group is paired with a J_Coil_<letter> entry in the
+    // variables: block so the $J_Coil_<letter> tokens emitted under
+    // materials:.jz actually resolve. insertMaterialsSection merges this
+    // into the editor doc's existing variables non-destructively.
+    const coilGroupsUsed = new Set();
+    for (const c of colors) {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const a = assign[hex];
+        if (a && a.kind === 'Coil') coilGroupsUsed.add(a.coilGroup || 'A');
+    }
+    if (coilGroupsUsed.size > 0) {
+        lines.push('variables:');
+        const sorted = Array.from(coilGroupsUsed).sort();
+        for (const g of sorted) {
+            lines.push(`  J_Coil_${g}: 1.0e6    # Coil-${g} current density [A/m^2] — adjust to match your drive`);
+        }
+        lines.push('');
+    }
+
+    // Phase E.3: material_presets are NOT emitted inline. server.js
+    // already merges AppState.selectedLibrary into the config YAML at
+    // analysis launch via mergeLibraryIntoConfig (server.js ~L189), so
+    // copying the preset definitions here would just produce stale
+    // duplicates that drift from the library file the user edits in
+    // the Library Manager. We emit a one-line note instead pointing
+    // at which presets the materials: block depends on, and the
+    // active library that resolves them.
+    const referencedPresets = [];
+    for (const c of colors) {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const kind = assign[hex] && assign[hex].kind;
+        if (kind && kind !== 'none' && kind !== 'Coil' && presetsAll[kind]) {
+            if (!usedPresetNames.has(kind)) {
+                usedPresetNames.add(kind);
+                referencedPresets.push(kind);
+            }
+        }
+    }
+    if (referencedPresets.length > 0) {
+        const lib = AppState.detectLibraryName || '(none)';
+        lines.push(`# Referenced presets (resolved at run time by merging the active`);
+        lines.push(`# material library "${lib}"): ${referencedPresets.join(', ')}.`);
+        lines.push('');
+    }
+
+    // Now the materials: block. For each detected colour we either copy
+    // the library material verbatim (kind in materialsAll) with rgb
+    // overridden to the detected value, reference a preset (kind in
+    // presetsAll), emit a Coil expression, or fall back to the default.
+    lines.push('materials:');
+    for (const c of colors) {
+        const [r, g, b] = c.rgb;
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const a = assign[hex] || { kind: 'none' };
+        const ratio = (c.ratio * 100).toFixed(1);
+        if (a.kind === 'Coil') {
+            const grp = a.coilGroup || 'A';
+            const sign = (a.coilSign === '-') ? '-' : '';
+            const dir = (a.coilSign === '-') ? '-' : '+';
+            lines.push(`  coil_${grp}_${sign === '-' ? 'neg' : 'pos'}_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # coverage: ${ratio}%`);
+            lines.push(`    jz: ${sign}$J_Coil_${grp}    # Coil-${grp}, J direction: ${dir}Z`);
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
+        } else if (a.kind && a.kind !== 'none' && presetsAll[a.kind]) {
+            lines.push(`  material_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    preset: ${a.kind}    # coverage: ${ratio}%`);
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
+            // Phase D.7: append per-chip magnetization block when the
+            // selected preset is a magnet. This overrides the preset's
+            // own magnetization direction with the user's choice while
+            // keeping Br / mu_r etc. inherited from the preset.
+            if (isMagnetMaterial(presetsAll[a.kind])) {
+                appendMagnetizationBlock(lines, '    ', a.magnetization);
+            }
+        } else if (a.kind && a.kind !== 'none' && materialsAll[a.kind]) {
+            // Library material picked directly (no preset): copy props
+            // verbatim but override rgb to the detected colour.
+            lines.push(`  material_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            const props = materialsAll[a.kind] || {};
+            const skipMag = isMagnetMaterial(props);
+            for (const k of Object.keys(props)) {
+                if (k === 'rgb') continue;
+                // Phase D.7: skip the library's magnetization block; we
+                // emit the user-edited one explicitly below.
+                if (skipMag && k === 'magnetization') continue;
+                const sub = jsyaml.dump({ [k]: props[k] }, { indent: 2, lineWidth: -1 }).replace(/\n$/, '');
+                for (const ln of sub.split('\n')) lines.push('    ' + ln);
+            }
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
+            if (skipMag) appendMagnetizationBlock(lines, '    ', a.magnetization);
+        } else {
+            lines.push(`  material_${hex.slice(1)}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # Set permeability  (coverage: ${ratio}%)`);
+            lines.push(`    jz: 0.0`);
+            if (c.antialias === true) lines.push(`    anti_aliasing: true`);
+        }
+    }
+
+    // Phase L: auto-emit flux_linkage entries for every Coil group that
+    // has BOTH a +sign and a -sign chip assigned. The solver's
+    // material_a / material_b mode computes mean(Az over +) − mean(Az
+    // over −) per step, which is exactly the per-phase flux linkage
+    // Φ_X of a synchronous machine. The solver caveat: this mode is
+    // cartesian-only -- for polar coordinates the entries are still
+    // emitted (the user often switches coords later), but the solver
+    // will print a warning and the value stays zero. We surface that
+    // in an inline comment so the user is not surprised.
+    const coilByGroup = {};   // { 'A': { pos: '#hex', neg: '#hex' }, ... }
+    for (const c of colors) {
+        const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
+        const a = assign[hex];
+        if (!a || a.kind !== 'Coil') continue;
+        const grp = a.coilGroup || 'A';
+        if (!coilByGroup[grp]) coilByGroup[grp] = { pos: null, neg: null };
+        if (a.coilSign === '-') coilByGroup[grp].neg = hex;
+        else                    coilByGroup[grp].pos = hex;
+    }
+    const groupsWithPair = Object.keys(coilByGroup)
+        .filter(g => coilByGroup[g].pos && coilByGroup[g].neg)
+        .sort();
+    if (groupsWithPair.length > 0) {
+        lines.push('');
+        lines.push('# Flux linkage Phi_Coil_X = ⟨Az⟩(+X pixels) - ⟨Az⟩(-X pixels).');
+        lines.push('# Cartesian uses uniform per-cell weight; polar uses the r·dr·dθ');
+        lines.push('# Jacobian, so the average is area-weighted in either coord system.');
+        lines.push('flux_linkage:');
+        for (const g of groupsWithPair) {
+            const posHex = coilByGroup[g].pos.slice(1);
+            const negHex = coilByGroup[g].neg.slice(1);
+            lines.push(`  - name: Phi_Coil_${g}`);
+            lines.push(`    material_a: coil_${g}_pos_${posHex}`);
+            lines.push(`    material_b: coil_${g}_neg_${negHex}`);
+        }
+    }
+
+    // Preserve the trailing AA-blends comment block from the stock
+    // template so the user still has the AA diagnostic info.
+    const aaIdx = stockYaml.indexOf('# Anti-aliasing blends detected');
+    if (aaIdx >= 0) {
+        lines.push('');
+        lines.push(stockYaml.slice(aaIdx).replace(/\n$/, ''));
+    }
+    return lines.join('\n');
 }
 
 async function rerunDetect() {
@@ -1045,12 +2175,526 @@ function closeDetectColorsModal() {
     document.getElementById('detectColorsModal').style.display = 'none';
 }
 
-async function copyDetectedYaml() {
-    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
+// ============================================================
+// Phase I: Magnetization full-image preview modal
+// ============================================================
+// Opens a side-by-side view of the loaded image with sampled M
+// vector arrows overlaid. The arrows come from parsing the current
+// editor YAML for materials that carry a magnetization block (preset
+// references are resolved through AppState.selectedLibrary the same
+// way the WebUI server does at analysis launch, so the preview
+// matches what the solver will see).
+
+AppState.magPreview = {
+    materials: [],   // resolved magnet entries [{ name, rgb:[r,g,b], magnetization }]
+    image: null,     // HTMLImageElement
+    pixels: null,    // ImageData
+    coordSystem: 'cartesian',
+    dx: 1e-3,
+    dy: 1e-3,
+};
+
+async function openMagnetizationPreviewModal() {
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'Select an image first', 'error');
         return;
     }
+    if (!AppState.aceEditor) {
+        showStatus('solverStatus', 'YAML editor not available', 'error');
+        return;
+    }
+    // Parse YAML
+    let doc;
     try {
-        await navigator.clipboard.writeText(AppState.lastDetectResult.yamlTemplate);
+        doc = jsyaml.load(AppState.aceEditor.getValue()) || {};
+    } catch (e) {
+        showStatus('solverStatus', `YAML parse error: ${e.message}`, 'error');
+        return;
+    }
+    // Resolve presets via the active library exactly like server.js
+    // mergeLibraryIntoConfig does at run time.
+    let presets = Object.assign({}, doc.material_presets || {});
+    if (AppState.selectedLibrary) {
+        try {
+            const r = await fetch(`/api/material-libraries/${encodeURIComponent(AppState.selectedLibrary)}?userId=${AppState.userId}`);
+            if (r.ok) {
+                const lib = jsyaml.load(await r.text()) || {};
+                const libPresets = Object.assign({}, lib.material_presets || {});
+                for (const [n, p] of Object.entries(lib.materials || {})) {
+                    const { rgb: _rgb, ...rest } = (p || {});
+                    libPresets[n] = rest;
+                }
+                presets = Object.assign({}, libPresets, presets);
+            }
+        } catch (_) { /* best effort */ }
+    }
+    // Find magnet materials (rgb + magnetization carrying Br/Hc or B-H remanence).
+    const magnetMaterials = [];
+    const materials = doc.materials || {};
+    for (const [name, raw] of Object.entries(materials)) {
+        let props = raw || {};
+        if (props.preset && presets[props.preset]) {
+            props = Object.assign({}, presets[props.preset], props);
+        }
+        if (!Array.isArray(props.rgb) || props.rgb.length < 3) continue;
+        const m = props.magnetization;
+        if (!m || typeof m !== 'object') continue;
+        if (m.Br == null && m.Hc == null && !isMagnetMaterial(props)) continue;
+        magnetMaterials.push({
+            name,
+            rgb: [Number(props.rgb[0]) | 0, Number(props.rgb[1]) | 0, Number(props.rgb[2]) | 0],
+            magnetization: m,
+        });
+    }
+    AppState.magPreview.materials = magnetMaterials;
+    AppState.magPreview.coordSystem = (doc.coordinate_system === 'polar') ? 'polar' : 'cartesian';
+    AppState.magPreview.dx = (doc.mesh && Number(doc.mesh.dx)) || 1e-3;
+    AppState.magPreview.dy = (doc.mesh && Number(doc.mesh.dy)) || AppState.magPreview.dx;
+    // Populate sidebar list
+    const matList = document.getElementById('magPreviewMaterialList');
+    if (magnetMaterials.length === 0) {
+        matList.innerHTML = '<div style="color:#856404; background:#fff3cd; padding:6px 8px; border-radius:3px;">No magnet materials found in the current YAML (need rgb + magnetization block).</div>';
+    } else {
+        matList.innerHTML = magnetMaterials.map(mm => {
+            const hex = '#' + mm.rgb.map(v => v.toString(16).padStart(2, '0')).join('');
+            const pat = (mm.magnetization && mm.magnetization.pattern) || '?';
+            return `<div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
+                <div style="width:14px; height:14px; background:${hex}; border:1px solid #aaa;"></div>
+                <span style="font-family:monospace; font-size:0.78rem;">${hex}</span>
+                <span style="color:#495057;">${mm.name}</span>
+                <span style="color:#6c757d;">(${pat})</span>
+            </div>`;
+        }).join('');
+    }
+    document.getElementById('magPreviewStatus').textContent =
+        `coord_system: ${AppState.magPreview.coordSystem}  ·  ${magnetMaterials.length} magnet material(s)`;
+    // Show modal + attach zoom-pan (idempotent)
+    document.getElementById('magnetizationPreviewModal').style.display = 'flex';
+    attachZoomPan(
+        document.getElementById('magPreviewContainer'),
+        document.getElementById('magPreviewZoomStage'),
+        {
+            indicatorEl: document.getElementById('magPreviewZoomIndicator'),
+            onScaleChange: () => { /* arrows are in image-coord space; no rescale needed */ },
+        }
+    );
+    // Load image into the preview + into a canvas for pixel sampling
+    const imgEl = document.getElementById('magPreviewImg');
+    await new Promise((resolve, reject) => {
+        imgEl.onload = () => {
+            // Mirror onto an off-screen canvas so we can read pixels.
+            const canvas = document.createElement('canvas');
+            canvas.width = imgEl.naturalWidth;
+            canvas.height = imgEl.naturalHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(imgEl, 0, 0);
+            AppState.magPreview.image = imgEl;
+            try {
+                AppState.magPreview.pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            } catch (e) {
+                AppState.magPreview.pixels = null;
+            }
+            const svg = document.getElementById('magPreviewOverlay');
+            svg.setAttribute('viewBox', `0 0 ${imgEl.naturalWidth} ${imgEl.naturalHeight}`);
+            resolve();
+        };
+        imgEl.onerror = () => reject(new Error('image load failed'));
+        imgEl.src = `/uploads/${AppState.userId}/${AppState.uploadedImageFilename}?t=${Date.now()}`;
+    });
+    renderMagnetizationFieldOverlay();
+}
+
+function closeMagnetizationPreviewModal() {
+    document.getElementById('magnetizationPreviewModal').style.display = 'none';
+    AppState.magPreview.image = null;
+    AppState.magPreview.pixels = null;
+}
+
+// Phase I: paint sampled M-vector arrows onto the modal's SVG overlay
+// based on AppState.magPreview state. Cheap to re-run, so the user
+// can tweak grid stride / arrow scale without reloading the image.
+function renderMagnetizationFieldOverlay() {
+    const pix = AppState.magPreview.pixels;
+    const mats = AppState.magPreview.materials || [];
+    const svg = document.getElementById('magPreviewOverlay');
+    if (!svg) return;
+    if (!pix || mats.length === 0) {
+        svg.innerHTML = '';
+        return;
+    }
+    const W = pix.width, H = pix.height;
+    const data = pix.data;
+    const stride = Math.max(2, parseInt(document.getElementById('magPreviewStride').value, 10) || 12);
+    const arrowScale = Math.max(0.1, parseFloat(document.getElementById('magPreviewArrowScale').value) || 1.0);
+    const arrowLen = stride * 0.6 * arrowScale;
+    const isPolar = (AppState.magPreview.coordSystem === 'polar');
+    const dx = AppState.magPreview.dx || 1e-3;
+    const dy = AppState.magPreview.dy || dx;
+    // Index the magnet materials by packed RGB for O(1) per-pixel lookup.
+    const matByRgb = new Map();
+    for (const mm of mats) {
+        const key = (mm.rgb[0] << 16) | (mm.rgb[1] << 8) | mm.rgb[2];
+        matByRgb.set(key, mm);
+    }
+    const parts = [];
+    let arrowCount = 0;
+    for (let j = Math.floor(stride / 2); j < H; j += stride) {
+        for (let i = Math.floor(stride / 2); i < W; i += stride) {
+            const p = (j * W + i) * 4;
+            const key = (data[p] << 16) | (data[p + 1] << 8) | data[p + 2];
+            const mm = matByRgb.get(key);
+            if (!mm) continue;
+            // Convert image pixel (i, j) to a physical (x, y) in
+            // metres. For cartesian: image y is down, analysis y is up
+            // (the solver does cv::flip), so flip j here too.
+            // For polar: the warped image's i,j IS the rotor frame (r
+            // along one axis, θ along the other); we treat them as
+            // direct (x_norm, y_norm) for vector evaluation since the
+            // magnetization block's cx,cy are also rotor-frame.
+            const x_phys = i * dx;
+            const y_phys = (H - 1 - j) * dy;
+            const m = mm.magnetization;
+            const cx = Number(m.cx) || 0;
+            const cy = Number(m.cy) || 0;
+            const r_local = Math.hypot(x_phys - cx, y_phys - cy);
+            const theta_local = Math.atan2(y_phys - cy, x_phys - cx);
+            // Use unit-circle-normalised r for polar_anisotropy so its
+            // Kn-based Biot-Savart computation works regardless of
+            // physical scale.
+            const Rm_estimate = Math.max(r_local, 1e-9);
+            const res = evalMagnetizationDirection(m, theta_local,
+                r_local / (Number(m.R_pc) || Rm_estimate));
+            if (!res) continue;
+            const angle = res.angle_rad + (res.sign < 0 ? Math.PI : 0);
+            // Render in IMAGE coords (y down) so the arrow visually
+            // matches the image. Physical +y is image -y.
+            const cos_a = Math.cos(angle);
+            const sin_a = Math.sin(angle);
+            const x_tip = i + arrowLen * cos_a;
+            const y_tip = j - arrowLen * sin_a;   // flip y for SVG
+            const colour = (res.sign >= 0) ? '#d63333' : '#3366cc';
+            parts.push(`<line x1="${i}" y1="${j}" x2="${x_tip.toFixed(2)}" y2="${y_tip.toFixed(2)}" stroke="${colour}" stroke-width="${(stride * 0.08).toFixed(2)}" stroke-linecap="round" opacity="0.9"/>`);
+            // Arrowhead triangle
+            const ah = arrowLen * 0.33;
+            const tail_x = x_tip - ah * cos_a;
+            const tail_y = y_tip + ah * sin_a;   // image-coord flip
+            const perp_x =  sin_a * ah * 0.5;
+            const perp_y =  cos_a * ah * 0.5;
+            parts.push(`<polygon points="${x_tip.toFixed(2)},${y_tip.toFixed(2)} ${(tail_x + perp_x).toFixed(2)},${(tail_y + perp_y).toFixed(2)} ${(tail_x - perp_x).toFixed(2)},${(tail_y - perp_y).toFixed(2)}" fill="${colour}" opacity="0.9"/>`);
+            arrowCount++;
+        }
+    }
+    svg.innerHTML = parts.join('');
+    document.getElementById('magPreviewStatus').textContent =
+        `coord_system: ${AppState.magPreview.coordSystem}  ·  ${mats.length} material(s)  ·  ${arrowCount} arrow(s) painted (stride=${stride}px${isPolar ? ', polar' : ''})`;
+}
+
+// ============================================================
+// Uniform-colour quantization filter modal (Phase 5c.2)
+// ============================================================
+// Triggered from the warning banner on Detect Colors modal (or any other
+// caller that knows there's a loaded image). Live preview is generated
+// server-side via /api/preprocess-filter/quantize?preview=true with a
+// 350 ms debounce on slider changes; Apply persists a non-preview output
+// and swaps it in as the loaded image.
+AppState.quantizeFilter = {
+    sourceFilename: null,
+    previewFilename: null,
+    busy: false,
+    debounceTimer: null,
+    lastResult: null,
+    closing: false,
+};
+
+async function openQuantizeFilterModal() {
+    const qf = AppState.quantizeFilter;
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'No image selected', 'error');
+        return;
+    }
+    qf.sourceFilename = AppState.uploadedImageFilename;
+    qf.previewFilename = null;
+    qf.lastResult = null;
+    qf.closing = false;
+
+    const modal = document.getElementById('quantizeFilterModal');
+    modal.style.display = 'flex';
+
+    // Attach zoom/pan once and reset to 100 %.
+    const zp = attachZoomPan(
+        document.getElementById('qfilterPreviewContainer'),
+        document.getElementById('qfilterZoomStage'),
+        { indicatorEl: document.getElementById('qfilterZoomIndicator') }
+    );
+    if (zp) zp.reset();
+
+    // Initialise preview to source so the user sees the un-filtered image
+    // before the first server round-trip lands.
+    document.getElementById('qfilterPreviewImg').src =
+        `/uploads/${AppState.userId}/${qf.sourceFilename}?t=${Date.now()}`;
+    document.getElementById('qfilterStatus').textContent = '';
+    document.getElementById('qfilterFooterNote').textContent =
+        `source: ${qf.sourceFilename}`;
+    bindQuantizeFilterControls();
+
+    // Fire an initial preview render with the default slider values.
+    scheduleQuantizePreview(50);
+}
+
+function closeQuantizeFilterModal() {
+    const qf = AppState.quantizeFilter;
+    qf.closing = true;
+    if (qf.debounceTimer) { clearTimeout(qf.debounceTimer); qf.debounceTimer = null; }
+    document.getElementById('quantizeFilterModal').style.display = 'none';
+    document.getElementById('qfilterPreviewImg').src = '';
+}
+
+// Wire range<->number pairs and slider->preview debounce. Idempotent.
+function bindQuantizeFilterControls() {
+    const pairs = [
+        ['qfilterThresholdRange', 'qfilterThreshold'],
+        ['qfilterNRange',         'qfilterN'],
+        ['qfilterMinDistRange',   'qfilterMinDist'],
+        ['qfilterDespeckleRange', 'qfilterDespeckle'],
+        ['qfilterMinIslandRange', 'qfilterMinIsland'],
+        ['qfilterBilSpaceRange',  'qfilterBilSpace'],
+        ['qfilterBilColorRange',  'qfilterBilColor'],
+    ];
+    for (const [rangeId, numId] of pairs) {
+        const r = document.getElementById(rangeId);
+        const n = document.getElementById(numId);
+        if (r._qfBound) continue;
+        r.addEventListener('input', () => {
+            n.value = r.value;
+            scheduleQuantizePreview();
+        });
+        n.addEventListener('input', () => {
+            const v = Number(n.value);
+            if (Number.isFinite(v)) r.value = v;
+            scheduleQuantizePreview();
+        });
+        r._qfBound = true;
+    }
+}
+
+function scheduleQuantizePreview(delayMs = 350) {
+    const qf = AppState.quantizeFilter;
+    if (qf.debounceTimer) clearTimeout(qf.debounceTimer);
+    qf.debounceTimer = setTimeout(() => runQuantizePreview(), delayMs);
+}
+
+async function runQuantizePreview() {
+    const qf = AppState.quantizeFilter;
+    if (qf.busy || qf.closing || !qf.sourceFilename) return;
+    qf.busy = true;
+    const loading = document.getElementById('qfilterLoading');
+    const status = document.getElementById('qfilterStatus');
+    loading.classList.add('active');
+    status.textContent = 'Generating preview…';
+
+    const params = currentQuantizeParams();
+    try {
+        const res = await fetch('/api/preprocess-filter/quantize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: qf.sourceFilename,
+                rareThreshold: params.rareThreshold,
+                nTargets: params.nTargets,
+                minTargetDist: params.minTargetDist,
+                despeckleRadius: params.despeckleRadius,
+                minIslandSize:   params.minIslandSize,
+                bilateralSigmaSpatial: params.bilateralSigmaSpatial,
+                bilateralSigmaColor:   params.bilateralSigmaColor,
+                preview: true,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'preview failed');
+        qf.previewFilename = res.filename;
+        qf.lastResult = res;
+        const img = document.getElementById('qfilterPreviewImg');
+        // Bust the cache: the preview file is overwritten on each request
+        // so we have to force the browser to re-fetch the same URL.
+        img.src = `${res.path}?t=${Date.now()}`;
+        renderQuantizeTargetChips(res.targets || []);
+        document.getElementById('qfilterTargetCount').textContent =
+            `(N=${res.n_targets_used}, source uniqueColors=${res.unique_colors_in.toLocaleString()})`;
+        status.textContent = '';
+    } catch (err) {
+        status.textContent = `Error: ${err.message}`;
+    } finally {
+        qf.busy = false;
+        loading.classList.remove('active');
+    }
+}
+
+function currentQuantizeParams() {
+    return {
+        rareThreshold:         Math.max(0, Number(document.getElementById('qfilterThreshold').value || 0)) / 100,
+        nTargets:              Math.max(1, Number(document.getElementById('qfilterN').value || 8)),
+        minTargetDist:         Math.max(0, Number(document.getElementById('qfilterMinDist').value || 30)),
+        despeckleRadius:       Math.max(0, Math.min(10, Math.floor(Number(document.getElementById('qfilterDespeckle').value || 1)))),
+        minIslandSize:         Math.max(0, Math.min(200, Math.floor(Number(document.getElementById('qfilterMinIsland').value || 0)))),
+        bilateralSigmaSpatial: Math.max(0, Number(document.getElementById('qfilterBilSpace').value || 0)),
+        bilateralSigmaColor:   Math.max(1, Number(document.getElementById('qfilterBilColor').value || 20)),
+    };
+}
+
+function renderQuantizeTargetChips(targets) {
+    const host = document.getElementById('qfilterTargetChips');
+    host.innerHTML = '';
+    targets.forEach(t => {
+        const [r, g, b] = t.rgb;
+        const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+        const chip = document.createElement('span');
+        chip.className = 'qfilter-chip';
+        chip.innerHTML = `
+            <span class="qfilter-chip-swatch" style="background:${hex}"></span>
+            <span>${hex}</span>
+            <span style="color:#6c757d;">${(t.ratio * 100).toFixed(2)}%</span>`;
+        host.appendChild(chip);
+    });
+}
+
+async function applyQuantizeFilter() {
+    const qf = AppState.quantizeFilter;
+    if (qf.busy || !qf.sourceFilename) return;
+    qf.busy = true;
+    const status = document.getElementById('qfilterStatus');
+    const applyBtn = document.getElementById('qfilterApplyBtn');
+    applyBtn.disabled = true;
+    status.textContent = 'Generating and saving image…';
+    const params = currentQuantizeParams();
+    try {
+        const res = await fetch('/api/preprocess-filter/quantize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: qf.sourceFilename,
+                rareThreshold: params.rareThreshold,
+                nTargets: params.nTargets,
+                minTargetDist: params.minTargetDist,
+                despeckleRadius: params.despeckleRadius,
+                minIslandSize:   params.minIslandSize,
+                bilateralSigmaSpatial: params.bilateralSigmaSpatial,
+                bilateralSigmaColor:   params.bilateralSigmaColor,
+                preview: false,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'apply failed');
+
+        // Swap the new filtered image in as the loaded image and re-render
+        // the YAML/material flows that depend on it.
+        AppState.uploadedImageFilename = res.filename;
+        await refreshImageList();
+        const sel = document.getElementById('imageSelect');
+        if (sel) sel.value = res.filename;
+        await loadSelectedImage();
+
+        showStatus('solverStatus',
+            `Color uniformization filter applied: ${res.filename} (${res.n_targets_used} colors)`,
+            'success');
+        closeQuantizeFilterModal();
+        // If the Detect Colors modal is still open, rerun it so the user
+        // sees the new "noise" count drop to ~the materials count.
+        const dm = document.getElementById('detectColorsModal');
+        if (dm && dm.style.display === 'flex') {
+            await detectColors();
+        }
+    } catch (err) {
+        status.textContent = `Error: ${err.message}`;
+    } finally {
+        qf.busy = false;
+        applyBtn.disabled = false;
+    }
+}
+
+// Helper for runAutoTune(): set both the range and the number input of
+// a slider pair to the same value (without triggering the input event
+// 5 times in a row, which would re-fire the preview debounce).
+function setQuantizeSlider(numId, rangeId, value) {
+    const num = document.getElementById(numId);
+    const rng = document.getElementById(rangeId);
+    if (num) num.value = value;
+    if (rng) rng.value = value;
+}
+
+async function runAutoTune() {
+    const qf = AppState.quantizeFilter;
+    if (qf.busy || !qf.sourceFilename) return;
+    qf.busy = true;
+    const status   = document.getElementById('qfilterStatus');
+    const tuneBtn  = document.getElementById('qfilterAutoTuneBtn');
+    const applyBtn = document.getElementById('qfilterApplyBtn');
+    tuneBtn.disabled = true;
+    applyBtn.disabled = true;
+    status.textContent = 'Optimising (this may take a few seconds)…';
+
+    // Start the search from the user's current slider values so they can
+    // pre-seed the optimiser. N and rareThreshold are held fixed by the
+    // backend (they define "what counts as a material" -- a user
+    // decision -- so optimising them tends to drive the output toward
+    // the dominant background colour).
+    const cur = currentQuantizeParams();
+    const seed = [
+        cur.minTargetDist,
+        cur.despeckleRadius,
+        cur.bilateralSigmaSpatial,
+        cur.bilateralSigmaColor,
+        cur.minIslandSize,
+    ];
+
+    try {
+        const res = await fetch('/api/preprocess-filter/auto-tune', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: qf.sourceFilename,
+                nTargets:      cur.nTargets,
+                rareThreshold: cur.rareThreshold,
+                maxEvals:      60,
+                subsampleSize: 256,
+                initial:       seed,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'auto-tune failed');
+
+        const p = res.params;
+        setQuantizeSlider('qfilterMinDist',   'qfilterMinDistRange',   Math.round(p.minTargetDist));
+        setQuantizeSlider('qfilterDespeckle', 'qfilterDespeckleRange', p.despeckleRadius);
+        setQuantizeSlider('qfilterMinIsland', 'qfilterMinIslandRange', p.minIslandSize);
+        setQuantizeSlider('qfilterBilSpace',  'qfilterBilSpaceRange',  p.bilateralSigmaSpatial.toFixed(1));
+        setQuantizeSlider('qfilterBilColor',  'qfilterBilColorRange',  Math.round(p.bilateralSigmaColor));
+
+        const before = res.score_initial;
+        const after  = res.score_final;
+        const pct = before > 0 ? Math.round(100 * (1 - after / before)) : 0;
+        status.textContent =
+            `Auto-tune: scattered noise ${(before * 100).toFixed(2)}% → ${(after * 100).toFixed(2)}% ` +
+            `(${pct}% reduction, ${res.evals} evals, ${res.elapsed_ms} ms, subsample ${res.subsample_w}×${res.subsample_h}).`;
+        // Re-render the preview at full resolution with the new params.
+        scheduleQuantizePreview(50);
+    } catch (err) {
+        status.textContent = `Auto-tune error: ${err.message}`;
+    } finally {
+        qf.busy = false;
+        tuneBtn.disabled = false;
+        applyBtn.disabled = false;
+    }
+}
+
+async function copyDetectedYaml() {
+    if (!AppState.lastDetectResult) return;
+    // Phase D.4: copy the regenerated YAML (assignments + presets) when
+    // available so the clipboard matches the preview.
+    const text = AppState.lastDetectResult.generatedYaml ||
+                 AppState.lastDetectResult.yamlTemplate || '';
+    if (!text) return;
+    try {
+        await navigator.clipboard.writeText(text);
         showStatus('solverStatus', 'YAML template copied to clipboard', 'success');
     } catch (e) {
         showStatus('solverStatus', 'Clipboard write failed', 'error');
@@ -1058,9 +2702,12 @@ async function copyDetectedYaml() {
 }
 
 function insertMaterialsSection() {
-    if (!AppState.lastDetectResult || !AppState.lastDetectResult.yamlTemplate) {
-        return;
-    }
+    if (!AppState.lastDetectResult) return;
+    // Phase D.4: prefer the regenerated YAML (carries the per-chip
+    // assignments + library presets) over the server's stock template.
+    const sourceYaml = AppState.lastDetectResult.generatedYaml ||
+                       AppState.lastDetectResult.yamlTemplate || '';
+    if (!sourceYaml) return;
     if (!AppState.aceEditor) {
         showStatus('solverStatus', 'Config editor not initialized', 'error');
         return;
@@ -1068,7 +2715,7 @@ function insertMaterialsSection() {
 
     try {
         // Parse detected materials
-        const detectedDoc = jsyaml.load(AppState.lastDetectResult.yamlTemplate);
+        const detectedDoc = jsyaml.load(sourceYaml);
         if (!detectedDoc || !detectedDoc.materials) {
             showStatus('solverStatus', 'No materials found in detected template', 'error');
             return;
@@ -1085,8 +2732,50 @@ function insertMaterialsSection() {
 
         // Replace only the materials section
         currentDoc.materials = detectedDoc.materials;
+        // Phase E.3: material_presets are intentionally NOT merged here
+        // — the server merges AppState.selectedLibrary at run time, so
+        // inlining the presets would create a stale copy of the library
+        // contents inside every config file. The user keeps the library
+        // YAML authoritative.
+        // Phase F.3: merge detected variables (J_Coil_<group>) into the
+        // editor's existing variables non-destructively. The user's
+        // previously-set values win; only missing keys are added so
+        // re-running Detect Colors doesn't clobber drive-tuned current
+        // densities the user already set.
+        if (detectedDoc.variables && typeof detectedDoc.variables === 'object') {
+            if (!currentDoc.variables || typeof currentDoc.variables !== 'object') {
+                currentDoc.variables = {};
+            }
+            for (const k of Object.keys(detectedDoc.variables)) {
+                if (currentDoc.variables[k] == null) {
+                    currentDoc.variables[k] = detectedDoc.variables[k];
+                }
+            }
+        }
+        // Phase L: merge auto-generated Phi_Coil_X flux_linkage entries
+        // into the editor's existing array by name. Re-running Detect
+        // Colors after the user tuned an entry won't reset that entry,
+        // and the entries from new Coil chips get appended.
+        if (Array.isArray(detectedDoc.flux_linkage) && detectedDoc.flux_linkage.length > 0) {
+            if (!Array.isArray(currentDoc.flux_linkage)) currentDoc.flux_linkage = [];
+            const existing = new Set(
+                currentDoc.flux_linkage.map(e => (e && e.name) || '').filter(Boolean));
+            for (const entry of detectedDoc.flux_linkage) {
+                if (entry && entry.name && !existing.has(entry.name)) {
+                    currentDoc.flux_linkage.push(entry);
+                    existing.add(entry.name);
+                }
+            }
+        }
 
-        const merged = jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 });
+        // Phase BA: jsyaml.dump strips every comment from the document,
+        // including the polar / cartesian Insert YAML's hint block. Re-
+        // append it so the user keeps seeing the optional-controls
+        // section after every Detect Colors round-trip. ensureSolverHintBlock
+        // is idempotent so running Detect Colors twice in a row doesn't
+        // duplicate the block.
+        const merged = ensureSolverHintBlock(
+            jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 }));
         AppState.aceEditor.setValue(merged, -1);
 
         closeDetectColorsModal();
@@ -1095,6 +2784,1596 @@ function insertMaterialsSection() {
     } catch (e) {
         showStatus('solverStatus', `Insert failed: ${e.message}`, 'error');
     }
+}
+
+// =====================================================
+// Polar Preprocess Modal (v1.5) — Phase 5c (skeleton)
+// =====================================================
+// Phase 5c implements: state holder, open/close, read-only overlay drawn
+// from the auto-detect response, numeric input one-way sync (state -> input,
+// no edit handling yet), color chip list with non-functional dropdowns.
+// Phase 5d adds mouse/wheel/key editing + backend color_groups; Phase 5e
+// adds preview + save & insert. Keep this section self-contained.
+
+AppState.polarPreprocess = {
+    sourceFilename: null,
+    imageNaturalWidth: 0,
+    imageNaturalHeight: 0,
+    detection: null,
+    current: {
+        center_x: 0, center_y: 0,
+        // r_inner_px is the *warp* inner radius. Defaults to 0 so the
+        // polar warp covers the entire machine; the detected air gap is
+        // tracked separately in air_gap_px and shown only as a yellow
+        // dashed visual marker (the user can copy it to r_inner via the
+        // dropdown button if they want to cut the inside off).
+        r_inner_px: 0, r_outer_px: 0,
+        air_gap_px: 0,
+        // Phase D.3: user-adjustable offset on top of the dropdown-selected
+        // dip radius. The yellow dashed marker is rendered at
+        // (air_gap_px + air_gap_offset_px). Reset to 0 on dropdown change
+        // or re-detect. Can be negative.
+        air_gap_offset_px: 0,
+        // Phase D.3: when true and save_as === 'polar', Insert YAML emits
+        // a transient.slides: skeleton anchored at the effective air gap.
+        air_gap_as_slide: false,
+        air_gap_slide_side: 'outside',     // 'inside' | 'outside'
+        air_gap_slide_pixels_per_step: 1,
+        theta_start: 0, theta_end: 2 * Math.PI,
+        is_sector: false,
+        nr: 0, ntheta: 0,
+        snap_ntheta: true,
+        r_orientation: 'horizontal',
+        r_outer_physical: 1.0,
+        save_as: 'polar',
+    },
+    lastPreview: { filename: null, path: null, polar_domain: null, width: 0, height: 0 },
+    lastSaved:   null,  // Set by Save image; { filename, path, polar_domain, width, height }
+    isDirty: false,
+    isWarping: false,
+    isDetecting: false,
+    _debounceTimer: null,
+    _activeDrag: null,
+    _rafScheduled: false,
+};
+
+// ============================================================
+// Reusable zoom + pan helper (used by the Polar Preprocess preview and the
+// uniform-colour Filter preview). Wheel zooms around the cursor, middle
+// mouse drag pans, double-click resets. SVG overlays still get correct
+// image-pixel coords through getScreenCTM().inverse() because CSS
+// transforms are reflected in the SVG CTM, so handle hit-tests don't need
+// any adjustment when zoomed.
+function attachZoomPan(containerEl, stageEl, opts = {}) {
+    if (!containerEl || !stageEl) return null;
+    if (containerEl._zoomPan) return containerEl._zoomPan;
+    const indicatorEl = opts.indicatorEl || null;
+    const minScale = opts.minScale ?? 0.25;
+    const maxScale = opts.maxScale ?? 16;
+    const zoomFactor = opts.zoomFactor ?? 1.15;
+    // Phase D.1: optional callback fired after every transform update so
+    // consumers (e.g. the Polar Preprocess overlay) can re-render their
+    // SVG content at sizes inversely proportional to the zoom level.
+    const onScaleChange = typeof opts.onScaleChange === 'function' ? opts.onScaleChange : null;
+    const state = { scale: 1, tx: 0, ty: 0, panning: false, panStart: null };
+    let indicatorTimer = null;
+
+    function apply() {
+        stageEl.style.transform =
+            `translate(${state.tx}px, ${state.ty}px) scale(${state.scale})`;
+        if (indicatorEl) {
+            indicatorEl.textContent = Math.round(state.scale * 100) + '%';
+            indicatorEl.classList.add('visible');
+            clearTimeout(indicatorTimer);
+            indicatorTimer = setTimeout(
+                () => indicatorEl.classList.remove('visible'), 1200);
+        }
+        if (onScaleChange) onScaleChange(state.scale);
+    }
+    function reset() {
+        state.scale = 1; state.tx = 0; state.ty = 0;
+        apply();
+    }
+    function onWheel(e) {
+        e.preventDefault();
+        const rect = containerEl.getBoundingClientRect();
+        const dx = e.clientX - rect.left;
+        const dy = e.clientY - rect.top;
+        // Cursor position in stage-local coords (pre-transform).
+        const wx = (dx - state.tx) / state.scale;
+        const wy = (dy - state.ty) / state.scale;
+        const f = e.deltaY < 0 ? zoomFactor : 1 / zoomFactor;
+        const next = Math.max(minScale, Math.min(maxScale, state.scale * f));
+        if (next === state.scale) return;
+        state.scale = next;
+        // Keep the cursor over the same stage point.
+        state.tx = dx - wx * state.scale;
+        state.ty = dy - wy * state.scale;
+        apply();
+    }
+    function onMouseDown(e) {
+        if (e.button !== 1) return;  // middle button only
+        e.preventDefault();
+        state.panning = true;
+        state.panStart = { x: e.clientX, y: e.clientY, tx: state.tx, ty: state.ty };
+        containerEl.classList.add('panning');
+    }
+    function onMouseMove(e) {
+        if (!state.panning) return;
+        state.tx = state.panStart.tx + (e.clientX - state.panStart.x);
+        state.ty = state.panStart.ty + (e.clientY - state.panStart.y);
+        apply();
+    }
+    function onMouseUp(e) {
+        if (!state.panning) return;
+        if (e.button === 1 || e.button === undefined) {
+            state.panning = false;
+            containerEl.classList.remove('panning');
+        }
+    }
+    function onAuxClick(e) {
+        // Prevent the browser's middle-click "auto-scroll" handler kicking in.
+        if (e.button === 1) e.preventDefault();
+    }
+    function onDblClick(e) {
+        // Only reset on background dbl-click; let handles handle their own.
+        if (e.target.closest('.handle')) return;
+        reset();
+    }
+    containerEl.addEventListener('wheel', onWheel, { passive: false });
+    containerEl.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    containerEl.addEventListener('auxclick', onAuxClick);
+    containerEl.addEventListener('dblclick', onDblClick);
+    apply();
+    const api = { reset, get scale() { return state.scale; } };
+    containerEl._zoomPan = api;
+    return api;
+}
+
+function resetPolarPreprocessState() {
+    const pp = AppState.polarPreprocess;
+    pp.sourceFilename = null;
+    pp.imageNaturalWidth = 0;
+    pp.imageNaturalHeight = 0;
+    pp.detection = null;
+    Object.assign(pp.current, {
+        center_x: 0, center_y: 0,
+        r_inner_px: 0, r_outer_px: 0,
+        air_gap_px: 0,
+        air_gap_offset_px: 0,
+        air_gap_as_slide: false,
+        air_gap_slide_side: 'outside',
+        air_gap_slide_pixels_per_step: 1,
+        theta_start: 0, theta_end: 2 * Math.PI,
+        is_sector: false,
+        nr: 0, ntheta: 0,
+        snap_ntheta: true,
+        r_orientation: 'horizontal',
+        r_outer_physical: 1.0,
+        save_as: 'polar',
+    });
+    pp.lastPreview = { filename: null, path: null, polar_domain: null, width: 0, height: 0 };
+    pp.lastSaved = null;
+    pp.isDirty = false;
+    pp.isWarping = false;
+    pp.isDetecting = false;
+    if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }
+    pp._activeDrag = null;
+    pp._rafScheduled = false;
+}
+
+async function openPolarPreprocessModal() {
+    const modal = document.getElementById('polarPreprocessModal');
+    if (modal.style.display === 'flex') return;
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'Please upload or select an image first', 'error');
+        return;
+    }
+    resetPolarPreprocessState();
+    const pp = AppState.polarPreprocess;
+    pp.sourceFilename = AppState.uploadedImageFilename;
+
+    // Show modal first so user sees instant feedback
+    modal.style.display = 'flex';
+    setPolarLoading(true, 'Loading image…');
+
+    // Wire up wheel-zoom / middle-drag-pan / dbl-click-reset on the preview
+    // (idempotent: attachZoomPan returns the existing handle if already set).
+    // Phase D.1: re-render the SVG overlay whenever the zoom changes so
+    // handle dots / dashed circles stay roughly constant-on-screen instead
+    // of inflating into pixel blobs at 5-10x zoom.
+    const zp = attachZoomPan(
+        document.getElementById('polarPreviewContainer'),
+        document.getElementById('polarZoomStage'),
+        {
+            indicatorEl: document.getElementById('polarZoomIndicator'),
+            onScaleChange: () => renderPolarOverlay(),
+        }
+    );
+    if (zp) zp.reset();
+    // Reset the view to the Source tab on every open, since the warp
+    // output is regenerated for the freshly-loaded image.
+    switchPolarView('source');
+    // Interactivity wiring (Phase 5d.1 / 5f). All idempotent.
+    bindPolarInputs();
+    bindPolarAirGapTuneInputs();
+    attachPolarSvgDrag();
+    attachPolarKeyboard();
+    attachPolarEscKey();
+
+    try {
+        await loadPolarSourceImage();
+        const detectRes = await fetch('/api/preprocess-polar/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                filename: pp.sourceFilename,
+            }),
+        }).then(r => r.json());
+        if (!detectRes.success) {
+            throw new Error(detectRes.error || 'detect failed');
+        }
+        pp.detection = detectRes;
+
+        applyDetectionToCurrent(pp.detection);
+        renderPolarStatusSummary();
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+        renderPolarDipDropdown();
+        // Phase 5f.2: fire an initial warp so the "Warp output" tab has
+        // something to show without the user having to wait for the 1.5 s
+        // dirty debounce. Best-effort -- failures fall through silently.
+        triggerPolarPreviewWarp();
+    } catch (err) {
+        showStatus('solverStatus', `Polar detect failed: ${err.message}`, 'error');
+        renderPolarStatusSummary(err.message);
+    } finally {
+        setPolarLoading(false);
+    }
+}
+
+// AA-noise probe + warning + filter-button toggle. Runs on every image
+// upload / load via /api/preprocess-filter/quick-stats (lightweight: just
+// counts distinct RGB values, no AA blend classification). If the count
+// exceeds the noisy threshold an inline banner appears in the Input
+// Image panel, independent of any other modal so the user sees it the
+// moment they pick the image. The "Apply Color Uniformization Filter"
+// button is exposed regardless so the user can also pre-emptively run
+// the filter on borderline images.
+async function checkInputImageNoise(filename) {
+    const banner = document.getElementById('inputImageNoiseBanner');
+    const detail = document.getElementById('inputImageNoiseBannerDetail');
+    const filterBtn = document.getElementById('quantizeFilterBtn');
+    if (!banner || !filterBtn) return;
+    banner.style.display = 'none';
+    filterBtn.style.display = 'none';
+    if (!filename) return;
+    try {
+        const res = await fetch('/api/preprocess-filter/quick-stats', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, filename }),
+        }).then(r => r.json());
+        if (!res.success) return;
+        filterBtn.style.display = 'block';
+        if (res.looks_noisy) {
+            if (detail) {
+                detail.textContent =
+                    ` (Unique color count: ${Number(res.unique_colors).toLocaleString()}).`;
+            }
+            banner.style.display = 'flex';
+        }
+    } catch (err) {
+        // Best-effort: stay silent on failure (the rest of the app still
+        // works without the noise banner).
+        console.warn('quick-stats failed:', err);
+    }
+}
+
+function closePolarPreprocessModal(saved = false) {
+    const pp = AppState.polarPreprocess;
+    // The "dirty" guard now means "user has been editing geometry but
+    // hasn't saved a permanent warp file" -- the preview file is
+    // disposable. We keep the confirmation only when there's actually
+    // unsaved geometry work (isDirty AND we never produced a saved
+    // image). After Save image the user can close freely.
+    if (!saved && pp.isDirty && !(pp.lastSaved && pp.lastSaved.filename)) {
+        if (!confirm('There are unsaved changes. Close anyway?')) return;
+    }
+    if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }
+    document.getElementById('polarPreprocessModal').style.display = 'none';
+    // Release image src so we don't keep the bitmap in memory
+    const img = document.getElementById('polarSourceImg');
+    if (img) img.src = '';
+    const warpImg = document.getElementById('polarWarpImg');
+    if (warpImg) warpImg.src = '';
+    const svg = document.getElementById('polarOverlay');
+    if (svg) svg.innerHTML = '';
+    // Best-effort cleanup of the deterministic warp preview file (named
+    // from the source filename, e.g. motor.__warp_preview__.png). Fire-
+    // and-forget; failure (permissions, race with another session) is
+    // non-fatal because the file is overwritten on every future open
+    // and `enforceImageLimit` will eventually evict it anyway.
+    if (pp.sourceFilename) {
+        fetch('/api/preprocess-polar/cleanup-preview', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, filename: pp.sourceFilename }),
+        }).catch(() => {});
+    }
+    // Reset the lastSaved / lastPreview tracking so the next open starts
+    // clean. (resetPolarPreprocessState() will also do this when the
+    // modal reopens.)
+    pp.lastPreview = { filename: null, path: null, polar_domain: null, width: 0, height: 0 };
+    pp.lastSaved   = null;
+}
+
+function setPolarLoading(on, msg) {
+    const overlay = document.getElementById('polarPreviewLoading');
+    if (!overlay) return;
+    overlay.textContent = msg || 'Loading…';
+    overlay.classList.toggle('active', !!on);
+}
+
+async function loadPolarSourceImage() {
+    const pp = AppState.polarPreprocess;
+    const img = document.getElementById('polarSourceImg');
+    return new Promise((resolve, reject) => {
+        img.onload = () => {
+            pp.imageNaturalWidth = img.naturalWidth;
+            pp.imageNaturalHeight = img.naturalHeight;
+            const svg = document.getElementById('polarOverlay');
+            svg.setAttribute('viewBox', `0 0 ${img.naturalWidth} ${img.naturalHeight}`);
+            resolve();
+        };
+        img.onerror = () => reject(new Error('image load failed'));
+        img.src = `/uploads/${AppState.userId}/${pp.sourceFilename}`;
+    });
+}
+
+// Pull center / radii / theta / nr / ntheta initial values from the detect
+// response into the editable state object.
+function applyDetectionToCurrent(detection) {
+    const cur = AppState.polarPreprocess.current;
+    cur.center_x = detection.center_x;
+    cur.center_y = detection.center_y;
+    // Phase 5f.2: the backend's r_inner_px is the *air-gap dip* and that's
+    // a visual marker, not the start of the polar warp. Warping the whole
+    // machine means r_inner = 0; the rotor (or inner stator) is then
+    // preserved in the warp output. The user can still copy the air-gap
+    // marker into r_inner explicitly via the dip dropdown's "use as
+    // r_inner" button.
+    cur.r_inner_px = 0;
+    cur.air_gap_px = (detection.r_inner_px && detection.r_inner_px > 0)
+        ? detection.r_inner_px : 0;
+    // Phase D.3: a re-detect invalidates any prior offset / slide choice.
+    cur.air_gap_offset_px = 0;
+    cur.air_gap_as_slide = false;
+    cur.air_gap_slide_side = 'outside';
+    cur.r_outer_px = detection.r_outer_px;
+    cur.theta_start = detection.theta_start;
+    cur.theta_end = detection.theta_end;
+    cur.is_sector = !detection.is_full_circle;
+    const per = detection.periodicity || {};
+    if (per.recommended_ntheta && per.recommended_ntheta > 1) {
+        cur.ntheta = per.recommended_ntheta;
+    } else {
+        cur.ntheta = Math.max(2, Math.round(2 * Math.PI * detection.r_outer_px));
+    }
+    // nr covers the entire radial extent (r=0 to r_outer) since we no
+    // longer cut at the air gap.
+    cur.nr = Math.max(2, detection.r_outer_px);
+}
+
+// Phase D.3: yellow-dashed marker radius is the detected dip plus the
+// user's offset; clamped at >= 0. Reused by the overlay, the slide-region
+// emission in buildPolarYamlBlock, and the airgap-handle drag math.
+function airGapEffectiveR() {
+    const cur = AppState.polarPreprocess.current;
+    return Math.max(0, (cur.air_gap_px || 0) + (cur.air_gap_offset_px || 0));
+}
+
+function renderPolarStatusSummary(errMsg) {
+    const el = document.getElementById('polarStatusSummary');
+    if (errMsg) {
+        el.textContent = `Detection error: ${errMsg}`;
+        return;
+    }
+    const det = AppState.polarPreprocess.detection;
+    if (!det) { el.textContent = '—'; return; }
+    const per = det.periodicity || {};
+    const gray = per.grayscale || {};
+    const rgb = per.rgb || {};
+    const lines = [];
+    lines.push(`shape: ${det.shape}  center: (${det.center_x}, ${det.center_y})  r=[${det.r_inner_px}, ${det.r_outer_px}]`);
+    if (det.hough) lines.push(`Hough gain: ${det.hough.gain > 99 ? '>99' : det.hough.gain.toFixed(2)}x`);
+    const gN = gray.n_fold != null ? `N≈${gray.n_fold} (int ${gray.n_integer})` : '—';
+    const rN = rgb.n_fold  != null ? `N≈${rgb.n_fold} (int ${rgb.n_integer})`   : '—';
+    lines.push(`periodicity grayscale: ${gN}`);
+    lines.push(`periodicity rgb     : ${rN}`);
+    const grp = per.grouped;
+    if (grp && grp.n_fold != null) {
+        lines.push(`periodicity grouped : N≈${grp.n_fold} (int ${grp.n_integer})`);
+    }
+    if (per.recommended_ntheta) lines.push(`recommended ntheta: ${per.recommended_ntheta}`);
+    // Phase 5f edge-case hints. These surface once per detection in the
+    // auto-detect status block so the user has the relevant warning
+    // right where they read the rest of the detection summary.
+    const pp = AppState.polarPreprocess;
+    const W = pp.imageNaturalWidth || det.image_width || 0;
+    const H = pp.imageNaturalHeight || det.image_height || 0;
+    if (W * H > 4_000_000) {
+        lines.push(`<span style="color:#8a6d3b">⚠ large image (${W}×${H}) — preview warp may take 1–2 s per change.</span>`);
+    }
+    if (det.shape === 'rectangular') {
+        lines.push(
+            `<span style="color:#8a6d3b">ℹ rectangular stator — r_inner is seeded from the Hough rotor lock-on; ` +
+            `verify it traces the actual rotor surface and adjust manually if needed.</span>`);
+    }
+    el.innerHTML = lines.map(s => `<div>${s}</div>`).join('');
+    // Enable sector snap button if N is detected
+    const snapBtn = document.getElementById('polarSnapSectorBtn');
+    if (snapBtn) snapBtn.disabled = !(gray.n_fold || rgb.n_fold);
+}
+
+// Render SVG overlay from the current state. Phase 5c is read-only: this is
+// just visualisation, no event handlers attached. Phase 5d will add the
+// drag handlers and call renderPolarOverlay() again whenever current changes.
+function renderPolarOverlay() {
+    const svg = document.getElementById('polarOverlay');
+    if (!svg) return;
+    const cur = AppState.polarPreprocess.current;
+    const det = AppState.polarPreprocess.detection;
+    const W = AppState.polarPreprocess.imageNaturalWidth || 1;
+    const H = AppState.polarPreprocess.imageNaturalHeight || 1;
+    const cx = cur.center_x, cy = cur.center_y;
+    const rIn = cur.r_inner_px, rOut = cur.r_outer_px;
+    const crossArm = Math.max(8, Math.min(W, H) * 0.02);
+
+    // Phase D.1: at zoom = s, an SVG element with image-coord dimension d
+    // appears on screen as d * s pixels. Dividing every literal size by s
+    // keeps handles / dashed strokes a constant on-screen size while the
+    // background image itself zooms. Floor at 0.25 so very-zoomed-out
+    // overlays don't render at zero stroke width.
+    const zp = document.getElementById('polarPreviewContainer') &&
+               document.getElementById('polarPreviewContainer')._zoomPan;
+    const scale = (zp && zp.scale) ? zp.scale : 1;
+    const sigma = (base) => base / Math.max(0.25, scale);
+    const HANDLE_R       = sigma(6);
+    const HANDLE_RXL     = sigma(7);
+    const STROKE_GUIDE   = sigma(1.8);
+    const STROKE_OUTER   = sigma(2);
+    const STROKE_AIRGAP  = sigma(2.2);
+    const STROKE_THETA   = sigma(1.8);
+    const STROKE_PERIOD  = sigma(1);
+    const STROKE_CROSS   = sigma(1.5);
+    const STROKE_HANDLE  = sigma(1.5);
+    const DASH_GUIDE_IN  = `${sigma(6)},${sigma(4)}`;
+    const DASH_AIRGAP    = `${sigma(9)},${sigma(5)}`;
+    const DASH_PERIOD    = `${sigma(2)},${sigma(3)}`;
+
+    let html = '';
+
+    // Period guides (drawn first so they sit behind the rings)
+    const periodGray = det && det.periodicity && det.periodicity.grayscale;
+    const N = periodGray && periodGray.n_integer;
+    if (N && N >= 2 && N <= 64 && rOut > 0) {
+        for (let k = 0; k < N; k++) {
+            const ang = 2 * Math.PI * k / N + (cur.theta_start || 0);
+            const x2 = cx + (rOut + 10) * Math.cos(ang);
+            const y2 = cy + (rOut + 10) * Math.sin(ang);
+            html += `<line class="guide-period" x1="${cx}" y1="${cy}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" stroke-width="${STROKE_PERIOD}" stroke-dasharray="${DASH_PERIOD}"/>`;
+        }
+    }
+
+    // Inner / outer radius circles (or arcs for sector mode)
+    if (rIn > 0) {
+        html += `<circle class="guide-inner" cx="${cx}" cy="${cy}" r="${rIn}" stroke-width="${STROKE_GUIDE}" stroke-dasharray="${DASH_GUIDE_IN}"/>`;
+    }
+    if (rOut > 0) {
+        html += `<circle class="guide-outer" cx="${cx}" cy="${cy}" r="${rOut}" stroke-width="${STROKE_OUTER}"/>`;
+    }
+    // Air-gap visual marker (Phase 5f.2). Yellow dashed circle so the
+    // detected dip stays obvious without dictating the warp range. Phase
+    // D.3 extends this to render at the *effective* radius (detected dip
+    // + user offset) and to expose a drag handle on the right side so the
+    // marker can be nudged interactively.
+    const rAG = airGapEffectiveR();
+    if (cur.air_gap_px > 0 && rAG > 0 && rAG < rOut) {
+        html += `<circle class="guide-airgap" cx="${cx}" cy="${cy}" r="${rAG}" stroke-width="${STROKE_AIRGAP}" stroke-dasharray="${DASH_AIRGAP}"/>`;
+    }
+
+    // Sector boundary lines
+    if (cur.is_sector) {
+        const r = Math.max(rOut, rIn || 0) + 4;
+        const xs = cx + r * Math.cos(cur.theta_start);
+        const ys = cy + r * Math.sin(cur.theta_start);
+        const xe = cx + r * Math.cos(cur.theta_end);
+        const ye = cy + r * Math.sin(cur.theta_end);
+        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xs.toFixed(2)}" y2="${ys.toFixed(2)}" stroke-width="${STROKE_THETA}"/>`;
+        html += `<line class="guide-theta" x1="${cx}" y1="${cy}" x2="${xe.toFixed(2)}" y2="${ye.toFixed(2)}" stroke-width="${STROKE_THETA}"/>`;
+    }
+
+    // Center cross + handle (drawn last so it sits on top)
+    html += `<line class="center-cross" x1="${cx - crossArm}" y1="${cy}" x2="${cx + crossArm}" y2="${cy}" stroke-width="${STROKE_CROSS}"/>`;
+    html += `<line class="center-cross" x1="${cx}" y1="${cy - crossArm}" x2="${cx}" y2="${cy + crossArm}" stroke-width="${STROKE_CROSS}"/>`;
+    html += `<circle class="handle handle-center" data-handle="center" cx="${cx}" cy="${cy}" r="${HANDLE_R}" stroke-width="${STROKE_HANDLE}"/>`;
+
+    // Radius handles at 0 rad (right side)
+    if (rIn > 0) {
+        html += `<circle class="handle handle-inner" data-handle="inner" cx="${cx + rIn}" cy="${cy}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
+    }
+    if (rOut > 0) {
+        html += `<circle class="handle handle-outer" data-handle="outer" cx="${cx + rOut}" cy="${cy}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
+    }
+    // Phase D.3: airgap drag handle on the right side of the yellow
+    // dashed circle. Drag updates air_gap_offset_px so the visual marker
+    // moves but the detected dip radius itself stays intact.
+    if (cur.air_gap_px > 0 && rAG > 0 && rAG < rOut) {
+        html += `<circle class="handle handle-airgap" data-handle="airgap" cx="${cx + rAG}" cy="${cy}" r="${HANDLE_R}" stroke-width="${STROKE_HANDLE}"/>`;
+    }
+    // Sector theta handles at the ring outer edge
+    if (cur.is_sector && rOut > 0) {
+        const xs = cx + rOut * Math.cos(cur.theta_start);
+        const ys = cy + rOut * Math.sin(cur.theta_start);
+        const xe = cx + rOut * Math.cos(cur.theta_end);
+        const ye = cy + rOut * Math.sin(cur.theta_end);
+        html += `<circle class="handle handle-theta" data-handle="theta_start" cx="${xs.toFixed(2)}" cy="${ys.toFixed(2)}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
+        html += `<circle class="handle handle-theta" data-handle="theta_end"   cx="${xe.toFixed(2)}" cy="${ye.toFixed(2)}" r="${HANDLE_RXL}" stroke-width="${STROKE_HANDLE}"/>`;
+    }
+
+    svg.innerHTML = html;
+}
+
+// State -> input one-way sync (Phase 5c is read-only). Phase 5d will add
+// the reverse direction.
+function syncPolarInputsFromState() {
+    const cur = AppState.polarPreprocess.current;
+    const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    setVal('polarCenterX', cur.center_x);
+    setVal('polarCenterY', cur.center_y);
+    setVal('polarRInner', cur.r_inner_px);
+    setVal('polarROuter', cur.r_outer_px);
+    setVal('polarROuterPhys', cur.r_outer_physical);
+    setVal('polarNr', cur.nr);
+    setVal('polarNtheta', cur.ntheta);
+    const snap = document.getElementById('polarSnapNtheta');
+    if (snap) snap.checked = cur.snap_ntheta;
+    // theta inputs (deg, CCW math convention -- negated from the
+    // internal image-coord state).
+    setVal('polarThetaStart', -radToDegRounded(cur.theta_start));
+    setVal('polarThetaEnd',   -radToDegRounded(cur.theta_end));
+    // theta mode radio
+    document.querySelectorAll('input[name="polarThetaMode"]').forEach(r => {
+        r.checked = (r.value === (cur.is_sector ? 'sector' : 'full'));
+    });
+    document.getElementById('polarSectorInputs').style.display = cur.is_sector ? '' : 'none';
+    // orientation
+    document.querySelectorAll('input[name="polarROrient"]').forEach(r => {
+        r.checked = (r.value === cur.r_orientation);
+    });
+    // save target
+    document.querySelectorAll('input[name="polarSaveAs"]').forEach(r => {
+        r.checked = (r.value === cur.save_as);
+    });
+    // Phase D.3: air-gap tune controls
+    setVal('polarAirGapOffset', cur.air_gap_offset_px || 0);
+    const slideEl = document.getElementById('polarAirGapAddSlide');
+    if (slideEl) slideEl.checked = !!cur.air_gap_as_slide;
+    document.querySelectorAll('input[name="polarAirGapSide"]').forEach(r => {
+        r.checked = (r.value === (cur.air_gap_slide_side || 'outside'));
+    });
+}
+
+function radToDegRounded(rad) { return Math.round(rad * 180 / Math.PI * 100) / 100; }
+
+// ============================================================
+// Polar Preprocess interactivity (Phase 5d.1)
+// ============================================================
+// Three independent wirings, all idempotent so the open-modal flow can
+// call them every time without piling up duplicate listeners:
+//   - bindPolarInputs(): every number / radio / checkbox edits the
+//     state and triggers a re-render. Wheel on number inputs steps
+//     +/- (Shift = x10).
+//   - attachPolarSvgDrag(): left-click on any data-handle element on
+//     the SVG overlay starts a drag that updates the corresponding
+//     centre / r_inner / r_outer / theta in the state and re-renders.
+//   - attachPolarKeyboard(): arrow keys on the focused preview
+//     container nudge the centre by +/-1 px (Shift = +/-10).
+
+// markPolarDirty: every state edit feeds through here. The yellow
+// "unupdated" badge surfaces immediately so the user knows the on-
+// screen overlay no longer matches the last warped preview; a 1.5 s
+// debounce then auto-fires a fresh warp. The user can also press
+// "Apply Transform" to skip the wait.
+function markPolarDirty() {
+    const pp = AppState.polarPreprocess;
+    pp.isDirty = true;
+    const badge = document.getElementById('polarDirtyBadge');
+    if (badge) badge.classList.add('active');
+    if (pp._debounceTimer) clearTimeout(pp._debounceTimer);
+    pp._debounceTimer = setTimeout(triggerPolarPreviewWarp, 1500);
+}
+
+async function triggerPolarPreviewWarp() {
+    const pp = AppState.polarPreprocess;
+    if (pp.isWarping || !pp.sourceFilename) return;
+    const cur = pp.current;
+    if (!(cur.r_outer_px > cur.r_inner_px)) {
+        // Geometry is invalid; leave the badge on and skip the warp.
+        return;
+    }
+    pp.isWarping = true;
+    setPolarWarpLoading(true);
+    try {
+        const res = await fetch('/api/preprocess-polar/warp', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId:           AppState.userId,
+                filename:         pp.sourceFilename,
+                center_x:         cur.center_x,
+                center_y:         cur.center_y,
+                r_start_px:       cur.r_inner_px,
+                r_end_px:         cur.r_outer_px,
+                theta_start:      cur.theta_start,
+                theta_end:        cur.theta_end,
+                nr:               cur.nr,
+                ntheta:           cur.ntheta,
+                r_orientation:    cur.r_orientation,
+                r_outer_physical: cur.r_outer_physical,
+                // Always overwrite the deterministic preview file -- the
+                // user gets a permanent file only when they press
+                // "Save image".
+                preview: true,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'warp failed');
+        pp.lastPreview = {
+            filename:     res.filename,
+            path:         res.path,
+            polar_domain: res.polar_domain,
+            width:        res.output_width,
+            height:       res.output_height,
+        };
+        pp.isDirty = false;
+        const badge = document.getElementById('polarDirtyBadge');
+        if (badge) badge.classList.remove('active');
+        renderPolarPreviewThumb(res.path);
+    } catch (err) {
+        showStatus('solverStatus', `Polar warp failed: ${err.message}`, 'error');
+    } finally {
+        pp.isWarping = false;
+        setPolarWarpLoading(false);
+    }
+}
+
+function renderPolarPreviewThumb(path) {
+    const canvas = document.getElementById('polarPreviewThumb');
+    if (canvas) {
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        img.onload = () => {
+            const w = canvas.width;
+            const h = canvas.height;
+            ctx.fillStyle = '#222';
+            ctx.fillRect(0, 0, w, h);
+            const ratio = Math.min(w / img.naturalWidth, h / img.naturalHeight);
+            const dw = img.naturalWidth * ratio;
+            const dh = img.naturalHeight * ratio;
+            ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+        };
+        img.onerror = () => {
+            ctx.fillStyle = '#222'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#888'; ctx.font = '12px sans-serif';
+            ctx.fillText('preview unavailable', 8, 80);
+        };
+        img.src = `${path}?t=${Date.now()}`;
+    }
+    // Phase 5f.2: the big <img> in the "Warp output" tab gets the same
+    // URL with a cache-busting query so the user sees the result of every
+    // warp at full size + zoom/pan.
+    const warpImg = document.getElementById('polarWarpImg');
+    if (warpImg) {
+        warpImg.src = `${path}?t=${Date.now()}`;
+    }
+    // Width x Height badge next to the tab.
+    const badge = document.getElementById('polarWarpDimsBadge');
+    const pp = AppState.polarPreprocess;
+    if (badge && pp.lastPreview && pp.lastPreview.width) {
+        badge.textContent = `${pp.lastPreview.width} × ${pp.lastPreview.height} px`;
+    }
+}
+
+// Tab switch in the preview pane. Each view has its own zoom/pan
+// instance so the source overlay stays at 100 % when the user is
+// inspecting the warp at 5x, and vice versa.
+function switchPolarView(mode) {
+    const srcWrap = document.getElementById('polarPreviewContainer');
+    const wrpWrap = document.getElementById('polarWarpContainer');
+    const srcTab  = document.getElementById('polarViewTabSource');
+    const wrpTab  = document.getElementById('polarViewTabWarp');
+    if (!srcWrap || !wrpWrap) return;
+    if (mode === 'warp') {
+        srcWrap.style.display = 'none';
+        wrpWrap.style.display = 'flex';
+        srcTab.classList.remove('polar-view-tab-active');
+        wrpTab.classList.add('polar-view-tab-active');
+        attachZoomPan(
+            wrpWrap,
+            document.getElementById('polarWarpZoomStage'),
+            { indicatorEl: document.getElementById('polarWarpZoomIndicator') }
+        );
+    } else {
+        wrpWrap.style.display = 'none';
+        srcWrap.style.display = 'flex';
+        srcTab.classList.add('polar-view-tab-active');
+        wrpTab.classList.remove('polar-view-tab-active');
+    }
+}
+
+function setPolarWarpLoading(on) {
+    const el = document.getElementById('polarWarpLoading');
+    if (el) el.classList.toggle('active', !!on);
+}
+
+// Dip-candidate dropdown (Phase 5d.2). Backend returns
+// detection.dip_candidates = [{r, ratio, inner_band, outer_band, score}]
+// sorted best-first; the dropdown lets the user pick one as r_inner when
+// the highest-scored guess isn't the physical air gap (e.g. an aux
+// mid-yoke gap outscoring the rotor/stator gap on a multi-gap design).
+function renderPolarDipDropdown() {
+    const row = document.getElementById('polarDipRow');
+    const sel = document.getElementById('polarDipSelect');
+    const tuneRow = document.getElementById('polarAirGapTuneRow');
+    if (!row || !sel) return;
+    const det = AppState.polarPreprocess.detection;
+    const list = (det && Array.isArray(det.dip_candidates)) ? det.dip_candidates : [];
+    // Always show the row when there is at least one candidate so the
+    // marker can be turned off too.
+    if (list.length === 0) {
+        row.style.display = 'none';
+        sel.innerHTML = '';
+        if (tuneRow) tuneRow.style.display = 'none';
+        return;
+    }
+    row.style.display = 'flex';
+    const opts = ['<option value="0">— none (marker off) —</option>']
+        .concat(list.map((c, i) => {
+            const marker = (i === 0) ? '★' : ' ';
+            return `<option value="${c.r}">${marker} r=${c.r}  ratio=${c.ratio.toFixed(2)}  score=${c.score}</option>`;
+        }));
+    sel.innerHTML = opts.join('');
+    const cur = AppState.polarPreprocess.current;
+    const match = list.findIndex(c => c.r === cur.air_gap_px);
+    sel.selectedIndex = (match >= 0) ? match + 1 : (cur.air_gap_px > 0 ? 1 : 0);
+    if (!sel._ppBound) {
+        sel.addEventListener('change', () => {
+            const v = Number(sel.value);
+            AppState.polarPreprocess.current.air_gap_px = Number.isFinite(v) && v > 0 ? v : 0;
+            // Phase D.3: a different dip resets the offset (offset is
+            // relative to the selected dip, not absolute).
+            AppState.polarPreprocess.current.air_gap_offset_px = 0;
+            updatePolarAirGapTuneRow();
+            renderPolarOverlay();
+            syncPolarInputsFromState();
+            // No markPolarDirty -- air-gap marker is purely informational
+            // and doesn't affect the warp output.
+        });
+        sel._ppBound = true;
+    }
+    updatePolarAirGapTuneRow();
+}
+
+// Phase D.3: tune-row visibility is gated on (a) at least one dip
+// candidate being available and (b) save target being 'polar' (slide
+// regions belong to the polar warp pipeline). Called from
+// renderPolarDipDropdown and from the save_as radio handler.
+function updatePolarAirGapTuneRow() {
+    const tuneRow = document.getElementById('polarAirGapTuneRow');
+    const sideRow = document.getElementById('polarAirGapSideRow');
+    if (!tuneRow) return;
+    const det = AppState.polarPreprocess.detection;
+    const list = (det && Array.isArray(det.dip_candidates)) ? det.dip_candidates : [];
+    const cur = AppState.polarPreprocess.current;
+    const visible = list.length > 0 && cur.save_as === 'polar';
+    tuneRow.style.display = visible ? 'flex' : 'none';
+    if (sideRow) {
+        sideRow.style.display = (visible && cur.air_gap_as_slide) ? 'inline-flex' : 'none';
+    }
+}
+
+// Phase D.3: tune-row listeners are bound once per modal lifetime.
+// Called from openPolarPreprocessModal alongside the other bindings.
+function bindPolarAirGapTuneInputs() {
+    const offsetEl = document.getElementById('polarAirGapOffset');
+    const slideEl  = document.getElementById('polarAirGapAddSlide');
+    const sideEls  = document.querySelectorAll('input[name="polarAirGapSide"]');
+    if (offsetEl && !offsetEl._ppBound) {
+        offsetEl.addEventListener('input', () => {
+            const v = Number(offsetEl.value);
+            AppState.polarPreprocess.current.air_gap_offset_px =
+                Number.isFinite(v) ? Math.round(v) : 0;
+            renderPolarOverlay();
+        });
+        offsetEl.addEventListener('wheel', e => {
+            e.preventDefault();
+            const step = e.shiftKey ? 10 : 1;
+            const dir = e.deltaY < 0 ? 1 : -1;
+            offsetEl.value = Number(offsetEl.value || 0) + step * dir;
+            offsetEl.dispatchEvent(new Event('input', { bubbles: true }));
+        }, { passive: false });
+        offsetEl._ppBound = true;
+    }
+    if (slideEl && !slideEl._ppBound) {
+        slideEl.addEventListener('change', () => {
+            AppState.polarPreprocess.current.air_gap_as_slide = slideEl.checked;
+            updatePolarAirGapTuneRow();
+        });
+        slideEl._ppBound = true;
+    }
+    sideEls.forEach(r => {
+        if (r._ppBound) return;
+        r.addEventListener('change', () => {
+            if (r.checked) {
+                AppState.polarPreprocess.current.air_gap_slide_side = r.value;
+            }
+        });
+        r._ppBound = true;
+    });
+}
+
+// Copies the currently-selected air-gap marker into r_inner so the warp
+// excludes the inside region. Reverse direction from the new default
+// (full machine in the warp). The user can always reset r_inner to 0
+// by typing it in or by clicking the dip dropdown's "none" entry first.
+function useAirGapAsInner() {
+    const cur = AppState.polarPreprocess.current;
+    if (!(cur.air_gap_px > 0)) return;
+    // Phase D.3: copy the *effective* radius (dip + offset) so a manually
+    // nudged marker still snaps to r_inner. Then zero the offset so the
+    // dropdown choice stays the visible anchor.
+    cur.r_inner_px = airGapEffectiveR();
+    cur.air_gap_offset_px = 0;
+    cur.nr = Math.max(2, cur.r_outer_px - cur.r_inner_px);
+    renderPolarOverlay();
+    syncPolarInputsFromState();
+    markPolarDirty();
+}
+
+function bindPolarInputs() {
+    const root = document.getElementById('polarPreprocessModal');
+    if (!root || root._ppInputsBound) return;
+    const cur = () => AppState.polarPreprocess.current;
+
+    // numericMap: data-pp key -> [state field, parser]
+    const numericMap = {
+        center_x:           ['center_x',           v => Math.round(Number(v))],
+        center_y:           ['center_y',           v => Math.round(Number(v))],
+        r_inner_px:         ['r_inner_px',         v => Math.max(0, Math.round(Number(v)))],
+        r_outer_px:         ['r_outer_px',         v => Math.max(1, Math.round(Number(v)))],
+        r_outer_physical:   ['r_outer_physical',   v => Math.max(0.001, Number(v))],
+        nr:                 ['nr',                 v => Math.max(2, Math.round(Number(v)))],
+        ntheta:             ['ntheta',             v => Math.max(2, Math.round(Number(v)))],
+        // Theta inputs are shown in CCW (math) convention. The internal
+        // state and the SVG / warp pipelines use the image-coord (Y-down,
+        // CW visually) convention, so we negate at the UI boundary.
+        theta_start_deg:    ['theta_start',        v => -Number(v) * Math.PI / 180],
+        theta_end_deg:      ['theta_end',          v => -Number(v) * Math.PI / 180],
+    };
+    root.querySelectorAll('input[type=number]').forEach(input => {
+        const key = input.dataset.pp;
+        const spec = numericMap[key];
+        if (!spec) return;
+        const [stateField, parse] = spec;
+        input.addEventListener('input', () => {
+            cur()[stateField] = parse(input.value);
+            renderPolarOverlay();
+            markPolarDirty();
+        });
+        input.addEventListener('wheel', e => {
+            e.preventDefault();
+            const step = Number(input.step) || 1;
+            const factor = e.shiftKey ? 10 : 1;
+            const dir = e.deltaY < 0 ? 1 : -1;
+            const v = Number(input.value) + step * factor * dir;
+            input.value = v;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        }, { passive: false });
+    });
+
+    const snap = document.getElementById('polarSnapNtheta');
+    if (snap) snap.addEventListener('change', () => {
+        cur().snap_ntheta = snap.checked;
+        markPolarDirty();
+    });
+
+    root.querySelectorAll('input[name=polarThetaMode]').forEach(r => {
+        r.addEventListener('change', () => {
+            if (!r.checked) return;
+            cur().is_sector = (r.value === 'sector');
+            document.getElementById('polarSectorInputs').style.display =
+                cur().is_sector ? '' : 'none';
+            // Initialise sector range if just switched on with full-circle
+            // theta. State stays in image-coord (Y-down) convention but
+            // the chosen pair displays as a clean increasing CCW range
+            // (-45°, +45° in the user-facing math convention).
+            if (cur().is_sector && Math.abs(cur().theta_end - cur().theta_start - 2 * Math.PI) < 1e-6) {
+                cur().theta_start =  Math.PI / 4;   // displays as -45°
+                cur().theta_end   = -Math.PI / 4;   // displays as +45°
+            }
+            renderPolarOverlay();
+            syncPolarInputsFromState();
+            markPolarDirty();
+        });
+    });
+    root.querySelectorAll('input[name=polarROrient]').forEach(r => {
+        r.addEventListener('change', () => {
+            if (r.checked) { cur().r_orientation = r.value; markPolarDirty(); }
+        });
+    });
+    root.querySelectorAll('input[name=polarSaveAs]').forEach(r => {
+        r.addEventListener('change', () => {
+            if (r.checked) {
+                cur().save_as = r.value;
+                // Phase D.3: slide-region tuning UI is polar-only.
+                updatePolarAirGapTuneRow();
+            }
+        });
+    });
+    root._ppInputsBound = true;
+}
+
+function attachPolarSvgDrag() {
+    const svg = document.getElementById('polarOverlay');
+    if (!svg || svg._ppDragBound) return;
+    function svgPoint(e) {
+        const pt = svg.createSVGPoint();
+        pt.x = e.clientX; pt.y = e.clientY;
+        const ctm = svg.getScreenCTM();
+        return ctm ? pt.matrixTransform(ctm.inverse()) : { x: 0, y: 0 };
+    }
+    svg.addEventListener('mousedown', e => {
+        if (e.button !== 0) return;
+        const handle = e.target.closest('[data-handle]');
+        if (!handle) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const kind = handle.dataset.handle;
+        const p0 = svgPoint(e);
+        const cur = AppState.polarPreprocess.current;
+        AppState.polarPreprocess._activeDrag = {
+            kind,
+            p0,
+            start: {
+                cx: cur.center_x, cy: cur.center_y,
+                rIn: cur.r_inner_px, rOut: cur.r_outer_px,
+                ts: cur.theta_start, te: cur.theta_end,
+            },
+        };
+        document.body.style.cursor = 'grabbing';
+    });
+    window.addEventListener('mousemove', e => {
+        const drag = AppState.polarPreprocess._activeDrag;
+        if (!drag) return;
+        const p = svgPoint(e);
+        const cur = AppState.polarPreprocess.current;
+        const W = AppState.polarPreprocess.imageNaturalWidth;
+        const H = AppState.polarPreprocess.imageNaturalHeight;
+        switch (drag.kind) {
+            case 'center': {
+                cur.center_x = Math.max(0, Math.min(W, Math.round(drag.start.cx + (p.x - drag.p0.x))));
+                cur.center_y = Math.max(0, Math.min(H, Math.round(drag.start.cy + (p.y - drag.p0.y))));
+                break;
+            }
+            case 'inner': {
+                const dx = p.x - drag.start.cx, dy = p.y - drag.start.cy;
+                cur.r_inner_px = Math.max(0, Math.round(Math.hypot(dx, dy)));
+                break;
+            }
+            case 'outer': {
+                const dx = p.x - drag.start.cx, dy = p.y - drag.start.cy;
+                cur.r_outer_px = Math.max(1, Math.round(Math.hypot(dx, dy)));
+                break;
+            }
+            case 'theta_start':
+                cur.theta_start = Math.atan2(p.y - drag.start.cy, p.x - drag.start.cx);
+                break;
+            case 'theta_end':
+                cur.theta_end   = Math.atan2(p.y - drag.start.cy, p.x - drag.start.cx);
+                break;
+            case 'airgap': {
+                // Phase D.3: adjust the offset relative to the detected
+                // dip so the dropdown choice stays the anchor and re-
+                // selecting a different dip drops the offset cleanly.
+                const dx = p.x - drag.start.cx, dy = p.y - drag.start.cy;
+                const rTotal = Math.max(0, Math.round(Math.hypot(dx, dy)));
+                cur.air_gap_offset_px = rTotal - (cur.air_gap_px || 0);
+                break;
+            }
+        }
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+        markPolarDirty();
+    });
+    window.addEventListener('mouseup', () => {
+        if (AppState.polarPreprocess._activeDrag) {
+            AppState.polarPreprocess._activeDrag = null;
+            document.body.style.cursor = '';
+        }
+    });
+    svg._ppDragBound = true;
+}
+
+function attachPolarKeyboard() {
+    const container = document.getElementById('polarPreviewContainer');
+    if (!container || container._ppKeysBound) return;
+    container.addEventListener('keydown', e => {
+        if (document.activeElement && /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)) return;
+        if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+        e.preventDefault();
+        const cur = AppState.polarPreprocess.current;
+        const step = e.shiftKey ? 10 : 1;
+        if (e.key === 'ArrowLeft')  cur.center_x -= step;
+        if (e.key === 'ArrowRight') cur.center_x += step;
+        if (e.key === 'ArrowUp')    cur.center_y -= step;
+        if (e.key === 'ArrowDown')  cur.center_y += step;
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+        markPolarDirty();
+    });
+    container._ppKeysBound = true;
+}
+
+// Esc anywhere in the document closes the polar modal if it is open
+// (after the existing dirty-confirmation in closePolarPreprocessModal).
+// One global listener -- idempotent flag on document.body so reloads
+// don't pile up duplicates.
+function attachPolarEscKey() {
+    if (document.body._ppEscBound) return;
+    document.addEventListener('keydown', e => {
+        if (e.key !== 'Escape') return;
+        const modal = document.getElementById('polarPreprocessModal');
+        if (modal && modal.style.display === 'flex') {
+            e.preventDefault();
+            closePolarPreprocessModal(false);
+        }
+    });
+    document.body._ppEscBound = true;
+}
+
+// Re-runs /api/preprocess-polar/detect with the current image and shape
+// hint. Used by the "Re-detect" button in the Auto-detect section.
+async function rerunPolarDetect() {
+    const pp = AppState.polarPreprocess;
+    if (pp.isDetecting || !pp.sourceFilename) return;
+    pp.isDetecting = true;
+    setPolarLoading(true, 'Re-detecting…');
+    try {
+        const res = await fetch('/api/preprocess-polar/detect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId:   AppState.userId,
+                filename: pp.sourceFilename,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'detect failed');
+        pp.detection = res;
+        applyDetectionToCurrent(res);
+        renderPolarStatusSummary();
+        renderPolarOverlay();
+        syncPolarInputsFromState();
+        renderPolarDipDropdown();
+    } catch (err) {
+        showStatus('solverStatus', `Re-detect failed: ${err.message}`, 'error');
+    } finally {
+        pp.isDetecting = false;
+        setPolarLoading(false);
+    }
+}
+
+function snapToDetectedPeriod() {
+    const pp = AppState.polarPreprocess;
+    const per = pp.detection && pp.detection.periodicity;
+    const N = per && per.grayscale && per.grayscale.n_integer;
+    if (!N || N < 2) {
+        showStatus('solverStatus', 'No detected period to snap to', 'error');
+        return;
+    }
+    const cur = pp.current;
+    cur.is_sector = true;
+    // Snap one sector with start=0 and width 2pi/N going CCW in the
+    // user-facing math convention. The internal state is in image-coord
+    // (Y-down) so the end angle is negated.
+    cur.theta_start = 0;
+    cur.theta_end   = -2 * Math.PI / N;
+    document.getElementById('polarSectorInputs').style.display = '';
+    renderPolarOverlay();
+    syncPolarInputsFromState();
+    markPolarDirty();
+}
+
+function applyPolarTransform() {
+    const pp = AppState.polarPreprocess;
+    if (pp._debounceTimer) { clearTimeout(pp._debounceTimer); pp._debounceTimer = null; }
+    triggerPolarPreviewWarp();
+}
+
+// "Save image" -- polar mode only. Triggers a fresh warp with preview=false
+// so the backend writes a permanent unique filename (e.g. motor_polar.png,
+// motor_polar_1.png, ...). The cartesian case has nothing to save here --
+// the source file already exists in /uploads -- so we show a hint instead.
+async function savePolarImage() {
+    const pp = AppState.polarPreprocess;
+    const cur = pp.current;
+    if (!pp.sourceFilename) {
+        showStatus('solverStatus', 'No source image loaded', 'error');
+        return;
+    }
+    if (cur.save_as === 'cartesian') {
+        showStatus('solverStatus',
+            'Cartesian save target: nothing to save here (the source image already exists in /uploads).',
+            'info');
+        return;
+    }
+    if (!(cur.r_outer_px > cur.r_inner_px)) {
+        showStatus('solverStatus', 'r_outer must be greater than r_inner', 'error');
+        return;
+    }
+    const btn = document.getElementById('polarSaveImageBtn');
+    if (btn) btn.disabled = true;
+    setPolarWarpLoading(true);
+    try {
+        const res = await fetch('/api/preprocess-polar/warp', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId:           AppState.userId,
+                filename:         pp.sourceFilename,
+                center_x:         cur.center_x,
+                center_y:         cur.center_y,
+                r_start_px:       cur.r_inner_px,
+                r_end_px:         cur.r_outer_px,
+                theta_start:      cur.theta_start,
+                theta_end:        cur.theta_end,
+                nr:               cur.nr,
+                ntheta:           cur.ntheta,
+                r_orientation:    cur.r_orientation,
+                r_outer_physical: cur.r_outer_physical,
+                preview: false,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'save failed');
+        // Track the saved image separately from the live preview. Insert
+        // YAML will reference this one if present.
+        pp.lastSaved = {
+            filename:     res.filename,
+            path:         res.path,
+            polar_domain: res.polar_domain,
+            width:        res.output_width,
+            height:       res.output_height,
+        };
+        await refreshImageList();
+        // Surface the new file in the image dropdown selection.
+        const sel = document.getElementById('imageSelect');
+        if (sel) sel.value = res.filename;
+        AppState.uploadedImageFilename = res.filename;
+        try { loadSelectedImage(); } catch { /* best effort */ }
+        showStatus('solverStatus',
+            `Saved warped image: ${res.filename} (${res.output_width} × ${res.output_height} px). ` +
+            `Press "Insert YAML" to add the polar_domain block to the editor.`,
+            'success');
+    } catch (err) {
+        showStatus('solverStatus', `Save image failed: ${err.message}`, 'error');
+    } finally {
+        if (btn) btn.disabled = false;
+        setPolarWarpLoading(false);
+    }
+}
+
+// "Insert YAML" -- writes coordinate_system + polar_domain + image_path
+// (polar mode) or coordinate_system + image_path + mesh (cartesian) into
+// the YAML editor. Independent from "Save image"; the polar branch
+// prefers the most recently saved image, falling back to the preview
+// filename and warning the user that they're referring to a transient
+// preview file.
+// Pick the θ boundary condition from Δθ relative to the detected polar
+// pitch Θp = 2π/N. Even-integer multiples → periodic, odd-integer →
+// anti-periodic (sign-flipped periodic), otherwise → Dirichlet.
+// Returns { kind, label, bcFlow } where bcFlow is the inline yaml fragment
+// "type: ..., value: ..." that goes inside `{ ... }`.
+function pickThetaBoundary(theta_range, N) {
+    if (!(N >= 2)) {
+        return {
+            kind: 'dirichlet',
+            label: 'no rotational period detected — defaulting to Az = 0 on θ boundaries',
+            bcFlow: 'type: dirichlet, value: 0.0',
+        };
+    }
+    const Theta_p = 2 * Math.PI / N;
+    const ratio = Math.abs(theta_range) / Theta_p;
+    const rounded = Math.round(ratio);
+    const tol = 0.05;
+    if (Math.abs(ratio - rounded) > tol || rounded < 1) {
+        return {
+            kind: 'dirichlet',
+            label: `Δθ / Θp = ${ratio.toFixed(3)} (Θp = 2π/${N}), not an integer multiple → Az = 0 on θ boundaries`,
+            bcFlow: 'type: dirichlet, value: 0.0',
+        };
+    }
+    if (rounded % 2 === 0) {
+        return {
+            kind: 'periodic',
+            label: `Δθ = ${rounded}·Θp (even multiple of pole pitch 2π/${N}) → periodic θ boundary`,
+            bcFlow: 'type: periodic,  value: 1.0',
+        };
+    }
+    return {
+        kind: 'antiperiodic',
+        label: `Δθ = ${rounded}·Θp (odd multiple of pole pitch 2π/${N}) → anti-periodic θ boundary`,
+        bcFlow: 'type: periodic,  value: -1.0',
+    };
+}
+
+// Phase K: split the theta-axis pixel count T into integer (N_step,
+// N_slide) such that N_step*N_slide simulates exactly one full rotor
+// revolution. Constraints, in order of priority:
+//   1. Both are integers (loop over divisors).
+//   2. N_step * N_slide = T (exact factorisation if possible).
+//   3. 32 ≤ N_step ≤ 256 (so the time resolution sits in a sensible
+//      band: not coarse, not absurdly fine).
+//   4. Prefer the SMALLEST N_slide so individual steps are smooth.
+//      With N_step = T fitting in range, N_slide = 1 (the natural
+//      "one pixel per step" cadence) is chosen.
+// Fallback when T has no suitable divisor: N_step = 100,
+// N_slide = round(T/100). N_step*N_slide then approximates T but
+// won't land exactly -- the user gets a reasonable schedule and can
+// retune in the editor.
+function computePolarSlideSchedule(theta_size) {
+    const T = Math.max(1, Math.round(theta_size));
+    const k_max = Math.max(1, Math.floor(T / 32));
+    for (let k = 1; k <= k_max; k++) {
+        if (T % k !== 0) continue;
+        const N_step = T / k;
+        if (N_step >= 32 && N_step <= 256) {
+            return { N_step, N_slide: k, exact: true };
+        }
+    }
+    return { N_step: 100, N_slide: Math.max(1, Math.round(T / 100)), exact: false };
+}
+
+// Phase K: return the slide schedule (N_step, N_slide) for the current
+// polar warp, based on the current ntheta pixel count.
+function getPolarSlideSchedule() {
+    const cur = AppState.polarPreprocess.current;
+    const T = Math.max(1, Math.round(Number(cur.ntheta) || 0));
+    return computePolarSlideSchedule(T);
+}
+
+// Phase F.4 / N: render a numeric theta_range value as a tinyexpr
+// expression using bare `pi` (tinyexpr built-in) when it matches a
+// simple rational multiple of π. `pi` works directly inside any field
+// that the solver routes through tinyexpr (Phase N moved transient
+// fields onto that path); $pi also works via the global substitution
+// pass, but `pi` is shorter and renders cleaner in the editor.
+function thetaToTinyExpr(theta_range) {
+    if (!isFinite(theta_range) || theta_range <= 0) return String(theta_range);
+    const r = theta_range / Math.PI;
+    const tol = 1e-6;
+    const intMul = Math.round(r);
+    if (Math.abs(r - intMul) < tol && intMul >= 1 && intMul <= 12) {
+        return (intMul === 1) ? 'pi' : `${intMul}*pi`;
+    }
+    for (let den = 2; den <= 16; den++) {
+        for (let num = 1; num < den * 4; num++) {
+            if (Math.abs(r - num / den) < tol) {
+                if (num === 1) return `pi/${den}`;
+                return `${num}*pi/${den}`;
+            }
+        }
+    }
+    return String(theta_range);
+}
+
+// =====================================================================
+// Phase BA: optional-controls hint block
+// =====================================================================
+//
+// A canonical block of commented YAML that surfaces the existence of
+// nonlinear-solver + coarsening knobs the solver supports but that
+// don't need to be on in every config. We append it to every YAML
+// emitted by the polar / cartesian "Insert YAML" path AND re-append
+// it after Detect Colors's jsyaml.dump round-trip (which strips
+// comments). The marker on the first line lets ensureSolverHintBlock
+// detect prior insertion so we never append twice.
+const SOLVER_HINT_MARKER = '# --- Optional controls (uncomment + edit as needed) ---';
+const SOLVER_HINT_BLOCK = `
+${SOLVER_HINT_MARKER}
+# Defaults below are what the solver uses out of the box; listed here so
+# you know which knobs exist when you want to tune. See README for full
+# semantics of each field.
+#
+# --- Nonlinear solver tuning (active when any material is nonlinear) ---
+# nonlinear_solver:
+#   enabled: true                   # auto-enabled when a NL material is present
+#   solver_type: newton-krylov      # alt: picard
+#   max_iterations: 50              # raise for tight TOL on 1M+ DOF problems
+#   tolerance: 5.0e-4               # relative residual ||R|| / ||b||
+#   verbose: false                  # per-iter mu/H/residual diagnostics
+#   use_phase6_precond_jfnk: true   # Galerkin-preconditioned JFNK -- keep on
+#   fine_finishing_iterations: 0    # 2-5 helps accuracy on coarsened runs
+#   anderson:
+#     enabled: false                # Anderson acceleration (Picard mainly)
+#     depth: 5
+#
+# --- Adaptive mesh coarsening (mark uniform regions for downsampling) ---
+# Per-material opt-in (add inside any material in the materials: block):
+#   coarsen: true
+#   coarsen_ratio: 2                # 2x2 fine cells → 1 active cell
+# Good candidates: air, coil interiors (uniform mu_r, constant jz).
+# Avoid on: nonlinear iron, magnets, fine material interfaces.
+# coarsening:
+#   boundary_shell: 1               # keep N cells fine near material edges
+#   smooth_iterations: 0            # harmonic mu interpolation for coarse cells
+`;
+
+// Append the SOLVER_HINT_BLOCK to the YAML string iff the marker isn't
+// already present. Used by every code path that hands the user a YAML
+// document so the hint survives Detect Colors' jsyaml.dump round-trip
+// (which would otherwise drop every comment in the file).
+function ensureSolverHintBlock(yamlString) {
+    if (typeof yamlString !== 'string') return yamlString;
+    if (yamlString.indexOf(SOLVER_HINT_MARKER) !== -1) return yamlString;
+    const sep = yamlString.endsWith('\n') ? '' : '\n';
+    return yamlString + sep + SOLVER_HINT_BLOCK;
+}
+
+// Build the polar coordinate_system / polar_domain / boundary block as a
+// hand-rolled YAML string. `jsyaml.dump` strips comments, so the block
+// has to be assembled as text instead of through the dumper.
+function buildPolarYamlBlock(filename, polarDomain) {
+    const pp = AppState.polarPreprocess;
+    const det = pp.detection || {};
+    const per = det.periodicity || {};
+    const N = (per.grouped && per.grouped.n_integer)
+           || (per.rgb && per.rgb.n_integer)
+           || (per.grayscale && per.grayscale.n_integer)
+           || null;
+    const theta_range = (polarDomain && polarDomain.theta_range) || 2 * Math.PI;
+    const bc = pickThetaBoundary(theta_range, N);
+    const rs = (polarDomain && polarDomain.r_start  != null) ? polarDomain.r_start  : 0;
+    const re = (polarDomain && polarDomain.r_end    != null) ? polarDomain.r_end    : 1;
+    const ro = (polarDomain && polarDomain.r_orientation)    ? polarDomain.r_orientation : 'horizontal';
+    const lines = [];
+    lines.push('# Auto-generated by Polar Preprocess.');
+    if (N) {
+        const Theta_p_deg = (360 / N).toFixed(3);
+        const dtheta_deg = (theta_range * 180 / Math.PI).toFixed(3);
+        lines.push(`# Detected periodicity N = ${N} → polar pitch Θp = 360°/${N} ≈ ${Theta_p_deg}°.`);
+        lines.push(`# Sector Δθ = ${dtheta_deg}°.`);
+        lines.push(`# ${bc.label}`);
+    } else {
+        lines.push('# No rotational periodicity detected; θ boundaries set to Dirichlet (Az = 0).');
+    }
+    lines.push('coordinate_system: polar');
+    lines.push('polar_domain:');
+    lines.push(`  r_start: ${rs}`);
+    lines.push(`  r_end: ${re}`);
+    lines.push(`  r_orientation: ${ro}`);
+    lines.push(`  theta_range: ${thetaToTinyExpr(theta_range)}`);
+    lines.push('polar_boundary_conditions:');
+    lines.push('  inner:     { type: dirichlet, value: 0.0 }   # rotor axis / r_inner — Az = 0');
+    lines.push('  outer:     { type: dirichlet, value: 0.0 }   # stator OD / r_outer — Az = 0');
+    lines.push(`  theta_min: { ${bc.bcFlow} }`);
+    lines.push(`  theta_max: { ${bc.bcFlow} }`);
+    // Phase E.2: image_path here is documentation only — the solver
+    // takes the image as argv[2] from the CLI (which the WebUI auto-
+    // sets to AppState.uploadedImageFilename = the saved warp output).
+    // We still write the filename so the YAML self-describes which
+    // image the polar_domain was authored for, and so re-importing the
+    // YAML elsewhere preserves that link.
+    lines.push(`# image_path: documentation only. The solver reads the image given on the`);
+    lines.push(`# command line; this field records which file the polar_domain was authored for.`);
+    lines.push(`image_path: ${filename}`);
+
+    // Phase D.3 / Phase F.2: optional transient slide skeleton from the
+    // air-gap marker. Polar save target only; the cartesian path emits
+    // nothing here (the slide region wouldn't map cleanly without a
+    // per-row angular axis). Phase F.2 switched to the legacy single-
+    // slide format so the inserted transient block uses
+    // `slide_direction / slide_region_* / slide_pixels_per_step` with
+    // `total_steps: $N_step` -- the N_step variable is auto-added to
+    // the editor's variables block by insertPolarYaml.
+    const cur = AppState.polarPreprocess.current;
+    const rAG = airGapEffectiveR();
+    if (cur.air_gap_as_slide && rAG > 0) {
+        const inside = (cur.air_gap_slide_side === 'inside');
+        const rOuter = Math.max(1, cur.r_outer_px || 0);
+        const region_start = inside ? 0   : rAG;
+        const region_end   = inside ? rAG : Math.max(rAG + 1, rOuter);
+        // Phase K: derive N_step / N_slide from ntheta so the slide
+        // simulates one full rotation in N_step steps of N_slide pixels
+        // each (subject to 32 ≤ N_step ≤ 256). The values themselves
+        // live in the variables: block; this YAML only references the
+        // $N_step / $N_slide tokens so the user can retune by editing
+        // a single variable.
+        const sched = getPolarSlideSchedule();
+        const T = Math.max(1, Math.round(Number(cur.ntheta) || 0));
+        // Slide direction = the warp axis perpendicular to r.
+        const slideDir = (ro === 'horizontal') ? 'vertical' : 'horizontal';
+        lines.push('');
+        lines.push('# Slide region inferred from the air-gap marker (Polar Preprocess).');
+        lines.push(`# Side: ${inside ? 'inside the air gap' : 'outside the air gap'}`);
+        lines.push('# region_start / region_end are radial-pixel indices in the warped image.');
+        if (sched.exact) {
+            lines.push(`# Schedule: N_step * N_slide = ${sched.N_step} * ${sched.N_slide} = ${T} (one full revolution over ntheta).`);
+        } else {
+            lines.push(`# Schedule: ntheta = ${T} has no clean factorisation in [32, 256], falling back to`);
+            lines.push(`#   N_step = 100, N_slide = ${sched.N_slide} (approximates one revolution).`);
+        }
+        lines.push('transient:');
+        lines.push('  enabled: true');
+        lines.push('  enable_sliding: true');
+        lines.push('  total_steps: $N_step');
+        lines.push(`  slide_direction: ${slideDir}`);
+        lines.push(`  slide_region_start: ${region_start}`);
+        lines.push(`  slide_region_end: ${region_end}`);
+        lines.push('  slide_pixels_per_step: $N_slide');
+    }
+    // Phase BA: surface the nonlinear_solver / coarsening knobs even when
+    // they aren't active in this template, so a user reading the inserted
+    // YAML in Ace sees them as a discoverable optional section.
+    return ensureSolverHintBlock(lines.join('\n') + '\n');
+}
+
+// Build the cartesian coordinate_system / mesh block. mesh.dx and .dy are
+// auto-sized from the detected r_outer (in pixels) and the user-supplied
+// r_outer_physical (in metres) so the user gets a meaningful default.
+function buildCartesianYamlBlock(filename) {
+    const pp = AppState.polarPreprocess;
+    const cur = pp.current;
+    const det = pp.detection || {};
+    const r_outer_px = (cur.r_outer_px > 0) ? cur.r_outer_px : (det.r_outer_px || 0);
+    const r_outer_m  = (cur.r_outer_physical > 0) ? cur.r_outer_physical : 1.0;
+    const lines = [];
+    lines.push('# Auto-generated by Polar Preprocess (cartesian save target).');
+    let dxdy;
+    if (r_outer_px > 0) {
+        dxdy = r_outer_m / r_outer_px;
+        lines.push('# Mesh sized from the auto-detected outer radius:');
+        lines.push(`#   dx = dy = r_outer_physical / r_outer_px = ${r_outer_m} / ${r_outer_px} ≈ ${dxdy.toExponential(4)} m`);
+    } else {
+        dxdy = 0.2e-3;
+        lines.push('# Outer radius detection unavailable; falling back to dx = dy = 0.2 mm.');
+        lines.push('# Adjust mesh.dx / mesh.dy to match your image scale.');
+    }
+    lines.push('coordinate_system: cartesian');
+    lines.push('mesh:');
+    lines.push(`  dx: ${dxdy}`);
+    lines.push(`  dy: ${dxdy}`);
+    // Phase E.2: same documentation-only semantics as the polar block.
+    lines.push(`# image_path: documentation only. The solver reads the image given on the`);
+    lines.push(`# command line; this field records which file the mesh was authored for.`);
+    lines.push(`image_path: ${filename}`);
+    // Phase BA: same optional-controls hint block as the polar branch.
+    return ensureSolverHintBlock(lines.join('\n') + '\n');
+}
+
+async function insertPolarYaml() {
+    const pp = AppState.polarPreprocess;
+    const cur = pp.current;
+    if (!pp.sourceFilename) {
+        showStatus('solverStatus', 'No source image loaded', 'error');
+        return;
+    }
+    if (!AppState.aceEditor) {
+        showStatus('solverStatus', 'YAML editor not available', 'error');
+        return;
+    }
+    let targetFilename;
+    let block;
+    if (cur.save_as === 'polar') {
+        let polarDomain;
+        // Phase E.2: ensure the polar warp lives on disk before
+        // referencing it from image_path.
+        if (!(pp.lastSaved && pp.lastSaved.filename) &&
+            pp.lastPreview && pp.lastPreview.filename) {
+            try {
+                await savePolarImage();
+            } catch (err) {
+                showStatus('solverStatus',
+                    `Auto-save before insert failed: ${err.message}. ` +
+                    `Press "Save image" then try Insert YAML again.`,
+                    'error');
+                return;
+            }
+        }
+        if (pp.lastSaved && pp.lastSaved.filename) {
+            targetFilename = pp.lastSaved.filename;
+            polarDomain    = pp.lastSaved.polar_domain;
+        } else {
+            showStatus('solverStatus',
+                'No polar warp available. Press "Apply Transform" then "Save image" first.',
+                'error');
+            return;
+        }
+        block = buildPolarYamlBlock(targetFilename, polarDomain);
+    } else {
+        block = buildCartesianYamlBlock(pp.sourceFilename);
+        targetFilename = pp.sourceFilename;
+    }
+
+    // Phase S: build a complete, self-contained YAML from scratch and
+    // persist it as a new config file rather than merging into the
+    // editor's existing content. Rationale: when the user warps an
+    // image and runs Detect Colors against the warped image, any
+    // materials / variables / transient blocks left over from the
+    // pre-warp config are stale (colours and pixel indices changed).
+    // Starting from a fresh YAML file makes the workflow
+    //   1) Polar Preprocess → 2) Detect Colors → 3) Run
+    // produce a clean, image-specific config every time. The new file
+    // is named after the warped image so the user can tell which YAML
+    // matches which image at a glance.
+    let yamlText = block;
+    if (cur.save_as === 'polar' && cur.air_gap_as_slide && airGapEffectiveR() > 0) {
+        // Phase F.2 / K: emit the variables: block alongside the
+        // transient: section so $N_step / $N_slide resolve. The values
+        // come from the polar warp's ntheta schedule.
+        const sched = getPolarSlideSchedule();
+        yamlText += `\nvariables:\n`;
+        yamlText += `  N_step: ${sched.N_step}\n`;
+        yamlText += `  N_slide: ${sched.N_slide}\n`;
+    }
+
+    // Compose the new config filename from the image base name.
+    const baseName = String(targetFilename).replace(/\.[^./\\]+$/, '');
+    const newConfigName = `${baseName}.yaml`;
+
+    try {
+        const res = await fetch('/api/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                file: newConfigName,
+                content: yamlText,
+            }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'save failed');
+    } catch (err) {
+        showStatus('solverStatus',
+            `Failed to save new config "${newConfigName}": ${err.message}`,
+            'error');
+        return;
+    }
+
+    // Refresh the config dropdown, switch to the new file, load it.
+    try { await refreshConfigList(); } catch (_) { /* best effort */ }
+    const select = document.getElementById('configFileSelect');
+    if (select) {
+        select.value = newConfigName;
+        try { await loadConfig(); } catch (_) { /* best effort */ }
+    } else if (AppState.aceEditor) {
+        AppState.aceEditor.setValue(yamlText, -1);
+    }
+    if (typeof switchTab === 'function') switchTab('config');
+    showStatus('solverStatus',
+        `New config "${newConfigName}" created and loaded. ` +
+        `Run Detect Colors on the warped image to fill in materials.`,
+        'success');
+}
+
+// Legacy entry point preserved so anything still calling
+// savePolarAndInsert() does the closest thing: save image (if polar)
+// then insert YAML. The footer no longer wires this.
+async function savePolarAndInsert() {
+    const pp = AppState.polarPreprocess;
+    if (pp.current.save_as === 'polar') await savePolarImage();
+    await insertPolarYaml();
 }
 
 async function deleteConfig() {
@@ -2184,7 +5463,9 @@ const plotDefinitions = {
     force_y_time: { name: 'Force Y-axis', render: renderForceYTime },
     torque_time: { name: 'Torque', render: renderTorqueTime },
     energy_time: { name: 'Magnetic Energy', render: renderEnergyTime },
-    virtual_work: { name: 'Virtual Work (dW/dx)', render: renderVirtualWork }
+    virtual_work: { name: 'Virtual Work (dW/dx)', render: renderVirtualWork },
+    flux_linkage_time: { name: 'Flux Linkage Timeline', render: renderFluxLinkageTime },
+    back_emf_time: { name: 'Back-EMF Timeline', render: renderBackEMFTime }
 };
 
 let plotIdCounter = 0;
@@ -5669,6 +8950,216 @@ async function renderTorqueTime(containerId) {
         await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
     } catch (error) {
         console.error('Torque time plot error:', error);
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
+    }
+}
+
+// =====================================================================
+// Phase Z: Flux Linkage / Back-EMF timeline (CSV-driven)
+// =====================================================================
+//
+// Source: <resultPath>/FluxLinkage/flux_linkage.csv written by the solver's
+// exportFluxLinkageCSV() (MagneticFieldAnalyzer.cpp:2347+). Header row is
+//   step,<Phi_name_1>,<Phi_name_2>,...
+// Each subsequent row is a step index and one Φ value per defined path.
+//
+// One fetch+parse per result path is cached on AppState.fluxLinkageCache.
+// Two palette items consume this:
+//   - flux_linkage_time  → Φ(step)
+//   - back_emf_time      → -dΦ/dstep (back-EMF convention, proportional to
+//                          the per-phase induced voltage when the rotor
+//                          advances uniformly per step)
+//
+// Plotly's built-in legend click hides/shows traces, so the user can
+// inspect one phase at a time without us writing a custom legend.
+async function loadFluxLinkageData() {
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) return null;
+
+    if (!AppState.fluxLinkageCache) AppState.fluxLinkageCache = {};
+    if (AppState.fluxLinkageCache[resultPath]) return AppState.fluxLinkageCache[resultPath];
+
+    try {
+        const response = await fetch(
+            `/api/load-csv-raw?result=${encodeURIComponent(resultPath)}`
+            + `&file=FluxLinkage/flux_linkage.csv`);
+        if (!response.ok) return null;
+        const text = await response.text();
+        if (!text || !text.trim()) return null;
+
+        const lines = text.trim().split(/\r?\n/);
+        if (lines.length < 2) return null;
+        const headers = lines[0].split(',').map(s => s.trim());
+        if (headers[0].toLowerCase() !== 'step' || headers.length < 2) return null;
+        const phiNames = headers.slice(1);
+        const steps = [];
+        const phiSeries = {};
+        phiNames.forEach(n => { phiSeries[n] = []; });
+        for (let i = 1; i < lines.length; i++) {
+            const parts = lines[i].split(',');
+            if (parts.length < 1) continue;
+            const step = Number(parts[0]);
+            if (!Number.isFinite(step)) continue;
+            steps.push(step);
+            for (let k = 0; k < phiNames.length; k++) {
+                const v = Number(parts[k + 1]);
+                phiSeries[phiNames[k]].push(Number.isFinite(v) ? v : null);
+            }
+        }
+        if (steps.length === 0) return null;
+
+        const data = { headers, phiNames, steps, phiSeries };
+        AppState.fluxLinkageCache[resultPath] = data;
+        return data;
+    } catch (e) {
+        console.error('loadFluxLinkageData failed:', e);
+        return null;
+    }
+}
+
+// Map "Phi_Coil_A" / "Phi_A" / "PhiA" → red, B → green, C → blue.
+// IPMSM / electrical-engineering convention. Falls back to Plotly auto
+// for anything that doesn't pattern-match.
+function fluxPhaseColor(name) {
+    const u = name.toUpperCase();
+    if (/(^|[_-])A$|COIL[_-]?A|PHI[_-]?A|_PHASEA/.test(u)) return '#d62728';
+    if (/(^|[_-])B$|COIL[_-]?B|PHI[_-]?B|_PHASEB/.test(u)) return '#2ca02c';
+    if (/(^|[_-])C$|COIL[_-]?C|PHI[_-]?C|_PHASEC/.test(u)) return '#1f77b4';
+    return null;
+}
+
+async function renderFluxLinkageTime(containerId) {
+    try {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        const data = await loadFluxLinkageData();
+        if (!data || data.steps.length === 0) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">'
+                + 'No flux_linkage.csv in this result.<br>'
+                + 'Define <code>flux_linkage:</code> in the YAML and rerun the transient analysis.'
+                + '</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // CSV step column is 0-based to match the solver's `step 0:` print;
+        // display as 1-based so it lines up with "Step 1/N" elsewhere in the UI.
+        const xSteps = data.steps.map(s => s + 1);
+        const traces = data.phiNames.map(name => {
+            const color = fluxPhaseColor(name);
+            const trace = {
+                x: xSteps,
+                y: data.phiSeries[name],
+                type: 'scatter',
+                mode: 'lines+markers',
+                name,
+                line: { width: 2 },
+                marker: { size: 6 }
+            };
+            if (color) { trace.line.color = color; trace.marker.color = color; }
+            return trace;
+        });
+
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 60, r: 10, t: 10, b: 35 },
+            xaxis: { title: 'Step', zeroline: false },
+            yaxis: { title: 'Φ [Wb/m]', zeroline: true, tickformat: '.2e' },
+            legend: legendConfig,
+            showlegend: true,
+            hovermode: 'closest'
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+    } catch (error) {
+        console.error('Flux linkage time plot error:', error);
+        const container = document.getElementById(containerId);
+        if (container) {
+            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        }
+    }
+}
+
+async function renderBackEMFTime(containerId) {
+    try {
+        const container = document.getElementById(containerId);
+        if (!container) return;
+
+        const data = await loadFluxLinkageData();
+        if (!data || data.steps.length < 2) {
+            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">'
+                + 'Need at least 2 transient steps to compute dΦ/dstep.<br>'
+                + 'Define <code>flux_linkage:</code> and run a transient analysis (total_steps ≥ 2).'
+                + '</div>';
+            return;
+        }
+
+        container.innerHTML = '';
+        const size = getContainerSize(container);
+
+        // Forward-difference EMF ∝ -ΔΦ/Δstep, plotted at the midpoint
+        // between adjacent steps. We don't divide by physical Δt here —
+        // the solver doesn't write it to the CSV — so this is "EMF in
+        // Wb/m per step". For a uniformly-rotating rotor (Δstep ↔
+        // constant electrical angle), the shape and amplitude of this
+        // curve is exactly the back-EMF up to a known (RPM, pole-pair)
+        // scale factor the user can apply downstream.
+        const xCenters = [];
+        const dPhi = {};
+        data.phiNames.forEach(n => { dPhi[n] = []; });
+        for (let i = 1; i < data.steps.length; i++) {
+            // midpoint, in 1-based display coords
+            xCenters.push(data.steps[i - 1] + 1.5);
+            for (const name of data.phiNames) {
+                const a = data.phiSeries[name][i - 1];
+                const b = data.phiSeries[name][i];
+                dPhi[name].push((a == null || b == null) ? null : -(b - a));
+            }
+        }
+
+        const traces = data.phiNames.map(name => {
+            const color = fluxPhaseColor(name);
+            // Rename Φ_* → EMF_* in the legend so the user can tell at a
+            // glance which palette item produced this trace.
+            const legendName = name.replace(/^Phi/i, 'EMF').replace(/^Φ/i, 'EMF');
+            const trace = {
+                x: xCenters,
+                y: dPhi[name],
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: legendName,
+                line: { width: 2 },
+                marker: { size: 6 }
+            };
+            if (color) { trace.line.color = color; trace.marker.color = color; }
+            return trace;
+        });
+
+        const legendConfig = traces.length <= 3
+            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
+            : { x: 1.02, y: 1, xanchor: 'left' };
+
+        await Plotly.newPlot(container, traces, {
+            width: size.width,
+            height: size.height,
+            margin: { l: 60, r: 10, t: 10, b: 35 },
+            xaxis: { title: 'Step', zeroline: false },
+            yaxis: { title: '-dΦ/dstep [Wb/m per step]', zeroline: true, tickformat: '.2e' },
+            legend: legendConfig,
+            showlegend: true,
+            hovermode: 'closest'
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+    } catch (error) {
+        console.error('Back-EMF time plot error:', error);
         const container = document.getElementById(containerId);
         if (container) {
             container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;

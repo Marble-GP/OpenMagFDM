@@ -60,20 +60,26 @@ material_presets:
   # ===========================================================================
 
   # Pure Iron (soft magnetic iron)
-  # Characteristics: very high permeability, low coercivity, high saturation (~2.1 T)
+  # Characteristics: very high permeability, low coercivity, high saturation (~1.9 T)
+  # B(H) is the Langevin-like saturating form: B = H/(H_knee + slope·H) + μ₀·H,
+  # so μ_r is highest near H=0 (≈19900) and saturates toward H = ∞.
+  # NOTE: an earlier version multiplied the curve by a logistic sigmoid centred
+  # at H ≈ H_knee, which artificially suppressed B in the H << H_knee regime and
+  # trapped the nonlinear solver in a "self-consistent vacuum" fixed point. The
+  # sigmoid has been removed -- real soft iron does not have a turn-on knee.
   pure_iron_model:
-    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))
+    B-H: $H/(40 + 0.52*$H) + 4*pi*1e-7*$H
 
   # Permendur (Fe-Co 49/49 alloy)
-  # Characteristics: highest saturation of common soft magnetics (~2.4 T),
-  # used in pole tips and actuators requiring maximum flux density
+  # Characteristics: highest saturation of common soft magnetics (~2.2 T),
+  # used in pole tips and actuators requiring maximum flux density.
   permendur_model:
-    B-H: ($H/(14.5 + 0.45*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 25))))
+    B-H: $H/(14.5 + 0.45*$H) + 4*pi*1e-7*$H
 
   # Structural steel (mild steel / SS400 equivalent)
-  # Characteristics: moderate permeability, widely available structural material
+  # Characteristics: moderate permeability, widely available structural material.
   structural_steel_model:
-    B-H: ($H/(97.0 + 0.625*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 20))))
+    B-H: $H/(97.0 + 0.625*$H) + 4*pi*1e-7*$H
 
   # ===========================================================================
   # Permanent magnets (IEC 60404-8-1 / JIS C 2502 typical values)

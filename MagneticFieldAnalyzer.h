@@ -440,11 +440,25 @@ private:
     cv::Mat boundary_image;  // Cached boundary detection visualization
     double system_total_energy;  // Total magnetic energy of the entire system [J/m]
 
-    // Flux linkage calculation path
+    // Flux linkage calculation path. Two variants, distinguished by
+    // `use_material`:
+    //   - use_material == false (default): the existing point-to-point
+    //     path. Φ = Az(end) - Az(start) with bilinear interpolation at
+    //     the two physical coordinates.
+    //   - use_material == true (Phase B.3, v1.5): pixel-region variant
+    //     for thick coils. Φ = mean(Az over material A pixels) -
+    //     mean(Az over material B pixels). The material name -> RGB key
+    //     is resolved at parse time so the per-step computation is just
+    //     an image scan.
     struct FluxLinkagePath {
-        std::string name;           // Path identifier (e.g., "coil_A")
-        double x_start, y_start;    // Start point [m] (physical coordinates)
-        double x_end, y_end;        // End point [m] (physical coordinates)
+        std::string name;           // Path identifier (e.g., "phase_U")
+        bool use_material = false;
+        // Path variant
+        double x_start = 0.0, y_start = 0.0;
+        double x_end   = 0.0, y_end   = 0.0;
+        // Material variant
+        std::string material_a, material_b;
+        int rgb_key_a = -1, rgb_key_b = -1;  // (R<<16)|(G<<8)|B, -1 = unresolved
     };
 
     // Flux linkage calculation
@@ -454,6 +468,31 @@ private:
     // Boundary detection optimization for transient analysis (incremental update)
     cv::Mat cached_boundaries;  // Cached boundary detection result (binary mask)
     bool boundary_cache_valid;  // Whether the cache is valid
+
+    // Phase B.5: per-pixel sign factor for antiperiodic slide wrap.
+    // Initialised to +1 on first slide; cells that cross the wrap seam
+    // in an antiperiodic-mode slide have their sign flipped, and
+    // setupMaterialPropertiesForStep multiplies jz_map (and the
+    // magnetisation grids) by this sign so the source term reflects the
+    // pole-pair polarity flip after the wrap. CV_8S, same dimensions as
+    // `image` (cv::Mat, rows × cols, BGR Y-down).
+    cv::Mat slide_sign_map;
+
+    // Phase B.6: per-rectangle-slide cumulative displacement state.
+    // dx / dy can be tinyexpr formulas in $step, so we accumulate the
+    // float velocity into a float position and take the integer shift
+    // per step as the delta between consecutive rounded values. This
+    // way fractional velocities ("0.5") still produce coherent pixel
+    // motion (alternating 0 / 1 shifts) rather than being silently
+    // rounded to zero each step.
+    struct RectSlideState {
+        double cum_x = 0.0;
+        double cum_y = 0.0;
+        int    prev_int_x = 0;
+        int    prev_int_y = 0;
+    };
+    std::vector<RectSlideState> rect_slide_states;  // index aligned with transient_config.slides
+    int slide_step_counter = 0;  // increments at every slideImageRegion() call
 
     // Boundary conditions structure
     struct BoundaryCondition {
@@ -491,11 +530,70 @@ private:
     BoundaryCondition bc_inner, bc_outer;  // Polar (radial direction)
     BoundaryCondition bc_theta_min, bc_theta_max;  // Polar (angular direction)
 
+    // Phase B.2: a single sliding region. Multi-slide support is exposed
+    // through the `slides` vector on TransientConfig; for a single slide
+    // the loader fills both the vector and the legacy scalar fields from
+    // the same source so the polar transient code paths keep working
+    // unchanged while the cartesian image-domain slide loops over every
+    // entry in the vector.
+    //
+    // Phase B.5: each slide also picks a wrap_mode that controls what
+    // happens to content (and source terms) that crosses the seam:
+    //   - "periodic"     : circular shift (current behaviour). The
+    //                      material identity wraps unchanged.
+    //   - "antiperiodic" : circular shift, AND every pixel that crossed
+    //                      the seam gets jz / magnetisation sign-flipped.
+    //                      This matches the algebra of an anti-periodic
+    //                      theta BC -- the next pole is the opposite
+    //                      polarity.
+    //   - "vacuum"       : NO wrap. Cells vacated on the inlet side
+    //                      get filled with the configured vacuum_rgb
+    //                      (default white = air). Matches a Dirichlet
+    //                      BC on the wrap axis.
+    //   - "auto"         : inspect the corresponding BC type/value and
+    //                      pick periodic/antiperiodic/vacuum so the
+    //                      slide stays self-consistent with the field
+    //                      boundary. Default for new yamls.
+    struct SlideRegion {
+        std::string name = "slide";
+        // Phase B.6: "band" (existing — slides a vertical/horizontal strip with a
+        // fixed integer pixels_per_step) or "rectangle" (slides a 2-D rectangular
+        // cut-out by per-step (dx, dy), supporting tinyexpr formulas).
+        std::string kind = "band";
+        // Band variant
+        std::string direction = "vertical";  // "vertical" | "horizontal"
+        int region_start = 0;
+        int region_end = 0;
+        int pixels_per_step = 0;
+        // Common
+        std::string wrap_mode = "auto";
+        std::vector<int> vacuum_rgb = {255, 255, 255};  // air, used by vacuum mode
+        // Phase B.6 rectangle variant — image-coordinate (BGR Y-down) rect.
+        // The rectangle's content is cut from this position, vacuum-filled in
+        // place, and pasted at (rect + cumulative_displacement). The dx / dy
+        // formulas are evaluated PER STEP with $step bound; users can write
+        // either a constant ("5") or an expression ("$omega * cos(2*pi*$step/$N)").
+        int rect_x_start = 0, rect_x_end = 0;
+        int rect_y_start = 0, rect_y_end = 0;
+        std::string dx_formula = "0";
+        std::string dy_formula = "0";
+    };
+
     // Transient analysis configuration
     struct TransientConfig {
         bool enabled;
         bool enable_sliding;          // Enable/disable image sliding
         int total_steps;
+
+        // Phase B.2: explicit list of sliding regions. The cartesian slide
+        // path iterates this vector, applying each region's shift
+        // independently to its [region_start, region_end] interval.
+        std::vector<SlideRegion> slides;
+
+        // Legacy single-slide fields. Populated from `slides[0]` (if any)
+        // during the loader pass and kept around because the polar
+        // permutation / Δb / Gaussian-smoothing code paths assume one
+        // sliding region. Polar multi-slide is left as a TODO for v1.6.
         std::string slide_direction;  // "vertical" or "horizontal"
         int slide_region_start;       // Pixel position (x for vertical, y for horizontal)
         int slide_region_end;         // Pixel position (x for vertical, y for horizontal)
@@ -569,11 +667,32 @@ private:
     struct MagnetizationConfig {
         bool enabled = false;
         double Hc = 0.0;          // Effective magnetization magnitude [A/m] (resolved from Br or Hc in YAML)
-        std::string pattern;       // "parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "custom"
-        double angle_deg = 0.0;    // Magnetization angle [deg] (parallel)
-        int p = 1;                 // Pole pairs (halbach_continuous, polar_anisotropy)
+        std::string pattern;       // "parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "radial_array", "parallel_array", "custom"
+        double angle_deg = 0.0;    // Magnetization angle [deg] (parallel, parallel_array)
+        // Phase J: p is the number of POLES (not pole pairs). A 4-pole
+        // machine uses p=4. Should be even for a closed NS alternation
+        // (odd values are accepted but the M field doesn't close at
+        // θ=2π and the user typically wants p even). The halbach
+        // formula uses p/2 internally; the array / polar_anisotropy
+        // patterns use p sectors / p OJ centres directly.
+        int p = 4;
         double cx = 0.0, cy = 0.0; // Rotation center [m]
         double R_pc = 0.0;         // Pitch circle radius [m] (polar_anisotropy)
+        // Phase E.4: per-pattern direction sign. +1 = outward / first
+        // pole positive (default, backward compat); -1 = inward / first
+        // pole negative. Applies to radial / tangential (uniform flip)
+        // and radial_array / parallel_array (sets pole 0's sign before
+        // alternation).
+        double direction_sign = 1.0;
+        // Phase D.7: orientation offset for halbach_continuous and
+        // polar_anisotropy. Rotates the first pole's orientation centre
+        // (OJ in Kano 2025) by this angle around the rotor centre,
+        // letting the user align the pole structure with an arbitrary
+        // rotor initial angle. Defaults to 0.0 for backward compat.
+        // NOTE: distinct from the *transient* theta_offset in
+        // applyMaterials() which tracks cumulative sliding rotation
+        // between steps.
+        double orientation_offset_deg = 0.0;
         std::string Mx_expr, My_expr;  // tinyexpr expressions for Mx, My (parallel/halbach/custom)
     };
     std::map<std::string, MagnetizationConfig> material_magnetization;
@@ -688,6 +807,14 @@ private:
     void loadConfig(const std::string& config_path);
     void loadImage(const std::string& image_path);
     void parseUserVariables();  // Parse and evaluate user-defined variables from YAML
+    // v1.5 / Phase B.1: walk every YAML node and substitute "$name" tokens
+    // with the corresponding value from user_variables. Lets the user write
+    // e.g. `mesh: { dx: $cell_size }` or `transient: { total_steps: $N }`
+    // without each field having to opt in to substitution. Must be called
+    // AFTER parseUserVariables() (otherwise the variable map is empty).
+    void expandUserVariablesGlobally();
+    void expandUserVariablesInNode(YAML::Node node);
+    std::string substituteDollarVarsInString(const std::string& s) const;
     void setupCartesianSystem();
     void setupPolarSystem();
     void setupMaterialProperties();
@@ -696,6 +823,14 @@ private:
 
     // Transient analysis methods
     void slideImageRegion();
+    // Phase B.5: resolves SlideRegion.wrap_mode for "auto" by inspecting
+    // the field BC perpendicular to the slide axis. Returns one of
+    // "periodic", "antiperiodic", "vacuum".
+    std::string resolveSlideWrapMode(const SlideRegion& slide) const;
+    // Phase B.6: evaluates a rectangle slide's dx / dy formula at the
+    // given step. The formula's $name tokens were globally substituted
+    // at load time, so only $step is bound here.
+    double evaluateSlideFormula(const std::string& formula, int step) const;
 
     // Dynamic Jz evaluation
     JzValue parseJzValue(const YAML::Node& jz_node);
@@ -714,7 +849,7 @@ private:
     void updateMuDistribution();  // Update mu_map based on current H_map
 
     // Permanent magnet magnetization model
-    void computeMagnetizationGrids();        // Build Mx_map, My_map from material_magnetization configs
+    void computeMagnetizationGrids(int step = 0);  // Build Mx_map, My_map. Phase AA: step lets transient sliding rotate the magnetisation pattern with the rotor.
     void computeMagnetizationCurl();         // Cartesian: Jz_mag = ∂My/∂x - ∂Mx/∂y
     void computeMagnetizationCurlPolar();    // Polar: Jz_mag = (1/r)∂(r·Mθ)/∂r - (1/r)∂Mr/∂θ
 
@@ -722,6 +857,16 @@ private:
     double calculateRGBDistance(const cv::Vec3b& a, const cv::Vec3b& b) const;
     bool isPointOnLineSegment(const cv::Vec3b& pixel, const cv::Vec3b& a, const cv::Vec3b& b, double tolerance = 15.0) const;
     double interpolateAntialiasedMu(const cv::Vec3b& pixel, double& out_mu_r) const;
+
+    // Phase N: parse the transient: block after $name expansion so
+    // formulas (mu0 * 1000, ntheta / 2, pi/4, ...) and $variable
+    // references in fields like total_steps, slide_pixels_per_step,
+    // and the per-slide region / pixels_per_step entries resolve
+    // through tinyexpr instead of failing the strict .as<int>() path.
+    void parseTransientConfig();
+    // Tinyexpr-aware scalar evaluation helpers used by parseTransientConfig.
+    double evaluateScalarAsDouble(const YAML::Node& node, double fallback) const;
+    int    evaluateScalarAsInt   (const YAML::Node& node, int    fallback) const;
 
     // Flux linkage calculation methods
     void parseFluxLinkagePaths();           // Parse flux_linkage section from YAML

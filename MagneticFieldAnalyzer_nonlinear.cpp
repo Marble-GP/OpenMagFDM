@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
+#include <cmath>
+#include <limits>
 #include <Eigen/Dense>
 #include <Eigen/Cholesky>
 
@@ -892,7 +894,7 @@ void MagneticFieldAnalyzer::calculateHField() {
         double B_mag = std::sqrt(Bx_val * Bx_val + By_val * By_val);
 
         cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB; LUT keys are R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -929,33 +931,96 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
     int n_rows = image_to_use.rows;
     int n_cols = image_to_use.cols;
 
+    // Phase V: diagnostic — accumulate per-call stats over nonlinear
+    // material cells so the verbose log can confirm whether updateMu
+    // actually changed the μ distribution between iterations. The cost
+    // is one double-precision min/max/mean reduction per call (~5 ms
+    // for a 2976×450 grid), negligible vs. AMGCL.
+    double H_min = std::numeric_limits<double>::infinity();
+    double H_max = -std::numeric_limits<double>::infinity();
+    double H_sum = 0.0;
+    double mu_r_min = std::numeric_limits<double>::infinity();
+    double mu_r_max = -std::numeric_limits<double>::infinity();
+    double mu_r_sum = 0.0;
+    long long n_nl = 0;
+    long long n_changed = 0;
+
     // rgb_to_material LUT replaces config["materials"] iteration for thread-safety
-    // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility
-    #pragma omp parallel for schedule(static)
-    for (int k = 0; k < n_rows * n_cols; k++) {
-        int j = k / n_cols, i = k % n_cols;
-        cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+    // flat k = j*n_cols+i avoids collapse(2) for MSVC OpenMP 2.0 compatibility.
+    // MSVC OpenMP 2.0 doesn't support reduction(min:) / reduction(max:); use
+    // per-thread accumulators merged via #pragma omp critical instead.
+    #pragma omp parallel
+    {
+        double H_min_local = std::numeric_limits<double>::infinity();
+        double H_max_local = -std::numeric_limits<double>::infinity();
+        double H_sum_local = 0.0;
+        double mu_r_min_local = std::numeric_limits<double>::infinity();
+        double mu_r_max_local = -std::numeric_limits<double>::infinity();
+        double mu_r_sum_local = 0.0;
+        long long n_nl_local = 0;
+        long long n_changed_local = 0;
 
-        auto lut_it = rgb_to_material.find(rgb_key);
-        if (lut_it != rgb_to_material.end()) {
-            const std::string& name = lut_it->second.name;
-            auto it = material_mu.find(name);
+        #pragma omp for schedule(static)
+        for (int k = 0; k < n_rows * n_cols; k++) {
+            int j = k / n_cols, i = k % n_cols;
+            cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
+            int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB; LUT keys are R<<16|G<<8|B
 
-            // Skip linear (STATIC) materials — μ is constant, already set
-            if (it != material_mu.end() && it->second.type == MuType::STATIC) {
-                continue;
+            auto lut_it = rgb_to_material.find(rgb_key);
+            if (lut_it != rgb_to_material.end()) {
+                const std::string& name = lut_it->second.name;
+                auto it = material_mu.find(name);
+
+                // Skip linear (STATIC) materials — μ is constant, already set
+                if (it != material_mu.end() && it->second.type == MuType::STATIC) {
+                    continue;
+                }
+
+                double H_mag = H_map(j, i);
+                double mu_r = 1.0;
+
+                if (it != material_mu.end()) {
+                    mu_r = evaluateMu(it->second, H_mag);
+                }
+
+                const double mu_new = mu_r * MU_0;
+                const double mu_old = mu_map(j, i);
+                mu_map(j, i) = mu_new;
+
+                n_nl_local++;
+                if (std::abs(mu_new - mu_old) > 1e-15 * std::abs(mu_old)) n_changed_local++;
+                if (H_mag < H_min_local) H_min_local = H_mag;
+                if (H_mag > H_max_local) H_max_local = H_mag;
+                H_sum_local += H_mag;
+                if (mu_r < mu_r_min_local) mu_r_min_local = mu_r;
+                if (mu_r > mu_r_max_local) mu_r_max_local = mu_r;
+                mu_r_sum_local += mu_r;
             }
-
-            double H_mag = H_map(j, i);
-            double mu_r = 1.0;
-
-            if (it != material_mu.end()) {
-                mu_r = evaluateMu(it->second, H_mag);
-            }
-
-            mu_map(j, i) = mu_r * MU_0;
         }
+
+        #pragma omp critical
+        {
+            if (H_min_local < H_min) H_min = H_min_local;
+            if (H_max_local > H_max) H_max = H_max_local;
+            H_sum += H_sum_local;
+            if (mu_r_min_local < mu_r_min) mu_r_min = mu_r_min_local;
+            if (mu_r_max_local > mu_r_max) mu_r_max = mu_r_max_local;
+            mu_r_sum += mu_r_sum_local;
+            n_nl     += n_nl_local;
+            n_changed += n_changed_local;
+        }
+    }
+
+    if (nonlinear_config.verbose && n_nl > 0) {
+        std::cout << " [updateMu: NL_cells=" << n_nl
+                  << " (changed=" << n_changed << ")"
+                  << " H=[" << std::scientific << std::setprecision(2)
+                  << H_min << ", " << (H_sum / static_cast<double>(n_nl))
+                  << ", " << H_max << "]"
+                  << " mu_r=[" << mu_r_min
+                  << ", " << (mu_r_sum / static_cast<double>(n_nl))
+                  << ", " << mu_r_max << "]]"
+                  << std::flush;
     }
 }
 

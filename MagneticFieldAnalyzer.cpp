@@ -3,6 +3,8 @@
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
+#include <cctype>
 #include <stdexcept>
 #include <cmath>
 #include <chrono>
@@ -34,10 +36,53 @@ static void createDirectory(const std::string& path) {
 
 constexpr double MU_0 = 4.0 * M_PI * 1e-7;  // Vacuum permeability [H/m]
 
+// Phase O: deep-merge a material's overrides on top of a referenced
+// preset. Top-level scalar / sequence keys still override outright,
+// but for nested maps (notably `magnetization`) the override's keys
+// are merged INTO the preset's map -- so writing
+//     magnetization: { pattern: parallel_array, p: 4, ... }
+// on top of a NdFeB preset that supplied Br: 1.27 no longer drops Br
+// and silently turns every magnet pixel into vacuum (the pre-Phase-O
+// behaviour). Anything not redeclared in the override keeps the
+// preset's value; anything redeclared (e.g. pattern, angle) wins.
+static YAML::Node mergeMaterialPreset(const YAML::Node& preset_props,
+                                     const YAML::Node& override_props) {
+    YAML::Node merged = YAML::Clone(preset_props);
+    for (auto it = override_props.begin(); it != override_props.end(); ++it) {
+        const std::string key = it->first.as<std::string>("");
+        if (key.empty() || key == "preset") continue;
+        const YAML::Node child = it->second;
+        if (child.IsMap() && merged[key] && merged[key].IsMap()) {
+            YAML::Node merged_child = YAML::Clone(merged[key]);
+            for (auto cit = child.begin(); cit != child.end(); ++cit) {
+                const std::string ck = cit->first.as<std::string>("");
+                if (!ck.empty()) merged_child[ck] = cit->second;
+            }
+            merged[key] = merged_child;
+        } else {
+            merged[key] = child;
+        }
+    }
+    return merged;
+}
+
 MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
                                              const std::string& image_path) {
     loadConfig(config_path);
     loadImage(image_path);
+
+    // v1.5 / Phase B.1: parse user-defined variables and expand `$name`
+    // tokens throughout the YAML tree BEFORE any other parsing pass, so
+    // every downstream field (mesh, polar_domain, nonlinear_solver,
+    // transient, flux_linkage, ...) sees the substituted numeric strings.
+    parseUserVariables();
+    expandUserVariablesGlobally();
+    // Phase N: now that every $name in the YAML tree has been replaced
+    // with its numeric value, the transient block can be parsed and its
+    // fields evaluated through tinyexpr. Anything that survives this
+    // pass (formulas with pi / e / mu0, plain numbers, post-substitution
+    // expressions like "100 * 2") resolves correctly.
+    parseTransientConfig();
 
     // Initialize flags BEFORE setup methods
     // Transient analysis optimization flags
@@ -124,7 +169,9 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         setupCartesianSystem();
     }
 
-    parseUserVariables();  // Parse user-defined variables before material properties
+    // (parseUserVariables + expandUserVariablesGlobally already ran at
+    // the top of the constructor; setupMaterialProperties just needs the
+    // user_variables map populated.)
     setupMaterialProperties();  // This may set has_nonlinear_materials = true
     validateBoundaryConditions();
 
@@ -137,36 +184,11 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
         config = YAML::LoadFile(config_path);
         std::cout << "Configuration loaded from: " << config_path << std::endl;
 
-        // Load transient analysis configuration
-        if (config["transient"]) {
-            auto trans = config["transient"];
-            transient_config.enabled = trans["enabled"].as<bool>(false);
-            transient_config.enable_sliding = trans["enable_sliding"].as<bool>(true);
-            transient_config.total_steps = trans["total_steps"].as<int>(0);
-            transient_config.slide_direction = trans["slide_direction"].as<std::string>("vertical");
-            transient_config.slide_region_start = trans["slide_region_start"].as<int>(0);
-            transient_config.slide_region_end = trans["slide_region_end"].as<int>(0);
-            transient_config.slide_pixels_per_step = trans["slide_pixels_per_step"].as<int>(0);
-
-            // Optional output field selection (empty = export all)
-            if (trans["export_fields"] && trans["export_fields"].IsSequence()) {
-                for (const auto& field : trans["export_fields"]) {
-                    transient_config.export_fields.push_back(field.as<std::string>());
-                }
-            }
-
-            if (transient_config.enabled) {
-                std::cout << "Transient analysis enabled: " << transient_config.total_steps << " steps" << std::endl;
-                std::cout << "  Sliding: " << (transient_config.enable_sliding ? "enabled" : "disabled") << std::endl;
-                if (transient_config.enable_sliding) {
-                    std::cout << "  Slide direction: " << transient_config.slide_direction << std::endl;
-                    std::string axis = (transient_config.slide_direction == "vertical") ? "x" : "y";
-                    std::cout << "  Slide region: " << axis << " in [" << transient_config.slide_region_start
-                              << ", " << transient_config.slide_region_end << "]" << std::endl;
-                    std::cout << "  Pixels per step: " << transient_config.slide_pixels_per_step << std::endl;
-                }
-            }
-        }
+        // Phase N: the transient block is parsed in a deferred pass
+        // (parseTransientConfig, called from the constructor after
+        // expandUserVariablesGlobally). That lets tinyexpr formulas
+        // and $name references resolve in fields like total_steps and
+        // slide_pixels_per_step.
 
         // Load result export configuration. Phase 1 ships the schema + dispatch wiring;
         // only the CSV path is functional, so behavior is unchanged unless format=tiff
@@ -451,6 +473,166 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
     }
 }
 
+// Phase N: read a YAML scalar as a double, accepting either a plain
+// numeric literal (fast path) or a tinyexpr expression. Bare `pi`,
+// `e`, and `mu0` are available as identifiers; `$name` substitution
+// must already have happened (expandUserVariablesGlobally) so the
+// expression seen here only contains numeric tokens, operators, and
+// the three built-ins.
+double MagneticFieldAnalyzer::evaluateScalarAsDouble(const YAML::Node& node,
+                                                    double fallback) const {
+    if (!node || !node.IsScalar()) return fallback;
+    std::string s;
+    try { s = node.as<std::string>(); } catch (...) { return fallback; }
+    if (s.empty()) return fallback;
+    // Trim leading whitespace for the fast path.
+    std::size_t lead = 0;
+    while (lead < s.size() && std::isspace(static_cast<unsigned char>(s[lead]))) ++lead;
+    try {
+        std::size_t consumed = 0;
+        const double v = std::stod(s.substr(lead), &consumed);
+        std::size_t tail = lead + consumed;
+        while (tail < s.size() && std::isspace(static_cast<unsigned char>(s[tail]))) ++tail;
+        if (tail == s.size()) return v;
+    } catch (...) { /* fall through to tinyexpr */ }
+    te_parser parser;
+    {
+        te_variable mu0_var; mu0_var.m_name = "mu0"; mu0_var.m_value = MU_0;
+        parser.set_variables_and_functions({mu0_var});
+    }
+    const double v = parser.evaluate(s);
+    if (parser.success() && std::isfinite(v)) return v;
+    std::cerr << "Warning: failed to evaluate '" << s
+              << "' as a number, using fallback " << fallback << std::endl;
+    return fallback;
+}
+
+int MagneticFieldAnalyzer::evaluateScalarAsInt(const YAML::Node& node,
+                                               int fallback) const {
+    if (!node) return fallback;
+    return static_cast<int>(std::lround(
+        evaluateScalarAsDouble(node, static_cast<double>(fallback))));
+}
+
+void MagneticFieldAnalyzer::parseTransientConfig() {
+    if (!config["transient"]) return;
+    auto trans = config["transient"];
+    transient_config.enabled       = trans["enabled"].as<bool>(false);
+    transient_config.enable_sliding = trans["enable_sliding"].as<bool>(true);
+    transient_config.total_steps   = evaluateScalarAsInt(trans["total_steps"], 0);
+
+    transient_config.slides.clear();
+    if (trans["slides"] && trans["slides"].IsSequence()) {
+        int idx = 0;
+        for (const auto& sn : trans["slides"]) {
+            SlideRegion sr;
+            sr.name      = sn["name"].as<std::string>("slide_" + std::to_string(idx));
+            sr.kind      = sn["kind"].as<std::string>("band");
+            sr.direction = sn["direction"].as<std::string>("vertical");
+            sr.region_start    = evaluateScalarAsInt(sn["region_start"],    0);
+            sr.region_end      = evaluateScalarAsInt(sn["region_end"],      0);
+            sr.pixels_per_step = evaluateScalarAsInt(sn["pixels_per_step"], 0);
+            sr.wrap_mode = sn["wrap_mode"].as<std::string>("auto");
+            if (sn["vacuum_rgb"] && sn["vacuum_rgb"].IsSequence()) {
+                auto v = sn["vacuum_rgb"].as<std::vector<int>>();
+                if (v.size() >= 3) sr.vacuum_rgb = {v[0], v[1], v[2]};
+            }
+            if (sr.kind == "rectangle") {
+                if (sn["rect"] && sn["rect"].IsSequence()) {
+                    auto r = sn["rect"].as<std::vector<int>>();
+                    if (r.size() >= 4) {
+                        sr.rect_x_start = r[0];
+                        sr.rect_y_start = r[1];
+                        sr.rect_x_end   = r[2];
+                        sr.rect_y_end   = r[3];
+                    }
+                }
+                // dx / dy keep their string form: they are evaluated
+                // per-step with $step bound to the current step count,
+                // a quantity that doesn't exist at parse time.
+                sr.dx_formula = sn["dx"].as<std::string>("0");
+                sr.dy_formula = sn["dy"].as<std::string>("0");
+                sr.wrap_mode  = "vacuum";
+            }
+            transient_config.slides.push_back(sr);
+            ++idx;
+        }
+        // Warn about overlapping initial rectangles (Phase B.6).
+        for (std::size_t i = 0; i < transient_config.slides.size(); ++i) {
+            const auto& a = transient_config.slides[i];
+            if (a.kind != "rectangle") continue;
+            for (std::size_t j = i + 1; j < transient_config.slides.size(); ++j) {
+                const auto& b = transient_config.slides[j];
+                if (b.kind != "rectangle") continue;
+                const bool overlap_x = !(a.rect_x_end <= b.rect_x_start
+                                      || b.rect_x_end <= a.rect_x_start);
+                const bool overlap_y = !(a.rect_y_end <= b.rect_y_start
+                                      || b.rect_y_end <= a.rect_y_start);
+                if (overlap_x && overlap_y) {
+                    std::cerr << "WARNING: rectangle slides '" << a.name << "' and '" << b.name
+                              << "' have overlapping initial regions; "
+                                 "later-defined slide will overlay the earlier one." << std::endl;
+                }
+            }
+        }
+    } else if (trans["slide_pixels_per_step"] || trans["slide_region_end"]
+               || trans["slide_region_start"]  || trans["slide_direction"]) {
+        // Legacy single-slide form.
+        SlideRegion sr;
+        sr.name       = "slide";
+        sr.direction  = trans["slide_direction"].as<std::string>("vertical");
+        sr.region_start    = evaluateScalarAsInt(trans["slide_region_start"],    0);
+        sr.region_end      = evaluateScalarAsInt(trans["slide_region_end"],      0);
+        sr.pixels_per_step = evaluateScalarAsInt(trans["slide_pixels_per_step"], 0);
+        sr.wrap_mode  = "periodic";
+        transient_config.slides.push_back(sr);
+    }
+
+    // Mirror slides[0] into the legacy scalar fields the polar
+    // transient code paths still read from.
+    if (!transient_config.slides.empty()) {
+        const auto& s0 = transient_config.slides.front();
+        transient_config.slide_direction       = s0.direction;
+        transient_config.slide_region_start    = s0.region_start;
+        transient_config.slide_region_end      = s0.region_end;
+        transient_config.slide_pixels_per_step = s0.pixels_per_step;
+    } else {
+        transient_config.slide_direction       = trans["slide_direction"].as<std::string>("vertical");
+        transient_config.slide_region_start    = evaluateScalarAsInt(trans["slide_region_start"],    0);
+        transient_config.slide_region_end      = evaluateScalarAsInt(trans["slide_region_end"],      0);
+        transient_config.slide_pixels_per_step = evaluateScalarAsInt(trans["slide_pixels_per_step"], 0);
+    }
+
+    if (trans["export_fields"] && trans["export_fields"].IsSequence()) {
+        for (const auto& field : trans["export_fields"]) {
+            transient_config.export_fields.push_back(field.as<std::string>());
+        }
+    }
+
+    if (transient_config.enabled) {
+        std::cout << "Transient analysis enabled: "
+                  << transient_config.total_steps << " steps" << std::endl;
+        std::cout << "  Sliding: "
+                  << (transient_config.enable_sliding ? "enabled" : "disabled") << std::endl;
+        if (transient_config.enable_sliding) {
+            std::cout << "  Slides: " << transient_config.slides.size()
+                      << " region(s)" << std::endl;
+            for (const auto& s : transient_config.slides) {
+                std::string axis = (s.direction == "vertical") ? "x" : "y";
+                std::cout << "    [" << s.name << "] " << s.direction
+                          << ", region " << axis << " in [" << s.region_start
+                          << ", " << s.region_end << "], pixels/step=" << s.pixels_per_step
+                          << ", wrap=" << s.wrap_mode << std::endl;
+            }
+            const std::string cs = config["coordinate_system"].as<std::string>("cartesian");
+            if (cs == "polar" && transient_config.slides.size() > 1) {
+                std::cout << "  WARNING: polar transient currently uses only slides[0]. "
+                          << "Multi-slide polar is a v1.6 item." << std::endl;
+            }
+        }
+    }
+}
+
 void MagneticFieldAnalyzer::parseUserVariables() {
     // Reserved variable names that cannot be used as user-defined variables
     static const std::set<std::string> reserved_vars = {
@@ -463,8 +645,19 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         "mu0"              // Predefined physical constant: vacuum permeability (4π×10⁻⁷ H/m)
     };
 
+    // Phase F.4: pre-populate "system" variables so $pi / $e / $mu0
+    // expand globally everywhere $name substitution runs (polar_domain,
+    // mesh, transient, magnetization, ...). Users still cannot define
+    // a variable named pi / e / mu0 (reserved_vars check below). This
+    // also guarantees expandUserVariablesGlobally() runs even when no
+    // user "variables:" block is present, since user_variables is
+    // non-empty after this.
+    user_variables["pi"]  = M_PI;
+    user_variables["e"]   = std::exp(1.0);
+    user_variables["mu0"] = MU_0;
+
     if (!config["variables"]) {
-        return;  // No user-defined variables
+        return;  // No user-defined variables -- $pi/$e/$mu0 are still available globally
     }
 
     std::cout << "Parsing user-defined variables:" << std::endl;
@@ -523,6 +716,99 @@ void MagneticFieldAnalyzer::parseUserVariables() {
         user_variables[var_name] = var_value;
         std::cout << "  $" << var_name << " = " << var_value << std::endl;
     }
+}
+
+// --------------------------------------------------------------------------
+// v1.5 / Phase B.1: Global "$name" substitution across the YAML tree
+// --------------------------------------------------------------------------
+// Previously only material formulas (jz, mu_r, B-H) and the variables
+// section itself recognised $name tokens. Every other scalar field
+// (mesh.dx/dy, polar_domain.{r_start,r_end,theta_range},
+// polar_boundary_conditions.value, nonlinear_solver.*, transient.*,
+// flux_linkage.*, magnetization.*) went through `.as<double>()` directly
+// and tripped on the literal "$omega" string.
+//
+// This pass walks the YAML tree once after parseUserVariables() has
+// populated user_variables and replaces every "$name" that matches a
+// known user variable with the variable's numeric value (17-digit precision
+// so tinyexpr round-trips lossless). Reserved tokens like $step, $H, $N,
+// $A, $dx, $dy, $dr, $dtheta are *not* in user_variables and so survive
+// untouched -- they continue to be expanded at material / formula
+// evaluation time when their values become available.
+//
+// The walker explicitly skips the "variables:" section: those entries
+// were already evaluated to numeric values by parseUserVariables() and
+// re-substituting their formulas would be wasted work.
+
+std::string MagneticFieldAnalyzer::substituteDollarVarsInString(
+        const std::string& s) const {
+    if (s.find('$') == std::string::npos) return s;
+    // Sort by name length descending so $omega doesn't partial-match
+    // before $o gets a chance, matching parseUserVariables' contract.
+    std::vector<std::pair<std::string, double>> sorted_vars(
+        user_variables.begin(), user_variables.end());
+    std::sort(sorted_vars.begin(), sorted_vars.end(),
+              [](const auto& a, const auto& b) {
+                  return a.first.length() > b.first.length();
+              });
+    std::string out = s;
+    for (const auto& [name, value] : sorted_vars) {
+        const std::string needle = "$" + name;
+        std::size_t pos = 0;
+        while ((pos = out.find(needle, pos)) != std::string::npos) {
+            // Word-boundary check: $omega should not match inside $omegax.
+            const std::size_t after = pos + needle.length();
+            if (after < out.size()) {
+                const char c = out[after];
+                if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
+                    pos = after;
+                    continue;
+                }
+            }
+            std::ostringstream oss;
+            oss << std::setprecision(17) << value;
+            const std::string replacement = oss.str();
+            out.replace(pos, needle.length(), replacement);
+            pos += replacement.length();
+        }
+    }
+    return out;
+}
+
+void MagneticFieldAnalyzer::expandUserVariablesInNode(YAML::Node node) {
+    if (node.IsMap()) {
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const std::string key = it->first.as<std::string>("");
+            // Skip self-defining variables section; it was already evaluated
+            // by parseUserVariables() and the unsubstituted formulas are
+            // expected (recursive references like $a depending on $b).
+            if (key == "variables") continue;
+            YAML::Node child = it->second;
+            if (child.IsScalar()) {
+                std::string s = child.as<std::string>();
+                std::string out = substituteDollarVarsInString(s);
+                if (out != s) it->second = out;
+            } else {
+                expandUserVariablesInNode(child);
+            }
+        }
+    } else if (node.IsSequence()) {
+        for (std::size_t i = 0; i < node.size(); ++i) {
+            YAML::Node child = node[i];
+            if (child.IsScalar()) {
+                std::string s = child.as<std::string>();
+                std::string out = substituteDollarVarsInString(s);
+                if (out != s) node[i] = out;
+            } else {
+                expandUserVariablesInNode(child);
+            }
+        }
+    }
+}
+
+void MagneticFieldAnalyzer::expandUserVariablesGlobally() {
+    if (user_variables.empty()) return;  // nothing to substitute
+    expandUserVariablesInNode(config);
 }
 
 void MagneticFieldAnalyzer::setupMaterialProperties() {
@@ -604,23 +890,16 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         std::string name = material.first.as<std::string>();
         YAML::Node props = material.second;
 
-        // Resolve preset if specified (preset properties are merged, material-specific overrides)
+        // Resolve preset if specified. Phase O: deep-merge nested
+        // maps (magnetization etc.) so override blocks don't have to
+        // re-declare every preset field they want to keep.
         if (props["preset"]) {
             std::string preset_name = props["preset"].as<std::string>();
             auto preset_it = material_presets.find(preset_name);
             if (preset_it == material_presets.end()) {
                 throw std::runtime_error("Material '" + name + "' references unknown preset: " + preset_name);
             }
-
-            // Start with preset properties, then override with material-specific properties
-            YAML::Node merged = YAML::Clone(preset_it->second);
-            for (auto it = props.begin(); it != props.end(); ++it) {
-                std::string key = it->first.as<std::string>();
-                if (key != "preset") {  // Don't copy the preset reference itself
-                    merged[key] = it->second;
-                }
-            }
-            props = merged;
+            props = mergeMaterialPreset(preset_it->second, props);
             std::cout << "Material '" << name << "' using preset '" << preset_name << "'" << std::endl;
         }
 
@@ -918,11 +1197,31 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             generateBHTable(name, mu_value);
         }
 
-        // Evaluate mu_r for initial state (H=0)
-        double mu_r = evaluateMu(mu_value, 0.0);
+        // Phase U: initial mu_r seed for the linear pre-solve.
+        // For TABLE materials we use the PEAK mu_r so the first solve
+        // sees the iron at its most permeable, drives B into the
+        // saturating regime, and the nonlinear iteration then descends
+        // to the operating-point mu via interpolateH_from_B. Using
+        // mu_table[0] for B-H formulas with a sigmoidal onset can trap
+        // the iteration in a vacuum-like fixed point (see Phase U
+        // commit message for details).
+        double mu_r;
+        if (mu_value.type == MuType::TABLE && !mu_value.mu_table.empty()) {
+            mu_r = *std::max_element(mu_value.mu_table.begin(), mu_value.mu_table.end());
+        } else {
+            mu_r = evaluateMu(mu_value, 0.0);
+        }
 
-        // Parse antialias flag and add to antialias_materials if enabled
-        bool antialias_enabled = props["anti_aliasing"].as<bool>(false);
+        // Parse anti_aliasing flag and add to antialias_materials if enabled.
+        // Phase T: accept the legacy short key `antialias:` too -- the
+        // WebUI's Detect Colors used to emit that form, which the solver
+        // silently ignored. Any YAML with `antialias: true` was skipping
+        // edge-pixel mu interpolation and behaving as if AA was off,
+        // leaving large fractions of iron-coloured cells at vacuum mu
+        // when the input image had been processed by warpPolar (which
+        // produces heavily anti-aliased boundaries).
+        bool antialias_enabled = props["anti_aliasing"].as<bool>(false)
+                              || props["antialias"].as<bool>(false);
         if (antialias_enabled) {
             AntialiasableMaterial aa_mat;
             aa_mat.name = name;
@@ -1030,49 +1329,102 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
                 mc.My_expr = sy.str();
                 std::cout << "  [" << name << "] magnetization: parallel angle=" << mc.angle_deg << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "halbach_continuous") {
-                mc.p = mag["p"].as<int>(1);
+                mc.p = mag["p"].as<int>(2);
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
-                // Build tinyexpr formulas with numeric p, cx, cy substituted
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
+                double orient_rad = mc.orientation_offset_deg * M_PI / 180.0;
+                // Phase J: p = number of poles. Halbach formula needs the
+                // pole-pair count (p/2), so we divide here. p=4 → cos(2θ)
+                // → M completes 2 rotations as θ sweeps 2π → 4 poles.
+                const double p_pair = mc.p / 2.0;
                 std::ostringstream sx, sy;
-                // Mx = Hc * cos(p * atan2(y - cy, x - cx))
-                sx << std::setprecision(17) << mc.Hc << "*cos(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
-                sy << std::setprecision(17) << mc.Hc << "*sin(" << mc.p << "*atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sx << std::setprecision(17) << mc.Hc << "*cos(" << p_pair << "*(atan2(y-(" << mc.cy << "),x-(" << mc.cx << "))-(" << orient_rad << ")))";
+                sy << std::setprecision(17) << mc.Hc << "*sin(" << p_pair << "*(atan2(y-(" << mc.cy << "),x-(" << mc.cx << "))-(" << orient_rad << ")))";
                 mc.Mx_expr = sx.str();
                 mc.My_expr = sy.str();
-                std::cout << "  [" << name << "] magnetization: halbach_continuous p=" << mc.p << ", Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: halbach_continuous p=" << mc.p
+                          << " (poles), orientation_offset=" << mc.orientation_offset_deg
+                          << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "radial") {
-                // Radial magnetization: M points outward along r̂ from (cx, cy)
-                // Mx = Hc * cos(theta),  My = Hc * sin(theta)
-                // where theta = atan2(y - cy, x - cx)
+                // Radial magnetization: M points outward (direction=outward,
+                // default) or inward (direction=inward) along r̂ from
+                // (cx, cy). Mx = sign*Hc * cos(theta), My = sign*Hc * sin(theta).
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                double Hc_signed = mc.direction_sign * mc.Hc;
                 std::ostringstream sx, sy;
-                sx << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
-                sy << std::setprecision(17) << mc.Hc << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sx << std::setprecision(17) << Hc_signed << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << Hc_signed << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
                 mc.Mx_expr = sx.str();
                 mc.My_expr = sy.str();
-                std::cout << "  [" << name << "] magnetization: radial (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: radial dir=" << dir
+                          << " (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "tangential") {
-                // Tangential magnetization: M points counter-clockwise along θ̂ from (cx, cy)
-                // Mx = -Hc * sin(theta),  My = Hc * cos(theta)
+                // Tangential magnetization: M points counter-clockwise (default)
+                // or clockwise (direction=inward) along θ̂ from (cx, cy).
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                double Hc_signed = mc.direction_sign * mc.Hc;
                 std::ostringstream sx, sy;
-                sx << std::setprecision(17) << (-mc.Hc) << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
-                sy << std::setprecision(17) << mc.Hc << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sx << std::setprecision(17) << (-Hc_signed) << "*sin(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
+                sy << std::setprecision(17) << Hc_signed << "*cos(atan2(y-(" << mc.cy << "),x-(" << mc.cx << ")))";
                 mc.Mx_expr = sx.str();
                 mc.My_expr = sy.str();
-                std::cout << "  [" << name << "] magnetization: tangential (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: tangential dir=" << dir
+                          << " (cx=" << mc.cx << ", cy=" << mc.cy << "), Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "radial_array") {
+                // Phase E.4 / Phase J: alternating radial-out / radial-in
+                // per pole sector. p = number of poles. Sector k spans
+                // θ ∈ [k·2π/p, (k+1)·2π/p] + offset; sign alternates from
+                // `direction` (pole 0).
+                mc.p = mag["p"].as<int>(4);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                mc.Mx_expr = "";
+                mc.My_expr = "";
+                std::cout << "  [" << name << "] magnetization: radial_array p=" << mc.p
+                          << " (poles), dir=" << dir << ", orientation_offset="
+                          << mc.orientation_offset_deg << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
+            } else if (mc.pattern == "parallel_array") {
+                // Phase E.4 / Phase J: per pole sector, M is uniform within
+                // the sector and aligned with the sector mid-axis (rotor
+                // d-axis) with sign alternating per pole. Models IPM with
+                // axially-magnetised rectangular magnet blocks. p = poles.
+                mc.p = mag["p"].as<int>(4);
+                mc.cx = mag["cx"].as<double>(0.0);
+                mc.cy = mag["cy"].as<double>(0.0);
+                mc.angle_deg = mag["angle"].as<double>(0.0);  // offset from sector mid-axis
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
+                std::string dir = mag["direction"].as<std::string>("outward");
+                mc.direction_sign = (dir == "inward") ? -1.0 : 1.0;
+                mc.Mx_expr = "";
+                mc.My_expr = "";
+                std::cout << "  [" << name << "] magnetization: parallel_array p=" << mc.p
+                          << " (poles), dir=" << dir << ", angle=" << mc.angle_deg
+                          << " deg, orientation_offset=" << mc.orientation_offset_deg
+                          << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "polar_anisotropy") {
-                mc.p = mag["p"].as<int>(1);
+                // Phase J: p = number of poles. The Kano 2025 §3.2 model
+                // puts one OJ centre per pole on the pitch circle (so p
+                // OJ centres total, alternating sign).
+                mc.p = mag["p"].as<int>(4);
                 mc.R_pc = mag["R_pc"].as<double>(0.05);
                 mc.cx = mag["cx"].as<double>(0.0);
                 mc.cy = mag["cy"].as<double>(0.0);
-                // polar_anisotropy uses dedicated C++ loop (not tinyexpr)
+                mc.orientation_offset_deg = mag["orientation_offset"].as<double>(0.0);
                 mc.Mx_expr = "";
                 mc.My_expr = "";
-                std::cout << "  [" << name << "] magnetization: polar_anisotropy p=" << mc.p << ", R_pc=" << mc.R_pc << " m, Hc=" << mc.Hc << " A/m" << std::endl;
+                std::cout << "  [" << name << "] magnetization: polar_anisotropy p=" << mc.p
+                          << " (poles), R_pc=" << mc.R_pc << " m, orientation_offset="
+                          << mc.orientation_offset_deg << " deg, Hc=" << mc.Hc << " A/m" << std::endl;
             } else if (mc.pattern == "custom") {
                 mc.Mx_expr = mag["Mx"].as<std::string>("");
                 mc.My_expr = mag["My"].as<std::string>("");
@@ -1238,7 +1590,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
 // Permanent magnet magnetization model
 // ============================================================================
 
-void MagneticFieldAnalyzer::computeMagnetizationGrids() {
+void MagneticFieldAnalyzer::computeMagnetizationGrids(int step) {
     // Builds Mx_map, My_map from per-material MagnetizationConfig, then calls curl.
     //
     // For parallel/halbach_continuous/custom patterns: uses tinyexpr compile-once/
@@ -1247,6 +1599,45 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
     // For polar_anisotropy: uses 2p wire-current superposition model where
     // wires at radius R_pc create a p-pole field whose direction defines the
     // easy axis of magnetization.
+    //
+    // Phase AA: when transient sliding rotates the rotor in theta, the
+    // magnetisation pattern must rotate WITH the rotor (the magnet domains
+    // are physically glued to the iron core and rotate as a rigid body).
+    // The pre-AA code computed the pattern from the absolute lab-frame
+    // theta of each cell, which is equivalent to "the pole boundaries are
+    // welded to the lab frame and the rotor iron passes through them" --
+    // every time a magnet crossed a lab-frame pole boundary, its M flipped.
+    // For a 4-pole rotor sliding 90° per pole pitch, this manufactured a
+    // spurious 6-step periodic discontinuity in the no-load flux linkages
+    // (see the user-supplied ISEEJ-D plot — Phi_C swung by ±2e-2 Wb/m on
+    // every pole crossing while a balanced 3-phase signal should have
+    // had zero mean and equal amplitudes 120° apart).
+    //
+    // Fix: compute the rotor's cumulative angular displacement from the
+    // slide config, then evaluate the pattern in the ROTOR frame
+    // (theta_rotor = theta_lab - rotor_angle - orient) and rotate the
+    // resulting magnetisation vector BACK into the lab frame
+    // (angle_mid_lab = angle_mid_rotor + rotor_angle). This is
+    // mathematically identical to "slide M alongside the image and rotate
+    // each vector by Δθ per step", but avoids any cumulative slide-drift
+    // and naturally handles multi-region slides + antiperiodic seams.
+    //
+    // rotor_angle = 0 at step 0 (and whenever sliding is disabled), so
+    // the static / single-shot path is unchanged.
+    double rotor_angle = 0.0;
+    if (step > 0 && transient_config.enable_sliding && coordinate_system == "polar") {
+        for (const auto& slide : transient_config.slides) {
+            if (slide.kind == "rectangle") continue;
+            const bool is_theta_slide =
+                (r_orientation == "horizontal" && slide.direction == "vertical") ||
+                (r_orientation == "vertical"   && slide.direction == "horizontal");
+            if (is_theta_slide) {
+                rotor_angle += static_cast<double>(step)
+                             * static_cast<double>(slide.pixels_per_step)
+                             * dtheta;
+            }
+        }
+    }
 
     bool is_polar = (coordinate_system == "polar");
 
@@ -1276,10 +1667,14 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
         }
         cv::Vec3b rgb(rgb_vec[0], rgb_vec[1], rgb_vec[2]);
 
-        if (mc.pattern == "polar_anisotropy") {
-            // 2p concentrated wire currents on pitch circle → superposed B direction
+        const bool is_array_pattern = (mc.pattern == "radial_array" || mc.pattern == "parallel_array");
+        if (mc.pattern == "polar_anisotropy" || is_array_pattern) {
+            // Dedicated loop for polar_anisotropy (Phase D.7) and the two
+            // Phase E.4 array patterns. They all need per-cell pole-sector
+            // bookkeeping that doesn't fit the tinyexpr fast path.
             int grid_rows = is_polar ? (int)Mx_map.rows() : ny;
             int grid_cols = is_polar ? (int)Mx_map.cols() : nx;
+            const double orient_rad = mc.orientation_offset_deg * M_PI / 180.0;
 
             for (int j = 0; j < grid_rows; j++) {
                 for (int i = 0; i < grid_cols; i++) {
@@ -1308,22 +1703,67 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
                         y_phys = j * dy;
                     }
 
-                    // Superpose field of 2p wire currents at R_pc
-                    double Bx_sum = 0.0, By_sum = 0.0;
-                    for (int k = 0; k < 2 * mc.p; k++) {
-                        double theta_k = M_PI * k / mc.p;
-                        double sign = (k % 2 == 0) ? 1.0 : -1.0;
-                        double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
-                        double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
-                        double r2 = dx_w * dx_w + dy_w * dy_w;
-                        if (r2 < 1e-20) continue;
-                        // μ₀I/2π factor omitted — only direction matters
-                        Bx_sum += sign * (-dy_w) / r2;
-                        By_sum += sign * ( dx_w) / r2;
+                    if (mc.pattern == "polar_anisotropy") {
+                        // Phase J: superpose field of p wire currents at
+                        // R_pc, one per pole. Adjacent currents alternate
+                        // sign for the NS layout. theta_k = 2π·k/p.
+                        //
+                        // Phase AA: the virtual wire sources are anchored
+                        // to the rotor, so their lab-frame angular
+                        // positions advance by rotor_angle as the rotor
+                        // turns. Adding rotor_angle to theta_k rotates
+                        // the whole pole pattern with the slide.
+                        double Bx_sum = 0.0, By_sum = 0.0;
+                        for (int k = 0; k < mc.p; k++) {
+                            double theta_k = 2.0 * M_PI * k / mc.p + orient_rad + rotor_angle;
+                            double sign = (k % 2 == 0) ? 1.0 : -1.0;
+                            double dx_w = x_phys - mc.cx - mc.R_pc * std::cos(theta_k);
+                            double dy_w = y_phys - mc.cy - mc.R_pc * std::sin(theta_k);
+                            double r2 = dx_w * dx_w + dy_w * dy_w;
+                            if (r2 < 1e-20) continue;
+                            // μ₀I/2π factor omitted — only direction matters
+                            Bx_sum += sign * (-dy_w) / r2;
+                            By_sum += sign * ( dx_w) / r2;
+                        }
+                        double B_norm = std::sqrt(Bx_sum * Bx_sum + By_sum * By_sum);
+                        Mx_map(j, i) = mc.Hc * Bx_sum / (B_norm + 1e-20);
+                        My_map(j, i) = mc.Hc * By_sum / (B_norm + 1e-20);
+                    } else {
+                        // Phase E.4 / Phase J: radial_array / parallel_array.
+                        // Determine pole sector index k (0 .. p-1) and apply
+                        // alternating sign + per-pole direction.
+                        //
+                        // Phase AA: subtract rotor_angle before determining
+                        // pole_k so the magnet's identity (which pole it
+                        // is on the rotor) is preserved across slides --
+                        // i.e. pole_k is computed in the ROTOR frame, not
+                        // the lab frame. For parallel_array the direction
+                        // we emit (angle_mid) then needs rotor_angle
+                        // added back so the vector is expressed in the
+                        // lab frame Mx/My grid. radial_array's "outward
+                        // radial" direction is intrinsically lab-frame
+                        // (defined by where the pixel is right now), so
+                        // theta_local stays untouched.
+                        double theta_pos = std::atan2(y_phys - mc.cy, x_phys - mc.cx) - orient_rad - rotor_angle;
+                        double twopi = 2.0 * M_PI;
+                        theta_pos = std::fmod(theta_pos, twopi);
+                        if (theta_pos < 0.0) theta_pos += twopi;
+                        double pole_span = twopi / mc.p;     // 2π / p
+                        int k_pole = (int)std::floor(theta_pos / pole_span);
+                        if (k_pole < 0) k_pole = 0;
+                        if (k_pole >= mc.p) k_pole = mc.p - 1;
+                        double sign = ((k_pole % 2) == 0) ? mc.direction_sign : -mc.direction_sign;
+                        if (mc.pattern == "radial_array") {
+                            double theta_local = std::atan2(y_phys - mc.cy, x_phys - mc.cx);
+                            Mx_map(j, i) = sign * mc.Hc * std::cos(theta_local);
+                            My_map(j, i) = sign * mc.Hc * std::sin(theta_local);
+                        } else {  // parallel_array
+                            double angle_mid = (k_pole + 0.5) * pole_span + orient_rad + rotor_angle
+                                             + mc.angle_deg * M_PI / 180.0;
+                            Mx_map(j, i) = sign * mc.Hc * std::cos(angle_mid);
+                            My_map(j, i) = sign * mc.Hc * std::sin(angle_mid);
+                        }
                     }
-                    double B_norm = std::sqrt(Bx_sum * Bx_sum + By_sum * By_sum);
-                    Mx_map(j, i) = mc.Hc * Bx_sum / (B_norm + 1e-20);
-                    My_map(j, i) = mc.Hc * By_sum / (B_norm + 1e-20);
                 }
             }
         } else {
@@ -1387,6 +1827,36 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids() {
         }
 
         std::cout << "Magnetization computed for '" << mat_name << "' (" << mc.pattern << ")" << std::endl;
+    }
+
+    // Phase B.5: apply the antiperiodic-wrap sign tracker to the
+    // magnetisation vector. A magnet that has crossed an antiperiodic
+    // seam reverses its M direction, so both Mx and My flip sign.
+    // Jz_mag = curl(M) is computed AFTER this flip so the curl picks up
+    // the correct (negated) magnetisation gradient automatically.
+    if (!slide_sign_map.empty()
+        && slide_sign_map.rows == image.rows
+        && slide_sign_map.cols == image.cols) {
+        const int H = image.rows;
+        const int grid_rows = static_cast<int>(Mx_map.rows());
+        const int grid_cols = static_cast<int>(Mx_map.cols());
+        for (int j = 0; j < grid_rows; j++) {
+            for (int i = 0; i < grid_cols; i++) {
+                int img_i, img_j;
+                if (is_polar) {
+                    if (r_orientation == "horizontal") { img_i = i; img_j = j; }
+                    else                                { img_i = j; img_j = i; }
+                } else {
+                    img_i = i; img_j = j;
+                }
+                if (img_j < 0 || img_j >= H || img_i < 0 || img_i >= image.cols) continue;
+                const schar sgn = slide_sign_map.at<schar>(H - 1 - img_j, img_i);
+                if (sgn < 0) {
+                    Mx_map(j, i) = -Mx_map(j, i);
+                    My_map(j, i) = -My_map(j, i);
+                }
+            }
+        }
     }
 
     // Compute equivalent magnetization current Jz_mag = curl(M)
@@ -1687,6 +2157,22 @@ void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
         return;  // No flux linkage paths defined
     }
 
+    // Phase B.3: build a material-name -> RGB key lookup from the
+    // materials section so material_a / material_b can be resolved
+    // up-front. The RGB key matches the encoding used by rgb_to_material
+    // and the image-pixel scan loop below: (R<<16)|(G<<8)|B.
+    std::map<std::string, int> name_to_rgb_key;
+    if (config["materials"]) {
+        for (const auto& mat : config["materials"]) {
+            const std::string mat_name = mat.first.as<std::string>();
+            YAML::Node props = mat.second;
+            if (!props["rgb"]) continue;
+            auto rgb = props["rgb"].as<std::vector<int>>();
+            if (rgb.size() < 3) continue;
+            name_to_rgb_key[mat_name] = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2];
+        }
+    }
+
     std::cout << "Parsing flux linkage paths..." << std::endl;
 
     for (const auto& path_node : config["flux_linkage"]) {
@@ -1698,30 +2184,63 @@ void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
         }
         path.name = path_node["name"].as<std::string>();
 
-        if (!path_node["start"] || !path_node["end"]) {
-            std::cerr << "Warning: flux_linkage '" << path.name << "' missing start/end, skipping" << std::endl;
+        // Material variant: prefer material_a / material_b when present.
+        const bool has_material = path_node["material_a"] && path_node["material_b"];
+        const bool has_path = path_node["start"] && path_node["end"];
+
+        if (has_material) {
+            path.use_material = true;
+            path.material_a = path_node["material_a"].as<std::string>();
+            path.material_b = path_node["material_b"].as<std::string>();
+            auto it_a = name_to_rgb_key.find(path.material_a);
+            auto it_b = name_to_rgb_key.find(path.material_b);
+            if (it_a == name_to_rgb_key.end()) {
+                std::cerr << "Warning: flux_linkage '" << path.name
+                          << "' references unknown material_a '" << path.material_a
+                          << "', skipping" << std::endl;
+                continue;
+            }
+            if (it_b == name_to_rgb_key.end()) {
+                std::cerr << "Warning: flux_linkage '" << path.name
+                          << "' references unknown material_b '" << path.material_b
+                          << "', skipping" << std::endl;
+                continue;
+            }
+            path.rgb_key_a = it_a->second;
+            path.rgb_key_b = it_b->second;
+            // Phase M: polar is supported with r-weighted (Jacobian)
+            // averaging in calculateFluxLinkage.
+            std::cout << "  Flux linkage [material] '" << path.name
+                      << "': ⟨Az⟩(" << path.material_a
+                      << ") - ⟨Az⟩(" << path.material_b
+                      << ")  [" << coordinate_system
+                      << (coordinate_system == "polar" ? "; r-weighted" : "; uniform")
+                      << "]" << std::endl;
+        } else if (has_path) {
+            auto start = path_node["start"].as<std::vector<double>>();
+            auto end = path_node["end"].as<std::vector<double>>();
+            if (start.size() < 2 || end.size() < 2) {
+                std::cerr << "Warning: flux_linkage '" << path.name
+                          << "' invalid start/end format, skipping" << std::endl;
+                continue;
+            }
+            path.use_material = false;
+            path.x_start = start[0];
+            path.y_start = start[1];
+            path.x_end = end[0];
+            path.y_end = end[1];
+            std::cout << "  Flux linkage [path] '" << path.name << "': ("
+                      << path.x_start << ", " << path.y_start << ") -> ("
+                      << path.x_end << ", " << path.y_end << ")" << std::endl;
+        } else {
+            std::cerr << "Warning: flux_linkage '" << path.name
+                      << "' missing both {start, end} and {material_a, material_b}, skipping"
+                      << std::endl;
             continue;
         }
-
-        auto start = path_node["start"].as<std::vector<double>>();
-        auto end = path_node["end"].as<std::vector<double>>();
-
-        if (start.size() < 2 || end.size() < 2) {
-            std::cerr << "Warning: flux_linkage '" << path.name << "' invalid start/end format, skipping" << std::endl;
-            continue;
-        }
-
-        path.x_start = start[0];
-        path.y_start = start[1];
-        path.x_end = end[0];
-        path.y_end = end[1];
 
         flux_linkage_paths.push_back(path);
-        flux_linkage_results[path.name] = std::vector<double>();  // Initialize empty results
-
-        std::cout << "  Flux linkage path '" << path.name << "': ("
-                  << path.x_start << ", " << path.y_start << ") -> ("
-                  << path.x_end << ", " << path.y_end << ")" << std::endl;
+        flux_linkage_results[path.name] = std::vector<double>();
     }
 
     std::cout << "Loaded " << flux_linkage_paths.size() << " flux linkage path(s)" << std::endl;
@@ -1767,13 +2286,89 @@ double MagneticFieldAnalyzer::interpolateAz(double x_phys, double y_phys) const 
 }
 
 double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) const {
-    // Flux linkage Φ = Az(end) - Az(start) [Wb/m]
-    // In 2D analysis, this gives flux per unit depth
+    // Path variant (existing): Φ = Az(end) - Az(start) [Wb/m].
+    if (!path.use_material) {
+        double Az_start = interpolateAz(path.x_start, path.y_start);
+        double Az_end   = interpolateAz(path.x_end,   path.y_end);
+        return Az_end - Az_start;
+    }
 
-    double Az_start = interpolateAz(path.x_start, path.y_start);
-    double Az_end = interpolateAz(path.x_end, path.y_end);
-
-    return Az_end - Az_start;
+    // Material-pair variant (Phase B.3 / Phase M):
+    //   Φ = ⟨Az⟩_A − ⟨Az⟩_B
+    // where ⟨·⟩ is the area-weighted mean over the cells whose pixel
+    // RGB matches the resolved key. Useful for thick coil legs where a
+    // single point sample misses the bulk; the average of Az across
+    // the conductor cross-section is the per-phase flux linkage.
+    //
+    // In Cartesian the cell area is dx·dy = constant, so the weighted
+    // mean reduces to the arithmetic mean.
+    //
+    // In polar the cell area is r·dr·dθ, so the dr·dθ factor cancels
+    // in the ratio and the weighting is just r at the cell. Phase M
+    // adds the polar branch which honours that Jacobian; the Cartesian
+    // branch is unchanged.
+    double sum_a = 0.0, sum_b = 0.0;
+    double w_a = 0.0, w_b = 0.0;
+    const int img_rows = image.rows;
+    const int img_cols = image.cols;
+    if (coordinate_system == "polar") {
+        // Az matrix shape mirrors the warp orientation:
+        //   horizontal: (ntheta rows × nr cols) → row j is θ, col i is r
+        //   vertical  : (nr rows × ntheta cols) → row j is r, col i is θ
+        const bool horiz = (r_orientation == "horizontal");
+        const int grid_rows = horiz ? ntheta : nr;
+        const int grid_cols = horiz ? nr : ntheta;
+        for (int j = 0; j < grid_rows && j < img_rows; ++j) {
+            for (int i = 0; i < grid_cols && i < img_cols; ++i) {
+                const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
+                // Phase Y: image is RGB (loadImage cvtColor'd BGR→RGB at
+                // line 276), so px[0]=R, px[1]=G, px[2]=B. The matching
+                // rgb_key_a / rgb_key_b stored on the FluxLinkagePath were
+                // built as (rgb[0]<<16)|(rgb[1]<<8)|rgb[2] = R<<16|G<<8|B
+                // (see parseFluxLinkagePaths line 2115), so pack the
+                // pixel in the same order. The original code packed
+                // (px[2]<<16)|(px[1]<<8)|px[0] = B<<16|G<<8|R which
+                // never matched on R≠B colours and silently produced
+                // sum_a = sum_b = 0 → Φ = 0 for every step (same
+                // R/B-swap pattern that Phase W fixed in the LUT path,
+                // just hidden behind the px alias).
+                const int key = (static_cast<int>(px[0]) << 16)
+                              | (static_cast<int>(px[1]) << 8)
+                              |  static_cast<int>(px[2]);
+                const int i_r = horiz ? i : j;
+                const double r_phys = r_start + i_r * dr;
+                // Weight = r (the Jacobian). dr·dθ cancels in the
+                // numerator / denominator ratio so we omit it here.
+                // Cells at the rotor axis (r=0) carry zero weight,
+                // which is the geometrically correct contribution
+                // from a degenerate point cell.
+                if (key == path.rgb_key_a) {
+                    sum_a += Az(j, i) * r_phys;
+                    w_a   += r_phys;
+                } else if (key == path.rgb_key_b) {
+                    sum_b += Az(j, i) * r_phys;
+                    w_b   += r_phys;
+                }
+            }
+        }
+    } else {
+        // Cartesian: every cell has area dx·dy = const, so the weight
+        // collapses to 1 and the ratio is the plain count.
+        for (int j = 0; j < ny && j < img_rows; ++j) {
+            for (int i = 0; i < nx && i < img_cols; ++i) {
+                const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
+                // Phase Y: same R/B swap fix as the polar branch above.
+                const int key = (static_cast<int>(px[0]) << 16)
+                              | (static_cast<int>(px[1]) << 8)
+                              |  static_cast<int>(px[2]);
+                if (key == path.rgb_key_a) { sum_a += Az(j, i); w_a += 1.0; }
+                else if (key == path.rgb_key_b) { sum_b += Az(j, i); w_b += 1.0; }
+            }
+        }
+    }
+    const double mean_a = (w_a > 0.0) ? (sum_a / w_a) : 0.0;
+    const double mean_b = (w_b > 0.0) ? (sum_b / w_b) : 0.0;
+    return mean_a - mean_b;
 }
 
 void MagneticFieldAnalyzer::calculateAllFluxLinkages(int step) {
@@ -1781,13 +2376,29 @@ void MagneticFieldAnalyzer::calculateAllFluxLinkages(int step) {
         return;
     }
 
+    // Snapshot the current cout formatting so the high-precision flux
+    // print doesn't leak into the next thing the solver writes (Force
+    // / Energy banners, etc.). Phase Y bumped this from default
+    // formatting to %.6e so a 1e-5 Wb/m phase flux doesn't display as
+    // "0.000e+00" and get misread as a bug.
+    std::ios_base::fmtflags cout_flags(std::cout.flags());
+    std::streamsize cout_prec = std::cout.precision();
+
     for (const auto& path : flux_linkage_paths) {
         double phi = calculateFluxLinkage(path);
         flux_linkage_results[path.name].push_back(phi);
 
         std::cout << "Flux linkage [" << path.name << "] step " << step
-                  << ": " << phi << " Wb/m" << std::endl;
+                  << ": " << std::scientific << std::setprecision(6) << phi << " Wb/m";
+        if (phi == 0.0) {
+            std::cout << "  [WARNING: exactly zero -- check that material_a / material_b"
+                         " rgb_key resolved and that some image pixels matched]";
+        }
+        std::cout << std::endl;
     }
+
+    std::cout.flags(cout_flags);
+    std::cout.precision(cout_prec);
 }
 
 void MagneticFieldAnalyzer::exportFluxLinkageCSV(const std::string& output_dir) const {
@@ -3468,7 +4079,7 @@ void MagneticFieldAnalyzer::interpolateMuToFullGrid() {
 
             cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
             // Note: image_flipped stores BGR, pixel[0]=B, pixel[1]=G, pixel[2]=R
-            int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+            int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
             auto lut_it = rgb_to_material.find(rgb_key);
             if (lut_it != rgb_to_material.end()) {
@@ -3834,7 +4445,7 @@ void MagneticFieldAnalyzer::calculateHFieldAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         // O(1) material lookup via LUT
         bool found = false;
@@ -3897,7 +4508,7 @@ void MagneticFieldAnalyzer::updateMuAtActiveCells(
         }
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -3948,7 +4559,7 @@ void MagneticFieldAnalyzer::updateMuDiffAtActiveCells(const Eigen::VectorXd& H_a
             img_i < 0 || img_i >= image_flipped.cols) continue;
 
         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(img_j, img_i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -3992,7 +4603,7 @@ void MagneticFieldAnalyzer::updateMuDiffDistribution() {
     for (int k = 0; k < n_rows * n_cols; k++) {
         int j = k / n_cols, i = k % n_cols;
         cv::Vec3b pixel = image_to_use.at<cv::Vec3b>(j, i);
-        int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+        int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
 
         auto lut_it = rgb_to_material.find(rgb_key);
         if (lut_it != rgb_to_material.end()) {
@@ -6397,96 +7008,75 @@ cv::Mat MagneticFieldAnalyzer::detectBoundaries() {
         // Incremental update: slide cached boundaries + recompute border regions
         std::cout << "Boundaries: Incremental update (slide + border recompute)" << std::endl;
         boundaries = cached_boundaries.clone();
-        int shift = transient_config.slide_pixels_per_step;
 
-        if (transient_config.slide_direction == "vertical") {
-            // Vertical slide: shift rows (y direction)
-            int x_start = transient_config.slide_region_start;
-            int x_end = transient_config.slide_region_end;
+        cv::Mat gray;
+        cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
+        const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
 
-            // Slide the boundary detection results within the region
-            cv::Mat slide_region = boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)).clone();
-            cv::Mat shifted_region = cv::Mat::zeros(slide_region.size(), slide_region.type());
+        // Phase B.2: process every configured slide independently. Each
+        // region creates its own circular-shift seam at row/col=0 inside
+        // its own band; the seam recompute is therefore per-region too.
+        for (const auto& slide : transient_config.slides) {
+            const int shift = slide.pixels_per_step;
+            if (shift == 0) continue;
 
-            for (int row = 0; row < slide_region.rows; row++) {
-                int src_row = (row + slide_region.rows + shift) % slide_region.rows;
-                slide_region.row(src_row).copyTo(shifted_region.row(row));
-            }
+            if (slide.direction == "vertical") {
+                const int x_start = slide.region_start;
+                const int x_end   = slide.region_end;
 
-            shifted_region.copyTo(boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)));
+                // Slide the boundary detection results within the region
+                cv::Mat slide_region_mat = boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)).clone();
+                cv::Mat shifted_region = cv::Mat::zeros(slide_region_mat.size(), slide_region_mat.type());
 
-            // Recompute border region (±KERNEL_MARGIN around the circular shift seam)
-            // Circular shift creates ONE seam at row=0 where data wraps around
-            cv::Mat gray;
-            cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
+                for (int row = 0; row < slide_region_mat.rows; row++) {
+                    int src_row = (row + slide_region_mat.rows + shift) % slide_region_mat.rows;
+                    slide_region_mat.row(src_row).copyTo(shifted_region.row(row));
+                }
+                shifted_region.copyTo(boundaries(cv::Rect(x_start, 0, x_end - x_start, boundaries.rows)));
 
-            // std::cout << "[DEBUG] Recomputing seam at circular shift boundary (row=0)" << std::endl;
-            const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
-            int seam_row = 0;  // Circular shift seam is always at row=0
+                // Recompute border region around the seam at row=0
+                int seam_row = 0;
+                int y_min = std::max(0, seam_row + shift - KERNEL_MARGIN);
+                int y_max = std::min(boundaries.rows, seam_row + shift + KERNEL_MARGIN + 1);
 
-            // Recompute region around the seam with margin for kernel
-            int y_min = std::max(0, seam_row + shift - KERNEL_MARGIN);
-            int y_max = std::min(boundaries.rows, seam_row + shift + KERNEL_MARGIN + 1);
+                if (y_max > y_min) {
+                    cv::Rect roi(x_start, y_min, x_end - x_start, y_max - y_min);
+                    cv::Mat gray_roi = gray(roi);
+                    cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
+                    applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
+                    cv::convertScaleAbs(laplacian_s16, laplacian_abs);
+                    cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
+                    boundaries_roi.copyTo(boundaries(roi));
+                }
+            } else {  // horizontal
+                const int y_start = slide.region_start;
+                const int y_end   = slide.region_end;
 
-            if (y_max > y_min) {
-                cv::Rect roi(x_start, y_min, x_end - x_start, y_max - y_min);
-                cv::Mat gray_roi = gray(roi);
-                cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
+                cv::Mat slide_region_mat = boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)).clone();
+                cv::Mat shifted_region = cv::Mat::zeros(slide_region_mat.size(), slide_region_mat.type());
 
-                // Note: ROI processing doesn't fully respect periodic BC at ROI boundaries
-                // For full accuracy, consider recomputing the entire image
-                applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
-                cv::convertScaleAbs(laplacian_s16, laplacian_abs);
-                cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
+                for (int col = 0; col < slide_region_mat.cols; col++) {
+                    int src_col = (col + slide_region_mat.cols + shift) % slide_region_mat.cols;
+                    slide_region_mat.col(src_col).copyTo(shifted_region.col(col));
+                }
+                shifted_region.copyTo(boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)));
 
-                boundaries_roi.copyTo(boundaries(roi));
-                // std::cout << "[DEBUG] Seam recomputed: y_range=[" << y_min << ", " << y_max << ")" << std::endl;
-            }
-        } else {  // horizontal
-            // Horizontal slide: shift columns (x direction)
-            int y_start = transient_config.slide_region_start;
-            int y_end = transient_config.slide_region_end;
+                int seam_col = 0;
+                int x_min = std::max(0, seam_col + shift - KERNEL_MARGIN);
+                int x_max = std::min(boundaries.cols, seam_col + shift + KERNEL_MARGIN + 1);
 
-            // Slide the boundary detection results within the region
-            cv::Mat slide_region = boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)).clone();
-            cv::Mat shifted_region = cv::Mat::zeros(slide_region.size(), slide_region.type());
-
-            for (int col = 0; col < slide_region.cols; col++) {
-                int src_col = (col + slide_region.cols + shift) % slide_region.cols;
-                slide_region.col(src_col).copyTo(shifted_region.col(col));
-            }
-
-            shifted_region.copyTo(boundaries(cv::Rect(0, y_start, boundaries.cols, y_end - y_start)));
-
-            // Recompute border region (±KERNEL_MARGIN around the circular shift seam)
-            // Circular shift creates ONE seam at col=0 where data wraps around
-            cv::Mat gray;
-            cv::cvtColor(image, gray, cv::COLOR_RGB2GRAY);
-
-            // std::cout << "[DEBUG] Recomputing seam at circular shift boundary (col=0)" << std::endl;
-            const int KERNEL_MARGIN = 2;  // Laplacian kernel margin
-            int seam_col = 0;  // Circular shift seam is always at col=0
-
-            // Recompute region around the seam with margin for kernel
-            int x_min = std::max(0, seam_col + shift - KERNEL_MARGIN);
-            int x_max = std::min(boundaries.cols, seam_col + shift + KERNEL_MARGIN + 1);
-
-            if (x_max > x_min) {
-                cv::Rect roi(x_min, y_start, x_max - x_min, y_end - y_start);
-                cv::Mat gray_roi = gray(roi);
-                cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
-
-                // Note: ROI processing doesn't fully respect periodic BC at ROI boundaries
-                applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
-                cv::convertScaleAbs(laplacian_s16, laplacian_abs);
-                cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
-
-                boundaries_roi.copyTo(boundaries(roi));
-                // std::cout << "[DEBUG] Seam recomputed: x_range=[" << x_min << ", " << x_max << ")" << std::endl;
+                if (x_max > x_min) {
+                    cv::Rect roi(x_min, y_start, x_max - x_min, y_end - y_start);
+                    cv::Mat gray_roi = gray(roi);
+                    cv::Mat laplacian_s16, laplacian_abs, boundaries_roi;
+                    applyLaplacianWithPeriodicBC(gray_roi, laplacian_s16, 3);
+                    cv::convertScaleAbs(laplacian_s16, laplacian_abs);
+                    cv::threshold(laplacian_abs, boundaries_roi, 10, 255, cv::THRESH_BINARY);
+                    boundaries_roi.copyTo(boundaries(roi));
+                }
             }
         }
 
-        // std::cout << "[DEBUG] Incremental boundary detection complete" << std::endl;
         // Update cache
         cached_boundaries = boundaries.clone();
     }
@@ -9602,7 +10192,7 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
                 double w;
                 if (need_image_lookup) {
                     cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
-                    int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                    int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
                     auto lut_it = rgb_to_material.find(rgb_key);
                     const BHTable* bh = nullptr;
                     if (lut_it != rgb_to_material.end()) {
@@ -9661,7 +10251,7 @@ double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
             double w;
             if (need_image_lookup) {
                 cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
-                int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
                 auto lut_it = rgb_to_material.find(rgb_key);
                 const BHTable* bh = nullptr;
                 if (lut_it != rgb_to_material.end()) {
@@ -9938,7 +10528,7 @@ void MagneticFieldAnalyzer::exportResults(const std::string& base_folder, int st
         auto co_energy_at = [&](int j, int i, double B_mag) -> double {
             if (need_image_lookup_ed) {
                 cv::Vec3b pixel = image_flipped_ed.at<cv::Vec3b>(j, i);
-                int rgb_key = (pixel[2] << 16) | (pixel[1] << 8) | pixel[0];
+                int rgb_key = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];  // Phase W: image is RGB (loadImage cvtColor'd BGR→RGB at line 276); LUT keys built as R<<16|G<<8|B
                 auto lut_it = rgb_to_material.find(rgb_key);
                 if (lut_it != rgb_to_material.end()) {
                     auto bh_it = material_bh_tables.find(lut_it->second.name);
@@ -11331,6 +11921,37 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         return;
     }
 
+    // Phase AB: warm-start non-linear μ from the previously converged
+    // distribution.
+    //
+    // Before AB, every step reset mu_map to vacuum, then seeded every
+    // non-linear (TABLE) cell at the peak permeability via Phase U. That
+    // gave a clean cold-start for step 0 but a huge initial residual on
+    // every subsequent step: solving step N-1 had just descended the
+    // iron from peak (~9967·μ₀) to its operating-point μ (~6500·μ₀ in
+    // the user's IPMSM yoke, much lower in the saturated bridges), only
+    // for step N's reset to push it back to peak before the warm-started
+    // Az was applied — producing ||R|| jumps from ~5e-3 at the end of
+    // step 1 to ~2e+02 at the start of step 2 in the user's log, then
+    // having to slowly descend again across the 50-iter cap.
+    //
+    // AB snapshots the converged mu_map first; in the per-material loop
+    // below, NL cells that are still NL after the slide reuse their
+    // snapshotted value instead of the peak seed. STATIC (linear)
+    // materials still get their constant μ written verbatim because
+    // their value is exact and cheap. Cells whose material changed due
+    // to the slide (rotor magnet now sitting where iron yoke used to
+    // be, etc.) get the peak seed, since the snapshot's value reflects
+    // the OLD material there and would be wrong as a warm-start.
+    //
+    // Cost: one matrix-copy (one mu_map'th of memory) per step. Saves
+    // tens of NK iterations in practice.
+    const bool warm_start_mu = (step > 0) && has_nonlinear_materials;
+    Eigen::MatrixXd mu_map_prev;
+    if (warm_start_mu) {
+        mu_map_prev = mu_map;  // snapshot pre-reset
+    }
+
     // IMPORTANT: Reset mu_map and jz_map to default values (air) before applying materials
     // This ensures that pixels that changed material due to sliding get updated correctly
     // Without this reset, old material values would persist even after the image slides
@@ -11341,27 +11962,70 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         std::string name = material.first.as<std::string>();
         YAML::Node props = material.second;
 
-        // Resolve preset if specified (preset properties are merged, material-specific overrides)
+        // Resolve preset if specified. Phase O: deep-merge nested
+        // maps (see mergeMaterialPreset for the rationale -- shallow
+        // merge silently dropped Br on magnetization overrides).
         if (props["preset"]) {
             std::string preset_name = props["preset"].as<std::string>();
             auto preset_it = material_presets.find(preset_name);
             if (preset_it != material_presets.end()) {
-                YAML::Node merged = YAML::Clone(preset_it->second);
-                for (auto it = props.begin(); it != props.end(); ++it) {
-                    std::string key = it->first.as<std::string>();
-                    if (key != "preset") {
-                        merged[key] = it->second;
-                    }
-                }
-                props = merged;
+                props = mergeMaterialPreset(preset_it->second, props);
             }
         }
 
         // Get RGB values
         std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
 
-        // Get relative permeability
-        double mu_r = props["mu_r"].as<double>(1.0);
+        // Phase P + U: resolve the per-cell initial mu_r through the
+        // parsed material_mu cache instead of props["mu_r"].as<double>().
+        //   - STATIC mu_r: the constant value (unchanged from the
+        //     pre-Phase-P read).
+        //   - TABLE  mu_r: the PEAK mu_r in the table, not mu_table[0].
+        //     Some B-H formulas (e.g. ones with a sigmoidal onset near
+        //     H ≈ H_knee) report mu(H=0) far below the working-point
+        //     mu, which traps the Newton-Krylov iteration in a
+        //     "self-consistent vacuum" solution: low initial mu →
+        //     small B in the iron → small H → mu stays low → converged
+        //     in 2 iters on a pure_iron model. Seeding from the peak
+        //     instead lets the linear solve drive B up the iron-leg of
+        //     the curve, the next iteration then descends to the true
+        //     saturated mu via the BH table lookup. Standard FE/FDM
+        //     codes (FEMM, JMAG, Ansys Maxwell) use the same "high mu
+        //     initial guess + iterate down" strategy for nonlinear
+        //     soft magnetics.
+        //   - FORMULA mu_r: evaluated at H=0 (we don't sample the
+        //     formula for a peak; FORMULAs are rare in practice and
+        //     usually monotone-decreasing with H).
+        double mu_r = 1.0;
+        bool is_nl_material = false;  // Phase AB: TABLE / FORMULA → warm-start eligible
+        {
+            auto mu_it = material_mu.find(name);
+            if (mu_it != material_mu.end()) {
+                const MuValue& mv = mu_it->second;
+                is_nl_material = (mv.type != MuType::STATIC);
+                if (mv.type == MuType::TABLE && !mv.mu_table.empty()) {
+                    mu_r = *std::max_element(mv.mu_table.begin(), mv.mu_table.end());
+                } else {
+                    mu_r = evaluateMu(mv, 0.0);
+                }
+            } else if (props["mu_r"]) {
+                try { mu_r = props["mu_r"].as<double>(1.0); }
+                catch (...) { mu_r = 1.0; }
+            }
+        }
+        const double mu_cold = mu_r * MU_0;
+        // Phase AB: if this material is non-linear AND we have a
+        // previous-step μ snapshot, prefer the snapshot's value at each
+        // matching cell. Cells that were already this material at
+        // step-1 will hold the converged μ ≈ operating-point value,
+        // which is a vastly better warm-start than the peak seed. Cells
+        // whose material identity flipped at this step (the slide just
+        // brought a new color here) won't have anything sensible in
+        // the snapshot, so they fall back to the peak seed via the
+        // `mu_prev > 2·MU_0` gate -- "above air" means whatever was
+        // there was a permeable material, so reuse it; otherwise cold-start.
+        const bool use_warm_for_this_mat = warm_start_mu && is_nl_material;
+        const double mu_warm_floor = 2.0 * MU_0;
 
         // Evaluate Jz for this step (0.0 if not defined)
         double jz = 0.0;
@@ -11382,7 +12046,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                             jz_map(j, i) = jz;
-                            mu_map(j, i) = mu_r * MU_0;
+                            if (use_warm_for_this_mat) {
+                                const double mu_prev = mu_map_prev(j, i);
+                                mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                            } else {
+                                mu_map(j, i) = mu_cold;
+                            }
                         }
                     }
                 }
@@ -11393,7 +12062,12 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                         cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                         if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                             jz_map(j, i) = jz;
-                            mu_map(j, i) = mu_r * MU_0;
+                            if (use_warm_for_this_mat) {
+                                const double mu_prev = mu_map_prev(j, i);
+                                mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                            } else {
+                                mu_map(j, i) = mu_cold;
+                            }
                         }
                     }
                 }
@@ -11409,8 +12083,49 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                     cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
                     if (pixel[0] == rgb[0] && pixel[1] == rgb[1] && pixel[2] == rgb[2]) {
                         jz_map(j, i) = jz;
-                        mu_map(j, i) = mu_r * MU_0;
+                        if (use_warm_for_this_mat) {
+                            const double mu_prev = mu_map_prev(j, i);
+                            mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                        } else {
+                            mu_map(j, i) = mu_cold;
+                        }
                     }
+                }
+            }
+        }
+    }
+
+    // Phase B.5: apply the antiperiodic-wrap sign tracker to jz_map. Cells
+    // whose slide_sign_map entry is -1 have wrapped an odd number of
+    // times through an antiperiodic seam, so their source current should
+    // flip polarity. The map lives in image coords (BGR Y-down); the
+    // field grids are Y-up after the vertical flip in setupMaterialProperties,
+    // so we read at (rows-1-j, i).
+    if (!slide_sign_map.empty()
+        && slide_sign_map.rows == image.rows
+        && slide_sign_map.cols == image.cols) {
+        const int H = image.rows;
+        if (coordinate_system == "polar") {
+            if (r_orientation == "horizontal") {
+                for (int j = 0; j < ntheta; j++) {
+                    for (int i = 0; i < nr; i++) {
+                        const schar sgn = slide_sign_map.at<schar>(H - 1 - j, i);
+                        if (sgn < 0) jz_map(j, i) = -jz_map(j, i);
+                    }
+                }
+            } else {
+                for (int j = 0; j < nr; j++) {
+                    for (int i = 0; i < ntheta; i++) {
+                        const schar sgn = slide_sign_map.at<schar>(H - 1 - j, i);
+                        if (sgn < 0) jz_map(j, i) = -jz_map(j, i);
+                    }
+                }
+            }
+        } else {
+            for (int j = 0; j < ny; j++) {
+                for (int i = 0; i < nx; i++) {
+                    const schar sgn = slide_sign_map.at<schar>(H - 1 - j, i);
+                    if (sgn < 0) jz_map(j, i) = -jz_map(j, i);
                 }
             }
         }
@@ -11425,62 +12140,321 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         full_matrix_cache_valid = false;
     }
 
-    // Recompute magnetization grids (Mx_map, My_map, Jz_mag_map) for this step
-    // Required for transient/sliding cases where material positions change
+    // Recompute magnetization grids (Mx_map, My_map, Jz_mag_map) for this step.
+    // Required for transient/sliding cases where material positions change.
+    // The slide_sign_map antiperiodic flip is propagated into magnetisation
+    // inside computeMagnetizationGrids().
+    //
+    // Phase AA: pass the step index so computeMagnetizationGrids can
+    // accumulate the rotor's slide-driven angular displacement and
+    // rotate the pattern with the rotor (parallel_array / radial_array /
+    // polar_anisotropy). Without this the magnetisation is recomputed
+    // from absolute lab-frame theta and gets period-of-pole-pitch
+    // discontinuities every time the rotor crosses a pole boundary,
+    // visible as a non-balanced 3-phase flux linkage with spurious
+    // 6-step spikes in a 4-pole / 24-step rotation.
     if (!material_magnetization.empty()) {
-        computeMagnetizationGrids();
+        computeMagnetizationGrids(step);
     }
 }
 
+double MagneticFieldAnalyzer::evaluateSlideFormula(const std::string& formula, int step) const {
+    if (formula.empty()) return 0.0;
+    // Fast path: pure numeric (very common for constant velocities).
+    try {
+        std::size_t consumed = 0;
+        const double v = std::stod(formula, &consumed);
+        // Allow trailing whitespace.
+        while (consumed < formula.size()
+               && std::isspace(static_cast<unsigned char>(formula[consumed]))) {
+            ++consumed;
+        }
+        if (consumed == formula.size()) return v;
+    } catch (...) { /* fall through to tinyexpr */ }
+
+    // tinyexpr path: replace the $step token (the only one that survives
+    // global $var expansion at load time) and evaluate.
+    std::string expr = formula;
+    std::size_t pos = 0;
+    while ((pos = expr.find("$step", pos)) != std::string::npos) {
+        expr.replace(pos, 5, "step");
+        pos += 4;  // advance past the substituted "step"
+    }
+    te_parser parser;
+    std::set<te_variable> vars;
+    {
+        te_variable step_var;
+        step_var.m_name  = "step";
+        step_var.m_value = static_cast<double>(step);
+        vars.insert(step_var);
+    }
+    {
+        te_variable mu0_var;
+        mu0_var.m_name  = "mu0";
+        mu0_var.m_value = MU_0;
+        vars.insert(mu0_var);
+    }
+    parser.set_variables_and_functions(vars);
+    const double result = parser.evaluate(expr);
+    if (!parser.success()) {
+        throw std::runtime_error("Failed to evaluate slide displacement formula: " + formula);
+    }
+    return result;
+}
+
+std::string MagneticFieldAnalyzer::resolveSlideWrapMode(const SlideRegion& slide) const {
+    if (slide.wrap_mode != "auto") return slide.wrap_mode;
+    // Inspect the field BC perpendicular to the slide axis.
+    //   polar (theta-only slide)        : theta_min / theta_max
+    //   cartesian + direction=vertical  : top / bottom
+    //   cartesian + direction=horizontal: left / right
+    const BoundaryCondition* bc = nullptr;
+    if (coordinate_system == "polar") {
+        bc = &bc_theta_min;
+    } else if (slide.direction == "vertical") {
+        bc = &bc_top;
+    } else {
+        bc = &bc_right;
+    }
+    if (!bc) return "periodic";
+    if (bc->type == "periodic") {
+        return (bc->value < 0.0) ? "antiperiodic" : "periodic";
+    }
+    if (bc->type == "dirichlet") return "vacuum";
+    // neumann / robin / unknown: default to vacuum so we don't manufacture
+    // bogus source terms on wrap.
+    return "vacuum";
+}
+
 void MagneticFieldAnalyzer::slideImageRegion() {
-    int shift = transient_config.slide_pixels_per_step;
+    // Phase B.2: every configured sliding region is applied independently
+    // per step. Phase B.5: band slides honour wrap_mode (periodic /
+    // antiperiodic / vacuum / auto). Phase B.6: rectangle slides cut a
+    // 2-D region, vacuum-fill the source, and paste at a per-step
+    // (dx, dy) offset evaluated from a tinyexpr formula -- content that
+    // falls outside the image is dropped (no wrap), and multiple
+    // rectangles overlay in slides-list order at their destinations.
+    if (transient_config.slides.empty()) return;
 
-    if (transient_config.slide_direction == "vertical") {
-        // vertical: slide_region_start <= x <= slide_region_end (column range)
-        // slides in y direction (rows)
-        int x_start = transient_config.slide_region_start;
-        int x_end = transient_config.slide_region_end;
+    // Lazy-init the sign map at the first slide call, before any wrap
+    // could have happened.
+    if (slide_sign_map.empty()) {
+        slide_sign_map = cv::Mat(image.rows, image.cols, CV_8S, cv::Scalar(1));
+    }
+    // Phase B.6: per-rectangle cumulative-displacement state, lazy-init.
+    if (rect_slide_states.size() != transient_config.slides.size()) {
+        rect_slide_states.assign(transient_config.slides.size(), RectSlideState{});
+    }
+    const int rect_step = slide_step_counter++;  // current step for tinyexpr eval
 
-        // Validate region
-        if (x_start < 0 || x_end > image.cols || x_start >= x_end) {
-            throw std::runtime_error("Invalid slide region for vertical sliding (x range out of bounds)");
-        }
+    // Phase B.6: snapshot for rectangle reads. Rectangles read source
+    // content from this snapshot so the order of cuts doesn't change
+    // what each rectangle sees, only the order of pastes does. Band
+    // slides keep their pre-B.6 in-place semantics (they don't share
+    // the snapshot path).
+    cv::Mat rect_src_image, rect_src_sign;
+    bool snapshot_taken = false;
+    auto ensure_snapshot = [&]() {
+        if (snapshot_taken) return;
+        rect_src_image = image.clone();
+        rect_src_sign  = slide_sign_map.clone();
+        snapshot_taken = true;
+    };
 
-        // For each column in the x range, circularly shift all rows
-        for (int col = x_start; col < x_end; col++) {
-            // Extract the column
-            cv::Mat column = image.col(col).clone();
+    for (std::size_t si = 0; si < transient_config.slides.size(); ++si) {
+        const auto& slide = transient_config.slides[si];
+        const cv::Vec3b vac_rgb(
+            static_cast<uchar>(slide.vacuum_rgb.size() > 0 ? slide.vacuum_rgb[0] : 255),
+            static_cast<uchar>(slide.vacuum_rgb.size() > 1 ? slide.vacuum_rgb[1] : 255),
+            static_cast<uchar>(slide.vacuum_rgb.size() > 2 ? slide.vacuum_rgb[2] : 255));
 
-            // Circular shift in y direction (upward in FDM coordinates = positive y)
-            // In image coordinates: content moves toward smaller row numbers (top of image)
-            // In FDM coordinates (y-flipped): this corresponds to positive y direction
-            for (int row = 0; row < image.rows; row++) {
-                int src_row = (row + image.rows + shift) % image.rows;
-                image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+        // ===============================================================
+        // Phase B.6: rectangle slide
+        // ===============================================================
+        if (slide.kind == "rectangle") {
+            ensure_snapshot();
+            auto& st = rect_slide_states[si];
+            // Evaluate this step's velocity and integrate into the float
+            // cumulative position. The discrete shift applied this step
+            // is the delta between consecutive rounded cumulative values.
+            const double v_dx = evaluateSlideFormula(slide.dx_formula, rect_step);
+            const double v_dy = evaluateSlideFormula(slide.dy_formula, rect_step);
+            st.cum_x += v_dx;
+            st.cum_y += v_dy;
+            const int new_int_x = static_cast<int>(std::lround(st.cum_x));
+            const int new_int_y = static_cast<int>(std::lround(st.cum_y));
+            // Source rect = initial rect + previous cumulative offset.
+            const int rect_w = slide.rect_x_end - slide.rect_x_start;
+            const int rect_h = slide.rect_y_end - slide.rect_y_start;
+            if (rect_w <= 0 || rect_h <= 0) {
+                st.prev_int_x = new_int_x;
+                st.prev_int_y = new_int_y;
+                continue;
             }
+            const int rx0 = slide.rect_x_start + st.prev_int_x;
+            const int ry0 = slide.rect_y_start + st.prev_int_y;
+            // Clip source against the image.
+            const int src_x   = std::max(0, rx0);
+            const int src_y   = std::max(0, ry0);
+            const int src_xE  = std::min(image.cols, rx0 + rect_w);
+            const int src_yE  = std::min(image.rows, ry0 + rect_h);
+            // Read content from the SNAPSHOT so the order of cuts is
+            // independent of the order of pastes; fill the source on the
+            // LIVE image (idempotent), then paste at the new offset on
+            // the LIVE image (later rectangles overlay earlier ones).
+            cv::Mat content_img, content_sign;
+            int content_offset_x = 0, content_offset_y = 0;
+            if (src_xE > src_x && src_yE > src_y) {
+                const cv::Rect src_rect(src_x, src_y, src_xE - src_x, src_yE - src_y);
+                content_img      = rect_src_image(src_rect).clone();
+                content_sign     = rect_src_sign(src_rect).clone();
+                content_offset_x = src_x - rx0;
+                content_offset_y = src_y - ry0;
+                image(src_rect)          = vac_rgb;
+                slide_sign_map(src_rect) = cv::Scalar(1);
+            }
+            // Advance cumulative offset for the next step.
+            st.prev_int_x = new_int_x;
+            st.prev_int_y = new_int_y;
+            // Destination rect = initial rect + new cumulative offset.
+            // Paste the content there, clipped to image bounds. Pixels
+            // that fall outside are dropped (no wrap).
+            if (!content_img.empty()) {
+                const int new_rx0 = slide.rect_x_start + new_int_x;
+                const int new_ry0 = slide.rect_y_start + new_int_y;
+                const int abs_x   = new_rx0 + content_offset_x;
+                const int abs_y   = new_ry0 + content_offset_y;
+                const int paste_x  = std::max(0, abs_x);
+                const int paste_y  = std::max(0, abs_y);
+                const int paste_xE = std::min(image.cols, abs_x + content_img.cols);
+                const int paste_yE = std::min(image.rows, abs_y + content_img.rows);
+                if (paste_xE > paste_x && paste_yE > paste_y) {
+                    const int from_x = paste_x - abs_x;
+                    const int from_y = paste_y - abs_y;
+                    const cv::Rect cont_rect(from_x, from_y,
+                                             paste_xE - paste_x, paste_yE - paste_y);
+                    const cv::Rect dst_rect(paste_x, paste_y,
+                                            paste_xE - paste_x, paste_yE - paste_y);
+                    content_img(cont_rect).copyTo(image(dst_rect));
+                    content_sign(cont_rect).copyTo(slide_sign_map(dst_rect));
+                }
+            }
+            continue;  // rectangle case handled; skip the band logic below.
         }
 
-    } else {  // horizontal
-        // horizontal: slide_region_start <= y <= slide_region_end (row range)
-        // slides in x direction (columns)
-        int y_start = transient_config.slide_region_start;
-        int y_end = transient_config.slide_region_end;
+        // ===============================================================
+        // Band slide (existing Phase B.2 / B.5 logic)
+        // ===============================================================
+        const int shift = slide.pixels_per_step;
+        if (shift == 0) continue;
+        const std::string mode = resolveSlideWrapMode(slide);
 
-        // Validate region
-        if (y_start < 0 || y_end > image.rows || y_start >= y_end) {
-            throw std::runtime_error("Invalid slide region for horizontal sliding (y range out of bounds)");
-        }
-
-        // For each row in the y range, circularly shift all columns
-        for (int row = y_start; row < y_end; row++) {
-            // Extract the row
-            cv::Mat row_data = image.row(row).clone();
-
-            // Circular shift in x direction (rightward = positive x in physics coordinates)
-            // Positive shift moves content to the RIGHT (positive x direction)
-            for (int col = 0; col < image.cols; col++) {
-                int src_col = (col - shift + image.cols) % image.cols;
-                image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+        if (slide.direction == "vertical") {
+            const int x_start = slide.region_start;
+            const int x_end   = slide.region_end;
+            if (x_start < 0 || x_end > image.cols || x_start >= x_end) {
+                throw std::runtime_error("Invalid slide region for vertical sliding (x range out of bounds) in slide '" + slide.name + "'");
+            }
+            const int H = image.rows;
+            for (int col = x_start; col < x_end; col++) {
+                if (mode == "vacuum") {
+                    // No wrap: shift content by `shift` rows, vacated band
+                    // gets vacuum_rgb. shift > 0 = content moves toward
+                    // smaller row indices, top |shift| rows are vacated.
+                    cv::Mat column = image.col(col).clone();
+                    for (int row = 0; row < H; row++) {
+                        const int src_row = row + shift;
+                        if (src_row >= 0 && src_row < H) {
+                            image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+                        } else {
+                            image.at<cv::Vec3b>(row, col) = vac_rgb;
+                        }
+                    }
+                    // Sign map: vacated cells reset to +1 (no carry-over
+                    // polarity); shifted cells keep their previous sign.
+                    cv::Mat sign_col = slide_sign_map.col(col).clone();
+                    for (int row = 0; row < H; row++) {
+                        const int src_row = row + shift;
+                        if (src_row >= 0 && src_row < H) {
+                            slide_sign_map.at<schar>(row, col) = sign_col.at<schar>(src_row, 0);
+                        } else {
+                            slide_sign_map.at<schar>(row, col) = 1;
+                        }
+                    }
+                } else {  // periodic or antiperiodic
+                    cv::Mat column = image.col(col).clone();
+                    cv::Mat sign_col = slide_sign_map.col(col).clone();
+                    for (int row = 0; row < H; row++) {
+                        const int src_row = (row + H + shift) % H;
+                        image.at<cv::Vec3b>(row, col) = column.at<cv::Vec3b>(src_row, 0);
+                        slide_sign_map.at<schar>(row, col) = sign_col.at<schar>(src_row, 0);
+                    }
+                    if (mode == "antiperiodic") {
+                        // Cells whose src_row went through the (H, 0) seam
+                        // get their sign flipped.
+                        if (shift > 0) {
+                            const int s = shift % H;
+                            for (int row = H - s; row < H; row++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        } else {
+                            const int s = (-shift) % H;
+                            for (int row = 0; row < s; row++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        }
+                    }
+                }
+            }
+        } else {  // horizontal
+            const int y_start = slide.region_start;
+            const int y_end   = slide.region_end;
+            if (y_start < 0 || y_end > image.rows || y_start >= y_end) {
+                throw std::runtime_error("Invalid slide region for horizontal sliding (y range out of bounds) in slide '" + slide.name + "'");
+            }
+            const int W = image.cols;
+            for (int row = y_start; row < y_end; row++) {
+                if (mode == "vacuum") {
+                    cv::Mat row_data = image.row(row).clone();
+                    for (int col = 0; col < W; col++) {
+                        const int src_col = col - shift;
+                        if (src_col >= 0 && src_col < W) {
+                            image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+                        } else {
+                            image.at<cv::Vec3b>(row, col) = vac_rgb;
+                        }
+                    }
+                    cv::Mat sign_row = slide_sign_map.row(row).clone();
+                    for (int col = 0; col < W; col++) {
+                        const int src_col = col - shift;
+                        if (src_col >= 0 && src_col < W) {
+                            slide_sign_map.at<schar>(row, col) = sign_row.at<schar>(0, src_col);
+                        } else {
+                            slide_sign_map.at<schar>(row, col) = 1;
+                        }
+                    }
+                } else {  // periodic or antiperiodic
+                    cv::Mat row_data = image.row(row).clone();
+                    cv::Mat sign_row = slide_sign_map.row(row).clone();
+                    for (int col = 0; col < W; col++) {
+                        const int src_col = (col - shift + W) % W;
+                        image.at<cv::Vec3b>(row, col) = row_data.at<cv::Vec3b>(0, src_col);
+                        slide_sign_map.at<schar>(row, col) = sign_row.at<schar>(0, src_col);
+                    }
+                    if (mode == "antiperiodic") {
+                        if (shift > 0) {
+                            const int s = shift % W;
+                            for (int col = 0; col < s; col++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        } else {
+                            const int s = (-shift) % W;
+                            for (int col = W - s; col < W; col++) {
+                                slide_sign_map.at<schar>(row, col) = static_cast<schar>(-slide_sign_map.at<schar>(row, col));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -11531,11 +12505,54 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // 2. Solve FDM system
         auto solve_start = std::chrono::high_resolution_clock::now();
 
+        // Phase V diagnostic: μ stats AT START of step (after Phase U seed).
+        if (nonlinear_config.verbose && nonlinear_config.enabled && has_nonlinear_materials) {
+            double mu_min = 1e300, mu_max = -1e300, mu_sum = 0.0; long long nc = 0;
+            for (int j = 0; j < mu_map.rows(); j++) {
+                for (int i = 0; i < mu_map.cols(); i++) {
+                    const double m = mu_map(j, i);
+                    if (m > 2.0 * 4.0e-7 * M_PI) {  // Skip air (μ ≈ μ₀)
+                        mu_min = std::min(mu_min, m);
+                        mu_max = std::max(mu_max, m);
+                        mu_sum += m; nc++;
+                    }
+                }
+            }
+            if (nc > 0) {
+                std::cout << "[Phase V] step " << step << " START mu_map (NL cells): "
+                          << "min=" << std::scientific << std::setprecision(3) << mu_min
+                          << " mean=" << (mu_sum / nc)
+                          << " max=" << mu_max
+                          << " n=" << nc << std::endl;
+            }
+        }
+
         // Check if nonlinear solver is needed for this step
         if (has_nonlinear_materials && nonlinear_config.enabled) {
             // For nonlinear materials, use standard solve() which includes nonlinear iteration
             // This ensures mu_map is updated based on actual H-field at each transient step
             solve();
+            // Phase V diagnostic: μ stats AT END of solve (= what gets exported).
+            if (nonlinear_config.verbose) {
+                double mu_min = 1e300, mu_max = -1e300, mu_sum = 0.0; long long nc = 0;
+                for (int j = 0; j < mu_map.rows(); j++) {
+                    for (int i = 0; i < mu_map.cols(); i++) {
+                        const double m = mu_map(j, i);
+                        if (m > 2.0 * 4.0e-7 * M_PI) {  // Skip air
+                            mu_min = std::min(mu_min, m);
+                            mu_max = std::max(mu_max, m);
+                            mu_sum += m; nc++;
+                        }
+                    }
+                }
+                if (nc > 0) {
+                    std::cout << "[Phase V] step " << step << " END   mu_map (NL cells): "
+                              << "min=" << std::scientific << std::setprecision(3) << mu_min
+                              << " mean=" << (mu_sum / nc)
+                              << " max=" << mu_max
+                              << " n=" << nc << std::endl;
+                }
+            }
 
             // Update solution history for warm start in next step.
             // Shift history k-1 → k-2 BEFORE overwriting k-1.
@@ -12265,6 +13282,17 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
         // 3.2. Calculate flux linkage for all defined paths
         calculateAllFluxLinkages(step);
+
+        // Phase AC: rewrite the flux_linkage.csv after every step so the
+        // WebUI dashboard timeline can plot a partial run while the
+        // analysis is still grinding through the remaining steps. The
+        // export is overwrite-style (single file, single header, N rows
+        // where N = steps completed so far), so it stays correct after
+        // every call -- no append / no race with the async writer.
+        // Cost: writing a tiny CSV (one row per step × ~3 phases) is
+        // O(milliseconds) vs the multi-second NK solve, well below any
+        // user-visible budget.
+        exportFluxLinkageCSV(output_dir);
 
         // <<PROFILING_TIMER_BEGIN>>
         prof_d_flux = std::chrono::duration_cast<std::chrono::milliseconds>(

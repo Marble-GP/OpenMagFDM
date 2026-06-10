@@ -183,9 +183,9 @@
       "example": "material_presets:\n  my_steel:\n    mu_r: [[0, 100, 500], [5000, 4500, 3000]]\n  my_bh:\n    B-H: [[0, 100, 500, 2000], [0, 0.3, 1.0, 1.5]]"
     },
     "flux_linkage": {
-      "description": "Flux linkage calculation paths. Each path defines start/end points for Φ = Az(end) - Az(start)",
+      "description": "Flux linkage paths. Each entry is either a point-to-point path (Φ = Az(end) - Az(start)) OR a material pair (Φ = mean(Az over material_a) - mean(Az over material_b)). The material variant is the right shape for thick coil legs; v1.5 cartesian only (polar returns zero).",
       "type": "array",
-      "example": "flux_linkage:\n  - name: coil_A\n    start: [0.01, 0.05]\n    end: [0.01, 0.15]"
+      "example": "flux_linkage:\n  - name: phase_U          # material variant\n    material_a: coil_U_pos\n    material_b: coil_U_neg\n  - name: phase_V_path     # path variant\n    start: [0.01, 0.05]\n    end:   [0.01, 0.15]"
     },
     "name": {
       "description": "Name identifier for flux linkage path",
@@ -194,21 +194,99 @@
       "validParents": ["flux_linkage"]
     },
     "start": {
-      "description": "Start point coordinates [x, y] in physical units [m] for flux linkage calculation",
+      "description": "Start point coordinates [x, y] in physical units [m] for flux linkage path variant",
       "type": "array",
       "example": "start: [0.01, 0.05]",
       "validParents": ["flux_linkage"]
     },
     "end": {
-      "description": "End point coordinates [x, y] in physical units [m] for flux linkage calculation",
+      "description": "End point coordinates [x, y] in physical units [m] for flux linkage path variant",
       "type": "array",
       "example": "end: [0.01, 0.15]",
       "validParents": ["flux_linkage"]
     },
+    "material_a": {
+      "description": "v1.5/Phase B.3 — material name for the +Az side of a flux_linkage entry (cartesian only). Resolved to the material's RGB pixels at parse time.",
+      "type": "string",
+      "example": "material_a: coil_U_pos",
+      "validParents": ["flux_linkage"]
+    },
+    "material_b": {
+      "description": "v1.5/Phase B.3 — material name for the -Az side of a flux_linkage entry (cartesian only). Resolved to the material's RGB pixels at parse time.",
+      "type": "string",
+      "example": "material_b: coil_U_neg",
+      "validParents": ["flux_linkage"]
+    },
     "transient": {
-      "description": "Transient analysis configuration",
-      "children": ["enabled", "enable_sliding", "total_steps", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
-      "example": "transient:\n  enabled: true\n  total_steps: 100\n  enable_sliding: true\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n  slide_pixels_per_step: 1"
+      "description": "Transient analysis configuration. v1.5/Phase B.2: prefer transient.slides: [...] for multi-region sliding. The legacy single-slide keys still work and are auto-converted into a 1-element slides list.",
+      "children": ["enabled", "enable_sliding", "total_steps", "slides", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
+      "example": "transient:\n  enabled: true\n  total_steps: 100\n  enable_sliding: true\n  slides:\n    - name: rotor_outer\n      direction: vertical\n      region_start: 110\n      region_end: 390\n      pixels_per_step: 5\n    - name: rotor_inner\n      direction: vertical\n      region_start: 50\n      region_end: 100\n      pixels_per_step: -3"
+    },
+    "slides": {
+      "description": "v1.5/Phase B.2 — list of independent sliding regions for the transient solver. Each entry shifts its [region_start, region_end] band by pixels_per_step on every step. Cartesian fully supported; polar uses slides[0] only (multi-slide polar is v1.6).",
+      "type": "array",
+      "example": "slides:\n  - name: rotor\n    direction: vertical\n    region_start: 100\n    region_end: 400\n    pixels_per_step: 5",
+      "validParents": ["transient"]
+    },
+    "direction": {
+      "description": "v1.5/Phase B.2 — direction of a slide region: 'vertical' (slides rows) or 'horizontal' (slides cols)",
+      "values": ["vertical", "horizontal"],
+      "example": "direction: vertical",
+      "validParents": ["slides"]
+    },
+    "region_start": {
+      "description": "v1.5/Phase B.2 — first pixel index of the sliding band along the axis perpendicular to `direction`",
+      "type": "integer",
+      "example": "region_start: 110",
+      "validParents": ["slides"]
+    },
+    "region_end": {
+      "description": "v1.5/Phase B.2 — last pixel index (exclusive) of the sliding band",
+      "type": "integer",
+      "example": "region_end: 390",
+      "validParents": ["slides"]
+    },
+    "pixels_per_step": {
+      "description": "v1.5/Phase B.2 — circular-shift amount per step. Negative values reverse direction. Different slides in the same yaml can use different magnitudes / signs.",
+      "type": "integer",
+      "example": "pixels_per_step: 5",
+      "validParents": ["slides"]
+    },
+    "wrap_mode": {
+      "description": "v1.5/Phase B.5 — what happens to content (and to per-cell source-term polarity) at the slide-wrap seam. 'periodic': circular shift, identity wraps unchanged. 'antiperiodic': circular shift + flip jz / magnetisation sign on cells that crossed the seam (consistent with anti-periodic theta BC). 'vacuum': no wrap; vacated cells get vacuum_rgb (consistent with Dirichlet BC). 'auto' (default): pick based on the perpendicular boundary's BC type.",
+      "values": ["auto", "periodic", "antiperiodic", "vacuum"],
+      "example": "wrap_mode: antiperiodic",
+      "validParents": ["slides"]
+    },
+    "vacuum_rgb": {
+      "description": "v1.5/Phase B.5 — RGB triple [R,G,B] used to fill vacated cells when wrap_mode is 'vacuum'. Default is [255,255,255] (white = air). Set to the RGB of whichever 'background' material you defined under materials:.",
+      "type": "array",
+      "example": "vacuum_rgb: [255, 255, 255]",
+      "validParents": ["slides"]
+    },
+    "kind": {
+      "description": "v1.5/Phase B.6 — slide region shape. 'band' (default) slides a vertical or horizontal strip of the image (direction + region_start/end + pixels_per_step). 'rectangle' cuts a 2-D box (rect + dx + dy) and translates it; pixels that walk off the image edge are dropped, the vacated source region is filled with vacuum_rgb, and multiple rectangles overlay in slides-list order at any colliding destination.",
+      "values": ["band", "rectangle"],
+      "example": "kind: rectangle",
+      "validParents": ["slides"]
+    },
+    "rect": {
+      "description": "v1.5/Phase B.6 — rectangle slide initial position: [x_start, y_start, x_end, y_end] in image pixel coordinates (origin = top-left).",
+      "type": "array",
+      "example": "rect: [100, 50, 200, 150]",
+      "validParents": ["slides"]
+    },
+    "dx": {
+      "description": "v1.5/Phase B.6 — rectangle slide x-velocity per step. Either a numeric constant or a tinyexpr formula. $name tokens are globally substituted at load time; $step is bound per evaluation. Fractional values are accumulated in float space so e.g. 0.5 produces alternating 0 / 1 shifts rather than rounding to zero.",
+      "type": "string",
+      "example": "dx: $omega * cos(2*pi*$step/$N)",
+      "validParents": ["slides"]
+    },
+    "dy": {
+      "description": "v1.5/Phase B.6 — rectangle slide y-velocity per step. Same evaluation rules as dx.",
+      "type": "string",
+      "example": "dy: 1",
+      "validParents": ["slides"]
     },
     "enabled": {
       "description": "Enable feature (true/false)",
@@ -248,8 +326,8 @@
     },
     "nonlinear_solver": {
       "description": "Nonlinear solver configuration for materials with field-dependent permeability μ(H)",
-      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence"],
-      "example": "nonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  max_iterations: 50\n  tolerance: 1.0e-6\n  verbose: false"
+      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence", "use_galerkin_coarsening", "use_matrix_free_jv", "use_phase6_precond_jfnk", "precond_update_frequency", "precond_verbose", "fine_finishing_iterations", "fine_finishing_tolerance"],
+      "example": "nonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  max_iterations: 50\n  tolerance: 1.0e-6\n  verbose: false\n  use_phase6_precond_jfnk: true"
     },
     "solver_type": {
       "description": "Nonlinear solver algorithm: 'picard' (simple fixed-point) or 'newton-krylov' (recommended for fast convergence)",
@@ -347,6 +425,65 @@
       "example": "export_convergence: true",
       "validParents": ["nonlinear_solver"]
     },
+    "use_galerkin_coarsening": {
+      "description": "Phase 4: use Galerkin projection (P^T·A_f·P) for the coarse Newton step instead of the FVM-discretised coarse matrix. Default false. FVM converges to the true PDE fixed point; Galerkin converges faster but to a projection fixed point that may not satisfy the PDE exactly. Only relevant when any material has coarsen: true.",
+      "type": "boolean",
+      "example": "use_galerkin_coarsening: false",
+      "validParents": ["nonlinear_solver"]
+    },
+    "use_matrix_free_jv": {
+      "description": "Phase 5: matrix-free Jacobian-vector product inside GMRES. Avoids assembling the Jacobian and damps the oscillation that coarsened NL can otherwise show. Default true; keep on for almost all cases.",
+      "type": "boolean",
+      "example": "use_matrix_free_jv: true",
+      "validParents": ["nonlinear_solver"]
+    },
+    "use_phase6_precond_jfnk": {
+      "description": "Phase 6: use the Galerkin coarse matrix as a preconditioner for full-grid JFNK (Newton-Krylov on the fine grid, coarse system solves the inner Newton step). The single biggest speed lever for >1M-DOF nonlinear runs -- expect 3-5x fewer NK outer iters. Default true. Requires at least one material with coarsen: true.",
+      "type": "boolean",
+      "example": "use_phase6_precond_jfnk: true",
+      "validParents": ["nonlinear_solver"]
+    },
+    "precond_update_frequency": {
+      "description": "Rebuild the Phase 6 preconditioner every N outer NK iterations. 1 = rebuild every iter (most accurate, default), higher numbers (3-5) trade some convergence speed for cheaper iters on very large problems.",
+      "type": "integer",
+      "example": "precond_update_frequency: 1",
+      "validParents": ["nonlinear_solver"]
+    },
+    "precond_verbose": {
+      "description": "Print Phase 6 preconditioner diagnostics (per-iter ||R_coarse|| and ||delta_A||). Useful when tuning use_phase6_precond_jfnk; leave false in production.",
+      "type": "boolean",
+      "example": "precond_verbose: false",
+      "validParents": ["nonlinear_solver"]
+    },
+    "fine_finishing_iterations": {
+      "description": "Number of full-grid Newton iterations to run AFTER the coarse NK has converged. Default 0 (skip). Set 2-5 if you need tight accuracy on coarsened runs -- the coarse solution provides a good initial guess and the fine pass irons out boundary-layer errors invisible to the coarse mesh.",
+      "type": "integer",
+      "example": "fine_finishing_iterations: 3",
+      "validParents": ["nonlinear_solver"]
+    },
+    "fine_finishing_tolerance": {
+      "description": "Tolerance for the fine_finishing pass. -1 (default) = reuse the outer tolerance value. Set explicitly to tighten or loosen the post-coarse Newton convergence target.",
+      "type": "number",
+      "example": "fine_finishing_tolerance: 1.0e-5",
+      "validParents": ["nonlinear_solver"]
+    },
+    "coarsening": {
+      "description": "Global tuning for adaptive mesh coarsening (top-level block). Only takes effect when one or more materials opt in via the per-material coarsen: true / coarsen_ratio fields.",
+      "children": ["boundary_shell", "smooth_iterations"],
+      "example": "coarsening:\n  boundary_shell: 1\n  smooth_iterations: 0"
+    },
+    "boundary_shell": {
+      "description": "Width (in fine cells) of the precision-preserving shell around every material boundary. Cells within this shell stay un-coarsened even if their material has coarsen: true. Default 1; raise to 2-3 if you see boundary artefacts on tight iron-air interfaces.",
+      "type": "integer",
+      "example": "boundary_shell: 1",
+      "validParents": ["coarsening"]
+    },
+    "smooth_iterations": {
+      "description": "Number of harmonic-mean μ interpolation passes applied to coarsened cells (smooths the μ field between fine boundary cells and coarse interior cells). 0 = no smoothing (default). 1-3 cleans up visible μ stair-stepping at coarsening ratio ≥ 4.",
+      "type": "integer",
+      "example": "smooth_iterations: 2",
+      "validParents": ["coarsening"]
+    },
     "B-H": {
       "description": "B-H curve for a material. Three formats supported:\n  Normal curve (H >= 0):  [[H,...],[B,...]] [A/m, T]\n  Demagnetization curve (H <= 0):  [[-Hcb,...,0],[0,...,Br]] — Br and mu_r extracted from slope at H=0\n  Formula:  \"expression with $H\" [A/m → T]\nFor normal/formula: μr(H)=(B(H)-Br)/(μ₀H) is derived internally. If H[0]=0 and B[0]≠0, residual Br is detected. Supports $H, user-defined $variables, constants: pi, e, mu0 (4π×10⁻⁷ H/m)",
       "type": "array|string",
@@ -361,14 +498,21 @@
     },
     "magnetization": {
       "description": "Permanent magnet magnetization model. Implements equivalent magnetization current Jz_mag=∇×M. Specify Br (preferred) or Hc, then pattern and direction parameters",
-      "children": ["Br", "Hc", "pattern", "angle", "p", "cx", "cy", "R_pc", "Mx", "My"],
+      "children": ["Br", "Hc", "pattern", "angle", "p", "cx", "cy", "R_pc", "orientation_offset", "direction", "Mx", "My"],
       "validParents": ["materials"],
       "example": "magnetization:\n  Br: 1.27\n  pattern: parallel\n  angle: 0.0"
     },
     "pattern": {
-      "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward from center (cx, cy)\n  tangential — counter-clockwise from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy)\n  polar_anisotropy — pole-following easy axis (p, R_pc, cx, cy)\n  custom — user expression (Mx, My)",
-      "values": ["parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "custom"],
+      "description": "Magnetization pattern type:\n  parallel — uniform direction (specify angle)\n  radial — outward (or inward via direction) from center (cx, cy)\n  tangential — counter-clockwise (or clockwise via direction) from center (cx, cy)\n  halbach_continuous — continuous Halbach array (p, cx, cy, orientation_offset); M ∝ cos((p/2)·θ)\n  polar_anisotropy — pole-following easy axis from p orientation centres OJ on a pitch circle (p, R_pc, cx, cy, orientation_offset); see Kano 2025 §3.2\n  radial_array — alternating radial-out / radial-in per pole sector (axially-magnetised SPM, p sectors)\n  parallel_array — uniform parallel within each pole sector along the sector mid-axis, alternating per pole (axially-magnetised IPM with rectangular magnets, p sectors)\n  custom — user expression (Mx, My)",
+      "values": ["parallel", "radial", "tangential", "halbach_continuous", "polar_anisotropy", "radial_array", "parallel_array", "custom"],
       "example": "pattern: parallel",
+      "validParents": ["magnetization"]
+    },
+    "direction": {
+      "description": "Sign / orientation flag for radial, tangential, radial_array, and parallel_array patterns. 'outward' (default) puts the first pole positive / radial pointing out; 'inward' flips the sign. Use to express the second half of an NS alternation when each side is its own colour, or to set the initial pole of an array pattern.",
+      "type": "string",
+      "values": ["outward", "inward"],
+      "example": "direction: outward",
       "validParents": ["magnetization"]
     },
     "Br": {
@@ -390,9 +534,9 @@
       "validParents": ["magnetization"]
     },
     "p": {
-      "description": "Number of pole pairs for 'halbach_continuous' or 'polar_anisotropy' patterns",
+      "description": "Number of POLES for 'halbach_continuous', 'polar_anisotropy', 'radial_array', and 'parallel_array' patterns. A 4-pole machine uses p=4. Even values give a closed NS alternation (odd values are accepted but the M field does not close at θ=2π). For sector-based patterns the number of sectors equals p with each spanning 2π/p radians (360/p degrees). halbach_continuous internally uses p/2 in its M ∝ cos((p/2)·θ) formula. polar_anisotropy uses p OJ centres on the pitch circle.",
       "type": "integer",
-      "example": "p: 4",
+      "example": "p: 4     # 4-pole machine",
       "validParents": ["magnetization"]
     },
     "cx": {
@@ -408,9 +552,15 @@
       "validParents": ["magnetization"]
     },
     "R_pc": {
-      "description": "Pitch circle radius [m] for 'polar_anisotropy' pattern. Defines the reference circle for virtual concentrated currents that set the easy-axis direction",
+      "description": "Pitch circle radius [m] for 'polar_anisotropy' pattern. Defines the reference circle for the orientation-centre points OJ (Kano 2025 §3.2). Typical choice: Kn=Fn/Rm in [1.0, 4.0]; Kn≈1.6 gives near-sinusoidal gap density (THD<1%). Here Fn=R_pc and Rm is the magnet outer radius",
       "type": "number",
       "example": "R_pc: 0.075",
+      "validParents": ["magnetization"]
+    },
+    "orientation_offset": {
+      "description": "Pole-structure rotation offset [deg] for 'halbach_continuous', 'polar_anisotropy', 'radial_array', and 'parallel_array' patterns. Rotates the first pole / OJ around (cx, cy). Solver default is 0 (sector 0 spans [0°, 360°/p]); the WebUI Detect Colors UI seeds -180/p (sector 0 centred on θ=0, i.e. cardinal-aligned) when the user first picks a sector pattern. Distinct from the transient slide rotation tracked by the solver between time steps.",
+      "type": "number",
+      "example": "orientation_offset: -45    # p=4, sector 0 centred on θ=0",
       "validParents": ["magnetization"]
     },
     "Mx": {
@@ -633,12 +783,22 @@
     "magnetization_halbach": {
       "name": "Magnetization - Halbach Array (continuous)",
       "trigger": "magnetization",
-      "snippet": "Br: 1.2\npattern: halbach_continuous\np: 4\ncx: 0.0\ncy: 0.0"
+      "snippet": "Br: 1.2\npattern: halbach_continuous\np: 4          # poles (4-pole machine)\ncx: 0.0\ncy: 0.0\norientation_offset: -45    # sector 0 centred on θ=0"
     },
     "magnetization_polar_anisotropy": {
-      "name": "Magnetization - Polar Anisotropy",
+      "name": "Magnetization - Polar Anisotropy (Kano 2025 §3.2)",
       "trigger": "magnetization",
-      "snippet": "Br: 1.2\npattern: polar_anisotropy\np: 4\nR_pc: 0.075\ncx: 0.0\ncy: 0.0"
+      "snippet": "Br: 1.2\npattern: polar_anisotropy\np: 4          # poles (4-pole machine)\nR_pc: 0.064    # Fn = Kn * Rm; Kn=1.6 → near-sinusoidal gap density\ncx: 0.0\ncy: 0.0\norientation_offset: -45    # sector 0 centred on θ=0"
+    },
+    "magnetization_radial_array": {
+      "name": "Magnetization - Radial Array (axially-magnetised SPM, NS alternating)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: radial_array\np: 4          # poles (4-pole machine)\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: -45    # sector 0 centred on θ=0"
+    },
+    "magnetization_parallel_array": {
+      "name": "Magnetization - Parallel Array (IPM rectangular magnets, NS alternating)",
+      "trigger": "magnetization",
+      "snippet": "Br: 1.2\npattern: parallel_array\np: 4          # poles (4-pole machine)\nangle: 0        # extra rotation [deg] off the sector mid-axis\ncx: 0.0\ncy: 0.0\ndirection: outward\norientation_offset: -45    # sector 0 centred on θ=0"
     },
     "magnetization_custom": {
       "name": "Magnetization - Custom Expression",

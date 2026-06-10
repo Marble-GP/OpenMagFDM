@@ -82,6 +82,7 @@ user*
 
 # Build directories
 build/
+build_*/
 CMakeCache.txt
 CMakeFiles/
 compile_commands.json
@@ -97,10 +98,9 @@ output_*/
 # prototype scripts
 scripts/
 
-# Test files
-uploads/*.png
-uploads/*.jpg
-!uploads/test_core.png
+# Test files and uploaded artifacts. Never ship per-user uploads in a
+# release; the WebUI re-creates the upload root per session.
+uploads/
 
 # Node modules
 webui/node_modules/

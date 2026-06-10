@@ -371,10 +371,22 @@ jobs:
         choco install nsis -y
 
     - name: Create NSIS installer script
+      env:
+        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.5.0")
+        # for tag-triggered runs and the branch name for manual dispatch.
+        # We extract the numeric "1.5.0" form, with a hardcoded fallback so
+        # a workflow_dispatch from a feature branch still produces a
+        # reasonable installer label.
+        TAG_NAME: ${{ github.ref_name }}
       run: |
+        $version = "1.5.0"
+        if ($env:TAG_NAME -match '^v?(\d+\.\d+\.\d+)') {
+            $version = $matches[1]
+        }
+        Write-Host "Installer PRODUCT_VERSION = $version (from TAG_NAME='$env:TAG_NAME')"
         @"
         !define PRODUCT_NAME "OpenMagFDM"
-        !define PRODUCT_VERSION "1.3.0"
+        !define PRODUCT_VERSION "$version"
         !define PRODUCT_PUBLISHER "OpenMagFDM Project"
         !define PRODUCT_WEB_SITE "https://github.com/Marble-GP/OpenMagFDM"
 

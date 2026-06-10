@@ -69,6 +69,147 @@ arr = tifffile.imread("output_xxx/Az/step_0001.tiff")
 print(arr.dtype, arr.shape)  # float64 (500, 500)
 ```
 
+## v1.5 リリースノート（WebUI 画像処理パイプライン）
+
+v1.5 では、CAD モータ断面の **スクリーンショットを直接 OpenMagFDM の解析にかけられる状態まで整える前処理 WebUI** が追加されました。コアソルバーには変更ありません。
+
+### Uniform-colour Filter — `/api/preprocess-filter/quantize`
+
+JPEG 由来 / アンチエイリアスで何万色にも分かれた CAD 画像を、少数の "材料色" に圧縮します。
+
+- Input Image パネルで `uniqueColors > 1000` が検出されたら黄色の警告バナーが自動表示
+- 「Apply Color Uniformization Filter」ボタンでフィルタ用モーダルを起動
+- スライダー: rare threshold (%) / Top N targets / Minimum colour distance / Despeckle radius / Min island size / Bilateral σ-spatial / σ-color
+- **Auto-tune** ボタン — N と rare threshold をユーザーが固定し、残りを Nelder-Mead で boundary-noise 最小化方向に探索 (subsample 256 px, 60-80 評価, 1 秒未満)
+- 中心ボタンクリック → 即時プレビュー / 1.5 秒 debounce 自動プレビュー / Apply で元画像を量子化済みに差し替え
+- ホイールズーム + 中ボタンドラッグでプレビューをパン
+
+### Polar Preprocess — `/api/preprocess-polar/{detect,warp}`
+
+回転機の断面画像から、中心 / 内径 / 外径 / セクタ角 / 周期 N を自動検出し、極座標 warp を出力。
+
+- 自動検出パイプライン (Stage 1–4): 前景マスク + 形状分類 → ヒストグラム精密化 + Hough 補正 → エアギャップ dip 検出 → 360-pt DFT で N-fold 周期検出 (grayscale + RGB のデュアル) + Jacobsen 補間
+- インターラクティブ編集: SVG オーバーレイ上の中心 / 内径 / 外径 / θ ハンドルをマウスドラッグ、数値 input は同期、ホイール ±step (Shift = ±10×)、矢印キーで中心を ±1 px ナッジ
+- **Air-gap candidate dropdown** — 多重ギャップ構造 (mid-yoke 補助エアギャップ等) で上位スコアが物理エアギャップでない場合、トップ N 候補から手動選択
+- **Color grouping** — カラーチップに dropdown (None / A / B / C / D)、Recompute で grouped 周期検出 (3 相 UVW グループ化 → 8-fold 対称性のような色ベースの幾何対称を検出)
+- Hybrid preview: 1.5 秒 debounce 自動 warp + Apply Transform 即時実行 + 黄色 dirty バッジ + 160×160 サムネ
+- **Save & Insert** — Section 6 ラジオで polar / cartesian を選択
+  - polar: `coordinate_system: polar` + `polar_domain: { r_start, r_end, theta_range, r_orientation }` + `image_path` = warp 出力ファイル
+  - cartesian: `coordinate_system: cartesian` + `image_path` = 元画像 (`mesh.dx/dy` のデフォルトを補完)
+
+### 既知の制約
+
+- 大画像 (4MP 超) で warp は 1–2 秒 / 回。Polar Preprocess Modal の右上にヒント表示
+- 矩形 stator は Hough が rotor 内縁を捕捉、 r_inner は手動補正前提
+- Auto-tune は完全に AA に支配された JPEG 系画像 (EEEEpaper outerSPMSM 等) では完璧ではなく、Bilateral σ-spatial を上げる余地あり
+
+### v1.5 追加機能 (Phase A + B)
+
+WebUI 前処理に続き、ソルバー側 + WebUI YAML 生成を強化しました。
+
+**Insert YAML テンプレート自動生成 (Phase A.1)** — Polar Preprocess Modal の "Insert YAML" が `Δθ / Θp` 比 (Θp = 2π/N、N は検出された極対数) で θ-BC を自動選択するようになりました。整数倍偶数 → `periodic (value: 1.0)`、整数倍奇数 → `anti-periodic (value: -1.0)`、整数倍でない → `dirichlet`。cartesian 保存時は `mesh.dx = dy = r_outer_physical / r_outer_px` を自動算出。生成 YAML には選択理由のコメントが付きます。
+
+**Polar Modal UI 整理 (Phase A.2)** — 利用頻度の低い "External shape" / "Color grouping" セクションを削除し、Polar Preprocess Modal は中心・半径・セクタ・出力 nr/nθ + Save target の 4 セクションにフォーカスしました。
+
+**`$var` グローバル展開 (Phase B.1)** — YAML の `variables:` で定義した `$name` トークンが、`materials:` だけでなく `mesh`、`polar_domain`、`polar_boundary_conditions`、`transient`、`flux_linkage`、`nonlinear_solver`、`magnetization` など全フィールドで展開されるようになりました。`mesh: { dx: $cell_size }` や `transient: { total_steps: $N_steps }` がそのまま動きます。Reserved コンテキストトークン (`$step`, `$H`, `$N`, `$A`, `$dx`, `$dy`, `$dr`, `$dtheta`) はこれまで通り材料/フォーミュラ評価時に展開されます。
+
+**Multi-slide for transient (Phase B.2)** — 1 つの過渡解析設定で複数の独立スライド領域を指定できます。各領域は `name / direction / region_start / region_end / pixels_per_step` を持ち、各ステップで独立に circular shift されます。磁気ギア / 多段ロータなどに有用。後方互換あり (旧 `slide_*` キーは 1 要素 `slides` に自動変換)。
+
+```yaml
+transient:
+  enabled: true
+  total_steps: 100
+  slides:
+    - name: rotor_outer
+      direction: vertical
+      region_start: 110
+      region_end: 390
+      pixels_per_step: 5
+    - name: rotor_inner
+      direction: vertical
+      region_start: 50
+      region_end: 100
+      pixels_per_step: -3   # 逆方向回転
+```
+
+Cartesian は完全対応。Polar は `slides[0]` のみ (Multi-slide polar permutation は v1.6 予定、load 時に警告)。
+
+**スライド時の wrap モード (Phase B.5)** — スライドして反対側に出ていった領域の扱いを `wrap_mode` で 3 モードから選べます。デフォルトの `auto` は対応する境界条件タイプから物理的に自然なものを選択します:
+
+- `periodic`: 旧仕様。content を環状に巻き戻す。
+- `antiperiodic`: 反周期境界条件と一致。シームを跨いだ画素は `jz` と magnetisation の符号が反転 — 電気機械的に「次のポール」は反対極性、を再現。
+- `vacuum`: Dirichlet 境界条件と一致。巻き戻しせず、空白部に `vacuum_rgb` (デフォルト [255,255,255] = air) を埋める。
+
+例: 反周期 θ 境界 + 単一ポール解析
+
+```yaml
+polar_boundary_conditions:
+  theta_min: { type: periodic, value: -1.0 }   # anti-periodic
+  theta_max: { type: periodic, value: -1.0 }
+transient:
+  enabled: true
+  slides:
+    - direction: vertical
+      region_start: 0
+      region_end: 360
+      pixels_per_step: 5
+      wrap_mode: auto   # → "antiperiodic" が選ばれる
+```
+
+実装は per-cell `slide_sign_map` (符号トラッカー) として常駐し、`jz_map` と `(Mx_map, My_map)` 更新時に符号を掛けます。
+
+**矩形領域スライド (Phase B.6)** — Band タイプ (縦/横の短冊) に加えて、2D 矩形領域を切り取って `(dx, dy)` 方向に毎ステップ平行移動させる `rectangle` タイプを追加しました。
+
+```yaml
+transient:
+  slides:
+    - name: linear_mover
+      kind: rectangle
+      rect: [100, 50, 200, 150]   # [x0, y0, x1, y1] 画像座標 (origin = 左上)
+      dx: 2                        # 数値リテラルまたは tinyexpr 数式
+      dy: "$omega * cos(2*pi*$step/$N_step)"
+      vacuum_rgb: [255, 255, 255]  # 空白部の色 (デフォルト白)
+
+    - name: counter_mover
+      kind: rectangle
+      rect: [300, 50, 400, 150]
+      dx: -1                       # 反対方向に移動
+      dy: 0
+```
+
+**特徴**:
+
+- **per-region 独立 `dx` / `dy`** — 各矩形が独自の速度を持つ
+- **tinyexpr 数式対応** — `$omega`, `$N_step` 等の `$name` は load 時に Phase B.1 で展開済、`$step` のみ実行時に評価
+- **画像外はカット** — 矩形が境界を跨いだ場合、超過分の content は破棄 (周期 wrap なし)
+- **カット元領域は vacuum** — `vacuum_rgb` (デフォルト [255,255,255] = air, jz=0, mu_r=1) で埋める
+- **マルチ矩形の重ね合わせ** — `slides:` リスト後方の矩形が前方の矩形を上書き (overlay)
+- **初期位置の重なり警告** — yaml load 時に初期 `rect` 同士が重なってると `WARNING:` で通知
+- **小数速度対応** — `dx: 0.5` 等の小数値は float 累積で内部管理し、毎ステップの離散シフトは累積値の round の差分。`0.5` なら 0, 1, 0, 1, ... と交互にシフト
+
+Band と rectangle は同一 `slides:` リスト内で混在可能 (それぞれ独立に処理)。
+
+**材料ペア flux linkage (Phase B.3)** — 各 `flux_linkage` エントリで `material_a` / `material_b` (材料名) を指定すると、`mean(Az over material A pixels) - mean(Az over material B pixels)` を計算します。太い導体や多数巻コイルで「点間の Az 差」が物理的に不適切なケース向け。既存の path variant (`start` + `end`) と同じリスト内で混在可。Cartesian 専用。
+
+```yaml
+flux_linkage:
+  - name: phase_U                    # 新: 材料ペア variant
+    material_a: coil_U_pos
+    material_b: coil_U_neg
+  - name: phase_V_legacy             # 既存: path variant
+    start: [0.0, 0.05]
+    end:   [0.1, 0.05]
+```
+
+WebUI に `GET /api/get-flux-linkage?result=<folder>` を追加。`FluxLinkage/flux_linkage.csv` を `{ steps: [...], series: { name: [values] } }` 形式で返します。
+
+**反周期 BC 数値検証 (Phase B.4)** — `nonlinear_benchmark/anti_periodic_test/` に AP-BC の数値リグレッションテストを追加。Half-circle AP-BC vs Full-circle periodic + 反対符号コイルの等価性を `L2(diff) / ||Az_ref|| < 1e-3` で確認します。`bash run_test.sh /path/to/MagFDMsolver` で実行可、終了コード 0=PASS、1=FAIL。
+
+```bash
+cd nonlinear_benchmark/anti_periodic_test
+bash run_test.sh ../../build/MagFDMsolver
+```
+
 ## ダウンロード
 
 ### プリビルドバイナリ（推奨）
