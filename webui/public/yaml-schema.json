@@ -326,8 +326,8 @@
     },
     "nonlinear_solver": {
       "description": "Nonlinear solver configuration for materials with field-dependent permeability μ(H)",
-      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence"],
-      "example": "nonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  max_iterations: 50\n  tolerance: 1.0e-6\n  verbose: false"
+      "children": ["enabled", "solver_type", "max_iterations", "tolerance", "relaxation", "anderson", "gmres_restart", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence", "use_galerkin_coarsening", "use_matrix_free_jv", "use_phase6_precond_jfnk", "precond_update_frequency", "precond_verbose", "fine_finishing_iterations", "fine_finishing_tolerance"],
+      "example": "nonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  max_iterations: 50\n  tolerance: 1.0e-6\n  verbose: false\n  use_phase6_precond_jfnk: true"
     },
     "solver_type": {
       "description": "Nonlinear solver algorithm: 'picard' (simple fixed-point) or 'newton-krylov' (recommended for fast convergence)",
@@ -424,6 +424,65 @@
       "type": "boolean",
       "example": "export_convergence: true",
       "validParents": ["nonlinear_solver"]
+    },
+    "use_galerkin_coarsening": {
+      "description": "Phase 4: use Galerkin projection (P^T·A_f·P) for the coarse Newton step instead of the FVM-discretised coarse matrix. Default false. FVM converges to the true PDE fixed point; Galerkin converges faster but to a projection fixed point that may not satisfy the PDE exactly. Only relevant when any material has coarsen: true.",
+      "type": "boolean",
+      "example": "use_galerkin_coarsening: false",
+      "validParents": ["nonlinear_solver"]
+    },
+    "use_matrix_free_jv": {
+      "description": "Phase 5: matrix-free Jacobian-vector product inside GMRES. Avoids assembling the Jacobian and damps the oscillation that coarsened NL can otherwise show. Default true; keep on for almost all cases.",
+      "type": "boolean",
+      "example": "use_matrix_free_jv: true",
+      "validParents": ["nonlinear_solver"]
+    },
+    "use_phase6_precond_jfnk": {
+      "description": "Phase 6: use the Galerkin coarse matrix as a preconditioner for full-grid JFNK (Newton-Krylov on the fine grid, coarse system solves the inner Newton step). The single biggest speed lever for >1M-DOF nonlinear runs -- expect 3-5x fewer NK outer iters. Default true. Requires at least one material with coarsen: true.",
+      "type": "boolean",
+      "example": "use_phase6_precond_jfnk: true",
+      "validParents": ["nonlinear_solver"]
+    },
+    "precond_update_frequency": {
+      "description": "Rebuild the Phase 6 preconditioner every N outer NK iterations. 1 = rebuild every iter (most accurate, default), higher numbers (3-5) trade some convergence speed for cheaper iters on very large problems.",
+      "type": "integer",
+      "example": "precond_update_frequency: 1",
+      "validParents": ["nonlinear_solver"]
+    },
+    "precond_verbose": {
+      "description": "Print Phase 6 preconditioner diagnostics (per-iter ||R_coarse|| and ||delta_A||). Useful when tuning use_phase6_precond_jfnk; leave false in production.",
+      "type": "boolean",
+      "example": "precond_verbose: false",
+      "validParents": ["nonlinear_solver"]
+    },
+    "fine_finishing_iterations": {
+      "description": "Number of full-grid Newton iterations to run AFTER the coarse NK has converged. Default 0 (skip). Set 2-5 if you need tight accuracy on coarsened runs -- the coarse solution provides a good initial guess and the fine pass irons out boundary-layer errors invisible to the coarse mesh.",
+      "type": "integer",
+      "example": "fine_finishing_iterations: 3",
+      "validParents": ["nonlinear_solver"]
+    },
+    "fine_finishing_tolerance": {
+      "description": "Tolerance for the fine_finishing pass. -1 (default) = reuse the outer tolerance value. Set explicitly to tighten or loosen the post-coarse Newton convergence target.",
+      "type": "number",
+      "example": "fine_finishing_tolerance: 1.0e-5",
+      "validParents": ["nonlinear_solver"]
+    },
+    "coarsening": {
+      "description": "Global tuning for adaptive mesh coarsening (top-level block). Only takes effect when one or more materials opt in via the per-material coarsen: true / coarsen_ratio fields.",
+      "children": ["boundary_shell", "smooth_iterations"],
+      "example": "coarsening:\n  boundary_shell: 1\n  smooth_iterations: 0"
+    },
+    "boundary_shell": {
+      "description": "Width (in fine cells) of the precision-preserving shell around every material boundary. Cells within this shell stay un-coarsened even if their material has coarsen: true. Default 1; raise to 2-3 if you see boundary artefacts on tight iron-air interfaces.",
+      "type": "integer",
+      "example": "boundary_shell: 1",
+      "validParents": ["coarsening"]
+    },
+    "smooth_iterations": {
+      "description": "Number of harmonic-mean μ interpolation passes applied to coarsened cells (smooths the μ field between fine boundary cells and coarse interior cells). 0 = no smoothing (default). 1-3 cleans up visible μ stair-stepping at coarsening ratio ≥ 4.",
+      "type": "integer",
+      "example": "smooth_iterations: 2",
+      "validParents": ["coarsening"]
     },
     "B-H": {
       "description": "B-H curve for a material. Three formats supported:\n  Normal curve (H >= 0):  [[H,...],[B,...]] [A/m, T]\n  Demagnetization curve (H <= 0):  [[-Hcb,...,0],[0,...,Br]] — Br and mu_r extracted from slope at H=0\n  Formula:  \"expression with $H\" [A/m → T]\nFor normal/formula: μr(H)=(B(H)-Br)/(μ₀H) is derived internally. If H[0]=0 and B[0]≠0, residual Br is detected. Supports $H, user-defined $variables, constants: pi, e, mu0 (4π×10⁻⁷ H/m)",

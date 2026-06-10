@@ -2768,7 +2768,14 @@ function insertMaterialsSection() {
             }
         }
 
-        const merged = jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 });
+        // Phase BA: jsyaml.dump strips every comment from the document,
+        // including the polar / cartesian Insert YAML's hint block. Re-
+        // append it so the user keeps seeing the optional-controls
+        // section after every Detect Colors round-trip. ensureSolverHintBlock
+        // is idempotent so running Detect Colors twice in a row doesn't
+        // duplicate the block.
+        const merged = ensureSolverHintBlock(
+            jsyaml.dump(currentDoc, { indent: 2, lineWidth: -1 }));
         AppState.aceEditor.setValue(merged, -1);
 
         closeDetectColorsModal();
@@ -4072,6 +4079,59 @@ function thetaToTinyExpr(theta_range) {
     return String(theta_range);
 }
 
+// =====================================================================
+// Phase BA: optional-controls hint block
+// =====================================================================
+//
+// A canonical block of commented YAML that surfaces the existence of
+// nonlinear-solver + coarsening knobs the solver supports but that
+// don't need to be on in every config. We append it to every YAML
+// emitted by the polar / cartesian "Insert YAML" path AND re-append
+// it after Detect Colors's jsyaml.dump round-trip (which strips
+// comments). The marker on the first line lets ensureSolverHintBlock
+// detect prior insertion so we never append twice.
+const SOLVER_HINT_MARKER = '# --- Optional controls (uncomment + edit as needed) ---';
+const SOLVER_HINT_BLOCK = `
+${SOLVER_HINT_MARKER}
+# Defaults below are what the solver uses out of the box; listed here so
+# you know which knobs exist when you want to tune. See README for full
+# semantics of each field.
+#
+# --- Nonlinear solver tuning (active when any material is nonlinear) ---
+# nonlinear_solver:
+#   enabled: true                   # auto-enabled when a NL material is present
+#   solver_type: newton-krylov      # alt: picard
+#   max_iterations: 50              # raise for tight TOL on 1M+ DOF problems
+#   tolerance: 5.0e-4               # relative residual ||R|| / ||b||
+#   verbose: false                  # per-iter mu/H/residual diagnostics
+#   use_phase6_precond_jfnk: true   # Galerkin-preconditioned JFNK -- keep on
+#   fine_finishing_iterations: 0    # 2-5 helps accuracy on coarsened runs
+#   anderson:
+#     enabled: false                # Anderson acceleration (Picard mainly)
+#     depth: 5
+#
+# --- Adaptive mesh coarsening (mark uniform regions for downsampling) ---
+# Per-material opt-in (add inside any material in the materials: block):
+#   coarsen: true
+#   coarsen_ratio: 2                # 2x2 fine cells → 1 active cell
+# Good candidates: air, coil interiors (uniform mu_r, constant jz).
+# Avoid on: nonlinear iron, magnets, fine material interfaces.
+# coarsening:
+#   boundary_shell: 1               # keep N cells fine near material edges
+#   smooth_iterations: 0            # harmonic mu interpolation for coarse cells
+`;
+
+// Append the SOLVER_HINT_BLOCK to the YAML string iff the marker isn't
+// already present. Used by every code path that hands the user a YAML
+// document so the hint survives Detect Colors' jsyaml.dump round-trip
+// (which would otherwise drop every comment in the file).
+function ensureSolverHintBlock(yamlString) {
+    if (typeof yamlString !== 'string') return yamlString;
+    if (yamlString.indexOf(SOLVER_HINT_MARKER) !== -1) return yamlString;
+    const sep = yamlString.endsWith('\n') ? '' : '\n';
+    return yamlString + sep + SOLVER_HINT_BLOCK;
+}
+
 // Build the polar coordinate_system / polar_domain / boundary block as a
 // hand-rolled YAML string. `jsyaml.dump` strips comments, so the block
 // has to be assembled as text instead of through the dumper.
@@ -4164,7 +4224,10 @@ function buildPolarYamlBlock(filename, polarDomain) {
         lines.push(`  slide_region_end: ${region_end}`);
         lines.push('  slide_pixels_per_step: $N_slide');
     }
-    return lines.join('\n') + '\n';
+    // Phase BA: surface the nonlinear_solver / coarsening knobs even when
+    // they aren't active in this template, so a user reading the inserted
+    // YAML in Ace sees them as a discoverable optional section.
+    return ensureSolverHintBlock(lines.join('\n') + '\n');
 }
 
 // Build the cartesian coordinate_system / mesh block. mesh.dx and .dy are
@@ -4196,7 +4259,8 @@ function buildCartesianYamlBlock(filename) {
     lines.push(`# image_path: documentation only. The solver reads the image given on the`);
     lines.push(`# command line; this field records which file the mesh was authored for.`);
     lines.push(`image_path: ${filename}`);
-    return lines.join('\n') + '\n';
+    // Phase BA: same optional-controls hint block as the polar branch.
+    return ensureSolverHintBlock(lines.join('\n') + '\n');
 }
 
 async function insertPolarYaml() {
