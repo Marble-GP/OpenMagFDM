@@ -389,6 +389,18 @@ private:
         int fine_finishing_iterations;    // Number of full-grid Newton steps after coarse solve (default: 0 = disabled)
         double fine_finishing_tolerance;  // Convergence tolerance for fine finishing (default: -1 = use tolerance)
 
+        // Phase BC: Eisenstat-Walker inexact-Newton forcing for the inner
+        // AMGCL linear solve. When enabled, eta_k = gamma * (||R_k|| / ||R_{k-1}||)^alpha,
+        // clipped to [eta_min, eta_max]. Lets CG stop early in iterations
+        // where outer Newton residual is still large, avoiding pointless
+        // 1e-6 inner accuracy. Disabled by default to preserve existing
+        // behaviour for users who haven't opted in.
+        bool eisenstat_walker_enabled;
+        double eisenstat_walker_gamma;    // EW γ (default 0.9)
+        double eisenstat_walker_alpha;    // EW α (default 2.0, Choice 2)
+        double eisenstat_walker_eta_min;  // floor (default 1e-6, matches SOLVER_TOLERANCE)
+        double eisenstat_walker_eta_max;  // initial / cap (default 0.1)
+
         NonlinearSolverConfig() :
             enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
             relaxation(0.7), anderson(), gmres_restart(30), line_search_c(1e-4),
@@ -397,7 +409,10 @@ private:
             verbose(false), export_convergence(false), use_galerkin_coarsening(false),
             use_matrix_free_jv(true),
             use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false),
-            fine_finishing_iterations(0), fine_finishing_tolerance(-1.0) {}
+            fine_finishing_iterations(0), fine_finishing_tolerance(-1.0),
+            eisenstat_walker_enabled(false),
+            eisenstat_walker_gamma(0.9), eisenstat_walker_alpha(2.0),
+            eisenstat_walker_eta_min(1e-6), eisenstat_walker_eta_max(0.1) {}
     };
 
     // Maxwell stress and force calculation
@@ -798,10 +813,15 @@ private:
     void writeMatrix(const Eigen::MatrixXd& m, const std::string& base_path,
                      const ExportConfig& opts) const;
 
-    // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small
+    // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small.
+    // Phase BC: tolerance > 0 overrides SOLVER_TOLERANCE for this call only. Used by
+    // Eisenstat-Walker forcing in the Newton-Krylov outer loop to loosen the inner
+    // AMGCL CG tolerance when the outer residual is still large -- no point
+    // converging the linear system to 1e-6 when the Newton residual is at 1e+1.
     Eigen::VectorXd solveLinearSystem(const Eigen::SparseMatrix<double>& A,
                                       const Eigen::VectorXd& rhs,
-                                      const Eigen::VectorXd& initial_guess = Eigen::VectorXd());
+                                      const Eigen::VectorXd& initial_guess = Eigen::VectorXd(),
+                                      double tolerance = -1.0);
 
     // Private methods
     void loadConfig(const std::string& config_path);

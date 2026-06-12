@@ -150,6 +150,22 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         // Fine finishing: full-grid Picard after coarse convergence
         nonlinear_config.fine_finishing_iterations = nl_config["fine_finishing_iterations"].as<int>(0);
         nonlinear_config.fine_finishing_tolerance = nl_config["fine_finishing_tolerance"].as<double>(-1.0);
+
+        // Phase BC: Eisenstat-Walker forcing for the inner AMGCL solve.
+        // Accept either a flat "eisenstat_walker_enabled" boolean for
+        // quick toggle, or a nested "eisenstat_walker:" block with the
+        // gamma / alpha / eta_min / eta_max tunables.
+        nonlinear_config.eisenstat_walker_enabled =
+            nl_config["eisenstat_walker_enabled"].as<bool>(false);
+        if (nl_config["eisenstat_walker"]) {
+            auto ew_cfg = nl_config["eisenstat_walker"];
+            nonlinear_config.eisenstat_walker_enabled =
+                ew_cfg["enabled"].as<bool>(nonlinear_config.eisenstat_walker_enabled);
+            nonlinear_config.eisenstat_walker_gamma   = ew_cfg["gamma"].as<double>(0.9);
+            nonlinear_config.eisenstat_walker_alpha   = ew_cfg["alpha"].as<double>(2.0);
+            nonlinear_config.eisenstat_walker_eta_min = ew_cfg["eta_min"].as<double>(1e-6);
+            nonlinear_config.eisenstat_walker_eta_max = ew_cfg["eta_max"].as<double>(0.1);
+        }
     }
 
     // Parse global coarsening settings
@@ -6426,9 +6442,15 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
     const Eigen::SparseMatrix<double>& A,
     const Eigen::VectorXd& rhs,
-    const Eigen::VectorXd& initial_guess)
+    const Eigen::VectorXd& initial_guess,
+    double tolerance)
 {
     int n = A.rows();
+    // Phase BC: caller passes a positive tolerance to override the default
+    // SOLVER_TOLERANCE. The Eisenstat-Walker forcing hook in NK uses this
+    // to slacken AMGCL's stopping criterion when the outer Newton
+    // residual is still loose, avoiding wasteful inner iterations.
+    const double tol_effective = (tolerance > 0.0) ? tolerance : SOLVER_TOLERANCE;
 
     if (n > AMGCL_THRESHOLD) {
         // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems.
@@ -6456,7 +6478,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         auto A_crs = std::tie(rows, ptr, col, val);
 
         AMGSolver::params params;
-        params.solver.tol     = SOLVER_TOLERANCE;
+        params.solver.tol     = tol_effective;  // Phase BC: per-call override
         params.solver.maxiter = SOLVER_MAX_ITERATIONS;
 
         AMGSolver amg(A_crs, params);
@@ -6475,8 +6497,12 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
 
         Eigen::VectorXd x = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
-        if (error > SOLVER_TOLERANCE * 1000) {
+        // Phase BC: scale the "did not converge" threshold by tol_effective
+        // so an Eisenstat-Walker loosened call (e.g. tol=0.1) isn't flagged
+        // as a failure when CG legitimately stops at 0.05.
+        if (error > tol_effective * 1000) {
             std::cerr << "WARNING: AMGCL did not converge (error=" << error
+                      << ", tol=" << tol_effective
                       << "). Falling back to SparseLU." << std::endl;
             Eigen::SparseLU<Eigen::SparseMatrix<double>> fallback;
             fallback.compute(A);

@@ -689,7 +689,46 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Adaptive: SparseLU below the AMGCL threshold, AMGCL above.
             // For full-grid problems (n ~ 250k) this routes through the
             // OpenMP-parallel builtin backend rather than serial SparseLU.
-            delta_A = solveLinearSystem(J_matrix, -residual_coarse);
+            //
+            // Phase BC: Eisenstat-Walker forcing. The inner AMGCL CG
+            // doesn't need to converge to 1e-6 when the outer Newton
+            // residual is still at 1e+1 -- iterate-quality-wise, the
+            // Newton step δ has uncertainty proportional to the outer
+            // residual anyway. Tighten the inner tolerance only as the
+            // outer residual decreases.
+            //   eta_k = γ * (||R_k|| / ||R_{k-1}||)^α
+            // clipped to [eta_min, eta_max]. At iter 0 we have no
+            // previous residual to ratio against, so use eta_max.
+            //
+            // Choice 2 (α=2) is the more aggressive form; matches the
+            // Eisenstat-Walker 1996 paper's recommended setting for
+            // problems where the Newton step is well-aligned with the
+            // descent direction.
+            double inner_tol = -1.0;  // sentinel: solveLinearSystem uses default
+            if (nonlinear_config.eisenstat_walker_enabled) {
+                const double g  = nonlinear_config.eisenstat_walker_gamma;
+                const double a  = nonlinear_config.eisenstat_walker_alpha;
+                const double lo = nonlinear_config.eisenstat_walker_eta_min;
+                const double hi = nonlinear_config.eisenstat_walker_eta_max;
+                if (iter == 0 || residual_history.size() < 2 ||
+                    residual_history[residual_history.size() - 2] <= 0.0) {
+                    inner_tol = hi;
+                } else {
+                    const double r_curr = residual_history.back();
+                    const double r_prev = residual_history[residual_history.size() - 2];
+                    const double ratio  = (r_prev > 0.0) ? (r_curr / r_prev) : 1.0;
+                    double eta = g * std::pow(ratio, a);
+                    if (eta < lo) eta = lo;
+                    if (eta > hi) eta = hi;
+                    inner_tol = eta;
+                }
+                if (VERBOSE) {
+                    std::cout << " [EW: inner_tol=" << std::scientific
+                              << std::setprecision(2) << inner_tol << "]";
+                }
+            }
+            delta_A = solveLinearSystem(J_matrix, -residual_coarse,
+                                        Eigen::VectorXd(), inner_tol);
         }
 
         // ===== Step 6: Backtracking line search =====
