@@ -34,6 +34,8 @@
 #include <amgcl/amg.hpp>
 #include <amgcl/coarsening/smoothed_aggregation.hpp>
 #include <amgcl/relaxation/spai0.hpp>
+#include <amgcl/relaxation/ilu0.hpp>      // Phase BE candidate: incomplete LU(0)
+#include <amgcl/relaxation/gauss_seidel.hpp> // Phase BE candidate: GS (~SSOR)
 #include <amgcl/solver/cg.hpp>
 
 #define SOLVER_TOLERANCE (1e-6)

@@ -6456,6 +6456,18 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems.
         // Uses backend::builtin (OpenMP-parallel SpMV + vector ops) so AMG hierarchy
         // construction and CG iterations run multi-threaded.
+        //
+        // Phase BE: smoother choice. SPAI(0) (sparse approximate inverse) is
+        // dirt cheap to construct and applies via two SpMVs per CG iter; ILU(0)
+        // has a more expensive sparse triangular setup but typically halves CG
+        // iter count on Poisson with strong coefficient jumps (μ at iron/air
+        // interfaces, exactly our case). For the IEEJ-D / ISEEJ-D benchmark
+        // where Eisenstat-Walker (Phase BC) has already pushed CG to 2-4
+        // iters/outer, the extra setup cost of ILU(0) probably eats the
+        // remaining inner-iter savings, so SPAI(0) stays the default and
+        // ILU(0) is wired in but unused. Keeping the include + comment here
+        // so a future bench can A/B them without rummaging through AMGCL
+        // headers.
         std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
 
         typedef amgcl::make_solver<
