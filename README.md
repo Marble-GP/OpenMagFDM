@@ -464,6 +464,56 @@ materials:
 
 非線形材料でも使用可能（Newton-Krylov の Defect Correction 方式により、物理精度はファイングリッド残差で保証）。
 
+### 既知の制限 (v1.5.1)
+
+**`coarsen_ratio: 4` 以下が silent no-op になる場合があります**。極座標系で物理セル
+アスペクト比 `dr / (r_mid · dtheta)` が 1.5 以上ある場合、内部の skip 比計算が
+`min(skip_x, skip_y) = 1` を生成し、gradient coarsening の level cap が 1 になって
+**全 cell が active 化** → coarsening は機能しない経路に landing します。
+実例: IEEJ-D polar IPMSM (nr=450, ntheta=2976, aspect≈1.89) では `coarsen_ratio: 4`
+で 0 inactive cells、`coarsen_ratio: 8` で 42.6% reduction。
+
+**v1.5.1 ではこの状況で WARNING を出力**します:
+
+```
+WARNING: Coarsening enabled in YAML but 0 inactive cells generated.
+The full-grid solve path will run (this is silently equivalent to coarsening:disabled).
+Try a larger coarsen_ratio (>= 5 for non-square aspect meshes) or set coarsen:false.
+```
+
+WARNING が出たら `coarsen_ratio` を増やすか、`coarsen: false` で full-grid 経路を
+明示してください。
+
+### Solver 経路の選択 (v1.5.1)
+
+coarsening の effective 化に応じて 2 つの NK loop 経路に分岐します:
+
+| 条件 | 経路 | 内側 solver | Eisenstat-Walker (Phase BC) |
+|---|---|---|---|
+| `using_coarsening == false` | Standard direct solve | AMGCL-CG (iterative) | ✅ 適用 |
+| `using_coarsening == true` + `use_phase6_precond_jfnk: true` | Phase 6 + Galerkin | AMGCL-CG (Phase BJ-3 で統合) | ✅ 適用 |
+
+v1.5.1 以前は Phase 6 経路が SparseLU 直接呼出で EW (Phase BC) を bypass していました
+が、v1.5.1 で両経路が AMGCL+EW で統一されました ([Phase BJ-3](https://github.com/Marble-GP/OpenMagFDM/commits/main))。
+
+### 適応粗大化が IEEJ-D class motor で有効でない理由 (技術ノート)
+
+Gradient coarsening の level 上限 `max_skip_iso` は `min(skip_x, skip_y)` で決まります。
+ここで `skip_x, skip_y` は物理セルを概ね正方形にするための rounding 後の値:
+
+```
+skip_x = round(sqrt(ratio / aspect))
+skip_y = round(sqrt(ratio * aspect))
+```
+
+`aspect > 1.5` (radial direction が広い細長メッシュ) では `skip_x` が 1 に rounding され、
+`max_skip_iso = min(1, skip_y) = 1` で coarsening は無効化されます。
+
+回避策:
+1. `coarsen_ratio` を上げる (例: 8, 16)
+2. radial 方向 (`nr`) を増やしてセル aspect を 1 に近づける
+3. 直交座標系を使う (Cartesian なら aspect=1 が自然)
+
 ---
 
 ## 極座標系解析

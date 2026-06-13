@@ -2523,7 +2523,19 @@ cv::Mat MagneticFieldAnalyzer::detectMaterialBoundaries() {
 void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
     // Calculate skip_x and skip_y from coarsen_ratio to maintain aspect ratio
     // Goal: Make coarsened cells as square as possible
-
+    //
+    // NOTE (v1.5.1 / Phase BJ-1): the round-to-integer step at the bottom of
+    // this function can produce skip_x=1 OR skip_y=1 when the physical cell
+    // aspect ratio is non-1 and coarsen_ratio is small (≤4). This makes
+    // max_skip_iso=min(skip_x, skip_y)=1, which silently disables gradient
+    // coarsening (no cell is ever lifted above level 1). The IEEJ-D polar
+    // IPMSM is the canonical example: aspect = dr / (r_mid · dtheta) ≈ 1.89,
+    // coarsen_ratio=4 → skip_x=1, skip_y=3 → max_skip_iso=1 → no-op.
+    //
+    // generateCoarseningMask* prints a WARNING when this happens (Total
+    // inactive: 0 cells). Phase BJ-4 will revisit the rounding to either
+    // raise max_skip_iso to ≥2 when ratio≥2 is requested, or fail loudly
+    // when the requested ratio is geometrically infeasible.
     for (auto& [mat_name, cfg] : material_coarsen) {
         if (!cfg.enabled || cfg.ratio <= 1) {
             cfg.skip_x = cfg.skip_y = cfg.max_skip_iso = 1;
@@ -2760,6 +2772,20 @@ void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(
         std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
     }
     std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
+    // Phase BJ-1: surface silent-no-op coarsening (every material in the YAML
+    // has coarsen:true but the rounding in calculateOptimalSkipRatios produced
+    // max_skip_iso=1 for all of them, so no cell is ever marked inactive).
+    // Without this warning, users see "coarsening enabled" in their config and
+    // assume the matrix is being reduced — but it isn't, and the NK loop
+    // silently runs the full-grid (Standard) solve path instead of the
+    // coarsened Phase 6 + Galerkin path. See README for the IEEJ-D polar
+    // case where coarsen_ratio=4 produces this exact no-op.
+    if (coarsened_count == 0) {
+        std::cerr << "WARNING: Coarsening enabled in YAML but 0 inactive cells generated. "
+                  << "The full-grid solve path will run (this is silently equivalent to coarsening:disabled). "
+                  << "Try a larger coarsen_ratio (>= 5 for non-square aspect meshes) or set coarsen:false."
+                  << std::endl;
+    }
 }
 
 void MagneticFieldAnalyzer::generateCoarseningMaskPolar(
@@ -2903,6 +2929,19 @@ void MagneticFieldAnalyzer::generateCoarseningMaskPolar(
         std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
     }
     std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
+    // Phase BJ-1: surface silent-no-op coarsening (see Cartesian counterpart
+    // for the rationale). Polar meshes with non-1 physical aspect ratio
+    // (dr / (r_mid · dtheta) ≠ 1) are especially vulnerable: the round-to-
+    // integer in calculateOptimalSkipRatios produces min(skip_x, skip_y)=1
+    // for most coarsen_ratio values, and the gradient coarsening cap then
+    // becomes 1. The IEEJ-D polar bench (nr=450, ntheta=2976, aspect≈1.89)
+    // is documented as silently no-op'ing at coarsen_ratio=4.
+    if (coarsened_count == 0) {
+        std::cerr << "WARNING: Coarsening enabled in YAML but 0 inactive cells generated. "
+                  << "The full-grid solve path will run (this is silently equivalent to coarsening:disabled). "
+                  << "Try a larger coarsen_ratio (>= 5 for non-square aspect meshes) or set coarsen:false."
+                  << std::endl;
+    }
 }
 
 void MagneticFieldAnalyzer::polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const {
