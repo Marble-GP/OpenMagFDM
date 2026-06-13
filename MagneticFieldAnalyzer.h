@@ -729,6 +729,7 @@ private:
     int max_coarsen_skip = 1;  // Maximum skip across all coarsened materials (for locality check)
     int coarsen_boundary_shell = 1;      // Edge dilation radius [pixels] for boundary protection (YAML: coarsening.boundary_shell)
     int coarsen_smooth_iterations = 0;   // Post-interpolation Laplacian smoothing iterations (YAML: coarsening.smooth_iterations)
+    bool coarsen_auto_bump_skip = false; // [Phase BJ-4] When true, calculateOptimalSkipRatios bumps min(skip_x, skip_y) to 2 if the rounding would have produced 1, preventing silent no-op coarsening at the cost of overshooting the requested ratio. Opt-in only because the Phase 6 + Galerkin path that the bumped mask routes through has a known accuracy regression on saturated nonlinear polar problems (see README "適応粗大化が IEEJ-D class motor で有効でない理由"). YAML: coarsening.auto_bump_skip
 
     // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
     Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix

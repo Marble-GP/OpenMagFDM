@@ -173,6 +173,12 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         auto cs_cfg = config["coarsening"];
         coarsen_boundary_shell = cs_cfg["boundary_shell"].as<int>(1);
         coarsen_smooth_iterations = cs_cfg["smooth_iterations"].as<int>(0);
+        // [Phase BJ-4] opt-in to skip rounding bump that prevents silent
+        // no-op coarsening on non-square-aspect meshes. Default false to
+        // preserve v1.5.0 behaviour; the Phase 6 + Galerkin path it
+        // unlocks has a known accuracy regression on saturated nonlinear
+        // polar problems (Phase BJ-5 territory).
+        coarsen_auto_bump_skip = cs_cfg["auto_bump_skip"].as<bool>(false);
     }
 
     // Determine coordinate system
@@ -2566,14 +2572,63 @@ void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
         // Round to nearest integer
         cfg.skip_x = std::max(1, (int)std::round(skip_x_float));
         cfg.skip_y = std::max(1, (int)std::round(skip_y_float));
+
+        // [Phase BJ-4] If round-to-integer collapsed one direction to 1
+        // while the user requested ratio >= 2, the isotropic gradient
+        // mask uses min(skip_x, skip_y) as its level cap, so the mask
+        // would silently produce 0 inactive cells (the case that fires
+        // the BJ-1 warning). Optionally bump both directions to at
+        // least 2 so coarsening is actually applied. This overshoots
+        // the requested area ratio to the next isotropic-feasible
+        // value (effective skip is max_skip_iso^2 = 4 minimum):
+        //   - ratio=2 on aspect-1 mesh: was 1×1 silent no-op, now 2×2
+        //     (effective ratio 4, 2× overshoot)
+        //   - ratio=4 on aspect-1.89 mesh (IEEJ-D): was 1×3 silent
+        //     no-op, now 2×3 with max_skip_iso=2 (effective ratio 4)
+        //   - ratio=8 on aspect-1.89 (already-working): 2×4 unchanged
+        //
+        // GATED BY OPT-IN: as of v1.5.1, the Phase 6 + Galerkin path
+        // that the bumped mask routes through has a known accuracy
+        // regression on saturated nonlinear polar problems (IEEJ-D
+        // flux ~1/10 of the Standard-path value, see Phase BJ-5).
+        // To keep the default behaviour safe, auto-bump fires only
+        // when `coarsening.auto_bump_skip: true` is set in the YAML.
+        // Default (off): the BJ-1 warning still surfaces the no-op so
+        // the user can either bump coarsen_ratio manually or accept
+        // that coarsening is a no-op for this geometry.
+        int orig_skip_x = cfg.skip_x;
+        int orig_skip_y = cfg.skip_y;
+        const bool would_be_no_op =
+            (std::min(cfg.skip_x, cfg.skip_y) < 2 && cfg.ratio >= 2);
+        const bool bumped = would_be_no_op && coarsen_auto_bump_skip;
+        if (bumped) {
+            cfg.skip_x = std::max(2, cfg.skip_x);
+            cfg.skip_y = std::max(2, cfg.skip_y);
+        }
         cfg.max_skip_iso = std::min(cfg.skip_x, cfg.skip_y);
 
-        // Log actual reduction ratio
+        // Log actual reduction ratio. Note: the EFFECTIVE coarsening
+        // applied by the gradient mask is max_skip_iso × max_skip_iso
+        // (isotropic step inside the modulo check at the mask site),
+        // not skip_x × skip_y. The latter reflects only the rounding
+        // intent. We keep printing both for transparency.
         int actual_ratio = cfg.skip_x * cfg.skip_y;
         std::cout << "Material '" << mat_name << "': coarsen_ratio=" << cfg.ratio
                   << " -> skip_x=" << cfg.skip_x << ", skip_y=" << cfg.skip_y
                   << " (actual ratio=" << actual_ratio
-                  << ", gradient max_skip=" << cfg.max_skip_iso << ")" << std::endl;
+                  << ", gradient max_skip=" << cfg.max_skip_iso << ")";
+        if (bumped) {
+            std::cout << " [BJ-4: auto-bumped from skip_x=" << orig_skip_x
+                      << ",skip_y=" << orig_skip_y
+                      << " to avoid silent no-op]";
+        } else if (would_be_no_op) {
+            std::cout << " [BJ-4 NOTE: min(skip_x,skip_y)=1 would no-op this "
+                      << "material; set `coarsening.auto_bump_skip: true` to "
+                      << "force isotropic skip 2 (overshoots to ratio "
+                      << (std::max(2, cfg.skip_x) * std::max(2, cfg.skip_y))
+                      << ")]";
+        }
+        std::cout << std::endl;
     }
 }
 
