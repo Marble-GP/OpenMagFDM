@@ -404,19 +404,28 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                         }
                         mu_map = mu_map_eff_fine;                    // Restore μ_eff
 
-                        Eigen::SparseLU<Eigen::SparseMatrix<double>> fine_lu;
-                        fine_lu.compute(A_newton_fine);
-                        if (fine_lu.info() != Eigen::Success) {
-                            std::cerr << "  [Fine Newton LU failed, stopping fine finishing]" << std::endl;
-                            break;
-                        }
-                        // Newton step: δAz = A(μ_diff)^{-1} * (-(A(μ_eff)*Az - b))
+                        // [Phase BJ-3] Replace SparseLU on full-grid A_newton_fine
+                        // (1.34M dof for IEEJ-D, factorization measured in minutes)
+                        // with solveLinearSystem → AMGCL-CG + EW. Same rationale
+                        // as the coarse Newton solve above. EW η=eta_max (~0.1) is
+                        // used because fine finishing has its own residual sequence
+                        // that doesn't directly map to the NK outer loop's history.
                         Eigen::VectorXd R_fine_vec = A_fine * Az_fine_vec - b_fine;
-                        Eigen::VectorXd delta_fine = fine_lu.solve(-R_fine_vec);
-                        if (fine_lu.info() != Eigen::Success) {
-                            std::cerr << "  [Fine Newton solve failed, stopping fine finishing]" << std::endl;
-                            break;
+                        Eigen::VectorXd delta_fine;
+                        double fine_inner_tol = -1.0;
+                        if (nonlinear_config.eisenstat_walker_enabled) {
+                            fine_inner_tol = nonlinear_config.eisenstat_walker_eta_max;
                         }
+                        bool fine_solve_failed = false;
+                        try {
+                            delta_fine = solveLinearSystem(A_newton_fine, -R_fine_vec,
+                                                           Eigen::VectorXd(), fine_inner_tol);
+                        } catch (const std::exception& e) {
+                            std::cerr << "  [Fine Newton solve failed (" << e.what()
+                                      << "), stopping fine finishing]" << std::endl;
+                            fine_solve_failed = true;
+                        }
+                        if (fine_solve_failed) break;
 
                         // Step 4b: True nonlinear backtracking line search.
                         // At each trial α, update Az → recompute B/H/μ → rebuild A(μ) →
@@ -566,23 +575,60 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             full_matrix_cache_valid = false;
 
             // 5. Solve Newton step: δAz = A(μ_diff)^{-1} * (-R_coarse(μ_eff))
-            Eigen::SparseLU<Eigen::SparseMatrix<double>> newton_lu;
-            newton_lu.compute(A_newton);
-            if (newton_lu.info() == Eigen::Success) {
-                delta_A = newton_lu.solve(-residual_coarse);
-                if (newton_lu.info() != Eigen::Success) {
-                    if (VERBOSE) std::cout << " [Newton solve failed, Picard fallback]";
-                    // Fallback to Picard (A_eff)
-                    Eigen::SparseLU<Eigen::SparseMatrix<double>> picard_lu;
-                    picard_lu.compute(A_matrix);
-                    delta_A = picard_lu.solve(-residual_coarse);
+            //
+            // [Phase BJ-3] Route through solveLinearSystem so the Eisenstat-
+            // Walker forcing (Phase BC) applies on this path too. Pre-BJ-3
+            // this was a direct SparseLU.compute(A_newton) + solve, which:
+            //   - exact (good for correctness) but O(n^1.5) per call and
+            //     single-threaded in Eigen
+            //   - completely bypassed the EW inner-tolerance slackening
+            //     that Standard direct solve path enjoys
+            // solveLinearSystem internally picks SparseLU below
+            // AMGCL_THRESHOLD (10k) and AMGCL-CG above, with built-in
+            // SparseLU fallback on AMGCL non-convergence — so the
+            // very-small-problem behaviour is preserved.
+            double newton_inner_tol = -1.0;
+            if (nonlinear_config.eisenstat_walker_enabled) {
+                const double g  = nonlinear_config.eisenstat_walker_gamma;
+                const double a  = nonlinear_config.eisenstat_walker_alpha;
+                const double lo = nonlinear_config.eisenstat_walker_eta_min;
+                const double hi = nonlinear_config.eisenstat_walker_eta_max;
+                if (iter == 0 || residual_history.size() < 2 ||
+                    residual_history[residual_history.size() - 2] <= 0.0) {
+                    newton_inner_tol = hi;
+                } else {
+                    const double r_curr = residual_history.back();
+                    const double r_prev = residual_history[residual_history.size() - 2];
+                    const double ratio  = (r_prev > 0.0) ? (r_curr / r_prev) : 1.0;
+                    double eta = g * std::pow(ratio, a);
+                    if (eta < lo) eta = lo;
+                    if (eta > hi) eta = hi;
+                    newton_inner_tol = eta;
                 }
-            } else {
-                if (VERBOSE) std::cout << " [Newton LU failed, Jacobi step]";
-                delta_A.resize(n_active_cells);
-                for (int k = 0; k < A_newton.rows(); k++) {
-                    double diag = A_newton.coeff(k, k);
-                    delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
+                if (VERBOSE) {
+                    std::cout << " [EW(P6): inner_tol=" << std::scientific
+                              << std::setprecision(2) << newton_inner_tol << "]";
+                }
+            }
+            try {
+                delta_A = solveLinearSystem(A_newton, -residual_coarse,
+                                            Eigen::VectorXd(), newton_inner_tol);
+            } catch (const std::exception& e) {
+                if (VERBOSE) std::cout << " [Newton solve failed (" << e.what()
+                                       << "), Picard fallback]";
+                // Fallback to Picard (A_eff): solveLinearSystem will itself
+                // do its EW + AMGCL + SparseLU-fallback chain here. If even
+                // this throws, fall through to the Jacobi step below.
+                try {
+                    delta_A = solveLinearSystem(A_matrix, -residual_coarse,
+                                                Eigen::VectorXd(), newton_inner_tol);
+                } catch (const std::exception&) {
+                    if (VERBOSE) std::cout << " [Picard fallback failed, Jacobi step]";
+                    delta_A.resize(n_active_cells);
+                    for (int k = 0; k < A_newton.rows(); k++) {
+                        double diag = A_newton.coeff(k, k);
+                        delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
+                    }
                 }
             }
 
