@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <fstream>
+#include <sstream>
 #include <cmath>
 #include <Eigen/Dense>
 #ifdef _OPENMP
@@ -339,7 +340,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     std::cout << "Fine finishing: up to " << nonlinear_config.fine_finishing_iterations
                               << " full-grid Newton iter(s), tol=" << fine_tol << std::endl;
 
+                    // [Phase BJ-5] Track the latest fine-grid residual so the
+                    // post-loop quality check below can surface the wrong-
+                    // answer case (line search fails → loop exits at fi=1 with
+                    // a residual that hasn't moved from the coarse-plateau
+                    // value). Without this, the user sees "Newton-Krylov
+                    // solver converged" + a tiny Fine iter print, then a
+                    // numerically wrong flux output, with no clear flag.
+                    double last_fine_rel = -1.0;
+                    bool fine_converged = false;
+                    int fine_iters_done = 0;
+
                     for (int fi = 0; fi < nonlinear_config.fine_finishing_iterations; fi++) {
+                        fine_iters_done = fi + 1;
                         // Step 1: Update μ from full-grid Az
                         if (is_polar) {
                             calculateMagneticFieldPolar();
@@ -377,12 +390,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                         double R_fine_norm = (A_fine * Az_fine_vec - b_fine).norm();
                         double b_fine_norm = b_fine.norm();
                         double fine_rel = R_fine_norm / (b_fine_norm + 1e-12);
+                        last_fine_rel = fine_rel;  // [Phase BJ-5]
 
                         std::cout << "  Fine iter " << fi + 1 << "/" << nonlinear_config.fine_finishing_iterations
                                   << ": ||R_fine||_rel = " << std::scientific << std::setprecision(2) << fine_rel;
 
                         if (fine_rel < fine_tol) {
                             std::cout << " [converged]" << std::endl;
+                            fine_converged = true;  // [Phase BJ-5]
                             break;
                         }
                         std::cout << std::endl;
@@ -502,6 +517,43 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     }
                     calculateHField();
                     updateMuDistribution();
+
+                    // [Phase BJ-5] Post-fine-finishing quality check.
+                    // Surface the known wrong-answer case where Phase 6 +
+                    // Galerkin coarsening claims "converged" at coarse
+                    // plateau ‖R_c‖ ~ 2-4e-1 but the underlying fine
+                    // residual is also at ~2e-1 (50-100× above the
+                    // requested TOL). This is the saturated-polar trap
+                    // documented in README "適応粗大化が IEEJ-D class
+                    // motor で有効でない理由": flux magnitudes can land
+                    // at ~1/10 of the true value with no other warning
+                    // signal in the output.
+                    if (!fine_converged && last_fine_rel > 0.0) {
+                        const double quality_threshold = fine_tol * 100.0;
+                        if (last_fine_rel > quality_threshold) {
+                            std::cerr << "WARNING: Fine finishing exited at "
+                                      << "||R_fine||_rel = " << std::scientific
+                                      << std::setprecision(2) << last_fine_rel
+                                      << " after " << fine_iters_done
+                                      << " iter(s), ~" << (int)(last_fine_rel / fine_tol)
+                                      << "x above fine_tol=" << fine_tol << ". "
+                                      << "Phase 6 + Galerkin coarsening can systematically "
+                                      << "under-saturate iron on highly-nonlinear polar "
+                                      << "problems and produce flux ~1/10 of the true "
+                                      << "(non-coarsened) value. Consider coarsen:false "
+                                      << "for nonlinear materials, or set "
+                                      << "nonlinear_solver.strict_convergence:true to "
+                                      << "fail loudly on this case." << std::endl;
+                        }
+                        if (nonlinear_config.strict_convergence
+                            && last_fine_rel > fine_tol) {
+                            std::ostringstream oss;
+                            oss << "Strict convergence requested but fine finishing "
+                                << "exited at ||R_fine||_rel = " << last_fine_rel
+                                << " (target " << fine_tol << "). Aborting.";
+                            throw std::runtime_error(oss.str());
+                        }
+                    }
                 } else {
                     smoothInactiveCells(coarsen_smooth_iterations);
                     // Harmonically interpolate μ at inactive cells (IDW, series circuit model)

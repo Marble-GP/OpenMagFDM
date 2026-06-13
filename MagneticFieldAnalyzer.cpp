@@ -151,6 +151,9 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.fine_finishing_iterations = nl_config["fine_finishing_iterations"].as<int>(0);
         nonlinear_config.fine_finishing_tolerance = nl_config["fine_finishing_tolerance"].as<double>(-1.0);
 
+        // [Phase BJ-5] Strict convergence enforcement (default off).
+        nonlinear_config.strict_convergence = nl_config["strict_convergence"].as<bool>(false);
+
         // Phase BC: Eisenstat-Walker forcing for the inner AMGCL solve.
         // Accept either a flat "eisenstat_walker_enabled" boolean for
         // quick toggle, or a nested "eisenstat_walker:" block with the

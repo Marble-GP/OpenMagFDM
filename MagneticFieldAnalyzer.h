@@ -391,6 +391,20 @@ private:
         int fine_finishing_iterations;    // Number of full-grid Newton steps after coarse solve (default: 0 = disabled)
         double fine_finishing_tolerance;  // Convergence tolerance for fine finishing (default: -1 = use tolerance)
 
+        // [Phase BJ-5] Strict convergence enforcement.
+        // When using Phase 6 + Galerkin coarsening on saturated polar problems
+        // (e.g. IEEJ-D IPMSM), the coarse plateau detector at residual ~2-4e-1
+        // accepts a solution whose fine residual stays an order of magnitude
+        // above TOL and whose iron region is under-saturated by ~50000x.
+        // The flux magnitude on such a "converged" solve is ~1/10 of the true
+        // (Standard-path) value — see README "適応粗大化が IEEJ-D class motor
+        // で有効でない理由" / Phase BJ-5 note. When this flag is true, the
+        // post-fine-finishing residual check throws std::runtime_error
+        // instead of just warning, so production pipelines can catch the
+        // wrong-answer case loudly. Default false to preserve v1.5.0 behaviour
+        // — users who haven't seen the new diagnostic see only the warning.
+        bool strict_convergence;
+
         // Phase BC: Eisenstat-Walker inexact-Newton forcing for the inner
         // AMGCL linear solve. When enabled, eta_k = gamma * (||R_k|| / ||R_{k-1}||)^alpha,
         // clipped to [eta_min, eta_max]. Lets CG stop early in iterations
@@ -412,6 +426,7 @@ private:
             use_matrix_free_jv(true),
             use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false),
             fine_finishing_iterations(0), fine_finishing_tolerance(-1.0),
+            strict_convergence(false),
             eisenstat_walker_enabled(false),
             eisenstat_walker_gamma(0.9), eisenstat_walker_alpha(2.0),
             eisenstat_walker_eta_min(1e-6), eisenstat_walker_eta_max(0.1) {}
