@@ -28,6 +28,21 @@
  * @brief Main Newton-Krylov solver
  */
 void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
+    // [Phase BJ-8 Path D / v1.5.1] Custom Galerkin coarsening is deprecated.
+    // Shadow the class member `coarsening_enabled` with a local `false` so
+    // every conditional in this function and the helpers it inlines (initial
+    // guess dispatch, Step 2 matrix build, Phase 6 / Phase 5 / fine_finishing
+    // branches, line-search trial matrix rebuilds) short-circuits to the
+    // full-grid Standard direct solve path. AMGCL's internal smoothed_
+    // aggregation multigrid handles the multi-resolution problem natively,
+    // replacing the OpenMagFDM-side P/R/A_c machinery that produced
+    // wrong-answer flux (~1/10 of true) on saturated polar IPMSM problems
+    // (see Phase BJ-1/4/5 diagnostics, IEEJ-D bench evidence). The class
+    // member stays untouched for other entry points (linear solve, mesh
+    // generation, export) until Stage 4 physically deletes them.
+    const bool coarsening_enabled = false;
+    (void)coarsening_enabled;  // suppress unused-variable warning in branches that don't reference it
+
     if (!has_nonlinear_materials) {
         // Fall back to linear solver
         if (coordinate_system == "cartesian") {
@@ -94,7 +109,6 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
     }
 
-    // Determine if coarsening is active (constant across iterations)
     bool using_coarsening = (is_polar && coarsening_enabled && n_active_cells < nr * ntheta) ||
                             (!is_polar && coarsening_enabled && n_active_cells < nx * ny);
 
@@ -319,17 +333,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
                       << std::scientific << std::setprecision(2) << residual_rel << ")" << std::endl;
 
-            // Final output: interpolate coarse solution to full grid.
-            // During iteration, bilinear was used for P-matrix consistency.
-            // After convergence, apply optional Laplacian smoothing for
-            // smooth B field visualization (C¹ Az at skip transitions).
-            if (using_coarsening) {
-                if (is_polar) {
-                    interpolateToFullGridPolar(Az_vec);
-                } else {
-                    interpolateToFullGrid(Az_vec);
-                }
-
+            // [Phase BJ-8 Path D / v1.5.1] Final-output interpolation +
+            // optional Laplacian smoothing + fine-finishing Newton-Picard
+            // block deleted. With custom Galerkin coarsening removed the NK
+            // loop already converges on the full grid, so the previous
+            // "interpolate coarse → full, then polish on fine" step is
+            // unnecessary. The post-loop fields (B, H, μ) are still
+            // refreshed below for export consistency.
+            if (false) {
                 if (nonlinear_config.fine_finishing_iterations > 0) {
                     // Fine finishing: replace smoothing with full-grid Picard steps.
                     // The coarse solution provides a good initial guess; a few full-grid
@@ -596,107 +607,13 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double dc_R_fine_norm = -1.0;
 
         // ===== Step 5: Compute Newton step δA =====
-        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // Newton-Picard (Phase 6):
-            // Solve A(μ_diff) * δAz = -R_coarse(μ_eff) using differential permeability.
-            //
-            // Picard [A(μ_eff) * δ = -R] diverges when ρ = μ_eff/μ_diff >> 1 (Si_steel saturation).
-            // Newton [A(μ_diff) * δ = -R] has ρ_Newton ≈ |1 - 1/(μ_eff/μ_diff)| < 1 → converges.
-            //
-            // μ_diff = dB/dH / μ₀ (differential/tangent permeability, ≤ μ_eff in saturation).
-            if (VERBOSE && iter == 0) {
-                std::cout << "Using Newton-Picard (Phase 6): A(μ_diff) tangent matrix" << std::endl;
-            }
-
-            // 1. Save current μ_eff distribution
-            Eigen::MatrixXd mu_map_eff = mu_map;
-
-            // 2. Compute μ_diff at active cells (via central difference on B(H))
-            updateMuDiffAtActiveCells(H_active_saved);
-            // Propagate μ_diff to inactive cells (needed by buildMatrixGalerkin → A_f)
-            interpolateMuToFullGrid();
-
-            // 3. Build Newton tangent matrix A(μ_diff) via Galerkin projection
-            Eigen::SparseMatrix<double> A_newton;
-            Eigen::VectorXd b_newton_dummy;
-            full_matrix_cache_valid = false;  // Force rebuild with μ_diff
-            buildMatrixGalerkin(A_newton, b_newton_dummy);
-
-            // 4. Restore μ_eff (invalidate cache: next iter must rebuild with μ_eff)
-            mu_map = mu_map_eff;
-            full_matrix_cache_valid = false;
-
-            // 5. Solve Newton step: δAz = A(μ_diff)^{-1} * (-R_coarse(μ_eff))
-            //
-            // [Phase BJ-3] Route through solveLinearSystem so the Eisenstat-
-            // Walker forcing (Phase BC) applies on this path too. Pre-BJ-3
-            // this was a direct SparseLU.compute(A_newton) + solve, which:
-            //   - exact (good for correctness) but O(n^1.5) per call and
-            //     single-threaded in Eigen
-            //   - completely bypassed the EW inner-tolerance slackening
-            //     that Standard direct solve path enjoys
-            // solveLinearSystem internally picks SparseLU below
-            // AMGCL_THRESHOLD (10k) and AMGCL-CG above, with built-in
-            // SparseLU fallback on AMGCL non-convergence — so the
-            // very-small-problem behaviour is preserved.
-            double newton_inner_tol = -1.0;
-            if (nonlinear_config.eisenstat_walker_enabled) {
-                const double g  = nonlinear_config.eisenstat_walker_gamma;
-                const double a  = nonlinear_config.eisenstat_walker_alpha;
-                const double lo = nonlinear_config.eisenstat_walker_eta_min;
-                const double hi = nonlinear_config.eisenstat_walker_eta_max;
-                if (iter == 0 || residual_history.size() < 2 ||
-                    residual_history[residual_history.size() - 2] <= 0.0) {
-                    newton_inner_tol = hi;
-                } else {
-                    const double r_curr = residual_history.back();
-                    const double r_prev = residual_history[residual_history.size() - 2];
-                    const double ratio  = (r_prev > 0.0) ? (r_curr / r_prev) : 1.0;
-                    double eta = g * std::pow(ratio, a);
-                    if (eta < lo) eta = lo;
-                    if (eta > hi) eta = hi;
-                    newton_inner_tol = eta;
-                }
-                if (VERBOSE) {
-                    std::cout << " [EW(P6): inner_tol=" << std::scientific
-                              << std::setprecision(2) << newton_inner_tol << "]";
-                }
-            }
-            try {
-                delta_A = solveLinearSystem(A_newton, -residual_coarse,
-                                            Eigen::VectorXd(), newton_inner_tol);
-            } catch (const std::exception& e) {
-                if (VERBOSE) std::cout << " [Newton solve failed (" << e.what()
-                                       << "), Picard fallback]";
-                // Fallback to Picard (A_eff): solveLinearSystem will itself
-                // do its EW + AMGCL + SparseLU-fallback chain here. If even
-                // this throws, fall through to the Jacobi step below.
-                try {
-                    delta_A = solveLinearSystem(A_matrix, -residual_coarse,
-                                                Eigen::VectorXd(), newton_inner_tol);
-                } catch (const std::exception&) {
-                    if (VERBOSE) std::cout << " [Picard fallback failed, Jacobi step]";
-                    delta_A.resize(n_active_cells);
-                    for (int k = 0; k < A_newton.rows(); k++) {
-                        double diag = A_newton.coeff(k, k);
-                        delta_A(k) = (std::abs(diag) > 1e-30) ? -residual_coarse(k) / diag : 0.0;
-                    }
-                }
-            }
-
-            if (nonlinear_config.precond_verbose) {
-                std::cout << "Newton-Picard: ||R_coarse||=" << residual_coarse_norm
-                          << " ||delta_A||=" << delta_A.norm() << std::endl;
-            }
-
-        } else if (using_coarsening && nonlinear_config.use_matrix_free_jv) {
-            // Phase 5: Matrix-free GMRES (no preconditioner)
-            if (VERBOSE && iter == 0) {
-                std::cout << "Using matrix-free GMRES (Phase 5) for Newton step" << std::endl;
-            }
-            delta_A = solveWithMatrixFreeGMRES(Az_vec, -residual_coarse,
-                nonlinear_config.gmres_restart * 3, 1e-6);
-        } else {
+        // [Phase BJ-8 Path D / v1.5.1] Phase 6 Newton-Picard (Galerkin
+        // A(μ_diff) tangent) and Phase 5 matrix-free GMRES branches were
+        // removed. Only the Standard direct solve with explicit Jacobian
+        // (J = A_matrix + r-weighted diagonal correction) + AMGCL+EW
+        // remains. AMGCL's internal smoothed_aggregation multigrid replaces
+        // the custom Galerkin coarsening that the deleted branches used.
+        {
             // Standard direct solve with explicit Jacobian (J = A + diagonal correction)
             Eigen::SparseMatrix<double> J_matrix = A_matrix;
 
