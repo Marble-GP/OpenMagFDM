@@ -113,6 +113,36 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.verbose = nl_config["verbose"].as<bool>(false);
         nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>(false);
 
+        // [Phase BJ-8 stage 3 / v1.5.1] Deprecation warnings for YAML keys
+        // that controlled the now-removed custom Galerkin coarsening
+        // machinery. Each key still parses (no behavioural change) but the
+        // value is unreachable — Stage 4 deletes the parse calls + struct
+        // fields. The warning fires once per startup to tell users which
+        // keys to remove from their YAML.
+        {
+            static const char* kDeprecatedNlKeys[] = {
+                "relaxation",                  // Picard step damping (Picard solver_type unused)
+                "use_galerkin_coarsening",     // Phase 4 Galerkin projection
+                "use_matrix_free_jv",          // Phase 5 matrix-free GMRES on coarse system
+                "use_phase6_precond_jfnk",     // Phase 6 Newton-Picard A(μ_diff) tangent
+                "precond_update_frequency",    // Phase 6 preconditioner refresh policy
+                "precond_verbose",             // Phase 6 diagnostic
+                "fine_finishing_iterations",   // post-coarse full-grid Newton-Picard polish
+                "fine_finishing_tolerance",    // ↑ tolerance
+                "strict_convergence",          // Phase BJ-5 fine-finishing residual gate
+                nullptr
+            };
+            for (int i = 0; kDeprecatedNlKeys[i]; ++i) {
+                if (nl_config[kDeprecatedNlKeys[i]]) {
+                    std::cerr << "WARNING: YAML key 'nonlinear_solver." << kDeprecatedNlKeys[i]
+                              << "' is no longer supported as of v1.5.1 (Phase BJ-8: AMGCL native multigrid). "
+                              << "The custom Galerkin coarsening machinery it controlled has been removed. "
+                              << "The solver runs with full-grid AMGCL+EW which is now the only path. "
+                              << "Remove this key from YAML to silence." << std::endl;
+                }
+            }
+        }
+
         // Picard specific settings
         nonlinear_config.relaxation = nl_config["relaxation"].as<double>(0.7);
 
@@ -171,16 +201,28 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         }
     }
 
-    // Parse global coarsening settings
+    // [Phase BJ-8 stage 3 / v1.5.1] Global coarsening block is deprecated.
+    // All knobs control the now-removed custom Galerkin coarsening; values
+    // are parsed (Stage 4 deletes the parse) but unused.
     if (config["coarsening"]) {
         auto cs_cfg = config["coarsening"];
+        static const char* kDeprecatedCoarseningKeys[] = {
+            "boundary_shell",          // un-coarsened shell width at material edges
+            "smooth_iterations",       // harmonic-mean μ smoothing for coarse cells
+            "auto_bump_skip",          // [Phase BJ-4] silent-no-op fix (now moot)
+            "harmonic_interpolation",  // [Phase BJ-7] μ-weighted P (now moot)
+            nullptr
+        };
+        for (int i = 0; kDeprecatedCoarseningKeys[i]; ++i) {
+            if (cs_cfg[kDeprecatedCoarseningKeys[i]]) {
+                std::cerr << "WARNING: YAML key 'coarsening." << kDeprecatedCoarseningKeys[i]
+                          << "' is no longer supported as of v1.5.1 (Phase BJ-8: AMGCL native multigrid). "
+                          << "The custom Galerkin coarsening machinery it controlled has been removed. "
+                          << "Remove the entire 'coarsening:' block from YAML to silence." << std::endl;
+            }
+        }
         coarsen_boundary_shell = cs_cfg["boundary_shell"].as<int>(1);
         coarsen_smooth_iterations = cs_cfg["smooth_iterations"].as<int>(0);
-        // [Phase BJ-4] opt-in to skip rounding bump that prevents silent
-        // no-op coarsening on non-square-aspect meshes. Default false to
-        // preserve v1.5.0 behaviour; the Phase 6 + Galerkin path it
-        // unlocks has a known accuracy regression on saturated nonlinear
-        // polar problems (Phase BJ-5 territory).
         coarsen_auto_bump_skip = cs_cfg["auto_bump_skip"].as<bool>(false);
     }
 
@@ -1255,14 +1297,23 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             antialias_materials.push_back(aa_mat);
         }
 
-        // Parse coarsening settings for adaptive mesh
+        // [Phase BJ-8 stage 3 / v1.5.1] Per-material 'coarsen' / 'coarsen_ratio'
+        // are deprecated. Custom Galerkin coarsening was removed; values
+        // still parse + mask generation still fires (Stage 4 cleanup
+        // removes those entry points), but the NK solver routes through
+        // the full-grid AMGCL+EW path regardless of the value.
         CoarsenConfig coarsen_cfg;
-        // std::cerr << "*** COARSEN DEBUG: " << name << " ***" << std::endl;
-        // std::cerr.flush();
-
+        if (props["coarsen"] || props["coarsen_ratio"]) {
+            std::cerr << "WARNING: Material '" << name
+                      << "' uses 'coarsen' / 'coarsen_ratio' which are no longer "
+                      << "supported as of v1.5.1 (Phase BJ-8: AMGCL native multigrid). "
+                      << "The custom Galerkin coarsening machinery has been removed. "
+                      << "The solver runs the NK iteration on the full grid (AMGCL+EW) "
+                      << "regardless of these flags. Remove them from the YAML to silence."
+                      << std::endl;
+        }
         if (props["coarsen"]) {
             coarsen_cfg.enabled = props["coarsen"].as<bool>(false);
-            // std::cout << "  DEBUG [" << name << "] coarsen parsed: " << (coarsen_cfg.enabled ? "true" : "false") << std::endl;
         }
         if (props["coarsen_ratio"]) {
             coarsen_cfg.ratio = props["coarsen_ratio"].as<int>(2);
@@ -1270,7 +1321,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         material_coarsen[name] = coarsen_cfg;
         if (coarsen_cfg.enabled) {
             coarsening_enabled = true;
-            std::cout << "  [" << name << "] Coarsening enabled: ratio = " << coarsen_cfg.ratio << std::endl;
+            std::cout << "  [" << name << "] Coarsening enabled (deprecated, no-op): ratio = " << coarsen_cfg.ratio << std::endl;
         }
 
         // Parse Jz value (static, formula, or array)
