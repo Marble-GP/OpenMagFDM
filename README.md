@@ -449,70 +449,96 @@ WebUI の Material Library Manager から YAML ファイルの管理・B-H カ�
 
 ---
 
-## 適応粗大化メッシュ
+## v1.5.1 → AMGCL native multigrid 移行 (Phase BJ-8)
 
-均一材料領域のメッシュを自動的に粗くし、材料境界は高解像度を維持します。
+v1.5.1 で **OpenMagFDM 自前の Galerkin coarsening machinery は全廃**しました。AMGCL
+の internal smoothed_aggregation multigrid が multi-resolution を natively 処理する
+ため、自前で coarse 行列を構築する二重 coarsening 構造が不要になっています。
+
+### v1.5.0 までの「適応粗大化メッシュ」フィーチャは deprecated
+
+以下の YAML key は v1.5.1 で **parse 段階で WARNING を出して silent ignore** されます。
+削除しても挙動は変わりません:
 
 ```yaml
+# v1.5.0 までの書き方 (deprecated, 残しても動くが WARNING)
 materials:
   iron_stator:
     rgb: [128, 128, 128]
     mu_r: 1000
-    coarsen: true       # 粗大化を有効化
-    coarsen_ratio: 8    # 8×8 → 1セル
+    coarsen: true       # ← 無視
+    coarsen_ratio: 8    # ← 無視
+
+nonlinear_solver:
+  use_galerkin_coarsening: true   # ← 無視
+  use_matrix_free_jv: true        # ← 無視
+  use_phase6_precond_jfnk: true   # ← 無視
+  precond_update_frequency: 1     # ← 無視
+  precond_verbose: false          # ← 無視
+  fine_finishing_iterations: 3    # ← 無視
+  fine_finishing_tolerance: 1e-5  # ← 無視
+  strict_convergence: false       # ← 無視
+  relaxation: 0.7                 # ← 無視 (Picard 残骸)
+
+coarsening:                       # ← block ごと無視
+  boundary_shell: 1
+  smooth_iterations: 0
+  auto_bump_skip: false
 ```
 
-非線形材料でも使用可能（Newton-Krylov の Defect Correction 方式により、物理精度はファイングリッド残差で保証）。
+### 移行理由
 
-### 既知の制限 (v1.5.1)
+v1.5.0 までの自前 Galerkin coarsening (P_prolongation, R_restriction, A_c = R·A_f·P)
+は **saturated 非線形 polar 問題で flux を真値の ~1/10 に過小評価** する根本問題が
+ありました。原因は bilinear 補間がが磁石/iron 界面の急峻な flux conservation を表現
+できず、Galerkin 投影が iron flux highway を smooth out すること (v1.5.1 開発記録の
+Phase BJ-1〜7 参照)。
 
-**`coarsen_ratio: 4` 以下が silent no-op になる場合があります**。極座標系で物理セル
-アスペクト比 `dr / (r_mid · dtheta)` が 1.5 以上ある場合、内部の skip 比計算が
-`min(skip_x, skip_y) = 1` を生成し、gradient coarsening の level cap が 1 になって
-**全 cell が active 化** → coarsening は機能しない経路に landing します。
-実例: IEEJ-D polar IPMSM (nr=450, ntheta=2976, aspect≈1.89) では `coarsen_ratio: 4`
-で 0 inactive cells、`coarsen_ratio: 8` で 42.6% reduction。
+AMGCL の smoothed_aggregation は **operator-dependent な aggregate** を構築するため、
+iron-iron 強連結 / iron-air 弱連結が自動的に識別され、saturation 領域でも数値的に
+正しい挙動を保ちます。
 
-**v1.5.1 ではこの状況で WARNING を出力**します:
+### 推奨設定 (v1.5.1+)
 
-```
-WARNING: Coarsening enabled in YAML but 0 inactive cells generated.
-The full-grid solve path will run (this is silently equivalent to coarsening:disabled).
-Try a larger coarsen_ratio (>= 5 for non-square aspect meshes) or set coarsen:false.
-```
-
-WARNING が出たら `coarsen_ratio` を増やすか、`coarsen: false` で full-grid 経路を
-明示してください。
-
-### Solver 経路の選択 (v1.5.1)
-
-coarsening の effective 化に応じて 2 つの NK loop 経路に分岐します:
-
-| 条件 | 経路 | 内側 solver | Eisenstat-Walker (Phase BC) |
-|---|---|---|---|
-| `using_coarsening == false` | Standard direct solve | AMGCL-CG (iterative) | ✅ 適用 |
-| `using_coarsening == true` + `use_phase6_precond_jfnk: true` | Phase 6 + Galerkin | AMGCL-CG (Phase BJ-3 で統合) | ✅ 適用 |
-
-v1.5.1 以前は Phase 6 経路が SparseLU 直接呼出で EW (Phase BC) を bypass していました
-が、v1.5.1 で両経路が AMGCL+EW で統一されました ([Phase BJ-3](https://github.com/Marble-GP/OpenMagFDM/commits/main))。
-
-### 適応粗大化が IEEJ-D class motor で有効でない理由 (技術ノート)
-
-Gradient coarsening の level 上限 `max_skip_iso` は `min(skip_x, skip_y)` で決まります。
-ここで `skip_x, skip_y` は物理セルを概ね正方形にするための rounding 後の値:
-
-```
-skip_x = round(sqrt(ratio / aspect))
-skip_y = round(sqrt(ratio * aspect))
+```yaml
+nonlinear_solver:
+  enabled: true
+  solver_type: newton-krylov
+  max_iterations: 50
+  tolerance: 1.0e-3
+  verbose: false
+  eisenstat_walker:        # Phase BC: 2.5× 高速化の柱
+    enabled: true
+    gamma: 0.9
+    alpha: 2.0
+    eta_min: 1.0e-6
+    eta_max: 0.1
 ```
 
-`aspect > 1.5` (radial direction が広い細長メッシュ) では `skip_x` が 1 に rounding され、
-`max_skip_iso = min(1, skip_y) = 1` で coarsening は無効化されます。
+### IEEJ-D class motor での実証値 (BC reference)
 
-回避策:
-1. `coarsen_ratio` を上げる (例: 8, 16)
-2. radial 方向 (`nr`) を増やしてセル aspect を 1 に近づける
-3. 直交座標系を使う (Cartesian なら aspect=1 が自然)
+```
+3-step transient bench (WSL2 Linux, Ryzen AI 9 HX 370 24T)
+- v1.5.0 baseline (no EW):           377 s
+- v1.5.0 + EW (Phase BC):            153 s
+- v1.5.1 BJ-8 (full grid AMGCL+EW):  150 s
+
+Flux Phi_Coil_A step 2:
+- v1.5.0 baseline:                   -2.476e-3 Wb/m  ← 真値
+- v1.5.1 BJ-8:                       -2.476e-3 Wb/m  ← 真値 (byte-identical)
+- v1.5.1 BJ-4 (Galerkin enabled):    -3.745e-4 Wb/m  ← 真値の 1/10 (削除済 path)
+```
+
+### マイグレーション手順
+
+1. **既存 YAML はそのまま動く**: 移行ガイドだけ確認すれば再実行不要
+2. **WARNING を消したい場合**: stderr に出る `WARNING: YAML key '...' is no longer
+   supported as of v1.5.1` メッセージに従い、該当 key を YAML から削除
+3. **`coarsening:` block 全体削除** + **`materials.*.coarsen` / `coarsen_ratio` 削除**
+4. **`nonlinear_solver` の Phase 4/5/6 関連 knob 削除** (`use_galerkin_coarsening`,
+   `use_matrix_free_jv`, `use_phase6_precond_jfnk`, `precond_*`, `fine_finishing_*`,
+   `strict_convergence`, `relaxation`)
+5. **`eisenstat_walker:` block の追加** (まだ使っていなければ): 2.5× の高速化を得る
 
 ---
 

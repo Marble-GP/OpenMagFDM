@@ -4110,12 +4110,10 @@ ${SOLVER_HINT_MARKER}
 #   enabled: true                   # auto-enabled when a NL material is present
 #   solver_type: newton-krylov      # alt: picard
 #   max_iterations: 50              # raise for tight TOL on 1M+ DOF problems
-#   tolerance: 5.0e-4               # relative residual ||R|| / ||b||
+#   tolerance: 1.0e-3               # relative residual ||R|| / ||b||
 #   verbose: false                  # per-iter mu/H/residual diagnostics
-#   use_phase6_precond_jfnk: true   # Galerkin-preconditioned JFNK -- keep on
-#   fine_finishing_iterations: 0    # 2-5 helps accuracy on coarsened runs
 #   anderson:
-#     enabled: false                # Anderson acceleration (Picard mainly)
+#     enabled: false                # Anderson acceleration
 #     depth: 5
 #   # Phase BC (v1.5.1+): Eisenstat-Walker forcing for inner AMGCL CG tol.
 #   # Headline measured: 377s -> 153s (-59%) on IEEJ-D IPMSM. Turn on for
@@ -4126,26 +4124,13 @@ ${SOLVER_HINT_MARKER}
 #     alpha: 2.0
 #     eta_min: 1.0e-6
 #     eta_max: 0.1
-#   # Phase BJ-5 (v1.5.1+): abort instead of warn if fine_finishing exits
-#   # at ||R_fine||_rel > fine_tol. Catches the saturated-polar Phase 6 +
-#   # Galerkin wrong-answer case (flux ~1/10) loudly in production.
-#   strict_convergence: false
 #
-# --- Adaptive mesh coarsening (mark uniform regions for downsampling) ---
-# Per-material opt-in (add inside any material in the materials: block):
-#   coarsen: true
-#   coarsen_ratio: 2                # 2x2 fine cells → 1 active cell
-# Good candidates: air, coil interiors (uniform mu_r, constant jz).
-# Avoid on: nonlinear iron, magnets, fine material interfaces.
-# coarsening:
-#   boundary_shell: 1               # keep N cells fine near material edges
-#   smooth_iterations: 0            # harmonic mu interpolation for coarse cells
-#   # Phase BJ-4 (v1.5.1+): force min(skip_x, skip_y) >= 2 when rounding
-#   # would have produced 1 (silent no-op). Required for coarsening to
-#   # actually fire on non-square-aspect meshes (e.g. polar with aspect
-#   # 1.5-3 rounds skip_x to 1 at coarsen_ratio: 4). Overshoots ratio to
-#   # >= 4. Pairs with strict_convergence on saturated nonlinear problems.
-#   auto_bump_skip: false
+# --- v1.5.1 (Phase BJ-8): custom Galerkin coarsening removed ---
+# The previously documented per-material 'coarsen: true / coarsen_ratio'
+# flags and 'coarsening:' block are no longer supported. AMGCL's internal
+# smoothed_aggregation multigrid now handles multi-resolution natively.
+# Any pre-v1.5.1 YAML containing those knobs still parses but emits a
+# WARNING at startup and the values are ignored. Remove them to silence.
 `;
 
 // Append the SOLVER_HINT_BLOCK to the YAML string iff the marker isn't
