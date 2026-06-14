@@ -28,35 +28,21 @@
  * @brief Main Newton-Krylov solver
  */
 void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
-    // [Phase BJ-8 Path D / v1.5.1] Custom Galerkin coarsening is deprecated.
-    // Shadow the class member `coarsening_enabled` with a local `false` so
-    // every conditional in this function and the helpers it inlines (initial
-    // guess dispatch, Step 2 matrix build, Phase 6 / Phase 5 / fine_finishing
-    // branches, line-search trial matrix rebuilds) short-circuits to the
-    // full-grid Standard direct solve path. AMGCL's internal smoothed_
-    // aggregation multigrid handles the multi-resolution problem natively,
-    // replacing the OpenMagFDM-side P/R/A_c machinery that produced
-    // wrong-answer flux (~1/10 of true) on saturated polar IPMSM problems
-    // (see Phase BJ-1/4/5 diagnostics, IEEJ-D bench evidence). The class
-    // member stays untouched for other entry points (linear solve, mesh
-    // generation, export) until Stage 4 physically deletes them.
-    const bool coarsening_enabled = false;
-    (void)coarsening_enabled;  // suppress unused-variable warning in branches that don't reference it
-
+    // [Phase BJ-8 Path D / v1.5.1] All NK iterations and the initial-guess
+    // dispatch run on the full grid via AMGCL+EW. The custom Galerkin
+    // coarsening machinery (Phase 6 + Galerkin, Phase 5 matrix-free GMRES,
+    // fine-finishing Newton-Picard, coarse mask + P/R operators) has been
+    // removed; the previously-named "Standard direct solve" path is the
+    // only path. AMGCL's internal smoothed_aggregation multigrid handles
+    // multi-resolution natively, replacing the OpenMagFDM-side P/R/A_c
+    // machinery that produced wrong-answer flux (~1/10 of true) on
+    // saturated polar IPMSM problems (Phase BJ-1/4/5 diagnostics).
     if (!has_nonlinear_materials) {
-        // Fall back to linear solver
+        // Fall back to linear solver (always full grid post-BJ-8)
         if (coordinate_system == "cartesian") {
-            if (coarsening_enabled && n_active_cells < nx * ny) {
-                buildAndSolveSystemCoarsened();
-            } else {
-                buildAndSolveSystem();
-            }
-        } else {  // polar
-            if (coarsening_enabled && n_active_cells < nr * ntheta) {
-                buildAndSolveSystemPolarCoarsened();
-            } else {
-                buildAndSolveSystemPolar();
-            }
+            buildAndSolveSystem();
+        } else {
+            buildAndSolveSystemPolar();
         }
         return;
     }
@@ -88,102 +74,40 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     std::vector<Eigen::VectorXd> Az_history;      // Az^(k) history
     std::vector<Eigen::VectorXd> g_history;       // g^(k) = Az^(k+1) - Az^(k) history
 
-    // Az at previous iteration's convergence check (for Az-stagnation detection)
-    Eigen::VectorXd Az_vec_at_prev_check;
-
     // Initial guess: solve linear problem with initial μ distribution
+    // (always full grid post-BJ-8 path D)
     if (VERBOSE) {
         std::cout << "Computing initial guess..." << std::endl;
     }
     if (is_polar) {
-        if (coarsening_enabled && n_active_cells < nr * ntheta) {
-            buildAndSolveSystemPolarCoarsened();
-        } else {
-            buildAndSolveSystemPolar();
-        }
+        buildAndSolveSystemPolar();
     } else {
-        if (coarsening_enabled && n_active_cells < nx * ny) {
-            buildAndSolveSystemCoarsened();
-        } else {
-            buildAndSolveSystem();
-        }
+        buildAndSolveSystem();
     }
-
-    bool using_coarsening = (is_polar && coarsening_enabled && n_active_cells < nr * ntheta) ||
-                            (!is_polar && coarsening_enabled && n_active_cells < nx * ny);
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
         // ===== Step 1: Calculate B and H fields, update μ =====
-        // H_active_saved: stored outside the coarsening block so Phase 6 Jacobian
-        // correction can access H values without re-computation.
-        Eigen::VectorXd H_active_saved;
-        if (using_coarsening) {
-            // Phase 8: Wide-stencil B/H/μ at active cells only.
-            // Avoids stripe artifacts from bilinear-interpolated inactive cell Az.
-            Eigen::VectorXd Az_coarse_for_B(n_active_cells);
-            // coarse_to_fine / Az are read-only per cidx; Az_coarse_for_B(cidx) unique.
-            #pragma omp parallel for schedule(static)
-            for (int cidx = 0; cidx < n_active_cells; cidx++) {
-                auto [ci, cj] = coarse_to_fine[cidx];
-                Az_coarse_for_B(cidx) = Az(cj, ci);
-            }
-            Eigen::VectorXd Bx_active, By_active, H_active;
-            calculateBFieldAtActiveCells(Az_coarse_for_B, Bx_active, By_active);
-            calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
-            H_active_saved = H_active;  // Save for Jacobian correction in Phase 6
-            updateMuAtActiveCells(H_active);
-            // Fill inactive cells with interpolated μ.
-            // Required when use_galerkin_coarsening=true (A_f uses all cells via P^T*A_f*P).
-            // With use_galerkin_coarsening=false (FVM), A_FVM uses only active cells so
-            // this call is a no-op for the matrix, but still keeps mu_map consistent for
-            // diagnostics and the final-output call after convergence.
-            interpolateMuToFullGrid();
+        if (is_polar) {
+            calculateMagneticFieldPolar();
         } else {
-            // Full-grid path (unchanged)
-            if (is_polar) {
-                calculateMagneticFieldPolar();
-            } else {
-                calculateMagneticField();
-            }
-            calculateHField();
-            updateMuDistribution();
+            calculateMagneticField();
         }
+        calculateHField();
+        updateMuDistribution();
 
         // ===== Step 2: Build residual and system matrix with current μ =====
         Eigen::SparseMatrix<double> A_matrix;
         Eigen::VectorXd b_vec;
-
-        if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
-            // Phase 4: Galerkin projection A_c = R * A_f * P
-            buildMatrixGalerkin(A_matrix, b_vec);
-        } else if (is_polar) {
-            if (coarsening_enabled && n_active_cells < nr * ntheta) {
-                buildMatrixPolarCoarsened(A_matrix, b_vec);
-            } else {
-                buildMatrixPolar(A_matrix, b_vec);
-            }
+        if (is_polar) {
+            buildMatrixPolar(A_matrix, b_vec);
         } else {
-            if (coarsening_enabled && n_active_cells < nx * ny) {
-                buildMatrixCoarsened(A_matrix, b_vec);
-            } else {
-                buildMatrix(A_matrix, b_vec);
-            }
+            buildMatrix(A_matrix, b_vec);
         }
 
         // CRITICAL: buildMatrixPolar uses row-major indexing (idx = r_idx * ntheta + theta_idx)
         // but Eigen Az.data() is column-major. Must convert to row-major order.
-        // When coarsening is enabled, extract only active cell values.
         Eigen::VectorXd Az_vec;
-        // Note: using_coarsening is already defined above in Step 3
-
-        if (using_coarsening) {
-            // Coarsened: extract only active cells
-            Az_vec.resize(n_active_cells);
-            for (int idx = 0; idx < n_active_cells; idx++) {
-                auto [i, j] = coarse_to_fine[idx];
-                Az_vec(idx) = Az(j, i);  // Az(row, col) for both Cartesian and Polar
-            }
-        } else if (is_polar) {
+        if (is_polar) {
             // Full polar grid: convert Az to row-major order to match buildMatrixPolar indexing
             Az_vec.resize(Az.size());
             for (int i = 0; i < nr; i++) {
@@ -212,26 +136,13 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_coarse_norm = residual_coarse.norm();
         double b_vec_coarse_norm = b_vec.norm();
 
-        // Phase 6 (Galerkin Picard) uses R_coarse directly — no fine-grid
-        // matrix rebuild needed here.
-
-        // Convergence residual selection
-        double residual_norm, b_vec_norm;
-        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // Phase 6 (Galerkin Picard): converge on coarse-grid residual.
-            // R_fine has a non-zero coarsening error floor; only R_coarse → 0 as
-            // the Galerkin solution converges.
-            residual_norm = residual_coarse_norm;
-            b_vec_norm = b_vec_coarse_norm;
-        } else if (using_coarsening) {
-            // Other coarsening modes: full-grid residual for accurate convergence
-            residual_norm = computeFullGridResidual(b_vec_norm);
-            full_matrix_cache_valid = false;
-        } else {
-            residual_norm = residual_coarse_norm;
-            b_vec_norm = b_vec_coarse_norm;
-        }
-        double residual_rel = residual_norm / (b_vec_norm + 1e-12);
+        // [Phase BJ-8 Path D / v1.5.1] Convergence residual is the full-grid
+        // residual (the only one we have now). Phase 6's coarse-grid R + FVM
+        // computeFullGridResidual branches are gone; the renamed
+        // `residual_coarse_*` carry over by name only (computed at line ~144).
+        double residual_norm = residual_coarse_norm;
+        double b_vec_norm    = b_vec_coarse_norm;
+        double residual_rel  = residual_norm / (b_vec_norm + 1e-12);
 
         residual_history.push_back(residual_rel);
 
@@ -240,23 +151,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             double A_norm = A_matrix.norm();
             std::cout << "DEBUG: ||A|| = " << A_norm
                       << ", ||Az|| = " << Az_vec.norm()
-                      << ", ||b_coarse|| = " << b_vec_coarse_norm
-                      << ", ||R_coarse||_abs = " << residual_coarse_norm;
-            if (using_coarsening && !nonlinear_config.use_phase6_precond_jfnk) {
-                std::cout << ", ||R_FVM||_abs = " << residual_norm;
-            }
-            std::cout << std::endl;
+                      << ", ||b|| = " << b_vec_norm
+                      << ", ||R||_abs = " << residual_norm
+                      << std::endl;
         }
 
         if (VERBOSE) {
             std::cout << "NK iter " << std::setw(3) << iter + 1
-                      << ": ||R|| = " << std::scientific << std::setprecision(4) << residual_rel;
-            if (using_coarsening && !nonlinear_config.use_phase6_precond_jfnk) {
-                // Show FVM coarsened residual alongside fine-grid for comparison
-                double residual_coarse_rel = residual_coarse_norm / (b_vec_coarse_norm + 1e-12);
-                std::cout << " (FVM: " << residual_coarse_rel << ")";
-            }
-            std::cout << std::flush;
+                      << ": ||R|| = " << std::scientific << std::setprecision(4) << residual_rel
+                      << std::flush;
         }
 
         // ===== Step 4: Check convergence =====
@@ -271,7 +174,6 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Secondary criterion for polar coordinates: residual reduction rate
             // Useful when absolute residual is large but solution is converging
             if (is_polar && iter >= 3) {
-                // Check if residual has plateaued (< 5% change over last 3 iterations)
                 double reduction_rate = std::abs(residual_history[iter] - residual_history[iter-1]) /
                                        (residual_history[iter-1] + 1e-12);
                 if (residual_rel < TOL * 10.0 && reduction_rate < 0.05) {
@@ -282,47 +184,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
 
-            // Tertiary criterion for Phase 6: Az step size (handles oscillating residual).
-            // For non-monotone B-H materials, R_coarse can jump even when Az barely moves
-            // (crossing the μ_r peak). If the Newton/Anderson step size is very small,
-            // the iterate has effectively stabilized regardless of residual oscillation.
-            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk
-                && iter >= 4 && Az_vec_at_prev_check.size() == (size_t)n_active_cells) {
-                double az_step_rel = Az_vec.norm() > 1e-12
-                    ? (Az_vec - Az_vec_at_prev_check).norm() / Az_vec.norm()
-                    : 0.0;
-                if (az_step_rel < TOL * 0.1 && residual_rel < 1.0) {
-                    converged = true;
-                    if (VERBOSE) {
-                        std::cout << " [Az stagnation: ||δAz||/||Az||=" << std::scientific
-                                  << std::setprecision(2) << az_step_rel << "]";
-                    }
-                }
-            }
-
-            // Coarse-plateau criterion for Phase 6: detect coarsening error floor.
-            // With coarsen_ratio > 1, the coarse Galerkin solution has a residual floor
-            // that cannot be reduced below ~(coarsen error). When the last 5 residuals
-            // all lie within a 2x band (oscillating but not improving), the coarse phase
-            // has converged to its limit. Proceed to fine finishing for correction.
-            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk
-                && iter >= 5 && residual_rel < 1.0) {
-                const int plateau_window = 5;
-                double best_r  = residual_history[iter];
-                double worst_r = residual_history[iter];
-                for (int k = iter - plateau_window + 1; k <= iter; k++) {
-                    best_r  = std::min(best_r,  residual_history[k]);
-                    worst_r = std::max(worst_r, residual_history[k]);
-                }
-                if (worst_r < best_r * 2.0) {
-                    converged = true;
-                    if (VERBOSE) {
-                        std::cout << " [Coarse plateau: R∈["
-                                  << std::scientific << std::setprecision(2)
-                                  << best_r << ", " << worst_r << "]]";
-                    }
-                }
-            }
+            // [Phase BJ-8 Path D / v1.5.1] Az-stagnation + Coarse-plateau
+            // criteria were Phase 6 / Galerkin-specific (handled the
+            // coarsening error floor for the now-removed coarse-grid NK).
+            // Deleted.
         }
 
         if (converged) {
@@ -338,239 +203,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // block deleted. With custom Galerkin coarsening removed the NK
             // loop already converges on the full grid, so the previous
             // "interpolate coarse → full, then polish on fine" step is
-            // unnecessary. The post-loop fields (B, H, μ) are still
-            // refreshed below for export consistency.
-            if (false) {
-                if (nonlinear_config.fine_finishing_iterations > 0) {
-                    // Fine finishing: replace smoothing with full-grid Picard steps.
-                    // The coarse solution provides a good initial guess; a few full-grid
-                    // iterations correct boundary-layer errors invisible to the coarse mesh.
-                    const double fine_tol = (nonlinear_config.fine_finishing_tolerance > 0.0)
-                        ? nonlinear_config.fine_finishing_tolerance
-                        : TOL;
-                    std::cout << "Fine finishing: up to " << nonlinear_config.fine_finishing_iterations
-                              << " full-grid Newton iter(s), tol=" << fine_tol << std::endl;
-
-                    // [Phase BJ-5] Track the latest fine-grid residual so the
-                    // post-loop quality check below can surface the wrong-
-                    // answer case (line search fails → loop exits at fi=1 with
-                    // a residual that hasn't moved from the coarse-plateau
-                    // value). Without this, the user sees "Newton-Krylov
-                    // solver converged" + a tiny Fine iter print, then a
-                    // numerically wrong flux output, with no clear flag.
-                    double last_fine_rel = -1.0;
-                    bool fine_converged = false;
-                    int fine_iters_done = 0;
-
-                    for (int fi = 0; fi < nonlinear_config.fine_finishing_iterations; fi++) {
-                        fine_iters_done = fi + 1;
-                        // Step 1: Update μ from full-grid Az
-                        if (is_polar) {
-                            calculateMagneticFieldPolar();
-                        } else {
-                            calculateMagneticField();
-                        }
-                        calculateHField();
-                        updateMuDistribution();
-
-                        // Step 2: Build full-grid matrix
-                        Eigen::SparseMatrix<double> A_fine;
-                        Eigen::VectorXd b_fine;
-                        if (is_polar) {
-                            buildMatrixPolar(A_fine, b_fine);
-                        } else {
-                            buildMatrix(A_fine, b_fine);
-                        }
-
-                        // Step 3: Extract Az to vector and compute nonlinear residual
-                        int n_fine = is_polar ? (nr * ntheta) : (ny * nx);
-                        Eigen::VectorXd Az_fine_vec(n_fine);
-                        if (is_polar) {
-                            for (int i = 0; i < nr; i++) {
-                                for (int j = 0; j < ntheta; j++) {
-                                    double val = (r_orientation == "horizontal") ? Az(j, i) : Az(i, j);
-                                    Az_fine_vec(i * ntheta + j) = val;
-                                }
-                            }
-                        } else {
-                            for (int j = 0; j < ny; j++)
-                                for (int i = 0; i < nx; i++)
-                                    Az_fine_vec(j * nx + i) = Az(j, i);
-                        }
-
-                        double R_fine_norm = (A_fine * Az_fine_vec - b_fine).norm();
-                        double b_fine_norm = b_fine.norm();
-                        double fine_rel = R_fine_norm / (b_fine_norm + 1e-12);
-                        last_fine_rel = fine_rel;  // [Phase BJ-5]
-
-                        std::cout << "  Fine iter " << fi + 1 << "/" << nonlinear_config.fine_finishing_iterations
-                                  << ": ||R_fine||_rel = " << std::scientific << std::setprecision(2) << fine_rel;
-
-                        if (fine_rel < fine_tol) {
-                            std::cout << " [converged]" << std::endl;
-                            fine_converged = true;  // [Phase BJ-5]
-                            break;
-                        }
-                        std::cout << std::endl;
-
-                        // Step 4: Newton step on full grid using A(μ_diff) tangent matrix.
-                        // Standard Picard [Az_new = A(μ_eff)^{-1} * b] diverges when
-                        // ρ_Picard = μ_eff/μ_diff > 1 (Si_steel near μ_r peak).
-                        // Newton [Az += A(μ_diff)^{-1} * (-(A(μ_eff)*Az - b))] converges:
-                        //   ρ_Newton ≈ |1 - μ_eff/μ_diff| < 1 in saturation region.
-                        Eigen::MatrixXd mu_map_eff_fine = mu_map;   // Save μ_eff
-
-                        updateMuDiffDistribution();                  // mu_map = μ_diff
-                        Eigen::SparseMatrix<double> A_newton_fine;
-                        Eigen::VectorXd b_newton_dummy;
-                        if (is_polar) {
-                            buildMatrixPolar(A_newton_fine, b_newton_dummy);
-                        } else {
-                            buildMatrix(A_newton_fine, b_newton_dummy);
-                        }
-                        mu_map = mu_map_eff_fine;                    // Restore μ_eff
-
-                        // [Phase BJ-3] Replace SparseLU on full-grid A_newton_fine
-                        // (1.34M dof for IEEJ-D, factorization measured in minutes)
-                        // with solveLinearSystem → AMGCL-CG + EW. Same rationale
-                        // as the coarse Newton solve above. EW η=eta_max (~0.1) is
-                        // used because fine finishing has its own residual sequence
-                        // that doesn't directly map to the NK outer loop's history.
-                        Eigen::VectorXd R_fine_vec = A_fine * Az_fine_vec - b_fine;
-                        Eigen::VectorXd delta_fine;
-                        double fine_inner_tol = -1.0;
-                        if (nonlinear_config.eisenstat_walker_enabled) {
-                            fine_inner_tol = nonlinear_config.eisenstat_walker_eta_max;
-                        }
-                        bool fine_solve_failed = false;
-                        try {
-                            delta_fine = solveLinearSystem(A_newton_fine, -R_fine_vec,
-                                                           Eigen::VectorXd(), fine_inner_tol);
-                        } catch (const std::exception& e) {
-                            std::cerr << "  [Fine Newton solve failed (" << e.what()
-                                      << "), stopping fine finishing]" << std::endl;
-                            fine_solve_failed = true;
-                        }
-                        if (fine_solve_failed) break;
-
-                        // Step 4b: True nonlinear backtracking line search.
-                        // At each trial α, update Az → recompute B/H/μ → rebuild A(μ) →
-                        // evaluate ||A(μ_new)*Az_new - b||.  No LU factorization needed
-                        // (just a sparse matvec), so each trial is much cheaper than
-                        // the Newton step itself.
-                        Eigen::MatrixXd Az_save = Az;
-                        Eigen::MatrixXd mu_save = mu_map;
-                        double alpha_fine = 1.0;
-                        bool step_accepted = false;
-
-                        for (int ls = 0; ls < 4; ls++) {
-                            Eigen::VectorXd Az_trial = Az_fine_vec + alpha_fine * delta_fine;
-
-                            // Write trial Az to matrix
-                            if (is_polar) {
-                                for (int ir = 0; ir < nr; ir++)
-                                    for (int jt = 0; jt < ntheta; jt++) {
-                                        if (r_orientation == "horizontal")
-                                            Az(jt, ir) = Az_trial(ir * ntheta + jt);
-                                        else
-                                            Az(ir, jt) = Az_trial(ir * ntheta + jt);
-                                    }
-                            } else {
-                                for (int jj = 0; jj < ny; jj++)
-                                    for (int ii = 0; ii < nx; ii++)
-                                        Az(jj, ii) = Az_trial(jj * nx + ii);
-                            }
-
-                            // Recompute μ at trial point
-                            if (is_polar) calculateMagneticFieldPolar();
-                            else          calculateMagneticField();
-                            calculateHField();
-                            updateMuDistribution();
-
-                            // Build matrix with trial μ and evaluate true residual
-                            Eigen::SparseMatrix<double> A_trial;
-                            Eigen::VectorXd b_trial;
-                            if (is_polar) buildMatrixPolar(A_trial, b_trial);
-                            else          buildMatrix(A_trial, b_trial);
-
-                            double R_trial_norm = (A_trial * Az_trial - b_trial).norm();
-                            double R_trial_rel = R_trial_norm / (b_trial.norm() + 1e-12);
-
-                            if (R_trial_rel < fine_rel) {
-                                // Accept: Az and mu_map are already updated
-                                step_accepted = true;
-                                if (alpha_fine < 1.0) {
-                                    std::cout << "  (α=" << std::fixed << std::setprecision(4) << alpha_fine
-                                              << ", R=" << std::scientific << std::setprecision(2) << R_trial_rel << ")" << std::endl;
-                                }
-                                break;
-                            }
-
-                            // Restore state for next trial
-                            Az = Az_save;
-                            mu_map = mu_save;
-                            alpha_fine *= 0.5;
-                        }
-
-                        if (!step_accepted) {
-                            // No step size improved the residual → stop fine finishing
-                            std::cout << " [line search failed, stopping]" << std::endl;
-                            break;
-                        }
-                        // Az and mu_map are already at the accepted trial point
-                    }
-
-                    // Final μ update so exported fields are consistent with the finished Az
-                    if (is_polar) {
-                        calculateMagneticFieldPolar();
-                    } else {
-                        calculateMagneticField();
-                    }
-                    calculateHField();
-                    updateMuDistribution();
-
-                    // [Phase BJ-5] Post-fine-finishing quality check.
-                    // Surface the known wrong-answer case where Phase 6 +
-                    // Galerkin coarsening claims "converged" at coarse
-                    // plateau ‖R_c‖ ~ 2-4e-1 but the underlying fine
-                    // residual is also at ~2e-1 (50-100× above the
-                    // requested TOL). This is the saturated-polar trap
-                    // documented in README "適応粗大化が IEEJ-D class
-                    // motor で有効でない理由": flux magnitudes can land
-                    // at ~1/10 of the true value with no other warning
-                    // signal in the output.
-                    if (!fine_converged && last_fine_rel > 0.0) {
-                        const double quality_threshold = fine_tol * 100.0;
-                        if (last_fine_rel > quality_threshold) {
-                            std::cerr << "WARNING: Fine finishing exited at "
-                                      << "||R_fine||_rel = " << std::scientific
-                                      << std::setprecision(2) << last_fine_rel
-                                      << " after " << fine_iters_done
-                                      << " iter(s), ~" << (int)(last_fine_rel / fine_tol)
-                                      << "x above fine_tol=" << fine_tol << ". "
-                                      << "Phase 6 + Galerkin coarsening can systematically "
-                                      << "under-saturate iron on highly-nonlinear polar "
-                                      << "problems and produce flux ~1/10 of the true "
-                                      << "(non-coarsened) value. Consider coarsen:false "
-                                      << "for nonlinear materials, or set "
-                                      << "nonlinear_solver.strict_convergence:true to "
-                                      << "fail loudly on this case." << std::endl;
-                        }
-                        if (nonlinear_config.strict_convergence
-                            && last_fine_rel > fine_tol) {
-                            std::ostringstream oss;
-                            oss << "Strict convergence requested but fine finishing "
-                                << "exited at ||R_fine||_rel = " << last_fine_rel
-                                << " (target " << fine_tol << "). Aborting.";
-                            throw std::runtime_error(oss.str());
-                        }
-                    }
-                } else {
-                    smoothInactiveCells(coarsen_smooth_iterations);
-                    // Harmonically interpolate μ at inactive cells (IDW, series circuit model)
-                    interpolateMuToFullGrid();
-                }
-            }
+            // unnecessary.
 
             if (nonlinear_config.export_convergence) {
                 std::ofstream conv_file("newton_krylov_convergence.csv");
@@ -583,11 +216,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             return;
         }
 
-        // Save Az_vec at this convergence check point for stagnation detection next iter.
-        // Must be saved AFTER convergence check and BEFORE Phase 6 update.
-        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            Az_vec_at_prev_check = Az_vec;
-        }
+        // [Phase BJ-8 Path D] Az_vec_at_prev_check / stagnation save was for
+        // Phase 6 coarse-grid oscillation detection. Deleted.
 
         // ===== Step 5: Compute Newton step δA by solving J·δA = -R =====
         // Improved Jacobian: J ≈ L + D_r where D_r is r-weighted diagonal correction
@@ -641,15 +271,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
                 #pragma omp parallel for schedule(static)
                 for (int idx = 0; idx < n_dof; idx++) {
-                    int r_idx, theta_idx;
-                    if (using_coarsening) {
-                        auto [i, j] = coarse_to_fine[idx];
-                        r_idx = i;
-                        theta_idx = j;
-                    } else {
-                        r_idx = idx / ntheta;
-                        theta_idx = idx % ntheta;
-                    }
+                    int r_idx     = idx / ntheta;
+                    int theta_idx = idx % ntheta;
 
                     double r = r_start_local + r_idx * dr_local;
                     if (r < 1e-10) continue;
@@ -796,208 +419,38 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_0 = (dc_R_fine_norm >= 0.0) ? dc_R_fine_norm : residual_norm;
         Eigen::VectorXd Az_vec_0 = Az_vec;
 
-        // ===== Phase 6: Damped Picard + Anderson acceleration =====
-        //
-        // Standard backtracking line search fails for defect correction because the
-        // B-H piecewise-linear knee causes the true nonlinear residual to INCREASE
-        // for steps larger than some geometry-dependent threshold. Backtracking from
-        // α=1.0 with rho=0.65 cannot reach the good region in max_trials steps.
-        //
-        // This block replaces the line search with damped Picard + Anderson(m≥3):
-        //   1. Early iterations (no Anderson history): use ω-damped Picard step
-        //      Az_{k+1} = Az_k + ω·δ_k  (ω starts at 0.5)
-        //   2. Once Anderson history has ≥2 entries: compute Anderson extrapolation
-        //      from full Picard residuals δ_k, with safety cap at 3× Picard step
-        //   3. REACTIVE restart: if residual increased for 2+ consecutive iterations,
-        //      halve ω (0.5→0.25→0.1→0.05) and clear Anderson history
-        //   4. No proactive residual check — this avoids the regression caused by
-        //      evaluating true nonlinear residual (which rejects frozen-Jacobian
-        //      steps that would otherwise converge).
-        //
-        // The damped ω=0.5 approach keeps iterates in a safe B-H region, letting
-        // the μ update between iterations gradually resolve nonlinearity.
-        bool phase6_anderson_done = false;
-        if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-            // For Newton mode (Galerkin): enable Anderson with depth 2.
-            // The Newton tangent matrix A(μ_diff) can produce period-2 oscillation
-            // when μ_diff > μ_eff (near the B-H peak of non-monotone materials),
-            // giving iteration matrix M = 1 - μ_diff/μ_eff < 0.
-            // Anderson with m=2 detects this alternating pattern and extrapolates
-            // to the midpoint (the solution), breaking the limit cycle.
-            const int m_phase6 = nonlinear_config.use_galerkin_coarsening ? 2 : std::max(3, m_AA);
-
-            // Adaptive damping ω: applied to BOTH Picard and Anderson steps.
-            // For Galerkin mode: ρ_Galerkin < 1, so ω=1.0 (full Picard) is optimal.
-            //   ρ_eff(ω=1.0) = ρ ≈ 0.88 vs ρ_eff(ω=0.5) = 0.94 → significantly faster.
-            // For FVM mode: ρ_FVM may approach 1 → start with ω=0.5 for safety.
-            // Halves on 2+ consecutive residual increases; recovers (×1.5) on 3+ decreases.
-            static double p6_omega = 1.0;
-            const double p6_omega_max = nonlinear_config.use_galerkin_coarsening ? 1.0 : 0.5;
-            if (iter == 0) p6_omega = p6_omega_max;  // Reset at start of solve
-
-            int n_consec_increase = 0;
-            int n_consec_decrease = 0;
-            if (residual_history.size() >= 2) {
-                for (int rh = static_cast<int>(residual_history.size()) - 1; rh >= 1; rh--) {
-                    if (residual_history[rh] >= residual_history[rh - 1] * 0.999) {
-                        n_consec_increase++;
-                    } else {
-                        break;
-                    }
-                }
-                if (n_consec_increase == 0) {
-                    for (int rh = static_cast<int>(residual_history.size()) - 1; rh >= 1; rh--) {
-                        if (residual_history[rh] < residual_history[rh - 1] * 0.999) {
-                            n_consec_decrease++;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // REACTIVE: 2+ consecutive increases → halve ω and clear history
-            if (n_consec_increase >= 2) {
-                double old_omega = p6_omega;
-                p6_omega = std::max(0.05, p6_omega * 0.5);
-                if (!Az_history.empty()) {
-                    Az_history.clear();
-                    g_history.clear();
-                }
-                if (VERBOSE && old_omega != p6_omega) {
-                    std::cout << " [P6: " << n_consec_increase
-                              << " consec R↑ → ω=" << p6_omega << ", restart]";
-                }
-            }
-            // RECOVERY: 3+ consecutive decreases → increase ω (max = p6_omega_max)
-            else if (n_consec_decrease >= 3 && p6_omega < p6_omega_max) {
-                double old_omega = p6_omega;
-                p6_omega = std::min(p6_omega_max, p6_omega * 1.5);
-                if (VERBOSE && old_omega != p6_omega) {
-                    std::cout << " [P6: " << n_consec_decrease
-                              << " consec R↓ → ω=" << p6_omega << "]";
-                }
-            }
-
-            // ---- Anderson extrapolation (or ω-damped Picard if history < 2) ----
-            Eigen::VectorXd Az_next;
-            {
-                int m_k = std::min(m_phase6, static_cast<int>(g_history.size()));
-                if (m_k < 2) {
-                    // Not enough history for meaningful Anderson: use ω-damped Picard
-                    Az_next = Az_vec_0 + p6_omega * delta_A;
-                    if (VERBOSE) std::cout << " [P6: Picard ω=" << p6_omega << "]";
-                } else {
-                    // Anderson extrapolation: DG = differences of Picard residuals
-                    Eigen::MatrixXd DG(delta_A.size(), m_k);
-                    for (int j = 0; j < m_k; j++) {
-                        int hidx = static_cast<int>(g_history.size()) - m_k + j;
-                        DG.col(j) = g_history[hidx] - delta_A;
-                    }
-                    // Solve: min_θ ||DG θ + δ_k||²  (regularized normal equations)
-                    Eigen::MatrixXd DTD = DG.transpose() * DG;
-                    double reg = 1e-10 * std::max(DTD.diagonal().maxCoeff(), 1.0);
-                    DTD.diagonal().array() += reg;
-                    Eigen::VectorXd theta = DTD.ldlt().solve(-DG.transpose() * delta_A);
-
-                    // G_AA = G_k + Σ_j θ_j · ((Az_{k-j} + δ_{k-j}) - (Az_k + δ_k))
-                    Eigen::VectorXd G_k = Az_vec_0 + delta_A;
-                    Eigen::VectorXd G_anderson = G_k;
-                    for (int j = 0; j < m_k; j++) {
-                        int hidx = static_cast<int>(g_history.size()) - m_k + j;
-                        Eigen::VectorXd DX_j = Az_history[hidx] - Az_vec_0;
-                        G_anderson += theta(j) * (DX_j + DG.col(j));
-                    }
-                    // Mixing parameter β (default 1.0 = pure Anderson)
-                    const double beta_p6 = (beta_AA > 0.0 && beta_AA <= 1.0) ? beta_AA : 1.0;
-                    Az_next = beta_p6 * G_anderson + (1.0 - beta_p6) * G_k;
-
-                    // Safety: cap Anderson step at 2× Picard step (before ω damping)
-                    double picard_norm  = delta_A.norm();
-                    Eigen::VectorXd anderson_full_step = Az_next - Az_vec_0;
-                    double anderson_norm = anderson_full_step.norm();
-                    if (picard_norm > 1e-30 && anderson_norm > 2.0 * picard_norm) {
-                        // Anderson step too large → fall back to damped Picard
-                        Az_next = Az_vec_0 + p6_omega * delta_A;
-                        if (VERBOSE) std::cout << " [P6: Anderson→Picard(cap) ω=" << p6_omega << "]";
-                    } else {
-                        // Apply ω damping to Anderson step (critical: prevents overshoot)
-                        Az_next = Az_vec_0 + p6_omega * anderson_full_step;
-                        if (VERBOSE) {
-                            std::cout << " [P6: Anderson m=" << m_k
-                                      << " step=" << std::scientific << std::setprecision(2)
-                                      << (p6_omega * anderson_norm) << " (ω=" << p6_omega << ")]";
-                        }
-                    }
-                }
-            }
-
-            // Store full Picard residual δ_k in history (critical: not the damped step)
-            Az_history.push_back(Az_vec_0);
-            g_history.push_back(delta_A);
-            if (static_cast<int>(Az_history.size()) > m_phase6 + 1) {
-                Az_history.erase(Az_history.begin());
-                g_history.erase(g_history.begin());
-            }
-
-            // Apply Az_next: set active cells, interpolate inactive, sync
-            Az_vec = Az_next;
-            for (int cidx = 0; cidx < n_active_cells; cidx++) {
-                auto [ci, cj] = coarse_to_fine[cidx];
-                Az(cj, ci) = Az_next(cidx);
-            }
-            if (is_polar) interpolateInactiveCellsPolar(Az_next);
-            else          interpolateInactiveCells(Az_next);
-
-            alpha_prev = 1.0;  // Conceptually "full step" for adaptive init next iter
-            phase6_anderson_done = true;
-        }
-
-        if (!phase6_anderson_done) {
+        // [Phase BJ-8 Path D / v1.5.1] Phase 6 damped Picard + Anderson
+        // acceleration block was the alternate update path used when the
+        // (now-removed) Galerkin coarse system fed an A(μ_diff) tangent
+        // Newton step that needed globalisation against the B-H knee. With
+        // custom Galerkin coarsening eliminated, the only update path is the
+        // classic Armijo backtracking line search below.
         for (int ls = 0; ls < max_line_search; ls++) {
             // Trial step: A_trial = A + α·δA
             Eigen::VectorXd Az_trial = Az_vec_0 + alpha * delta_A;
 
             // Convert Az_trial (row-major vector) back to matrix form
             Eigen::MatrixXd Az_trial_mat;
-            if (using_coarsening) {
-                // Coarsened: update active cells, then interpolate inactive cells
-                Az_trial_mat = Az;  // Start with current Az (has full grid)
-                for (int idx = 0; idx < n_active_cells; idx++) {
-                    auto [i, j] = coarse_to_fine[idx];
-                    Az_trial_mat(j, i) = Az_trial(idx);  // Update active cell
-                }
-                // ★ CRITICAL FIX: Interpolate inactive cells to ensure consistent gradients
-                // This is required for accurate B/H/μ calculation in nonlinear iteration
-                Az = Az_trial_mat;  // Temporarily set Az for interpolation functions
-                if (is_polar) {
-                    interpolateInactiveCellsPolar(Az_trial);
-                } else {
-                    interpolateInactiveCells(Az_trial);
-                }
-                Az_trial_mat = Az;  // Copy back with interpolated inactive cells
-            } else if (is_polar) {
-                // Full polar grid: CRITICAL - buildMatrixPolar uses row-major indexing
-                // Convert from row-major vector to matrix
+            if (is_polar) {
+                // Full polar grid: buildMatrixPolar uses row-major indexing
                 if (r_orientation == "horizontal") {
                     Az_trial_mat.resize(ntheta, nr);
                     for (int i = 0; i < nr; i++) {
                         for (int j = 0; j < ntheta; j++) {
                             int idx = i * ntheta + j;
-                            Az_trial_mat(j, i) = Az_trial(idx);  // Az(theta, r)
+                            Az_trial_mat(j, i) = Az_trial(idx);
                         }
                     }
-                } else {  // vertical
+                } else {
                     Az_trial_mat.resize(nr, ntheta);
                     for (int i = 0; i < nr; i++) {
                         for (int j = 0; j < ntheta; j++) {
                             int idx = i * ntheta + j;
-                            Az_trial_mat(i, j) = Az_trial(idx);  // Az(r, theta)
+                            Az_trial_mat(i, j) = Az_trial(idx);
                         }
                     }
                 }
             } else {
-                // Full Cartesian grid: Convert from row-major vector to matrix
                 Az_trial_mat.resize(ny, nx);
                 for (int j = 0; j < ny; j++) {
                     for (int i = 0; i < nx; i++) {
@@ -1007,89 +460,30 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
 
-            // Build matrix and compute residual at trial point
-            double residual_trial_norm;
-            if (using_coarsening && nonlinear_config.use_phase6_precond_jfnk) {
-                // Defect correction: TRUE nonlinear line search (update μ, rebuild A_FVM).
-                //
-                // The frozen-Jacobian approach evaluates A_matrix * Az_trial - b_vec
-                // where A_matrix uses the CURRENT (unfrozen) μ. Since delta_c is computed as
-                // A_c_galerkin^{-1} * R_FVM and A_c_galerkin ≈ A_FVM, the trial residual
-                // is approximately zero at α=1 — Armijo is trivially satisfied every iteration.
-                // After updating μ from Az_trial, the TRUE nonlinear residual can be much
-                // larger, causing period-2 oscillation (residual never converges).
-                //
-                // Fix: update B/H/μ from Az_trial, rebuild A_FVM with new μ, evaluate the
-                // TRUE nonlinear residual ||A_new(μ(Az_trial)) * Az_trial - b||. This matches
-                // the convention in the non-defect-correction path and prevents trivial acceptance.
-                // μ contamination from rejected trials doesn't matter because Step 1 of the next
-                // Newton iteration always recomputes μ from Az.
-
-                // Az is already updated to Az_trial_mat by lines above (active cells set,
-                // inactive cells interpolated). Now update μ from Az_trial.
-                Az = Az_trial_mat;
-                {
-                    Eigen::VectorXd Bx_active, By_active, H_active;
-                    calculateBFieldAtActiveCells(Az_trial, Bx_active, By_active);
-                    calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
-                    updateMuAtActiveCells(H_active);
-                    interpolateMuToFullGrid();
-                }
-                // Rebuild coarsened FVM matrix with new μ and evaluate residual
-                {
-                    Eigen::SparseMatrix<double> A_nl_trial;
-                    Eigen::VectorXd b_nl_trial;
-                    if (is_polar) {
-                        buildMatrixPolarCoarsened(A_nl_trial, b_nl_trial);
-                    } else {
-                        buildMatrixCoarsened(A_nl_trial, b_nl_trial);
-                    }
-                    residual_trial_norm = (A_nl_trial * Az_trial - b_nl_trial).norm();
-                }
-                // Invalidate full-matrix cache (μ has changed)
-                full_matrix_cache_valid = false;
+            // [Phase BJ-8 Path D / v1.5.1] Build matrix and compute trial
+            // residual on the full grid. Phase 6 defect-correction branch
+            // (true-nonlinear LS via coarsened FVM rebuild) and the
+            // Galerkin computeFullGridResidual fast-path are gone — only the
+            // single non-DC full-grid path remains.
+            Az = Az_trial_mat;
+            if (is_polar) {
+                calculateMagneticFieldPolar();
             } else {
-                // Non-defect-correction paths: update B/H/μ and rebuild matrix per trial
-                Az = Az_trial_mat;
-                if (using_coarsening) {
-                    Eigen::VectorXd Bx_active, By_active, H_active;
-                    calculateBFieldAtActiveCells(Az_trial, Bx_active, By_active);
-                    calculateHFieldAtActiveCells(Bx_active, By_active, H_active);
-                    updateMuAtActiveCells(H_active);
-                    interpolateMuToFullGrid();
-                } else {
-                    if (is_polar) {
-                        calculateMagneticFieldPolar();
-                    } else {
-                        calculateMagneticField();
-                    }
-                    calculateHField();
-                    updateMuDistribution();
-                }
+                calculateMagneticField();
+            }
+            calculateHField();
+            updateMuDistribution();
 
-                if (using_coarsening && nonlinear_config.use_galerkin_coarsening) {
-                    full_matrix_cache_valid = false;
-                    double b_trial_norm;
-                    residual_trial_norm = computeFullGridResidual(b_trial_norm);
+            double residual_trial_norm;
+            {
+                Eigen::SparseMatrix<double> A_trial;
+                Eigen::VectorXd b_trial;
+                if (is_polar) {
+                    buildMatrixPolar(A_trial, b_trial);
                 } else {
-                    Eigen::SparseMatrix<double> A_trial;
-                    Eigen::VectorXd b_trial;
-                    if (is_polar) {
-                        if (coarsening_enabled && n_active_cells < nr * ntheta) {
-                            buildMatrixPolarCoarsened(A_trial, b_trial);
-                        } else {
-                            buildMatrixPolar(A_trial, b_trial);
-                        }
-                    } else {
-                        if (coarsening_enabled && n_active_cells < nx * ny) {
-                            buildMatrixCoarsened(A_trial, b_trial);
-                        } else {
-                            buildMatrix(A_trial, b_trial);
-                        }
-                    }
-                    Eigen::VectorXd residual_trial = A_trial * Az_trial - b_trial;
-                    residual_trial_norm = residual_trial.norm();
+                    buildMatrix(A_trial, b_trial);
                 }
+                residual_trial_norm = (A_trial * Az_trial - b_trial).norm();
             }
 
             // Check Armijo condition: ||R(A + α·δA)|| <= ||R(A)||·(1 - c·α)
@@ -1110,20 +504,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 // Line search failed, accept minimal step
                 Az_vec = Az_vec_0 + alpha_min * delta_A;
 
-                // Convert Az_vec (row-major) back to matrix form
-                if (using_coarsening) {
-                    // Coarsened: update active cells, then interpolate inactive cells
-                    for (int idx = 0; idx < n_active_cells; idx++) {
-                        auto [i, j] = coarse_to_fine[idx];
-                        Az(j, i) = Az_vec(idx);
-                    }
-                    // ★ CRITICAL FIX: Interpolate inactive cells
-                    if (is_polar) {
-                        interpolateInactiveCellsPolar(Az_vec);
-                    } else {
-                        interpolateInactiveCells(Az_vec);
-                    }
-                } else if (is_polar) {
+                // Convert Az_vec (row-major) back to matrix form (full grid)
+                if (is_polar) {
                     if (r_orientation == "horizontal") {
                         Az.resize(ntheta, nr);
                         for (int i = 0; i < nr; i++) {
@@ -1132,7 +514,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                                 Az(j, i) = Az_vec(idx);
                             }
                         }
-                    } else {  // vertical
+                    } else {
                         Az.resize(nr, ntheta);
                         for (int i = 0; i < nr; i++) {
                             for (int j = 0; j < ntheta; j++) {
@@ -1155,19 +537,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
         }
-        }  // end if (!phase6_anderson_done) [line search block]
 
         // Update previous step length for next iteration's adaptive algorithm
-        // Phase 6 already set alpha_prev = 1.0 inside its block; don't overwrite.
-        if (!phase6_anderson_done) {
-            alpha_prev = alpha;
-        }
+        alpha_prev = alpha;
 
         // ===== Step 7: Anderson Acceleration =====
-        // Skipped for Phase 6: history management is done inside the Phase 6 block,
-        // which stores full Picard residuals (δ_k) rather than the tiny α_min*δ steps
-        // that the line search produces — mixing the latter gives negligible acceleration.
-        if (!phase6_anderson_done && USE_ANDERSON && m_AA > 0) {
+        if (USE_ANDERSON && m_AA > 0) {
             Eigen::VectorXd g_k = Az_vec - Az_vec_0;  // Actual update
 
             if (iter >= 1 && g_history.size() > 0) {
@@ -1201,20 +576,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 // Apply mixing parameter β
                 Az_vec = beta_AA * Az_anderson + (1.0 - beta_AA) * Az_vec;
 
-                // Update Az matrix from Az_vec
-                if (using_coarsening) {
-                    // Coarsened: update active cells, then interpolate inactive cells
-                    for (int idx = 0; idx < n_active_cells; idx++) {
-                        auto [i, j] = coarse_to_fine[idx];
-                        Az(j, i) = Az_vec(idx);
-                    }
-                    // ★ CRITICAL FIX: Interpolate inactive cells after Anderson update
-                    if (is_polar) {
-                        interpolateInactiveCellsPolar(Az_vec);
-                    } else {
-                        interpolateInactiveCells(Az_vec);
-                    }
-                } else if (is_polar) {
+                // Update Az matrix from Az_vec (full grid only post-BJ-8)
+                if (is_polar) {
                     if (r_orientation == "horizontal") {
                         for (int i = 0; i < nr; i++) {
                             for (int j = 0; j < ntheta; j++) {
@@ -1263,26 +626,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
     std::cerr << "WARNING: Newton-Krylov solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
 
-    // Apply Hermite interpolation for output even if not converged
-    {
-        bool coarsen_active = is_polar
-            ? (coarsening_enabled && n_active_cells < nr * ntheta)
-            : (coarsening_enabled && n_active_cells < nx * ny);
-        if (coarsen_active) {
-            Eigen::VectorXd Az_c(n_active_cells);
-            for (int idx = 0; idx < n_active_cells; idx++) {
-                auto [ci, cj] = coarse_to_fine[idx];
-                Az_c(idx) = Az(cj, ci);
-            }
-            if (is_polar) {
-                interpolateToFullGridPolar(Az_c);
-            } else {
-                interpolateToFullGrid(Az_c);
-            }
-            // Harmonically interpolate μ at inactive cells (IDW, series circuit model)
-            interpolateMuToFullGrid();
-        }
-    }
+    // [Phase BJ-8 Path D / v1.5.1] Hermite-interpolation fallback (coarse →
+    // full + μ interpolation) was needed only when the coarsened NK could
+    // exit at a coarse-grid solution that had to be promoted to full grid
+    // before export. The NK loop now runs on the full grid throughout, so
+    // Az / mu_map are already full-grid when this maxiter-exit path runs.
 
     if (nonlinear_config.export_convergence) {
         std::ofstream conv_file("newton_krylov_convergence.csv");
