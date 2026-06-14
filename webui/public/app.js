@@ -248,8 +248,16 @@ async function initializeConfigEditor() {
                     availableKeywords = Object.keys(keywords);
                 }
             } else {
-                // Top level - show root-level keywords
-                availableKeywords = Object.keys(keywords);
+                // Top level - show only keywords that have no validParents
+                // (i.e. genuine root-level keys). Pre-BJ-fix this returned
+                // Object.keys(keywords), which surfaced per-material keys
+                // like `coarsen`/`coarsen_ratio` at the document root and
+                // led users to write `coarsen: true` outside any material
+                // block, where the parser silently ignores it.
+                availableKeywords = Object.keys(keywords).filter(k => {
+                    const info = keywords[k];
+                    return !info || !info.validParents || info.validParents.length === 0;
+                });
             }
 
             // Add keyword completions
@@ -4109,6 +4117,19 @@ ${SOLVER_HINT_MARKER}
 #   anderson:
 #     enabled: false                # Anderson acceleration (Picard mainly)
 #     depth: 5
+#   # Phase BC (v1.5.1+): Eisenstat-Walker forcing for inner AMGCL CG tol.
+#   # Headline measured: 377s -> 153s (-59%) on IEEJ-D IPMSM. Turn on for
+#   # any nonlinear run.
+#   eisenstat_walker:
+#     enabled: false
+#     gamma: 0.9
+#     alpha: 2.0
+#     eta_min: 1.0e-6
+#     eta_max: 0.1
+#   # Phase BJ-5 (v1.5.1+): abort instead of warn if fine_finishing exits
+#   # at ||R_fine||_rel > fine_tol. Catches the saturated-polar Phase 6 +
+#   # Galerkin wrong-answer case (flux ~1/10) loudly in production.
+#   strict_convergence: false
 #
 # --- Adaptive mesh coarsening (mark uniform regions for downsampling) ---
 # Per-material opt-in (add inside any material in the materials: block):
@@ -4119,6 +4140,12 @@ ${SOLVER_HINT_MARKER}
 # coarsening:
 #   boundary_shell: 1               # keep N cells fine near material edges
 #   smooth_iterations: 0            # harmonic mu interpolation for coarse cells
+#   # Phase BJ-4 (v1.5.1+): force min(skip_x, skip_y) >= 2 when rounding
+#   # would have produced 1 (silent no-op). Required for coarsening to
+#   # actually fire on non-square-aspect meshes (e.g. polar with aspect
+#   # 1.5-3 rounds skip_x to 1 at coarsen_ratio: 4). Overshoots ratio to
+#   # >= 4. Pairs with strict_convergence on saturated nonlinear problems.
+#   auto_bump_skip: false
 `;
 
 // Append the SOLVER_HINT_BLOCK to the YAML string iff the marker isn't
