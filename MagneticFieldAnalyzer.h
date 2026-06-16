@@ -597,6 +597,14 @@ private:
         int region_start = 0;
         int region_end = 0;
         int pixels_per_step = 0;
+        // [v1.6 Stage 0] Resolution-independent rotor rotation (polar only).
+        // If use_angle, the per-step theta shift is computed as
+        // round(angle_rad / dtheta) once the polar mesh is known
+        // (finalizeSlideRotationForResolution), overwriting pixels_per_step, so
+        // the SAME physical rotation is applied at any mesh resolution. This is
+        // what makes downsampled / multi-fidelity transient runs comparable.
+        bool use_angle = false;
+        double angle_rad = 0.0;
         // Common
         std::string wrap_mode = "auto";
         std::vector<int> vacuum_rgb = {255, 255, 255};  // air, used by vacuum mode
@@ -902,6 +910,10 @@ private:
     // and the per-slide region / pixels_per_step entries resolve
     // through tinyexpr instead of failing the strict .as<int>() path.
     void parseTransientConfig();
+    // [v1.6 Stage 0] Convert any angle-specified rotor rotation (SlideRegion
+    // use_angle) into an integer theta-pixel shift now that dtheta is known.
+    // Called once after setupPolarSystem(); polar only.
+    void finalizeSlideRotationForResolution();
     // Tinyexpr-aware scalar evaluation helpers used by parseTransientConfig.
     double evaluateScalarAsDouble(const YAML::Node& node, double fallback) const;
     int    evaluateScalarAsInt   (const YAML::Node& node, int    fallback) const;

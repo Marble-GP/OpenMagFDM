@@ -232,6 +232,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
 
     if (coordinate_system == "polar") {
         setupPolarSystem();
+        finalizeSlideRotationForResolution();  // [v1.6 Stage 0] resolve angle->pixels
     } else {
         setupCartesianSystem();
     }
@@ -599,6 +600,15 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
             sr.region_start    = evaluateScalarAsInt(sn["region_start"],    0);
             sr.region_end      = evaluateScalarAsInt(sn["region_end"],      0);
             sr.pixels_per_step = evaluateScalarAsInt(sn["pixels_per_step"], 0);
+            // [v1.6 Stage 0] Resolution-independent rotation: angle_rad takes
+            // precedence over angle_deg; both override pixels_per_step (resolved
+            // to a theta-pixel shift later in finalizeSlideRotationForResolution).
+            if (sn["angle_rad"] || sn["angle_deg"]) {
+                sr.use_angle = true;
+                sr.angle_rad = sn["angle_rad"]
+                    ? evaluateScalarAsDouble(sn["angle_rad"], 0.0)
+                    : evaluateScalarAsDouble(sn["angle_deg"], 0.0) * M_PI / 180.0;
+            }
             sr.wrap_mode = sn["wrap_mode"].as<std::string>("auto");
             if (sn["vacuum_rgb"] && sn["vacuum_rgb"].IsSequence()) {
                 auto v = sn["vacuum_rgb"].as<std::vector<int>>();
@@ -643,7 +653,8 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
             }
         }
     } else if (trans["slide_pixels_per_step"] || trans["slide_region_end"]
-               || trans["slide_region_start"]  || trans["slide_direction"]) {
+               || trans["slide_region_start"]  || trans["slide_direction"]
+               || trans["slide_angle_deg"]     || trans["slide_angle_rad"]) {
         // Legacy single-slide form.
         SlideRegion sr;
         sr.name       = "slide";
@@ -651,6 +662,13 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
         sr.region_start    = evaluateScalarAsInt(trans["slide_region_start"],    0);
         sr.region_end      = evaluateScalarAsInt(trans["slide_region_end"],      0);
         sr.pixels_per_step = evaluateScalarAsInt(trans["slide_pixels_per_step"], 0);
+        // [v1.6 Stage 0] Resolution-independent rotation (see slides[] form).
+        if (trans["slide_angle_rad"] || trans["slide_angle_deg"]) {
+            sr.use_angle = true;
+            sr.angle_rad = trans["slide_angle_rad"]
+                ? evaluateScalarAsDouble(trans["slide_angle_rad"], 0.0)
+                : evaluateScalarAsDouble(trans["slide_angle_deg"], 0.0) * M_PI / 180.0;
+        }
         sr.wrap_mode  = "periodic";
         transient_config.slides.push_back(sr);
     }
@@ -697,6 +715,51 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
                           << "Multi-slide polar is a v1.6 item." << std::endl;
             }
         }
+    }
+}
+
+void MagneticFieldAnalyzer::finalizeSlideRotationForResolution() {
+    // [v1.6 Stage 0] Convert any angle-specified rotor rotation into an integer
+    // theta-pixel shift now that the polar mesh (dtheta, ntheta) is known.
+    // Doing the conversion once here (after setupPolarSystem) means every
+    // downstream consumer keeps reading pixels_per_step and stays mutually
+    // consistent (image slide, computeMagnetizationGrids rotor_angle, warm-start
+    // permutation), while the PHYSICAL rotation per step is resolution-independent:
+    // the same angle maps to proportionally more theta-cells on a finer mesh, so
+    // downsampled / multi-fidelity transient runs represent the same rotation.
+    if (coordinate_system != "polar") {
+        for (const auto& s : transient_config.slides) {
+            if (s.use_angle) {
+                std::cerr << "WARNING: slide '" << s.name << "' angle rotation is only "
+                          << "supported for polar coordinates; ignoring (use pixels_per_step)."
+                          << std::endl;
+            }
+        }
+        return;
+    }
+    if (dtheta <= 0.0) return;
+
+    bool any = false;
+    for (auto& s : transient_config.slides) {
+        if (!s.use_angle) continue;
+        const int shift = static_cast<int>(std::lround(s.angle_rad / dtheta));
+        if (shift == 0 && s.angle_rad != 0.0) {
+            std::cerr << "WARNING: slide '" << s.name << "' rotation "
+                      << (s.angle_rad * 180.0 / M_PI) << " deg rounds to 0 theta-cells at "
+                      << "dtheta=" << dtheta << " (ntheta=" << ntheta
+                      << "); the rotor will not advance. Increase resolution or the angle."
+                      << std::endl;
+        }
+        s.pixels_per_step = shift;
+        any = true;
+        std::cout << "  [slide '" << s.name << "'] rotation "
+                  << (s.angle_rad * 180.0 / M_PI) << " deg -> " << shift
+                  << " theta-cells/step (dtheta=" << dtheta
+                  << ", ntheta=" << ntheta << ")" << std::endl;
+    }
+    // Re-mirror slides[0] into the legacy scalar field the polar paths read.
+    if (any && !transient_config.slides.empty()) {
+        transient_config.slide_pixels_per_step = transient_config.slides.front().pixels_per_step;
     }
 }
 
