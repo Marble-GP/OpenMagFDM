@@ -11545,9 +11545,13 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         // Center coefficient
         local_triplets.push_back({idx, idx, coeff_center});
 
-        // Source term: -Jz * r (r-weighted, no area scaling for FDM)
-        double jz = getJzPolar(jz_map, i_r, j_theta, r_orientation);
-        rhs(idx) -= jz * r;
+        // Source term: -(Jz_coil + Jz_magnet) * r, r-weighted. Matches the full
+        // builder buildMatrixPolar (line ~11189). The magnetization bound-current
+        // term Jz_mag_map was MISSING here -> the no-load (coil J=0) magnet source
+        // vanished on the coarse path, giving b=0 / Az=0 / zero flux. This dead
+        // code was never exercised on a magnet problem before Stage 1.
+        rhs(idx) += -(getJzPolar(jz_map, i_r, j_theta, r_orientation)
+                    + getJzPolar(Jz_mag_map, i_r, j_theta, r_orientation)) * r;
     }  // end omp for
 
         #pragma omp critical

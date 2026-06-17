@@ -74,12 +74,61 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     std::vector<Eigen::VectorXd> Az_history;      // Az^(k) history
     std::vector<Eigen::VectorXd> g_history;       // g^(k) = Az^(k+1) - Az^(k) history
 
-    // Initial guess: solve linear problem with initial μ distribution
-    // (always full grid post-BJ-8 path D)
+    // [v1.6 Stage 1b] Coarse-native Newton-Krylov. When an adaptive coarsening
+    // mask is active, run the NK on the coarse (active-cell) DOFs with the
+    // geometric FVM stencil buildMatrixPolarCoarsened. mu/B stay full-resolution:
+    // the working vector is prolonged to the full member Az before every field/mu
+    // update (Step 1) and at convergence (for force/flux), so this avoids the
+    // Phase BK "coarse mu from coarse B" 327% trap -- only the linear algebra
+    // (matrix assembly + solve + Newton/line-search vectors) is coarse.
+    const bool use_coarse = is_polar && coarsening_enabled
+                            && n_active_cells > 0 && n_active_cells < nr * ntheta;
+    const bool horiz = (r_orientation == "horizontal");
+
+    // working solve-vector <-> member Az (full). Coarse: restrict/prolong via the
+    // adaptive index maps; otherwise the original row-major (polar) / natural
+    // (cartesian) layout. These two helpers centralise every Az<->vector
+    // conversion in the loop (equivalent to the previous inline code for the
+    // full-grid path).
+    auto syncMemberAz = [&](const Eigen::VectorXd& v) {
+        if (use_coarse) { interpolateToFullGridPolar(v); return; }
+        if (is_polar) {
+            if (horiz) { Az.resize(ntheta, nr); for (int i=0;i<nr;i++) for(int j=0;j<ntheta;j++) Az(j,i)=v(i*ntheta+j); }
+            else       { Az.resize(nr, ntheta); for (int i=0;i<nr;i++) for(int j=0;j<ntheta;j++) Az(i,j)=v(i*ntheta+j); }
+        } else {
+            Az.resize(ny, nx); for (int j=0;j<ny;j++) for(int i=0;i<nx;i++) Az(j,i)=v(j*nx+i);
+        }
+    };
+    auto buildSolveVec = [&](Eigen::VectorXd& v) {
+        if (use_coarse) {
+            v.resize(n_active_cells);
+            for (int idx=0; idx<n_active_cells; idx++) {
+                int i_r = coarse_to_fine[idx].first, j_th = coarse_to_fine[idx].second;
+                v(idx) = horiz ? Az(j_th, i_r) : Az(i_r, j_th);
+            }
+        } else if (is_polar) {
+            v.resize(Az.size());
+            for (int i=0;i<nr;i++) for(int j=0;j<ntheta;j++) v(i*ntheta+j) = horiz ? Az(j,i) : Az(i,j);
+        } else {
+            v.resize(Az.size());
+            for (int j=0;j<ny;j++) for(int i=0;i<nx;i++) v(j*nx+i)=Az(j,i);
+        }
+    };
+    auto buildMatrixForSolve = [&](Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b) {
+        if (use_coarse) buildMatrixPolarCoarsened(A, b);
+        else if (is_polar) buildMatrixPolar(A, b);
+        else buildMatrix(A, b);
+    };
+
+    // Initial guess: solve linear problem with initial μ distribution. Coarse path
+    // uses the FVM coarsened linear solve (sets the full interpolated member Az).
     if (VERBOSE) {
-        std::cout << "Computing initial guess..." << std::endl;
+        std::cout << "Computing initial guess..."
+                  << (use_coarse ? " [coarse-native NK active]" : "") << std::endl;
     }
-    if (is_polar) {
+    if (use_coarse) {
+        buildAndSolveSystemPolarCoarsened();
+    } else if (is_polar) {
         buildAndSolveSystemPolar();
     } else {
         buildAndSolveSystem();
@@ -96,40 +145,16 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         updateMuDistribution();
 
         // ===== Step 2: Build residual and system matrix with current μ =====
+        // Coarse-native: buildMatrixForSolve -> FVM coarse operator (n_active),
+        // buildSolveVec -> restrict the (interpolated) full member Az to the
+        // active cells. Full path: original buildMatrixPolar/buildMatrix + the
+        // row-major Az_vec (buildSolveVec is equivalent there).
         Eigen::SparseMatrix<double> A_matrix;
         Eigen::VectorXd b_vec;
-        if (is_polar) {
-            buildMatrixPolar(A_matrix, b_vec);
-        } else {
-            buildMatrix(A_matrix, b_vec);
-        }
+        buildMatrixForSolve(A_matrix, b_vec);
 
-        // CRITICAL: buildMatrixPolar uses row-major indexing (idx = r_idx * ntheta + theta_idx)
-        // but Eigen Az.data() is column-major. Must convert to row-major order.
         Eigen::VectorXd Az_vec;
-        if (is_polar) {
-            // Full polar grid: convert Az to row-major order to match buildMatrixPolar indexing
-            Az_vec.resize(Az.size());
-            for (int i = 0; i < nr; i++) {
-                for (int j = 0; j < ntheta; j++) {
-                    int idx = i * ntheta + j;  // Row-major index
-                    if (r_orientation == "horizontal") {
-                        Az_vec(idx) = Az(j, i);  // Az is (ntheta, nr), so Az(theta, r)
-                    } else {  // vertical
-                        Az_vec(idx) = Az(i, j);  // Az is (nr, ntheta), so Az(r, theta)
-                    }
-                }
-            }
-        } else {
-            // Full Cartesian grid: row-major is natural for (ny, nx) with idx = j * nx + i
-            Az_vec.resize(Az.size());
-            for (int j = 0; j < ny; j++) {
-                for (int i = 0; i < nx; i++) {
-                    int idx = j * nx + i;
-                    Az_vec(idx) = Az(j, i);
-                }
-            }
-        }
+        buildSolveVec(Az_vec);
 
         // Coarse residual (used for Newton step direction in non-DC paths)
         Eigen::VectorXd residual_coarse = A_matrix * Az_vec - b_vec;
@@ -257,7 +282,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             //
             // We also pre-resolve material_mu pointers so the inner loop only
             // touches thread-safe data (no YAML node access).
-            if (is_polar && !rgb_to_material.empty() && !material_mu.empty()) {
+            // Skip for the coarse path: the correction indexes the FULL grid
+            // (idx = i_r*ntheta+j_theta) but J_matrix is n_active x n_active. The
+            // correction is numerically ~negligible anyway (Phase BL: ~3e-19% of
+            // ||J v||), so J_coarse = A_coarse.
+            if (!use_coarse && is_polar && !rgb_to_material.empty() && !material_mu.empty()) {
                 cv::Mat image_to_use;
                 cv::flip(image, image_to_use, 0);  // Match setupMaterialProperties()
 
@@ -429,43 +458,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Trial step: A_trial = A + α·δA
             Eigen::VectorXd Az_trial = Az_vec_0 + alpha * delta_A;
 
-            // Convert Az_trial (row-major vector) back to matrix form
-            Eigen::MatrixXd Az_trial_mat;
-            if (is_polar) {
-                // Full polar grid: buildMatrixPolar uses row-major indexing
-                if (r_orientation == "horizontal") {
-                    Az_trial_mat.resize(ntheta, nr);
-                    for (int i = 0; i < nr; i++) {
-                        for (int j = 0; j < ntheta; j++) {
-                            int idx = i * ntheta + j;
-                            Az_trial_mat(j, i) = Az_trial(idx);
-                        }
-                    }
-                } else {
-                    Az_trial_mat.resize(nr, ntheta);
-                    for (int i = 0; i < nr; i++) {
-                        for (int j = 0; j < ntheta; j++) {
-                            int idx = i * ntheta + j;
-                            Az_trial_mat(i, j) = Az_trial(idx);
-                        }
-                    }
-                }
-            } else {
-                Az_trial_mat.resize(ny, nx);
-                for (int j = 0; j < ny; j++) {
-                    for (int i = 0; i < nx; i++) {
-                        int idx = j * nx + i;
-                        Az_trial_mat(j, i) = Az_trial(idx);
-                    }
-                }
-            }
-
-            // [Phase BJ-8 Path D / v1.5.1] Build matrix and compute trial
-            // residual on the full grid. Phase 6 defect-correction branch
-            // (true-nonlinear LS via coarsened FVM rebuild) and the
-            // Galerkin computeFullGridResidual fast-path are gone — only the
-            // single non-DC full-grid path remains.
-            Az = Az_trial_mat;
+            // Set member Az from the trial vector (coarse: prolong via
+            // interpolateToFullGridPolar; full: original row-major write), then
+            // recompute the full-resolution field/mu and the trial residual on
+            // the (coarse or full) operator.
+            syncMemberAz(Az_trial);
             if (is_polar) {
                 calculateMagneticFieldPolar();
             } else {
@@ -478,19 +475,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             {
                 Eigen::SparseMatrix<double> A_trial;
                 Eigen::VectorXd b_trial;
-                if (is_polar) {
-                    buildMatrixPolar(A_trial, b_trial);
-                } else {
-                    buildMatrix(A_trial, b_trial);
-                }
+                buildMatrixForSolve(A_trial, b_trial);
                 residual_trial_norm = (A_trial * Az_trial - b_trial).norm();
             }
 
             // Check Armijo condition: ||R(A + α·δA)|| <= ||R(A)||·(1 - c·α)
             if (residual_trial_norm <= residual_0 * (1.0 - c * alpha) || alpha < alpha_min) {
-                // Accept step
+                // Accept step. Member Az already holds this trial's (full) field
+                // from syncMemberAz above, so no extra write is needed.
                 Az_vec = Az_trial;
-                Az = Az_trial_mat;
                 if (VERBOSE && ls > 0) {
                     std::cout << " [LS: α=" << alpha << ", " << ls+1 << " trials]";
                 }
@@ -501,37 +494,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             alpha *= rho;
 
             if (ls == max_line_search - 1) {
-                // Line search failed, accept minimal step
+                // Line search failed, accept minimal step.
                 Az_vec = Az_vec_0 + alpha_min * delta_A;
-
-                // Convert Az_vec (row-major) back to matrix form (full grid)
-                if (is_polar) {
-                    if (r_orientation == "horizontal") {
-                        Az.resize(ntheta, nr);
-                        for (int i = 0; i < nr; i++) {
-                            for (int j = 0; j < ntheta; j++) {
-                                int idx = i * ntheta + j;
-                                Az(j, i) = Az_vec(idx);
-                            }
-                        }
-                    } else {
-                        Az.resize(nr, ntheta);
-                        for (int i = 0; i < nr; i++) {
-                            for (int j = 0; j < ntheta; j++) {
-                                int idx = i * ntheta + j;
-                                Az(i, j) = Az_vec(idx);
-                            }
-                        }
-                    }
-                } else {
-                    Az.resize(ny, nx);
-                    for (int j = 0; j < ny; j++) {
-                        for (int i = 0; i < nx; i++) {
-                            int idx = j * nx + i;
-                            Az(j, i) = Az_vec(idx);
-                        }
-                    }
-                }
+                syncMemberAz(Az_vec);
                 if (VERBOSE) {
                     std::cout << " [LS failed, using α=" << alpha_min << "]";
                 }
@@ -576,31 +541,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 // Apply mixing parameter β
                 Az_vec = beta_AA * Az_anderson + (1.0 - beta_AA) * Az_vec;
 
-                // Update Az matrix from Az_vec (full grid only post-BJ-8)
-                if (is_polar) {
-                    if (r_orientation == "horizontal") {
-                        for (int i = 0; i < nr; i++) {
-                            for (int j = 0; j < ntheta; j++) {
-                                int idx = i * ntheta + j;
-                                Az(j, i) = Az_vec(idx);
-                            }
-                        }
-                    } else {
-                        for (int i = 0; i < nr; i++) {
-                            for (int j = 0; j < ntheta; j++) {
-                                int idx = i * ntheta + j;
-                                Az(i, j) = Az_vec(idx);
-                            }
-                        }
-                    }
-                } else {
-                    for (int j = 0; j < ny; j++) {
-                        for (int i = 0; i < nx; i++) {
-                            int idx = j * nx + i;
-                            Az(j, i) = Az_vec(idx);
-                        }
-                    }
-                }
+                // Update member Az from the accelerated vector (coarse: prolong;
+                // full: original row-major write) so the next iteration's field/mu
+                // update sees it.
+                syncMemberAz(Az_vec);
             }
 
             // Store history
