@@ -11415,154 +11415,102 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             continue;
         }
 
-        // Interior points and Neumann boundary points
-        // Non-uniform FDM on polar grid (r-weighted for symmetry):
-        //   Radial: 2 * r_face / (μ · h_r · (h_minus + h_plus))
-        //   Theta:  2 / (r · μ · h_θ · (h_θ_minus + h_θ_plus))
-        //   Source: -Jz * r
-        // For uniform: 2*r_face/(μ·dr·2dr) = r_face/(μ·dr²) → matches buildMatrixPolar()
-        double coeff_center = 0.0;
+        // [v1.6 Stage 1d] FACE-BY-FACE EXACTLY-SYMMETRIC conservative FV assembly.
+        // Each interior face is processed ONCE (as the +r / +theta face of a cell)
+        // and pushes 4 symmetric triplets: K[i][j]=K[j][i]=+c, K[i][i]=K[j][j]-=c.
+        // The resulting coarse operator is an EXACTLY symmetric SPD M-matrix, robust
+        // for AMGCL's CG even under the saturated mu_r contrast (Stages 1b/1c failed
+        // because the cell-by-cell stencil was asymmetric ~2e-4 and CG requires SPD).
+        // Dirichlet neighbours are ELIMINATED into the RHS (no interior<->Dirichlet
+        // column coupling), so the Dirichlet identity rows keep the matrix symmetric.
+        // Neumann boundary faces carry zero flux (skipped = natural BC). Periodic
+        // theta: the +theta seam face is processed once with the (anti)periodic sign.
+        // Conservative face coeff = r_face*(1/mu_face)*dth_cv/h (radial),
+        // dr_cv/(r*mu_face*h_theta) (theta); reduces to buildMatrixPolar x dr*dtheta
+        // on a uniform grid. The per-cell diagonal accumulates across its +/- faces
+        // via setFromTriplets' duplicate summation.
+        double mu_i = getMuPolar(mu_map, i_r, j_theta, r_orientation);
 
-        // --- Radial direction (non-uniform stencil) ---
         int i_prev = findNextActiveRadial(i_r, j_theta, -1);
         int i_next = findNextActiveRadial(i_r, j_theta, +1);
-
         double h_minus = (i_r - i_prev) * dr;
-        double h_plus = (i_next - i_r) * dr;
-
-        // Prevent division by zero
+        double h_plus  = (i_next - i_r) * dr;
         if (h_minus < 1e-15) h_minus = dr;
-        if (h_plus < 1e-15) h_plus = dr;
+        if (h_plus  < 1e-15) h_plus  = dr;
 
-        // --- Theta direction distances (needed for control volume) ---
         int j_prev_theta = findNextActiveTheta(i_r, j_theta, -1);
         int j_next_theta = findNextActiveTheta(i_r, j_theta, +1);
-
         double h_theta_minus = calculateThetaDistance(j_theta, j_prev_theta);
-        double h_theta_plus = calculateThetaDistance(j_next_theta, j_theta);
-
+        double h_theta_plus  = calculateThetaDistance(j_next_theta, j_theta);
         if (h_theta_minus < 1e-15) h_theta_minus = dtheta;
-        if (h_theta_plus < 1e-15) h_theta_plus = dtheta;
+        if (h_theta_plus  < 1e-15) h_theta_plus  = dtheta;
 
-        // [v1.6 Stage 1c] Control-volume widths for a CONSERVATIVE finite-volume
-        // stencil. The previous per-cell second-derivative normalisation
-        // 2/(h_minus+h_plus) made the off-diagonal coefficients NON-shared across a
-        // face -> the matrix was asymmetric, AMGCL's CG broke down to NaN under the
-        // saturated mu_r 2.5..9970 contrast (Stage 1b). Multiplying the radial flux
-        // by the theta CV width (and the theta flux by the radial CV width) makes
-        // each off-diagonal a FACE-SHARED quantity (r_face, mu_face, h_face and the
-        // perpendicular CV width are all common to both cells), so the matrix is
-        // symmetric + conservative within uniform-skip regions (an SPD M-matrix),
-        // reducing to buildMatrixPolar x (dr*dtheta) on a uniform grid.
-        double dr_cv  = 0.5 * (h_minus + h_plus);        // radial CV width
+        double dr_cv  = 0.5 * (h_minus + h_plus);              // radial CV width
         double dth_cv = 0.5 * (h_theta_minus + h_theta_plus);  // theta CV width
 
-        // Interface positions (r-weighting)
-        double r_imh = r - h_minus / 2.0;  // r_{i-1/2}
-        double r_iph = r + h_plus / 2.0;   // r_{i+1/2}
-
-        // Interface permeabilities (harmonic mean of ACTIVE cells only)
-        // getMuAtInterfacePolar(i_r ± 0.5) uses fine-grid neighbors (i_r ± 1) which
-        // are INACTIVE cells with μ reset to H=0 value (e.g. μ_r=5000) by
-        // interpolateMuToFullGrid(). This causes wrong FVM coefficients and prevents
-        // convergence. Use harmonic mean between the two ACTIVE cells instead,
-        // consistent with how the theta-direction interfaces are computed.
-        double mu_center_r = getMuPolar(mu_map, i_r,    j_theta, r_orientation);
-        double mu_prev_r   = getMuPolar(mu_map, i_prev,  j_theta, r_orientation);
-        double mu_next_r   = getMuPolar(mu_map, i_next,  j_theta, r_orientation);
-        double mu_inner_r = 2.0 / (1.0/mu_center_r + 1.0/mu_prev_r);
-        double mu_outer_r = 2.0 / (1.0/mu_center_r + 1.0/mu_next_r);
-
-        // Conservative radial face coefficients: r_face * (1/μ_face) * dθ_cv / h_face
-        double a_im = r_imh * dth_cv / (mu_inner_r * h_minus);
-        double a_ip = r_iph * dth_cv / (mu_outer_r * h_plus);
-
-        // Handle Neumann boundaries with ghost elimination
-        if (i_r == 0 && bc_inner.type == "neumann") {
-            if (r_imh <= 0.0) {
-                std::cerr << "Warning: r_imh <= 0 at inner Neumann BC, using mirror" << std::endl;
-                double r_imh_eff = r_iph;
-                double a_im_eff = r_imh_eff * dth_cv / (mu_inner_r * h_plus);  // conservative form
-                auto it_next = fine_to_coarse.find({i_next, j_theta});
-                if (it_next != fine_to_coarse.end()) {
-                    local_triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
-                }
-                coeff_center -= (a_im_eff + a_ip);
+        // --- Radial +r face (processed once; couples idx <-> i_next) ---
+        if (i_next > i_r && i_next <= nr - 1) {
+            double r_face  = 0.5 * (r_coords[i_r] + r_coords[i_next]);
+            double mu_nb   = getMuPolar(mu_map, i_next, j_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = r_face * dth_cv / (mu_face * h_plus);
+            if (i_next == nr - 1 && bc_outer.type == "dirichlet") {
+                local_triplets.push_back({idx, idx, -c});
+                rhs(idx) -= c * bc_outer.value;
             } else {
-                auto it_next = fine_to_coarse.find({i_next, j_theta});
-                if (it_next != fine_to_coarse.end()) {
-                    local_triplets.push_back({idx, it_next->second, a_im + a_ip});
+                auto it = fine_to_coarse.find({i_next, j_theta});
+                if (it != fine_to_coarse.end()) {
+                    int jdx = it->second;
+                    local_triplets.push_back({idx, jdx,  c});
+                    local_triplets.push_back({jdx, idx,  c});
+                    local_triplets.push_back({idx, idx, -c});
+                    local_triplets.push_back({jdx, jdx, -c});
                 }
-                coeff_center -= (a_im + a_ip);
             }
-        } else if (i_r == nr - 1 && bc_outer.type == "neumann") {
-            auto it_prev = fine_to_coarse.find({i_prev, j_theta});
-            if (it_prev != fine_to_coarse.end()) {
-                local_triplets.push_back({idx, it_prev->second, a_im + a_ip});
-            }
-            coeff_center -= (a_im + a_ip);
-        } else {
-            // Standard interior stencil
-            bool inner_neighbor_is_dirichlet = (i_r == 1) && (bc_inner.type == "dirichlet");
-            bool outer_neighbor_is_dirichlet = (i_r == nr - 2) && (bc_outer.type == "dirichlet");
-
-            auto it_prev = fine_to_coarse.find({i_prev, j_theta});
-            auto it_next = fine_to_coarse.find({i_next, j_theta});
-
-            if (!inner_neighbor_is_dirichlet && it_prev != fine_to_coarse.end()) {
-                local_triplets.push_back({idx, it_prev->second, a_im});
-            } else if (inner_neighbor_is_dirichlet) {
-                rhs(idx) -= a_im * bc_inner.value;
-            }
-
-            if (!outer_neighbor_is_dirichlet && it_next != fine_to_coarse.end()) {
-                local_triplets.push_back({idx, it_next->second, a_ip});
-            } else if (outer_neighbor_is_dirichlet) {
-                rhs(idx) -= a_ip * bc_outer.value;
-            }
-
-            coeff_center -= (a_im + a_ip);
+        }
+        // --- Radial -r face: only ELIMINATE a Dirichlet neighbour (an interior -r
+        //     face is added by that neighbour's +r face; Neumann = zero flux). ---
+        if (i_prev == 0 && i_prev < i_r && bc_inner.type == "dirichlet") {
+            double r_face  = 0.5 * (r_coords[i_r] + r_coords[i_prev]);
+            double mu_nb   = getMuPolar(mu_map, i_prev, j_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = r_face * dth_cv / (mu_face * h_minus);
+            local_triplets.push_back({idx, idx, -c});
+            rhs(idx) -= c * bc_inner.value;
         }
 
-        // --- Theta direction non-uniform FDM coefficients ---
-        // Interface permeabilities (harmonic mean, matching buildMatrixPolar)
-        double mu_ij = getMuPolar(mu_map, i_r, j_theta, r_orientation);
-        double mu_prev_theta = getMuPolar(mu_map, i_r, j_prev_theta, r_orientation);
-        double mu_next_theta = getMuPolar(mu_map, i_r, j_next_theta, r_orientation);
-        double mu_theta_prev = 2.0 / (1.0 / mu_ij + 1.0 / mu_prev_theta);
-        double mu_theta_next = 2.0 / (1.0 / mu_ij + 1.0 / mu_next_theta);
-
-        // Conservative theta face coefficients: (1/μ_face) * dr_cv / (r · h_θ)
-        double a_theta_m = dr_cv / (r * mu_theta_prev * h_theta_minus);
-        double a_theta_p = dr_cv / (r * mu_theta_next * h_theta_plus);
-
-        auto it_theta_prev = fine_to_coarse.find({i_r, j_prev_theta});
-        auto it_theta_next = fine_to_coarse.find({i_r, j_next_theta});
-
-        if (it_theta_prev != fine_to_coarse.end()) {
-            bool crosses_boundary = is_periodic &&
-                ((j_theta == 0 && j_prev_theta > j_theta) ||
-                 (j_theta > 0 && j_prev_theta > j_theta));
-            double sign = crosses_boundary ? periodic_sign : 1.0;
-            local_triplets.push_back({idx, it_theta_prev->second, sign * a_theta_m});
+        // --- Theta +theta face (processed once; periodic seam handled once w/ sign) ---
+        if (j_next_theta != j_theta && j_next_theta >= 0 && j_next_theta <= ntheta - 1) {
+            double mu_nb   = getMuPolar(mu_map, i_r, j_next_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = dr_cv / (r * mu_face * h_theta_plus);
+            if (!is_periodic && j_next_theta == ntheta - 1 && bc_theta_max.type == "dirichlet") {
+                local_triplets.push_back({idx, idx, -c});
+                rhs(idx) -= c * bc_theta_max.value;
+            } else {
+                auto it = fine_to_coarse.find({i_r, j_next_theta});
+                if (it != fine_to_coarse.end()) {
+                    int jdx = it->second;
+                    double sgn = (is_periodic && j_next_theta < j_theta) ? periodic_sign : 1.0;
+                    local_triplets.push_back({idx, jdx,  sgn * c});
+                    local_triplets.push_back({jdx, idx,  sgn * c});
+                    local_triplets.push_back({idx, idx, -c});
+                    local_triplets.push_back({jdx, jdx, -c});
+                }
+            }
         }
-        if (it_theta_next != fine_to_coarse.end()) {
-            bool crosses_boundary = is_periodic &&
-                ((j_theta == ntheta-1 && j_next_theta < j_theta) ||
-                 (j_theta < ntheta-1 && j_next_theta < j_theta));
-            double sign = crosses_boundary ? periodic_sign : 1.0;
-            local_triplets.push_back({idx, it_theta_next->second, sign * a_theta_p});
+        // --- Theta -theta face: only ELIMINATE a Dirichlet neighbour ---
+        if (!is_periodic && j_prev_theta == 0 && j_prev_theta != j_theta
+            && bc_theta_min.type == "dirichlet") {
+            double mu_nb   = getMuPolar(mu_map, i_r, j_prev_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = dr_cv / (r * mu_face * h_theta_minus);
+            local_triplets.push_back({idx, idx, -c});
+            rhs(idx) -= c * bc_theta_min.value;
         }
-        coeff_center -= (a_theta_m + a_theta_p);
 
-        // Center coefficient
-        local_triplets.push_back({idx, idx, coeff_center});
-
-        // Source term: -(Jz_coil + Jz_magnet) * r, r-weighted. Matches the full
-        // builder buildMatrixPolar (line ~11189). The magnetization bound-current
-        // term Jz_mag_map was MISSING here -> the no-load (coil J=0) magnet source
-        // vanished on the coarse path, giving b=0 / Az=0 / zero flux. This dead
-        // code was never exercised on a magnet problem before Stage 1.
+        // Source term: -(Jz_coil + Jz_magnet) * r * (CV area), matching the full
+        // builder buildMatrixPolar (line ~11189) scaled by the control-volume area.
         rhs(idx) += -(getJzPolar(jz_map, i_r, j_theta, r_orientation)
                     + getJzPolar(Jz_mag_map, i_r, j_theta, r_orientation)) * r * dr_cv * dth_cv;
     }  // end omp for
