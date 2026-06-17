@@ -11568,10 +11568,19 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
     Eigen::SparseMatrix<double> A;
     Eigen::VectorXd rhs;
 
-    // Use Galerkin projection instead of geometric coarsened matrix.
-    // buildMatrixGalerkin() auto-dispatches to Polar via updateFullMatrixCache()
-    // → buildMatrixPolar() and buildProlongationMatrix() → buildProlongationMatrixPolar().
-    buildMatrixGalerkin(A, rhs);
+    // [v1.6 Stage 1] Revive the geometric FVM non-uniform stencil as the default
+    // coarse operator (use_galerkin_coarsening default false). Per the design note
+    // at the flag: FVM's fixed point is the true physical solution, while Galerkin
+    // (A_c = P^T A_f P with bilinear P) converges to a projection fixed point that
+    // does not satisfy the PDE at material interfaces -- the Phase BK flux-1/10
+    // failure. buildMatrixPolarCoarsened builds the n_active x n_active non-uniform
+    // control-volume stencil (consistent with interpolateToFullGridPolar's
+    // coarse_to_fine indexing); buildMatrixGalerkin remains available for A/B tests.
+    if (nonlinear_config.use_galerkin_coarsening) {
+        buildMatrixGalerkin(A, rhs);
+    } else {
+        buildMatrixPolarCoarsened(A, rhs);
+    }
 
     std::cout << "Galerkin matrix size: " << A.rows() << "x" << A.cols() << std::endl;
     std::cout << "Non-zero elements: " << A.nonZeros() << std::endl;
