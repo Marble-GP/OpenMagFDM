@@ -11444,6 +11444,19 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         if (h_theta_minus < 1e-15) h_theta_minus = dtheta;
         if (h_theta_plus < 1e-15) h_theta_plus = dtheta;
 
+        // [v1.6 Stage 1c] Control-volume widths for a CONSERVATIVE finite-volume
+        // stencil. The previous per-cell second-derivative normalisation
+        // 2/(h_minus+h_plus) made the off-diagonal coefficients NON-shared across a
+        // face -> the matrix was asymmetric, AMGCL's CG broke down to NaN under the
+        // saturated mu_r 2.5..9970 contrast (Stage 1b). Multiplying the radial flux
+        // by the theta CV width (and the theta flux by the radial CV width) makes
+        // each off-diagonal a FACE-SHARED quantity (r_face, mu_face, h_face and the
+        // perpendicular CV width are all common to both cells), so the matrix is
+        // symmetric + conservative within uniform-skip regions (an SPD M-matrix),
+        // reducing to buildMatrixPolar x (dr*dtheta) on a uniform grid.
+        double dr_cv  = 0.5 * (h_minus + h_plus);        // radial CV width
+        double dth_cv = 0.5 * (h_theta_minus + h_theta_plus);  // theta CV width
+
         // Interface positions (r-weighting)
         double r_imh = r - h_minus / 2.0;  // r_{i-1/2}
         double r_iph = r + h_plus / 2.0;   // r_{i+1/2}
@@ -11460,16 +11473,16 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         double mu_inner_r = 2.0 / (1.0/mu_center_r + 1.0/mu_prev_r);
         double mu_outer_r = 2.0 / (1.0/mu_center_r + 1.0/mu_next_r);
 
-        // Non-uniform FDM radial coefficients: 2 * r_face / (μ · h_r · (h_minus + h_plus))
-        double a_im = 2.0 * r_imh / (mu_inner_r * h_minus * (h_minus + h_plus));
-        double a_ip = 2.0 * r_iph / (mu_outer_r * h_plus * (h_minus + h_plus));
+        // Conservative radial face coefficients: r_face * (1/μ_face) * dθ_cv / h_face
+        double a_im = r_imh * dth_cv / (mu_inner_r * h_minus);
+        double a_ip = r_iph * dth_cv / (mu_outer_r * h_plus);
 
         // Handle Neumann boundaries with ghost elimination
         if (i_r == 0 && bc_inner.type == "neumann") {
             if (r_imh <= 0.0) {
                 std::cerr << "Warning: r_imh <= 0 at inner Neumann BC, using mirror" << std::endl;
                 double r_imh_eff = r_iph;
-                double a_im_eff = 2.0 * r_imh_eff / (mu_inner_r * h_plus * (h_minus + h_plus));
+                double a_im_eff = r_imh_eff * dth_cv / (mu_inner_r * h_plus);  // conservative form
                 auto it_next = fine_to_coarse.find({i_next, j_theta});
                 if (it_next != fine_to_coarse.end()) {
                     local_triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
@@ -11519,9 +11532,9 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         double mu_theta_prev = 2.0 / (1.0 / mu_ij + 1.0 / mu_prev_theta);
         double mu_theta_next = 2.0 / (1.0 / mu_ij + 1.0 / mu_next_theta);
 
-        // Non-uniform FDM theta coefficients: 2 / (r · μ · h_θ · (h_θ_minus + h_θ_plus))
-        double a_theta_m = 2.0 / (r * mu_theta_prev * h_theta_minus * (h_theta_minus + h_theta_plus));
-        double a_theta_p = 2.0 / (r * mu_theta_next * h_theta_plus * (h_theta_minus + h_theta_plus));
+        // Conservative theta face coefficients: (1/μ_face) * dr_cv / (r · h_θ)
+        double a_theta_m = dr_cv / (r * mu_theta_prev * h_theta_minus);
+        double a_theta_p = dr_cv / (r * mu_theta_next * h_theta_plus);
 
         auto it_theta_prev = fine_to_coarse.find({i_r, j_prev_theta});
         auto it_theta_next = fine_to_coarse.find({i_r, j_next_theta});
@@ -11551,7 +11564,7 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
         // vanished on the coarse path, giving b=0 / Az=0 / zero flux. This dead
         // code was never exercised on a magnet problem before Stage 1.
         rhs(idx) += -(getJzPolar(jz_map, i_r, j_theta, r_orientation)
-                    + getJzPolar(Jz_mag_map, i_r, j_theta, r_orientation)) * r;
+                    + getJzPolar(Jz_mag_map, i_r, j_theta, r_orientation)) * r * dr_cv * dth_cv;
     }  // end omp for
 
         #pragma omp critical
