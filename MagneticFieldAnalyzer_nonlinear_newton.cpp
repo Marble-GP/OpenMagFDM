@@ -168,13 +168,47 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         updateMuDistribution();
     };
 
+    // [v1.6 DD warm-start] If nonlinear_solver.initial_az_path is set, load that
+    // file as the initial NK iterate and SKIP the linear init guess. This lets an
+    // outer Schwarz loop warm-start each subdomain from its previous-iterate Az so
+    // later outer iterations converge in a few NK steps. File = raw float64,
+    // row-major Az(j,i)=buf[j*ncols+i] (the Az TIFF layout; ncols=nr horizontal).
+    bool loaded_warm = false;
+    if (is_polar && !use_coarse && config["nonlinear_solver"] &&
+        config["nonlinear_solver"]["initial_az_path"]) {
+        std::string init_az_path =
+            config["nonlinear_solver"]["initial_az_path"].as<std::string>("");
+        if (!init_az_path.empty()) {
+            const int rows = (r_orientation == "horizontal") ? ntheta : nr;
+            const int cols = (r_orientation == "horizontal") ? nr : ntheta;
+            std::ifstream f(init_az_path, std::ios::binary);
+            std::vector<double> buf((size_t)rows * cols);
+            if (f && f.read(reinterpret_cast<char*>(buf.data()),
+                            (std::streamsize)buf.size() * sizeof(double))) {
+                if (Az.rows() != rows || Az.cols() != cols) Az.resize(rows, cols);
+                for (int j = 0; j < rows; ++j)
+                    for (int i = 0; i < cols; ++i)
+                        Az(j, i) = buf[(size_t)j * cols + i];
+                loaded_warm = true;
+                if (VERBOSE)
+                    std::cout << "Warm-start: loaded initial Az from " << init_az_path
+                              << " (skipping linear init guess)" << std::endl;
+            } else {
+                std::cerr << "Warning: failed to read initial_az_path '" << init_az_path
+                          << "', falling back to linear init guess" << std::endl;
+            }
+        }
+    }
+
     // Initial guess: solve linear problem with initial μ distribution. Coarse path
     // uses the FVM coarsened linear solve (sets the full interpolated member Az).
-    if (VERBOSE) {
+    if (VERBOSE && !loaded_warm) {
         std::cout << "Computing initial guess..."
                   << (use_coarse ? " [coarse-native NK active]" : "") << std::endl;
     }
-    if (use_coarse && coarse_skip_init_guess) {
+    if (loaded_warm) {
+        // member Az already holds the warm-start iterate; do not overwrite it.
+    } else if (use_coarse && coarse_skip_init_guess) {
         // [DIAGNOSTIC] member Az already holds the decimated true solution; do not
         // overwrite it with the linear coarse solve.
         std::cout << "[COARSE_TRUEINIT] starting coarse NK from the decimated true solution." << std::endl;
