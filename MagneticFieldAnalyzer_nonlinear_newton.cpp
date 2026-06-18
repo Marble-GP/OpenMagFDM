@@ -74,6 +74,34 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     std::vector<Eigen::VectorXd> Az_history;      // Az^(k) history
     std::vector<Eigen::VectorXd> g_history;       // g^(k) = Az^(k+1) - Az^(k) history
 
+    // [v1.6 Stage 2] Field-adaptive coarsening: build the coarse mask from an
+    // initial full-grid solution's |B| field (keeps saturated/high-gradient iron +
+    // air gap + boundaries fine, coarsens only smooth bulk). Must run BEFORE the
+    // use_coarse flag below so the coarse-native path picks up the new mask.
+    bool coarse_skip_init_guess = false;
+    if (adaptive_mesh_enabled && is_polar) {
+        if (std::getenv("OMFDM_COARSE_TRUEINIT")) {
+            // [DIAGNOSTIC] Start the coarse solve from the DECIMATED true (full
+            // nonlinear) solution. If the coarse residual stays small and the flux
+            // stays correct, the coarse fixed point == the true solution (so the
+            // earlier 1/6 was an initial-guess/convergence artefact). If it drifts
+            // back to ~1/6, the coarse operator's fixed point is genuinely different
+            // (a coarse mu/discretisation accuracy limit, not a bug).
+            std::cout << "[COARSE_TRUEINIT] full nonlinear solve for the true initial guess..." << std::endl;
+            adaptive_mesh_enabled = false;     // inner call runs the FULL nonlinear NK
+            solveNonlinearNewtonKrylov();      // -> member Az = true full solution
+            adaptive_mesh_enabled = true;
+            calculateMagneticFieldPolar();     // -> Br/Btheta from the true Az
+            generateAdaptiveCoarseningMask();  // mask from the true field
+            coarse_skip_init_guess = true;     // keep member Az = true solution (don't re-solve)
+        } else {
+            if (VERBOSE) std::cout << "Adaptive mesh: initial full solve for the |B| indicator..." << std::endl;
+            buildAndSolveSystemPolar();        // full linear solve -> member Az
+            calculateMagneticFieldPolar();     // -> Br, Btheta
+            generateAdaptiveCoarseningMask();  // -> active_cells / coarse_to_fine / n_active_cells / coarsening_enabled
+        }
+    }
+
     // [v1.6 Stage 1b] Coarse-native Newton-Krylov. When an adaptive coarsening
     // mask is active, run the NK on the coarse (active-cell) DOFs with the
     // geometric FVM stencil buildMatrixPolarCoarsened. mu/B stay full-resolution:
@@ -91,7 +119,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // conversion in the loop (equivalent to the previous inline code for the
     // full-grid path).
     auto syncMemberAz = [&](const Eigen::VectorXd& v) {
-        if (use_coarse) { interpolateToFullGridPolar(v); return; }
+        if (use_coarse) {
+            // [Stage 1e] Active-only scatter: write the coarse values into member Az
+            // at the active cells. The coarse curl (updateCoarseFieldAndMu) and
+            // buildMatrixPolarCoarsened only read active cells, so the O(N) full
+            // interpolation of inactive cells is NOT needed per iteration (done once
+            // at convergence for force/flux). Member Az is already full-sized from
+            // the initial guess.
+            for (int idx = 0; idx < n_active_cells; idx++) {
+                int i_r = coarse_to_fine[idx].first, j_th = coarse_to_fine[idx].second;
+                if (horiz) Az(j_th, i_r) = v(idx); else Az(i_r, j_th) = v(idx);
+            }
+            return;
+        }
         if (is_polar) {
             if (horiz) { Az.resize(ntheta, nr); for (int i=0;i<nr;i++) for(int j=0;j<ntheta;j++) Az(j,i)=v(i*ntheta+j); }
             else       { Az.resize(nr, ntheta); for (int i=0;i<nr;i++) for(int j=0;j<ntheta;j++) Az(i,j)=v(i*ntheta+j); }
@@ -119,6 +159,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         else if (is_polar) buildMatrixPolar(A, b);
         else buildMatrix(A, b);
     };
+    // [Stage 1e] Field + mu update. Coarse: B/H/mu at active cells from the COARSE
+    // curl (consistent with the coarse operator + O(n_active)); full: original path.
+    auto updateFieldAndMu = [&]() {
+        if (use_coarse) { updateCoarseFieldAndMu(); return; }
+        if (is_polar) calculateMagneticFieldPolar(); else calculateMagneticField();
+        calculateHField();
+        updateMuDistribution();
+    };
 
     // Initial guess: solve linear problem with initial μ distribution. Coarse path
     // uses the FVM coarsened linear solve (sets the full interpolated member Az).
@@ -126,7 +174,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         std::cout << "Computing initial guess..."
                   << (use_coarse ? " [coarse-native NK active]" : "") << std::endl;
     }
-    if (use_coarse) {
+    if (use_coarse && coarse_skip_init_guess) {
+        // [DIAGNOSTIC] member Az already holds the decimated true solution; do not
+        // overwrite it with the linear coarse solve.
+        std::cout << "[COARSE_TRUEINIT] starting coarse NK from the decimated true solution." << std::endl;
+    } else if (use_coarse) {
         buildAndSolveSystemPolarCoarsened();
     } else if (is_polar) {
         buildAndSolveSystemPolar();
@@ -136,13 +188,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
         // ===== Step 1: Calculate B and H fields, update μ =====
-        if (is_polar) {
-            calculateMagneticFieldPolar();
-        } else {
-            calculateMagneticField();
-        }
-        calculateHField();
-        updateMuDistribution();
+        updateFieldAndMu();
 
         // ===== Step 2: Build residual and system matrix with current μ =====
         // Coarse-native: buildMatrixForSolve -> FVM coarse operator (n_active),
@@ -222,6 +268,16 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Always print convergence message (important for user feedback)
             std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
                       << std::scientific << std::setprecision(2) << residual_rel << ")" << std::endl;
+
+            // [Stage 1e] Coarse path keeps only active cells current (active-only
+            // scatter + coarse curl). Prolong to the full grid ONCE and recompute
+            // full B/H/mu so downstream force/flux/export see a consistent full field.
+            if (use_coarse) {
+                interpolateToFullGridPolar(Az_vec);
+                calculateMagneticFieldPolar();
+                calculateHField();
+                updateMuDistribution();
+            }
 
             // [Phase BJ-8 Path D / v1.5.1] Final-output interpolation +
             // optional Laplacian smoothing + fine-finishing Newton-Picard
@@ -458,18 +514,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // Trial step: A_trial = A + α·δA
             Eigen::VectorXd Az_trial = Az_vec_0 + alpha * delta_A;
 
-            // Set member Az from the trial vector (coarse: prolong via
-            // interpolateToFullGridPolar; full: original row-major write), then
-            // recompute the full-resolution field/mu and the trial residual on
-            // the (coarse or full) operator.
+            // Set member Az from the trial vector (coarse: active-only scatter;
+            // full: row-major write), then recompute field/mu (coarse curl at active
+            // cells, or full grid) and the trial residual on the matching operator.
             syncMemberAz(Az_trial);
-            if (is_polar) {
-                calculateMagneticFieldPolar();
-            } else {
-                calculateMagneticField();
-            }
-            calculateHField();
-            updateMuDistribution();
+            updateFieldAndMu();
 
             double residual_trial_norm;
             {
@@ -569,6 +618,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     }
 
     std::cerr << "WARNING: Newton-Krylov solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
+
+    // [Stage 1e] As in the converged branch: promote the coarse solution to the
+    // full grid for downstream force/flux/export. (Az_vec is loop-scoped, so
+    // reconstruct the coarse vector from the active cells of member Az.)
+    if (use_coarse) {
+        Eigen::VectorXd Az_c; buildSolveVec(Az_c);
+        interpolateToFullGridPolar(Az_c);
+        calculateMagneticFieldPolar();
+        calculateHField();
+        updateMuDistribution();
+    }
 
     // [Phase BJ-8 Path D / v1.5.1] Hermite-interpolation fallback (coarse →
     // full + μ interpolation) was needed only when the coarsened NK could

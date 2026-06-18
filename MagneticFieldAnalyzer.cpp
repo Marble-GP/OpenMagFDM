@@ -12040,6 +12040,105 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
     // }
 }
 
+void MagneticFieldAnalyzer::updateCoarseFieldAndMu() {
+    // [v1.6 Stage 1e / A1] Coarse-consistent B/H/mu at the ACTIVE cells. B is the
+    // COARSE curl of the coarse Az (findNextActive spacing), so mu is consistent
+    // with the coarse FVM operator (which reads mu at active cells) -- this removes
+    // the A2 residual floor that gave wrong/1-of-3 flux. O(n_active) per call.
+    // Mirrors calculateMagneticFieldPolar (curl) + calculateHField + updateMuDistribution
+    // but evaluated only at active cells with the non-uniform coarse spacing.
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+    const bool horiz = (r_orientation == "horizontal");
+    const bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    const bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+
+    // Ensure Br/Btheta/H_map are allocated at the full (theta,r)/(r,theta) shape --
+    // the coarse path writes them at active cells but bypasses calculateHField /
+    // calculateMagneticFieldPolar which would otherwise size them (avoids a segfault
+    // when H_map is still empty on the first nonlinear solve).
+    const int rows = horiz ? ntheta : nr;
+    const int cols = horiz ? nr : ntheta;
+    if (Br.rows() != rows || Br.cols() != cols)         Br = Eigen::MatrixXd::Zero(rows, cols);
+    if (Btheta.rows() != rows || Btheta.cols() != cols) Btheta = Eigen::MatrixXd::Zero(rows, cols);
+    if (H_map.rows() != rows || H_map.cols() != cols)   H_map = Eigen::MatrixXd::Zero(rows, cols);
+
+    auto getAz = [&](int i_r, int j_th) -> double {
+        return horiz ? Az(j_th, i_r) : Az(i_r, j_th);
+    };
+
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // match setupMaterialProperties / rgb_to_material keys
+
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        const int i_r  = coarse_to_fine[idx].first;
+        const int j_th = coarse_to_fine[idx].second;
+        const double r = r_coords[i_r];
+        const double safe_r = (r > 1e-15) ? r : 1e-15;
+
+        // --- Br = (1/r) dAz/dtheta  (central diff over active theta neighbours) ---
+        int jp = findNextActiveTheta(i_r, j_th, -1);
+        int jn = findNextActiveTheta(i_r, j_th, +1);
+        double Az_jp = getAz(i_r, jp);
+        double Az_jn = getAz(i_r, jn);
+        if (is_antiperiodic) {
+            if (jp > j_th) Az_jp *= -1.0;   // -theta neighbour wrapped across the seam
+            if (jn < j_th) Az_jn *= -1.0;   // +theta neighbour wrapped across the seam
+        }
+        double h_th_m = calculateThetaDistance(j_th, jp);
+        double h_th_p = calculateThetaDistance(jn, j_th);
+        if (h_th_m < 1e-15) h_th_m = dtheta;
+        if (h_th_p < 1e-15) h_th_p = dtheta;
+        const double Br_val = ((Az_jn - Az_jp) / (h_th_m + h_th_p)) / safe_r;
+
+        // --- Btheta = -dAz/dr  (central over active radial neighbours; 1-sided at bnd) ---
+        int ip = findNextActiveRadial(i_r, j_th, -1);
+        int in = findNextActiveRadial(i_r, j_th, +1);
+        double dAz_dr;
+        if (ip == i_r && in == i_r)      dAz_dr = 0.0;
+        else if (ip == i_r)              dAz_dr = (getAz(in, j_th) - getAz(i_r, j_th)) / ((in - i_r) * dr);
+        else if (in == i_r)              dAz_dr = (getAz(i_r, j_th) - getAz(ip, j_th)) / ((i_r - ip) * dr);
+        else                             dAz_dr = (getAz(in, j_th) - getAz(ip, j_th)) / ((in - ip) * dr);
+        const double Bth_val = -dAz_dr;
+
+        if (horiz) { Br(j_th, i_r) = Br_val; Btheta(j_th, i_r) = Bth_val; }
+        else       { Br(i_r, j_th) = Br_val; Btheta(i_r, j_th) = Bth_val; }
+
+        const double B_mag = std::sqrt(Br_val * Br_val + Bth_val * Bth_val);
+
+        // material at this cell
+        const int img_row = horiz ? j_th : i_r;
+        const int img_col = horiz ? i_r : j_th;
+        cv::Vec3b px = image_to_use.at<cv::Vec3b>(img_row, img_col);
+        const int rgb = (px[0] << 16) | (px[1] << 8) | px[2];
+        auto lut = rgb_to_material.find(rgb);
+
+        const double mu_cur = horiz ? mu_map(j_th, i_r) : mu_map(i_r, j_th);
+
+        // H from B-H table or B/mu (mirrors calculateHField)
+        double H_mag;
+        if (lut != rgb_to_material.end()) {
+            auto bh = material_bh_tables.find(lut->second.name);
+            if (bh != material_bh_tables.end() && bh->second.is_valid)
+                H_mag = interpolateH_from_B(bh->second, B_mag);
+            else
+                H_mag = (mu_cur > 1e-20) ? B_mag / mu_cur : 0.0;
+        } else {
+            H_mag = (mu_cur > 1e-20) ? B_mag / mu_cur : 0.0;
+        }
+        if (horiz) H_map(j_th, i_r) = H_mag; else H_map(i_r, j_th) = H_mag;
+
+        // mu update (skip linear/STATIC materials)
+        if (lut != rgb_to_material.end()) {
+            auto mit = material_mu.find(lut->second.name);
+            if (mit != material_mu.end() && mit->second.type != MuType::STATIC) {
+                const double mu_new = evaluateMu(mit->second, H_mag) * MU_0;
+                if (horiz) mu_map(j_th, i_r) = mu_new; else mu_map(i_r, j_th) = mu_new;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Dynamic Jz Parsing and Evaluation
 // ============================================================================

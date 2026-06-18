@@ -764,6 +764,13 @@ private:
     double adaptive_field_tol = 0.1;        // YAML: adaptive_mesh.field_tol  [Tesla]
     int adaptive_coarsen_skip = 2;          // YAML: adaptive_mesh.skip  (block size S)
     void generateAdaptiveCoarseningMask();  // builds active_cells/cell_skip_level from |B| + material
+    // [v1.6 Stage 1e / A1] Compute B, H, mu at the ACTIVE cells from the COARSE curl
+    // of the coarse Az (findNextActive spacing), writing Br/Btheta/H_map/mu_map there.
+    // Replaces the per-iter interpolate-to-full + full-grid field/mu in the coarse NK:
+    // makes mu consistent with the coarse operator (correct flux) and is O(n_active)
+    // (per-iteration speedup). Polar only; member Az must hold the coarse values at
+    // active cells.
+    void updateCoarseFieldAndMu();
 
     // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
     Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix
