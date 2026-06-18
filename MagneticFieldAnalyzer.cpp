@@ -522,6 +522,42 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         if (bc_cfg["theta_max"]) {
             parsePolarRobinParams(bc_cfg["theta_max"], bc_theta_max);
         }
+
+        // v1.6 DD / optimized Schwarz: load optional per-theta boundary
+        // profiles for the RADIAL boundaries (inner / outer). The profile
+        // CSV holds `ntheta` numbers (whitespace/comma/newline separated),
+        // theta-index order. Dirichlet reads `value_profile`, Robin reads
+        // `gamma_profile`. Empty -> the scalar value/gamma is used (back-compat).
+        auto loadProfileCsv = [](const std::string& path, int expected) -> std::vector<double> {
+            std::vector<double> out;
+            std::ifstream f(path);
+            if (!f.is_open()) {
+                throw std::runtime_error("Boundary profile CSV not found: " + path);
+            }
+            std::string content((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+            for (char& c : content) { if (c == ',' || c == ';') c = ' '; }
+            std::stringstream ss(content);
+            double v;
+            while (ss >> v) out.push_back(v);
+            if (static_cast<int>(out.size()) != expected) {
+                throw std::runtime_error("Boundary profile '" + path + "' has " +
+                    std::to_string(out.size()) + " values, expected " +
+                    std::to_string(expected) + " (ntheta)");
+            }
+            return out;
+        };
+        auto loadRadialProfile = [&](const YAML::Node& node, BoundaryCondition& bc_out) {
+            std::string key = (bc_out.type == "robin") ? "gamma_profile" : "value_profile";
+            if (node[key]) {
+                std::string path = node[key].as<std::string>();
+                bc_out.profile = loadProfileCsv(path, ntheta);
+                std::cout << "Loaded " << key << " (" << bc_out.profile.size()
+                          << " values) from " << path << std::endl;
+            }
+        };
+        if (bc_cfg["inner"]) loadRadialProfile(bc_cfg["inner"], bc_inner);
+        if (bc_cfg["outer"]) loadRadialProfile(bc_cfg["outer"], bc_outer);
     }
 
     // Determine if theta is periodic (both theta_min and theta_max must be "periodic")
@@ -11109,44 +11145,29 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             // Radial boundary conditions (Dirichlet only handled here)
             // Neumann boundaries use ghost-elimination in interior stencil below
+            // v1.6 DD: profile[j] overrides the scalar along the boundary if present.
             if (i == 0 && bc_inner.type == "dirichlet") {
                 local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                rhs(idx) = bc_inner.value;
+                rhs(idx) = bc_inner.profile.empty() ? bc_inner.value : bc_inner.profile[j];
                 continue;
             }
 
             if (i == nr - 1 && bc_outer.type == "dirichlet") {
                 local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                rhs(idx) = bc_outer.value;
+                rhs(idx) = bc_outer.profile.empty() ? bc_outer.value : bc_outer.profile[j];
                 continue;
             }
 
-            // Robin boundary conditions for radial direction
-            // Inner boundary (i=0): outward normal is -r direction
-            // dAz/dn = -dAz/dr ≈ (Az(0,j) - Az(1,j))/dr
-            // => (alpha + beta/dr)*Az(0,j) - (beta/dr)*Az(1,j) = gamma
-            if (i == 0 && bc_inner.type == "robin") {
-                double a = bc_inner.alpha;
-                double b = bc_inner.beta;
-                double g = bc_inner.gamma;
-                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                local_triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
-
-            // Outer boundary (i=nr-1): outward normal is +r direction
-            // dAz/dn = dAz/dr ≈ (Az(nr-1,j) - Az(nr-2,j))/dr
-            // => (alpha + beta/dr)*Az(nr-1,j) - (beta/dr)*Az(nr-2,j) = gamma
-            if (i == nr - 1 && bc_outer.type == "robin") {
-                double a = bc_outer.alpha;
-                double b = bc_outer.beta;
-                double g = bc_outer.gamma;
-                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                local_triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
+            // Radial Robin boundary conditions are assembled SYMMETRICALLY inside
+            // the radial stencil below (v1.6 DD / optimized Schwarz). The boundary
+            // node keeps its full FV balance (kept radial face + theta coupling +
+            // source); only the boundary face flux is replaced by the Robin flux
+            //   r*nu/dr * (gamma - alpha*Az_B)/beta,
+            // which adds a symmetric -c*alpha/beta diagonal term (c=r*nu/dr) and an
+            // -c*gamma/beta RHS term. Off-diagonals then match the interior coupling
+            // -> SPD M-matrix (AMGCL-CG works). The OLD node-replacing form
+            //   (alpha+beta/dr)Az_B-(beta/dr)Az_{B-1}=gamma was non-symmetric +
+            //   badly scaled (CG diverged) and dropped the node's source/theta terms.
 
             // Interior points and Neumann boundary points (using ghost-elimination)
             // Polar Poisson equation with variable permeability (divergence form):
@@ -11196,6 +11217,30 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                     local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im + a_ip));
                     coeff_center -= (a_im + a_ip);
                 }
+            } else if (i == 0 && bc_inner.type == "robin") {
+                // Symmetric Robin (inner, outward normal -r): keep the OUTER radial
+                // face (-> node i+1, same a_ip as interior) and replace the inner
+                // face flux by the Robin flux r*nu/dr*(gamma-alpha*Az)/beta. Adds a
+                // symmetric -c*alpha/beta diagonal and -c*gamma/beta RHS (c=r*nu/dr).
+                // theta coupling + source are added by the common code below.
+                double a = bc_inner.alpha, b = bc_inner.beta;
+                double g = bc_inner.profile.empty() ? bc_inner.gamma : bc_inner.profile[j];
+                double c = r / (mu_current * dr);   // r_0 * nu_0 / dr
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
+                coeff_center -= a_ip;
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
+            } else if (i == nr - 1 && bc_outer.type == "robin") {
+                // Symmetric Robin (outer, outward normal +r): keep the INNER radial
+                // face (-> node i-1, same a_im as interior) and replace the outer
+                // face flux by the Robin flux. Symmetric -> SPD (AMGCL-CG works).
+                double a = bc_outer.alpha, b = bc_outer.beta;
+                double g = bc_outer.profile.empty() ? bc_outer.gamma : bc_outer.profile[j];
+                double c = r / (mu_current * dr);   // r_B * nu_B / dr
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
+                coeff_center -= a_im;
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
             } else if (i == nr - 1 && bc_outer.type == "neumann") {
                 // Ghost elimination: Az_{nr} = Az_{nr-2}
                 // Stencil: a_im·Az_{nr-2} + a_ip·Az_{nr} → (a_im + a_ip)·Az_{nr-2}
@@ -11210,15 +11255,17 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 if (!inner_neighbor_is_dirichlet) {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
                 } else {
-                    // Inner neighbor is Dirichlet: move bc value to RHS
-                    rhs(idx) -= a_im * bc_inner.value;
+                    // Inner neighbor is Dirichlet: move bc value to RHS (profile[j] if present)
+                    double bv = bc_inner.profile.empty() ? bc_inner.value : bc_inner.profile[j];
+                    rhs(idx) -= a_im * bv;
                 }
 
                 if (!outer_neighbor_is_dirichlet) {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
                 } else {
-                    // Outer neighbor is Dirichlet: move bc value to RHS
-                    rhs(idx) -= a_ip * bc_outer.value;
+                    // Outer neighbor is Dirichlet: move bc value to RHS (profile[j] if present)
+                    double bv = bc_outer.profile.empty() ? bc_outer.value : bc_outer.profile[j];
+                    rhs(idx) -= a_ip * bv;
                 }
 
                 coeff_center -= (a_im + a_ip);
@@ -11739,27 +11786,10 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
                 continue;
             }
 
-            // Handle radial boundaries (Robin)
-            // Inner boundary (i=0): outward normal is -r direction
-            if (i == 0 && bc_inner.type == "robin") {
-                double a = bc_inner.alpha;
-                double b = bc_inner.beta;
-                double g = bc_inner.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
-            // Outer boundary (i=nr-1): outward normal is +r direction
-            if (i == nr - 1 && bc_outer.type == "robin") {
-                double a = bc_outer.alpha;
-                double b = bc_outer.beta;
-                double g = bc_outer.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
+            // Radial Robin BCs assembled SYMMETRICALLY below (kept face + Robin
+            // closure), consistent with buildMatrixPolar (v1.6 DD). The boundary
+            // node keeps its kept radial face + theta + source; the boundary face
+            // is replaced by the Robin flux (nu/dx)*(gamma-alpha*Az)/beta.
 
             // Handle angular boundaries for non-periodic domains
             if (!is_periodic) {
@@ -11820,6 +11850,24 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
                     triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, coeff_ip));
                 }
                 coeff_center -= coeff_ip;
+            }
+
+            // Symmetric Robin radial closure (pseudo-Cartesian: c = nu_B/dx_pseudo).
+            // The kept radial face was added above; here we add the boundary-face
+            // Robin flux as a symmetric -c*alpha/beta diagonal + -c*gamma/beta RHS.
+            if (i == 0 && bc_inner.type == "robin") {
+                double a = bc_inner.alpha, b = bc_inner.beta;
+                double g = bc_inner.profile.empty() ? bc_inner.gamma : bc_inner.profile[j];
+                double c = 1.0 / (mu_c * dx_pseudo);
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
+            }
+            if (i == nr - 1 && bc_outer.type == "robin") {
+                double a = bc_outer.alpha, b = bc_outer.beta;
+                double g = bc_outer.profile.empty() ? bc_outer.gamma : bc_outer.profile[j];
+                double c = 1.0 / (mu_c * dx_pseudo);
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
             }
 
             // Angular direction (j ± 1)

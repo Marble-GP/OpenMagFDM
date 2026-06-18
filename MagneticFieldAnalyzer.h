@@ -536,6 +536,14 @@ private:
         double beta;          // Coefficient for dAz/dn (default: 0.0)
         double gamma;         // RHS value (default: 0.0)
 
+        // v1.6 domain-decomposition (optimized Schwarz): optional per-cell
+        // boundary profile that overrides the scalar along the boundary.
+        // For a radial boundary (inner/outer) it is indexed by theta-index j
+        // and has length ntheta; if empty the scalar value/gamma is used
+        // (backward compatible). Loaded from a CSV path in YAML:
+        //   dirichlet -> value_profile, robin -> gamma_profile.
+        std::vector<double> profile;
+
         BoundaryCondition() : type("dirichlet"), value(0.0),
                               alpha(1.0), beta(0.0), gamma(0.0) {}
     };
