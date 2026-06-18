@@ -226,6 +226,22 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         coarsen_auto_bump_skip = cs_cfg["auto_bump_skip"].as<bool>(false);
     }
 
+    // [v1.6 Stage 2] Field-adaptive coarsening config (polar). Distinct from the
+    // deprecated 'coarsening:' block: this mask is built from the |B| field after
+    // an initial solve (see generateAdaptiveCoarseningMask / the NK loop). The
+    // eligible materials are still those with `coarsen: true` (material_coarsen).
+    if (config["adaptive_mesh"]) {
+        auto am = config["adaptive_mesh"];
+        adaptive_mesh_enabled = am["enabled"].as<bool>(false);
+        adaptive_field_tol    = evaluateScalarAsDouble(am["field_tol"], 0.1);
+        adaptive_coarsen_skip = evaluateScalarAsInt(am["skip"], 2);
+        if (adaptive_mesh_enabled) {
+            std::cout << "Adaptive mesh enabled: field_tol=" << adaptive_field_tol
+                      << " T, block skip=" << adaptive_coarsen_skip
+                      << " (coarsens smooth coarsen:true regions after an initial solve)" << std::endl;
+        }
+    }
+
     // Determine coordinate system
     coordinate_system = config["coordinate_system"].as<std::string>("cartesian");
     std::cout << "Coordinate system: " << coordinate_system << std::endl;
@@ -2753,6 +2769,20 @@ void MagneticFieldAnalyzer::generateCoarseningMask() {
     // Generate mask of active cells based on material coarsening settings
     // Cells on or near boundaries are always kept active
 
+    // [v1.6 Stage 2] Field-adaptive mode defers mask generation to the NK loop
+    // (the mask needs the |B| field from an initial solve). Start all-active so the
+    // initial guess runs on the full grid; generateAdaptiveCoarseningMask() then
+    // builds the real mask.
+    if (adaptive_mesh_enabled && coordinate_system == "polar") {
+        active_cells.resize(ntheta, nr);
+        active_cells.setConstant(true);
+        cell_skip_level.resize(ntheta, nr);
+        cell_skip_level.setConstant(1);
+        n_active_cells = nr * ntheta;
+        std::cout << "Adaptive mesh: deferring coarsening mask to NK (after initial solve)." << std::endl;
+        return;
+    }
+
     if (!coarsening_enabled) {
         // No coarsening - all cells are active
         if (coordinate_system == "polar") {
@@ -3129,6 +3159,79 @@ void MagneticFieldAnalyzer::polarToImageIndices(int i_r, int j_theta, int& img_i
         img_i = j_theta;
         img_j = i_r;
     }
+}
+
+void MagneticFieldAnalyzer::generateAdaptiveCoarseningMask() {
+    // [v1.6 Stage 2] Build the coarse mask from the current |B| field. A skip-S
+    // block is coarsened only if (a) every cell in it is the SAME material, (b)
+    // that material is coarsen-eligible (coarsen:true), and (c) the |B| variation
+    // within the block is < adaptive_field_tol; blocks touching a radial domain
+    // boundary are kept fine. Hence saturated / high-gradient iron stays fine
+    // (mu well-resolved -> correct flux), the air gap stays fine (air is
+    // coarsen:false), and only smooth bulk iron is coarsened (the DOF reduction).
+    // Requires Br/Btheta -> call after an initial solve + calculateMagneticFieldPolar.
+    active_cells.resize(ntheta, nr);
+    active_cells.setConstant(true);
+    cell_skip_level.resize(ntheta, nr);
+    cell_skip_level.setConstant(1);
+
+    const bool horiz = (r_orientation == "horizontal");
+    auto Bmag = [&](int i_r, int j_th) -> double {
+        double br = horiz ? Br(j_th, i_r) : Br(i_r, j_th);
+        double bt = horiz ? Btheta(j_th, i_r) : Btheta(i_r, j_th);
+        return std::sqrt(br * br + bt * bt);
+    };
+
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // match setupMaterialProperties / rgb_to_material keys
+    auto cellRGB = [&](int i_r, int j_th) -> int {
+        int img_row = horiz ? j_th : i_r;
+        int img_col = horiz ? i_r : j_th;
+        if (img_row < 0 || img_row >= image_to_use.rows ||
+            img_col < 0 || img_col >= image_to_use.cols) return -1;
+        cv::Vec3b px = image_to_use.at<cv::Vec3b>(img_row, img_col);
+        return (px[0] << 16) | (px[1] << 8) | px[2];
+    };
+    auto eligible = [&](int rgb) -> bool {
+        auto lut = rgb_to_material.find(rgb);
+        if (lut == rgb_to_material.end()) return false;
+        auto mc = material_coarsen.find(lut->second.name);
+        return (mc != material_coarsen.end() && mc->second.enabled);
+    };
+
+    const int S = std::max(2, adaptive_coarsen_skip);
+    long coarsened = 0;
+    for (int i0 = 0; i0 + S <= nr; i0 += S) {
+        if (i0 == 0) continue;             // keep inner boundary block fine
+        if (i0 + S > nr - 1) continue;     // keep outer boundary block fine
+        for (int j0 = 0; j0 + S <= ntheta; j0 += S) {
+            int ref_rgb = cellRGB(i0, j0);
+            if (ref_rgb < 0 || !eligible(ref_rgb)) continue;
+            bool ok = true;
+            double bmin = 1e30, bmax = -1e30;
+            for (int ii = i0; ii < i0 + S && ok; ii++) {
+                for (int jj = j0; jj < j0 + S; jj++) {
+                    if (cellRGB(ii, jj) != ref_rgb) { ok = false; break; }
+                    double b = Bmag(ii, jj);
+                    if (b < bmin) bmin = b;
+                    if (b > bmax) bmax = b;
+                }
+            }
+            if (ok && (bmax - bmin) < adaptive_field_tol) {
+                for (int ii = i0; ii < i0 + S; ii++)
+                    for (int jj = j0; jj < j0 + S; jj++)
+                        if (!(ii == i0 && jj == j0)) { active_cells(jj, ii) = false; coarsened++; }
+            }
+        }
+    }
+
+    n_active_cells = static_cast<int>(static_cast<long>(nr) * ntheta - coarsened);
+    coarsening_enabled = (n_active_cells < nr * ntheta);
+    std::cout << "[adaptive mask] active " << n_active_cells << " / " << (nr * ntheta)
+              << " (" << std::fixed << std::setprecision(1)
+              << (100.0 * n_active_cells / (nr * ntheta)) << "%), skip=" << S
+              << ", field_tol=" << adaptive_field_tol << " T" << std::endl;
+    buildCoarseIndexMaps();
 }
 
 void MagneticFieldAnalyzer::buildCoarseIndexMaps() {

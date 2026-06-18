@@ -754,6 +754,17 @@ private:
     int coarsen_smooth_iterations = 0;   // Post-interpolation Laplacian smoothing iterations (YAML: coarsening.smooth_iterations)
     bool coarsen_auto_bump_skip = false; // [Phase BJ-4] When true, calculateOptimalSkipRatios bumps min(skip_x, skip_y) to 2 if the rounding would have produced 1, preventing silent no-op coarsening at the cost of overshooting the requested ratio. Opt-in only because the Phase 6 + Galerkin path that the bumped mask routes through has a known accuracy regression on saturated nonlinear polar problems (see README "適応粗大化が IEEJ-D class motor で有効でない理由"). YAML: coarsening.auto_bump_skip
 
+    // [v1.6 Stage 2] Field-adaptive material-conforming coarsening (polar).
+    // When enabled, the coarse mask is built AFTER an initial full solve from the
+    // |B| field: a block is coarsened only if it is material-homogeneous, the
+    // material is coarsen-eligible, and the |B| variation within it is below
+    // adaptive_field_tol [T] -- so saturated / high-gradient iron + air gap +
+    // boundaries stay fine (correct mu) while smooth bulk iron is coarsened.
+    bool adaptive_mesh_enabled = false;     // YAML: adaptive_mesh.enabled
+    double adaptive_field_tol = 0.1;        // YAML: adaptive_mesh.field_tol  [Tesla]
+    int adaptive_coarsen_skip = 2;          // YAML: adaptive_mesh.skip  (block size S)
+    void generateAdaptiveCoarseningMask();  // builds active_cells/cell_skip_level from |B| + material
+
     // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
     Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix
     Eigen::VectorXd rhs_full_cached;              // Cached full-grid RHS
