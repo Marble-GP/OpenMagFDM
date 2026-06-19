@@ -193,21 +193,30 @@ int main(int argc,char**argv){
     auto rcores=split(NR,Nr), tcores=split(NTH,Nth);
     std::cerr<<"=== DD Nr="<<Nr<<" Nth="<<Nth<<" ov="<<ov<<" p="<<p<<" ("<<Nr*Nth<<" patches) ===\n";
 
-    struct Patch{ int er0,er1,et0,et1,cr0,cr1,ct0,ct1; std::vector<int> tr; std::unique_ptr<MagneticFieldAnalyzer> an; };
+    // per-patch coarsening: cf>1 for patches NOT overlapping the gap/coil radial cols (env DD_GRID_CF,
+    // DD_FINE_LO:DD_FINE_HI keep-fine col range). 2D mortar (theta+r) down/up-sample.
+    int GCF = getenv("DD_GRID_CF") ? atoi(getenv("DD_GRID_CF")) : 1;
+    int finelo=200, finehi=330; if(getenv("DD_FINE")) sscanf(getenv("DD_FINE"),"%d:%d",&finelo,&finehi);
+    struct Patch{ int er0,er1,et0,et1,cr0,cr1,ct0,ct1,cf,nthc,nrc; std::unique_ptr<MagneticFieldAnalyzer> an; };
     std::vector<Patch> P;
     system("mkdir -p dd_tmp");
     long agg_dof=0; int pid=0;
+    auto flip=[&](int gt){ return ((NTH-1-(gt%NTH))%NTH+NTH)%NTH; };
     for(auto[ra0,ra1]:rcores){
         int er0=std::max(0,ra0-ov), er1=std::min(NR,ra1+ov);
+        // keep fine if the CORE r-band overlaps [finelo,finehi] (gap+coils); else coarsen by GCF
+        int cf = (ra1>finelo && ra0<finehi) ? 1 : std::max(1,GCF);
         for(auto[tb0,tb1]:tcores){
-            Patch q; q.er0=er0;q.er1=er1;q.cr0=ra0;q.cr1=ra1;q.ct0=tb0;q.ct1=tb1;
+            Patch q; q.er0=er0;q.er1=er1;q.cr0=ra0;q.cr1=ra1;q.ct0=tb0;q.ct1=tb1; q.cf=cf;
             if(Nth==1){q.et0=0;q.et1=NTH;} else {q.et0=tb0-ov;q.et1=tb1+ov;}
             int nthx=q.et1-q.et0, nrx=er1-er0;
-            for(int m=0;m<nthx;m++) q.tr.push_back((((q.et0+m)%NTH)+NTH)%NTH);
-            agg_dof += (long)nthx*nrx;
-            cv::Mat crop(nthx,nrx,CV_8UC3);
-            for(int m=0;m<nthx;m++){ int g=q.tr[nthx-1-m]; int ir=((NTH-1-g)%NTH+NTH)%NTH;
-                for(int c=0;c<nrx;c++) crop.at<cv::Vec3b>(m,c)=img.at<cv::Vec3b>(ir,er0+c); }
+            q.nthc=std::max(2,nthx/cf); q.nrc=std::max(2,nrx/cf);
+            agg_dof += (long)q.nthc*q.nrc;
+            // clean coarse crop: solver grid (mc,cc) <-> global theta [et0+mc*cf..], col [er0+cc*cf..];
+            // bake in the solver's grid<->image flip. cf=1 reduces exactly to the C1 crop.
+            cv::Mat crop(q.nthc,q.nrc,CV_8UC3);
+            for(int r=0;r<q.nthc;r++){ int gt=q.et0+(q.nthc-1-r)*cf+cf/2; int ir=flip(gt);
+                for(int cc=0;cc<q.nrc;cc++){ int gc=std::min(er0+cc*cf+cf/2,er1-1); crop.at<cv::Vec3b>(r,cc)=img.at<cv::Vec3b>(ir,gc); } }
             cv::Mat cb; cv::cvtColor(crop,cb,cv::COLOR_RGB2BGR);
             std::string png="dd_tmp/p"+std::to_string(pid)+".png"; cv::imwrite(png,cb);
             YAML::Node cfg=YAML::Clone(base);
@@ -243,26 +252,29 @@ int main(int argc,char**argv){
     auto tloop=Clock::now(); int it=0; double err=1.0;
     for(it=1; it<=maxo; ++it){
         for(auto&q:P){
-            int nthx=q.et1-q.et0, nrx=q.er1-q.er0;
-            std::vector<double> gin(nthx,0),gout(nthx,0),gtmin(nrx,0),gtmax(nrx,0);
-            for(int m=0;m<nthx;m++){ int gt=q.tr[m];
-                if(q.er0!=0)      gin[m] =p*PR*Gat(gt,q.er0)   -(Gat(gt,q.er0)-Gat(gt,q.er0-1))/DR;
-                if(q.er1-1!=NR-1) gout[m]=p*PR*Gat(gt,q.er1-1) +(Gat(gt,q.er1)-Gat(gt,q.er1-1))/DR; }
-            if(Nth>1){ int g0=q.tr.front(),g1=q.tr.back(); int g0m=((g0-1)%NTH+NTH)%NTH,g1p=(g1+1)%NTH;
-                for(int c=0;c<nrx;c++){ gtmin[c]=p*Gat(g0,q.er0+c)-(Gat(g0,q.er0+c)-Gat(g0m,q.er0+c))/DTH;
-                    gtmax[c]=p*Gat(g1,q.er0+c)+(Gat(g1p,q.er0+c)-Gat(g1,q.er0+c))/DTH; } }
+            int cf=q.cf;
+            // theta-avg over coarse cell j's fine global theta range; r-avg over coarse cell i's cols
+            auto Gth=[&](int j,int c)->double{ double s=0; for(int t=0;t<cf;t++) s+=Gat(q.et0+j*cf+t,c); return s/cf; };
+            std::vector<double> gin(q.nthc,0),gout(q.nthc,0),gtmin(q.nrc,0),gtmax(q.nrc,0);
+            for(int j=0;j<q.nthc;j++){
+                if(q.er0!=0)      gin[j] =p*PR*Gth(j,q.er0)   -(Gth(j,q.er0)-Gth(j,q.er0-1))/DR;
+                if(q.er1-1!=NR-1) gout[j]=p*PR*Gth(j,q.er1-1) +(Gth(j,q.er1)-Gth(j,q.er1-1))/DR; }
+            if(Nth>1){ int t0=q.et0, t1=q.et0+(q.nthc-1)*cf+cf/2;  // boundary cell-center global thetas
+                for(int i=0;i<q.nrc;i++){ int c=std::min(q.er0+i*cf+cf/2,q.er1-1);
+                    gtmin[i]=p*Gat(t0,c)         -(Gat(t0,c)-Gat(t0-cf,c))/(cf*DTH);
+                    gtmax[i]=p*Gat(t1,c)         +(Gat(t1+cf,c)-Gat(t1,c))/(cf*DTH); } }
             if(q.er0!=0)      q.an->setBoundaryProfile("inner",gin);
             if(q.er1-1!=NR-1) q.an->setBoundaryProfile("outer",gout);
             if(Nth>1){ q.an->setBoundaryProfile("theta_min",gtmin); q.an->setBoundaryProfile("theta_max",gtmax); }
-            Eigen::MatrixXd pAz(nthx,nrx);
-            for(int m=0;m<nthx;m++)for(int c=0;c<nrx;c++) pAz(m,c)=Gat(q.tr[m],q.er0+c);
+            Eigen::MatrixXd pAz(q.nthc,q.nrc);
+            for(int j=0;j<q.nthc;j++)for(int i=0;i<q.nrc;i++) pAz(j,i)=Gat(q.et0+j*cf+cf/2,std::min(q.er0+i*cf+cf/2,q.er1-1));
             q.an->setAz(pAz); q.an->solve();
             const Eigen::MatrixXd& sol=q.an->getAz();
-            for(int m=0;m<nthx;m++){ int gug=q.et0+m; int gt=q.tr[m];
-                bool core_t=(Nth==1)||(q.ct0<=gug&&gug<q.ct1);
-                if(!core_t) continue;
-                for(int c=0;c<nrx;c++){ int gc=q.er0+c;
-                    if(q.cr0<=gc&&gc<q.cr1) G(((gt%NTH)+NTH)%NTH,gc)=sol(m,c); } }
+            // write CORE back to fine G (piecewise-constant upsample over each coarse cell)
+            for(int j=0;j<q.nthc;j++) for(int t=0;t<cf;t++){ int gug=q.et0+j*cf+t; int gt=((gug%NTH)+NTH)%NTH;
+                if(Nth>1 && !(q.ct0<=gug&&gug<q.ct1)) continue;
+                for(int i=0;i<q.nrc;i++) for(int s=0;s<cf;s++){ int gc=q.er0+i*cf+s;
+                    if(gc>=q.er1) continue; if(q.cr0<=gc&&gc<q.cr1) G(gt,gc)=sol(j,i); } }
         }
         err=(G-Gref).cwiseAbs().maxCoeff()/denom;
         // flux from G via the full analyzer's material map
