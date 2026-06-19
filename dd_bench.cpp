@@ -19,6 +19,9 @@
 #include <fstream>
 #include <cmath>
 #include <memory>
+#include <array>
+#include <cstdio>
+#include <cstdlib>
 
 using Clock = std::chrono::steady_clock;
 static double secs(Clock::time_point a, Clock::time_point b){ return std::chrono::duration<double>(b-a).count(); }
@@ -60,6 +63,82 @@ int main(int argc,char**argv){
     // ---------- load image (RGB) + base config ----------
     cv::Mat bgr=cv::imread(img_path,cv::IMREAD_COLOR), img; cv::cvtColor(bgr,img,cv::COLOR_BGR2RGB);
     YAML::Node base=YAML::LoadFile(base_cfg);
+
+    // ===================== BANDED COARSENING MODE (radial bands, theta periodic) =====================
+    // DD_BANDS="c0:c1:cf,c0:c1:cf,..." -> material-aligned radial bands; smooth bands solved on a cf x
+    // downsampled own grid; radial Robin transmission with mortar (theta/r up/down-sample across the
+    // resolution jump). Nth ignored (theta periodic per band). This is the DOF-reduction lever.
+    if (const char* be = getenv("DD_BANDS")) {
+        std::vector<std::array<int,3>> bands;  // {c0,c1,cf}
+        { std::string s(be); size_t i=0; while(i<s.size()){ int c0,c1,cfb; sscanf(s.c_str()+i,"%d:%d:%d",&c0,&c1,&cfb);
+            bands.push_back({c0,c1,cfb}); size_t n=s.find(',',i); if(n==std::string::npos)break; i=n+1; } }
+        struct Band{ int c0,c1,cf,er0,er1,nth,nrb; std::unique_ptr<MagneticFieldAnalyzer> an; };
+        std::vector<Band> B; system("mkdir -p dd_tmp"); long agg=0; int bid=0;
+        for(auto&bd:bands){ Band b; b.c0=bd[0];b.c1=bd[1];b.cf=bd[2];
+            b.er0=std::max(0,bd[0]-ov*bd[2]); b.er1=std::min(NR,bd[1]+ov*bd[2]);   // overlap in fine cols
+            b.nth=NTH/b.cf; b.nrb=std::max(2,(b.er1-b.er0)/b.cf);
+            agg += (long)b.nth*b.nrb;
+            cv::Mat crop(NTH, b.er1-b.er0, CV_8UC3);   // full theta, ext cols (RGB)
+            for(int j=0;j<NTH;j++) for(int c=0;c<b.er1-b.er0;c++) crop.at<cv::Vec3b>(j,c)=img.at<cv::Vec3b>((NTH-1-j),b.er0+c);
+            cv::Mat cs; cv::resize(crop, cs, cv::Size(b.nrb,b.nth), 0,0, cv::INTER_NEAREST);
+            cv::Mat cb; cv::cvtColor(cs,cb,cv::COLOR_RGB2BGR);
+            std::string png="dd_tmp/b"+std::to_string(bid)+".png"; cv::imwrite(png,cb);
+            YAML::Node cfg=YAML::Clone(base);
+            cfg["polar_domain"]["r_start"]=RS+b.er0*DR; cfg["polar_domain"]["r_end"]=RS+(b.er1-1)*DR;
+            cfg["polar_domain"]["theta_range"]="2*pi"; cfg["polar_domain"]["theta_offset"]=0.0;
+            if(cfg["transient"])cfg["transient"]["enabled"]=false;
+            if(cfg["nonlinear_solver"])cfg["nonlinear_solver"]["verbose"]=false;
+            YAML::Node bc(YAML::NodeType::Map);
+            auto ed=[&](const char*e,const char*t,double a){ YAML::Node n(YAML::NodeType::Map); n["type"]=std::string(t);
+                if(std::string(t)=="robin"){n["alpha"]=a;n["beta"]=1.0;n["gamma"]=0.0;} else if(std::string(t)=="dirichlet")n["value"]=0; else n["value"]=1; bc[e]=n; };
+            ed("inner", b.er0==0?"dirichlet":"robin", p*PR);
+            ed("outer", b.er1-1==NR-1?"dirichlet":"robin", p*PR);
+            ed("theta_min","periodic",0); ed("theta_max","periodic",0);
+            cfg["polar_boundary_conditions"]=bc;
+            std::string yp="dd_tmp/b"+std::to_string(bid)+".yaml"; std::ofstream(yp)<<cfg;
+            b.an=std::make_unique<MagneticFieldAnalyzer>(yp,png); b.an->setDDWarmStart(true);
+            B.push_back(std::move(b)); bid++;
+        }
+        std::cerr<<"banded: "<<B.size()<<" bands, aggregate DOF="<<agg<<" ("<<100.0*agg/(NTH*NR)<<"% of monolithic)\n";
+        Eigen::MatrixXd G=Eigen::MatrixXd::Zero(NTH,NR);
+        auto tl=Clock::now(); int it=0; double err=1.0;
+        for(it=1; it<=maxo; ++it){
+            for(auto&b:B){
+                // ---- mortar gamma: downsample fine G edge traces to band theta ----
+                std::vector<double> gin(b.nth,0),gout(b.nth,0);
+                for(int mb=0;mb<b.nth;mb++){ double ui=0,di=0,uo=0,doo=0; int n=b.cf;
+                    for(int t=0;t<b.cf;t++){ int j=mb*b.cf+t;
+                        if(b.er0!=0){ ui+=G(j,b.er0); di+=(G(j,b.er0)-G(j,b.er0-1))/DR; }
+                        if(b.er1-1!=NR-1){ uo+=G(j,b.er1-1); doo+=(G(j,b.er1)-G(j,b.er1-1))/DR; } }
+                    if(b.er0!=0)      gin[mb]=p*PR*(ui/n)-(di/n);
+                    if(b.er1-1!=NR-1) gout[mb]=p*PR*(uo/n)+(doo/n); }
+                if(b.er0!=0)      b.an->setBoundaryProfile("inner",gin);
+                if(b.er1-1!=NR-1) b.an->setBoundaryProfile("outer",gout);
+                // ---- warm start: sample G into band grid ----
+                Eigen::MatrixXd pAz(b.nth,b.nrb);
+                for(int mb=0;mb<b.nth;mb++)for(int kb=0;kb<b.nrb;kb++){
+                    int j=mb*b.cf+b.cf/2; int c=b.er0+(int)std::llround((double)kb*(b.er1-1-b.er0)/(b.nrb-1));
+                    pAz(mb,kb)=G(std::min(j,NTH-1),std::min(c,NR-1)); }
+                b.an->setAz(pAz); b.an->solve();
+                const Eigen::MatrixXd& sol=b.an->getAz();
+                // ---- write CORE back to fine G (nearest-neighbor upsample) ----
+                for(int j=0;j<NTH;j++){ int mb=j/b.cf; if(mb>=b.nth)mb=b.nth-1;
+                    for(int c=b.c0;c<b.c1;c++){ int kb=(int)std::llround((double)(c-b.er0)*(b.nrb-1)/(b.er1-1-b.er0));
+                        kb=std::max(0,std::min(kb,b.nrb-1)); G(j,c)=sol(mb,kb); } }
+            }
+            err=(G-Gref).cwiseAbs().maxCoeff()/denom; full.setAz(G);
+            double ea=std::abs((full.fluxLinkageMaterialPair(ph[0].a,ph[0].b)-fref[0])/(std::abs(fref[0])+1e-30));
+            std::cerr<<"outer "<<it<<": err_vs_mono="<<err<<" PhiA_err="<<ea<<" cum_wall="<<secs(tl,Clock::now())<<"s\n";
+            if(err<tol) break;
+        }
+        double tloopb=secs(tl,Clock::now()); full.setAz(G);
+        std::cerr<<"=== BANDED DONE outer="<<it<<" err="<<err<<" ===\nflux: ";
+        for(int k=0;k<3;k++){ double f=full.fluxLinkageMaterialPair(ph[k].a,ph[k].b);
+            std::cerr<<ph[k].n<<"="<<f<<"(err "<<std::abs((f-fref[k])/(std::abs(fref[k])+1e-30))*100<<"%) "; }
+        std::cerr<<"\nWALL: monolithic="<<t_full<<"s DD_loop="<<tloopb<<"s speedup="<<t_full/tloopb<<"x aggDOF="<<100.0*agg/(NTH*NR)<<"%\n";
+        return 0;
+    }
+
     auto rcores=split(NR,Nr), tcores=split(NTH,Nth);
     std::cerr<<"=== DD Nr="<<Nr<<" Nth="<<Nth<<" ov="<<ov<<" p="<<p<<" ("<<Nr*Nth<<" patches) ===\n";
 
