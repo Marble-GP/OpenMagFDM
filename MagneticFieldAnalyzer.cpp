@@ -11286,6 +11286,34 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             // Simplified using cell-centered μ (for θ-varying μ, use interface values)
             // double coeff_theta = 1.0 / (r * r * mu_current * dtheta * dtheta);
 
+            // v1.6 DD: symmetric theta-Robin at a theta-sector boundary node. Keep the interior
+            // theta face; replace the boundary theta face by the Robin flux (c_th = 1/(r*mu*dtheta)),
+            // adding a symmetric -c_th*alpha/beta diagonal + -c_th*gamma/beta RHS. profile[i] is per-r.
+            if (!is_periodic && j == 0 && bc_theta_min.type == "robin") {
+                double mu_ij = getMuPolar(mu_map, i, j, r_orientation);
+                double mu_next = getMuPolar(mu_map, i, j + 1, r_orientation);
+                double mu_tn = 2.0 / (1.0 / mu_ij + 1.0 / mu_next);
+                double ct_next = 1.0 / (r * mu_tn * dtheta * dtheta);
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + (j + 1), ct_next));
+                coeff_center -= ct_next;
+                double a = bc_theta_min.alpha, b = bc_theta_min.beta;
+                double g = bc_theta_min.profile.empty() ? bc_theta_min.gamma : bc_theta_min.profile[i];
+                double c_th = 1.0 / (r * mu_current * dtheta);
+                coeff_center -= c_th * a / b;
+                rhs(idx) -= c_th * g / b;
+            } else if (!is_periodic && j == ntheta - 1 && bc_theta_max.type == "robin") {
+                double mu_ij = getMuPolar(mu_map, i, j, r_orientation);
+                double mu_prev = getMuPolar(mu_map, i, j - 1, r_orientation);
+                double mu_tp = 2.0 / (1.0 / mu_ij + 1.0 / mu_prev);
+                double ct_prev = 1.0 / (r * mu_tp * dtheta * dtheta);
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + (j - 1), ct_prev));
+                coeff_center -= ct_prev;
+                double a = bc_theta_max.alpha, b = bc_theta_max.beta;
+                double g = bc_theta_max.profile.empty() ? bc_theta_max.gamma : bc_theta_max.profile[i];
+                double c_th = 1.0 / (r * mu_current * dtheta);
+                coeff_center -= c_th * a / b;
+                rhs(idx) -= c_th * g / b;
+            } else {
             // Determine neighbor indices for angular direction
             // For periodic boundary: use modulo wrapping (% ntheta)
             // For sector domain: boundaries already handled, interior points use simple ±1
@@ -11341,6 +11369,7 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             }
 
             coeff_center -= (coeff_theta_prev + coeff_theta_next);
+            }  // end else (interior / theta-Dirichlet theta term; theta-Robin handled above)
 
             // Center coefficient
             local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
