@@ -6556,6 +6556,39 @@ void MagneticFieldAnalyzer::solve() {
     }
 }
 
+// ---- v1.6 domain-decomposition accessors ----
+void MagneticFieldAnalyzer::setBoundaryProfile(const std::string& edge,
+                                               const std::vector<double>& prof) {
+    if      (edge == "inner")     bc_inner.profile     = prof;
+    else if (edge == "outer")     bc_outer.profile     = prof;
+    else if (edge == "theta_min") bc_theta_min.profile = prof;
+    else if (edge == "theta_max") bc_theta_max.profile = prof;
+    else throw std::runtime_error("setBoundaryProfile: unknown edge '" + edge + "'");
+}
+
+double MagneticFieldAnalyzer::fluxLinkageMaterialPair(int key_a, int key_b) const {
+    // Polar r-weighted material-pair flux linkage from the current Az (mirrors
+    // calculateFluxLinkage's polar branch): Phi = <Az>_a - <Az>_b, weight = r.
+    double sum_a = 0.0, sum_b = 0.0, w_a = 0.0, w_b = 0.0;
+    const int img_rows = image.rows, img_cols = image.cols;
+    const bool horiz = (r_orientation == "horizontal");
+    const int grid_rows = horiz ? ntheta : nr;
+    const int grid_cols = horiz ? nr : ntheta;
+    for (int j = 0; j < grid_rows && j < img_rows; ++j) {
+        for (int i = 0; i < grid_cols && i < img_cols; ++i) {
+            const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
+            const int key = (int(px[0]) << 16) | (int(px[1]) << 8) | int(px[2]);
+            const int i_r = horiz ? i : j;
+            const double r_phys = r_start + i_r * dr;
+            if      (key == key_a) { sum_a += Az(j, i) * r_phys; w_a += r_phys; }
+            else if (key == key_b) { sum_b += Az(j, i) * r_phys; w_b += r_phys; }
+        }
+    }
+    const double ma = (w_a > 0.0) ? sum_a / w_a : 0.0;
+    const double mb = (w_b > 0.0) ? sum_b / w_b : 0.0;
+    return ma - mb;
+}
+
 void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs) {
     // Build FDM system matrix and right-hand side (Cartesian coordinates)
     int n = nx * ny;

@@ -61,6 +61,26 @@ public:
      */
     void solve();
 
+    // ---- v1.6 domain-decomposition accessors (used by the dd_bench orchestrator) ----
+    // Persistent patch instances re-solved per Schwarz sweep: read/write Az, update the
+    // per-edge transmission profile, and query the polar geometry.
+    void setAz(const Eigen::MatrixXd& a) { Az = a; }
+    int getNr() const { return nr; }
+    int getNtheta() const { return ntheta; }
+    double getDr() const { return dr; }
+    double getDtheta() const { return dtheta; }
+    double getRStart() const { return r_start; }
+    double getREnd() const { return r_end; }
+    std::string getROrientation() const { return r_orientation; }
+    // Update a radial (inner/outer, len ntheta) or theta (theta_min/theta_max, len nr) transmission
+    // profile in-place between Schwarz sweeps. edge in {inner,outer,theta_min,theta_max}.
+    void setBoundaryProfile(const std::string& edge, const std::vector<double>& prof);
+    // r-weighted material-pair flux linkage from the CURRENT Az (polar): <Az>_a - <Az>_b.
+    double fluxLinkageMaterialPair(int rgb_key_a, int rgb_key_b) const;
+    // When true, solveNonlinearNewtonKrylov starts the NK from the current member Az (warm) and
+    // SKIPS the linear init guess -- for the DD Schwarz outer loop's per-patch re-solves.
+    void setDDWarmStart(bool b) { dd_warm_start_ = b; }
+
     /**
      * @brief Export all results to folder structure
      * @param base_folder Base folder name (e.g., "output")
@@ -567,6 +587,7 @@ private:
                                 // at the correct GLOBAL angle. theta_phys = j_theta*dtheta + theta_offset.
     std::string r_orientation;  // "horizontal" or "vertical"
     std::vector<double> r_coords;  // Radial coordinates
+    bool dd_warm_start_ = false;   // v1.6 DD: NK warm-starts from member Az, skips init guess
 
     // Boundary conditions
     BoundaryCondition bc_left, bc_right, bc_bottom, bc_top;  // Cartesian

@@ -174,7 +174,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // later outer iterations converge in a few NK steps. File = raw float64,
     // row-major Az(j,i)=buf[j*ncols+i] (the Az TIFF layout; ncols=nr horizontal).
     bool loaded_warm = false;
-    if (is_polar && !use_coarse && config["nonlinear_solver"] &&
+    if (dd_warm_start_ && is_polar && !use_coarse) {
+        // v1.6 DD: the orchestrator already set member Az to the warm iterate -> use it, skip init.
+        loaded_warm = true;
+        if (VERBOSE) std::cout << "DD warm-start: NK from member Az (skip init guess)" << std::endl;
+    }
+    if (!loaded_warm && is_polar && !use_coarse && config["nonlinear_solver"] &&
         config["nonlinear_solver"]["initial_az_path"]) {
         std::string init_az_path =
             config["nonlinear_solver"]["initial_az_path"].as<std::string>("");
