@@ -389,6 +389,9 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         r_start = config["polar_domain"]["r_start"].as<double>(0.01);
         r_end = config["polar_domain"]["r_end"].as<double>(1.0);
         r_orientation = config["polar_domain"]["r_orientation"].as<std::string>("horizontal");
+        // v1.6 DD: absolute angle of local theta=0 (radians); lets a theta-sector subdomain
+        // place theta-dependent sources (magnetization atan2) at the correct global angle.
+        theta_offset = config["polar_domain"]["theta_offset"].as<double>(0.0);
 
         // Parse theta_range (supports tinyexpr formula like "2*pi" or "pi/2", or numeric values)
         if (config["polar_domain"]["theta_range"]) {
@@ -547,17 +550,23 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
             }
             return out;
         };
-        auto loadRadialProfile = [&](const YAML::Node& node, BoundaryCondition& bc_out) {
+        // Radial (inner/outer) profiles are indexed by theta-index j (length ntheta);
+        // theta (theta_min/theta_max) profiles are indexed by radial-index i (length nr).
+        // This lets a 2D rectangular sub-domain take transmission data on ALL four edges
+        // (v1.6 2D patch domain decomposition).
+        auto loadAxisProfile = [&](const YAML::Node& node, BoundaryCondition& bc_out, int expected) {
             std::string key = (bc_out.type == "robin") ? "gamma_profile" : "value_profile";
             if (node[key]) {
                 std::string path = node[key].as<std::string>();
-                bc_out.profile = loadProfileCsv(path, ntheta);
+                bc_out.profile = loadProfileCsv(path, expected);
                 std::cout << "Loaded " << key << " (" << bc_out.profile.size()
                           << " values) from " << path << std::endl;
             }
         };
-        if (bc_cfg["inner"]) loadRadialProfile(bc_cfg["inner"], bc_inner);
-        if (bc_cfg["outer"]) loadRadialProfile(bc_cfg["outer"], bc_outer);
+        if (bc_cfg["inner"])     loadAxisProfile(bc_cfg["inner"],     bc_inner,     ntheta);
+        if (bc_cfg["outer"])     loadAxisProfile(bc_cfg["outer"],     bc_outer,     ntheta);
+        if (bc_cfg["theta_min"]) loadAxisProfile(bc_cfg["theta_min"], bc_theta_min, nr);
+        if (bc_cfg["theta_max"]) loadAxisProfile(bc_cfg["theta_max"], bc_theta_max, nr);
     }
 
     // Determine if theta is periodic (both theta_min and theta_max must be "periodic")
@@ -1886,7 +1895,7 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids(int step) {
                         int i_r   = (r_orientation == "horizontal") ? i : j;
                         int j_theta = (r_orientation == "horizontal") ? j : i;
                         double r_phys = r_start + i_r * dr;
-                        double theta_phys = j_theta * dtheta;
+                        double theta_phys = j_theta * dtheta + theta_offset;  // v1.6 DD: global angle
                         x_phys = r_phys * std::cos(theta_phys);
                         y_phys = r_phys * std::sin(theta_phys);
                     } else {
@@ -11129,16 +11138,18 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             // Angular boundary conditions (only for non-periodic boundaries)
             if (!is_periodic) {
-                // Handle theta_min boundary (j == 0)
+                // Handle theta_min boundary (j == 0); profile[i] (per-r) overrides scalar
                 if (j == 0 && bc_theta_min.type == "dirichlet") {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                    rhs(idx) = bc_theta_min.value;
+                    rhs(idx) = bc_theta_min.profile.empty() ? bc_theta_min.value
+                                                            : bc_theta_min.profile[i];
                     continue;
                 }
-                // Handle theta_max boundary (j == ntheta - 1)
+                // Handle theta_max boundary (j == ntheta - 1); profile[i] overrides scalar
                 if (j == ntheta - 1 && bc_theta_max.type == "dirichlet") {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                    rhs(idx) = bc_theta_max.value;
+                    rhs(idx) = bc_theta_max.profile.empty() ? bc_theta_max.value
+                                                            : bc_theta_max.profile[i];
                     continue;
                 }
             }
@@ -11315,16 +11326,18 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 double sign = prev_crosses_boundary ? periodic_sign : 1.0;
                 local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, sign * coeff_theta_prev));
             } else {
-                // Theta_min neighbor is Dirichlet: move bc value to RHS
-                rhs(idx) -= coeff_theta_prev * bc_theta_min.value;
+                // Theta_min neighbor is Dirichlet: move bc value to RHS (profile[i] per-r if present)
+                double bv = bc_theta_min.profile.empty() ? bc_theta_min.value : bc_theta_min.profile[i];
+                rhs(idx) -= coeff_theta_prev * bv;
             }
 
             if (!theta_next_is_dirichlet) {
                 double sign = next_crosses_boundary ? periodic_sign : 1.0;
                 local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, sign * coeff_theta_next));
             } else {
-                // Theta_max neighbor is Dirichlet: move bc value to RHS
-                rhs(idx) -= coeff_theta_next * bc_theta_max.value;
+                // Theta_max neighbor is Dirichlet: move bc value to RHS (profile[i] per-r if present)
+                double bv = bc_theta_max.profile.empty() ? bc_theta_max.value : bc_theta_max.profile[i];
+                rhs(idx) -= coeff_theta_next * bv;
             }
 
             coeff_center -= (coeff_theta_prev + coeff_theta_next);

@@ -562,6 +562,9 @@ private:
     double dr, dtheta; // Mesh spacing
     double r_start, r_end;  // Radial domain
     double theta_range;     // Angular range [rad] (default: 2*pi, sector: pi/2, etc.)
+    double theta_offset = 0.0;  // v1.6 DD: absolute angle [rad] of local theta=0, so a theta-sector
+                                // subdomain computes theta-dependent sources (magnetization atan2)
+                                // at the correct GLOBAL angle. theta_phys = j_theta*dtheta + theta_offset.
     std::string r_orientation;  // "horizontal" or "vertical"
     std::vector<double> r_coords;  // Radial coordinates
 
