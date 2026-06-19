@@ -2118,7 +2118,7 @@ void MagneticFieldAnalyzer::computeMagnetizationCurlPolar() {
             int i_r   = horiz ? i : j;
             int j_th  = horiz ? j : i;
             double r     = r_start + i_r * dr;
-            double theta = j_th * dtheta;
+            double theta = j_th * dtheta + theta_offset;  // v1.6 DD: global angle (theta-sector)
 
             // Convert Mx/My to radial/tangential
             double cos_t = std::cos(theta), sin_t = std::sin(theta);
