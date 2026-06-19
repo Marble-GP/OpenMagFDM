@@ -68,15 +68,33 @@ int main(int argc,char**argv){
     // DD_BANDS="c0:c1:cf,c0:c1:cf,..." -> material-aligned radial bands; smooth bands solved on a cf x
     // downsampled own grid; radial Robin transmission with mortar (theta/r up/down-sample across the
     // resolution jump). Nth ignored (theta periodic per band). This is the DOF-reduction lever.
-    if (const char* be = getenv("DD_BANDS")) {
-        std::vector<std::array<int,3>> bands;  // {c0,c1,cf}
-        { std::string s(be); size_t i=0; while(i<s.size()){ int c0,c1,cfb; sscanf(s.c_str()+i,"%d:%d:%d",&c0,&c1,&cfb);
-            bands.push_back({c0,c1,cfb}); size_t n=s.find(',',i); if(n==std::string::npos)break; i=n+1; } }
-        struct Band{ int c0,c1,cf,er0,er1,nth,nrb; std::unique_ptr<MagneticFieldAnalyzer> an; };
+    const char* be = getenv("DD_BANDS");
+    bool dd_yaml = base["domain_decomposition"] && base["domain_decomposition"]["enabled"]
+                   && base["domain_decomposition"]["enabled"].as<bool>(false);
+    if (be || dd_yaml) {
+        // bands: {c0,c1,cf_r,cf_theta}. cf_theta=1 -> r-ONLY coarsening (keeps full theta -> preserves
+        // theta-varying structure: magnets, slots -> stable for the active region). cf_theta=cf_r ->
+        // 2D coarsening (theta-uniform regions: bore, yoke).
+        std::vector<std::array<int,4>> bands;
+        if (dd_yaml && base["domain_decomposition"]["bands"]) {
+            for (auto bn : base["domain_decomposition"]["bands"])
+                bands.push_back({bn[0].as<int>(), bn[1].as<int>(), bn[2].as<int>(),
+                                 bn.size()>3 ? bn[3].as<int>() : bn[2].as<int>()});
+            auto dd = base["domain_decomposition"];
+            if (dd["robin_p"])   p   = dd["robin_p"].as<double>() / PR;   // radial Robin uses p*PR
+            if (dd["overlap"])   ov  = dd["overlap"].as<int>();
+            if (dd["max_outer"]) maxo= dd["max_outer"].as<int>();
+            if (dd["tol"])       tol = dd["tol"].as<double>();
+        } else {
+            std::string s(be?be:""); size_t i=0; while(i<s.size()){ int c0,c1,cfr,cft=-1;
+                int got=sscanf(s.c_str()+i,"%d:%d:%d:%d",&c0,&c1,&cfr,&cft); if(got<4)cft=cfr;
+                bands.push_back({c0,c1,cfr,cft}); size_t n=s.find(',',i); if(n==std::string::npos)break; i=n+1; }
+        }
+        struct Band{ int c0,c1,cfr,cft,er0,er1,nth,nrb; std::unique_ptr<MagneticFieldAnalyzer> an; };
         std::vector<Band> B; system("mkdir -p dd_tmp"); long agg=0; int bid=0;
-        for(auto&bd:bands){ Band b; b.c0=bd[0];b.c1=bd[1];b.cf=bd[2];
-            b.er0=std::max(0,bd[0]-ov*bd[2]); b.er1=std::min(NR,bd[1]+ov*bd[2]);   // overlap in fine cols
-            b.nth=NTH/b.cf; b.nrb=std::max(2,(b.er1-b.er0)/b.cf);
+        for(auto&bd:bands){ Band b; b.c0=bd[0];b.c1=bd[1];b.cfr=bd[2];b.cft=bd[3];
+            b.er0=std::max(0,bd[0]-ov*b.cfr); b.er1=std::min(NR,bd[1]+ov*b.cfr);   // overlap in fine cols
+            b.nth=NTH/b.cft; b.nrb=std::max(2,(b.er1-b.er0)/b.cfr);
             agg += (long)b.nth*b.nrb;
             cv::Mat crop(NTH, b.er1-b.er0, CV_8UC3);   // full theta, ext cols (RGB)
             for(int j=0;j<NTH;j++) for(int c=0;c<b.er1-b.er0;c++) crop.at<cv::Vec3b>(j,c)=img.at<cv::Vec3b>((NTH-1-j),b.er0+c);
@@ -106,8 +124,8 @@ int main(int argc,char**argv){
             for(auto&b:B){
                 // ---- mortar gamma: downsample fine G edge traces to band theta ----
                 std::vector<double> gin(b.nth,0),gout(b.nth,0);
-                for(int mb=0;mb<b.nth;mb++){ double ui=0,di=0,uo=0,doo=0; int n=b.cf;
-                    for(int t=0;t<b.cf;t++){ int j=mb*b.cf+t;
+                for(int mb=0;mb<b.nth;mb++){ double ui=0,di=0,uo=0,doo=0; int n=b.cft;
+                    for(int t=0;t<b.cft;t++){ int j=mb*b.cft+t;
                         if(b.er0!=0){ ui+=G(j,b.er0); di+=(G(j,b.er0)-G(j,b.er0-1))/DR; }
                         if(b.er1-1!=NR-1){ uo+=G(j,b.er1-1); doo+=(G(j,b.er1)-G(j,b.er1-1))/DR; } }
                     if(b.er0!=0)      gin[mb]=p*PR*(ui/n)-(di/n);
@@ -117,12 +135,12 @@ int main(int argc,char**argv){
                 // ---- warm start: sample G into band grid ----
                 Eigen::MatrixXd pAz(b.nth,b.nrb);
                 for(int mb=0;mb<b.nth;mb++)for(int kb=0;kb<b.nrb;kb++){
-                    int j=mb*b.cf+b.cf/2; int c=b.er0+(int)std::llround((double)kb*(b.er1-1-b.er0)/(b.nrb-1));
+                    int j=mb*b.cft+b.cft/2; int c=b.er0+(int)std::llround((double)kb*(b.er1-1-b.er0)/(b.nrb-1));
                     pAz(mb,kb)=G(std::min(j,NTH-1),std::min(c,NR-1)); }
                 b.an->setAz(pAz); b.an->solve();
                 const Eigen::MatrixXd& sol=b.an->getAz();
                 // ---- write CORE back to fine G (nearest-neighbor upsample) ----
-                for(int j=0;j<NTH;j++){ int mb=j/b.cf; if(mb>=b.nth)mb=b.nth-1;
+                for(int j=0;j<NTH;j++){ int mb=j/b.cft; if(mb>=b.nth)mb=b.nth-1;
                     for(int c=b.c0;c<b.c1;c++){ int kb=(int)std::llround((double)(c-b.er0)*(b.nrb-1)/(b.er1-1-b.er0));
                         kb=std::max(0,std::min(kb,b.nrb-1)); G(j,c)=sol(mb,kb); } }
             }
