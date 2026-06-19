@@ -6566,6 +6566,14 @@ void MagneticFieldAnalyzer::setBoundaryProfile(const std::string& edge,
     else throw std::runtime_error("setBoundaryProfile: unknown edge '" + edge + "'");
 }
 
+void MagneticFieldAnalyzer::buildPolarOperator(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b) {
+    // v1.6 DD coarse space: refresh mu from the current member Az (nonlinear), then assemble A,b.
+    calculateMagneticFieldPolar();
+    calculateHField();
+    updateMuDistribution();
+    buildMatrixPolar(A, b);
+}
+
 double MagneticFieldAnalyzer::fluxLinkageMaterialPair(int key_a, int key_b) const {
     // Polar r-weighted material-pair flux linkage from the current Az (mirrors
     // calculateFluxLinkage's polar branch): Phi = <Az>_a - <Az>_b, weight = r.

@@ -12,6 +12,8 @@
 #include <opencv2/opencv.hpp>
 #include <yaml-cpp/yaml.h>
 #include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <Eigen/SparseLU>
 #include <chrono>
 #include <vector>
 #include <string>
@@ -97,7 +99,9 @@ int main(int argc,char**argv){
             b.nth=NTH/b.cft; b.nrb=std::max(2,(b.er1-b.er0)/b.cfr);
             agg += (long)b.nth*b.nrb;
             cv::Mat crop(NTH, b.er1-b.er0, CV_8UC3);   // full theta, ext cols (RGB)
-            for(int j=0;j<NTH;j++) for(int c=0;c<b.er1-b.er0;c++) crop.at<cv::Vec3b>(j,c)=img.at<cv::Vec3b>((NTH-1-j),b.er0+c);
+            // NO theta pre-flip: the band keeps full theta; the solver's internal grid<->image flip
+            // (grid g <-> image row NTH-1-g) already aligns band grid g with the monolithic grid g.
+            for(int j=0;j<NTH;j++) for(int c=0;c<b.er1-b.er0;c++) crop.at<cv::Vec3b>(j,c)=img.at<cv::Vec3b>(j,b.er0+c);
             cv::Mat cs; cv::resize(crop, cs, cv::Size(b.nrb,b.nth), 0,0, cv::INTER_NEAREST);
             cv::Mat cb; cv::cvtColor(cs,cb,cv::COLOR_RGB2BGR);
             std::string png="dd_tmp/b"+std::to_string(bid)+".png"; cv::imwrite(png,cb);
@@ -119,6 +123,24 @@ int main(int argc,char**argv){
         }
         std::cerr<<"banded: "<<B.size()<<" bands, aggregate DOF="<<agg<<" ("<<100.0*agg/(NTH*NR)<<"% of monolithic)\n";
         Eigen::MatrixXd G=Eigen::MatrixXd::Zero(NTH,NR);
+        // ---- 2-level coarse space (DD_COARSE="CR:CTH"; DD_CS_NONLIN=1 rebuilds A each iter) ----
+        int CR=0,CTH=0; bool use_cs=false, cs_nonlin=(getenv("DD_CS_NONLIN")!=nullptr);
+        Eigen::SparseMatrix<double> Pcs, Afull; Eigen::VectorXd bvec;
+        Eigen::SparseLU<Eigen::SparseMatrix<double>> Aclu;
+        if(const char* cs=getenv("DD_COARSE")){ sscanf(cs,"%d:%d",&CR,&CTH); use_cs=(CR>0&&CTH>0); }
+        if(use_cs){
+            int nrc=NR/CR, nthc=NTH/CTH; long Nc=(long)nrc*nthc;
+            std::vector<Eigen::Triplet<double>> tp;
+            for(int i=0;i<NR;i++){ double fic=(double)i/CR; int ic0=std::min((int)fic,nrc-1),ic1=std::min(ic0+1,nrc-1); double wr=fic-(int)fic;
+                for(int j=0;j<NTH;j++){ double fjc=(double)j/CTH; int jc0=((int)fjc)%nthc,jc1=(jc0+1)%nthc; double wt=fjc-(int)fjc; int f=i*NTH+j;
+                    tp.push_back({f,(int)(ic0*nthc+jc0),(1-wr)*(1-wt)}); tp.push_back({f,(int)(ic0*nthc+jc1),(1-wr)*wt});
+                    tp.push_back({f,(int)(ic1*nthc+jc0),wr*(1-wt)});     tp.push_back({f,(int)(ic1*nthc+jc1),wr*wt}); } }
+            Pcs.resize((long)NTH*NR,Nc); Pcs.setFromTriplets(tp.begin(),tp.end());
+            full.setAz(G); full.buildPolarOperator(Afull,bvec);
+            Eigen::SparseMatrix<double> Ac=(Eigen::SparseMatrix<double>(Pcs.transpose())*Afull*Pcs).pruned();
+            Aclu.analyzePattern(Ac); Aclu.factorize(Ac);
+            std::cerr<<"coarse space: CR="<<CR<<" CTH="<<CTH<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
+        }
         auto tl=Clock::now(); int it=0; double err=1.0;
         for(it=1; it<=maxo; ++it){
             for(auto&b:B){
@@ -143,6 +165,17 @@ int main(int argc,char**argv){
                 for(int j=0;j<NTH;j++){ int mb=j/b.cft; if(mb>=b.nth)mb=b.nth-1;
                     for(int c=b.c0;c<b.c1;c++){ int kb=(int)std::llround((double)(c-b.er0)*(b.nrb-1)/(b.er1-1-b.er0));
                         kb=std::max(0,std::min(kb,b.nrb-1)); G(j,c)=sol(mb,kb); } }
+            }
+            // ---- 2-level coarse correction: G += P * Ac^-1 * P^T (b - A*G) ----
+            if(use_cs){
+                if(cs_nonlin){ full.setAz(G); full.buildPolarOperator(Afull,bvec);
+                    Eigen::SparseMatrix<double> Ac=(Eigen::SparseMatrix<double>(Pcs.transpose())*Afull*Pcs).pruned();
+                    Aclu.factorize(Ac); }
+                Eigen::VectorXd Gv((long)NTH*NR);
+                for(int i=0;i<NR;i++)for(int j=0;j<NTH;j++) Gv[(long)i*NTH+j]=G(j,i);
+                Eigen::VectorXd R=bvec-Afull*Gv;
+                Eigen::VectorXd d=Pcs*Aclu.solve(Eigen::VectorXd(Pcs.transpose()*R));
+                for(int i=0;i<NR;i++)for(int j=0;j<NTH;j++) G(j,i)+=d[(long)i*NTH+j];
             }
             err=(G-Gref).cwiseAbs().maxCoeff()/denom; full.setAz(G);
             double ea=std::abs((full.fluxLinkageMaterialPair(ph[0].a,ph[0].b)-fref[0])/(std::abs(fref[0])+1e-30));

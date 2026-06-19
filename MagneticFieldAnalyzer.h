@@ -80,6 +80,10 @@ public:
     // When true, solveNonlinearNewtonKrylov starts the NK from the current member Az (warm) and
     // SKIPS the linear init guess -- for the DD Schwarz outer loop's per-patch re-solves.
     void setDDWarmStart(bool b) { dd_warm_start_ = b; }
+    // v1.6 DD coarse space: update mu from the current member Az and assemble the polar operator A,b
+    // (A*Az_solution = b). Used by the orchestrator to form the global residual r = b - A*Az_vec for
+    // the 2-level coarse correction. Az_vec ordering matches buildMatrixPolar: idx = i_r*ntheta + j_th.
+    void buildPolarOperator(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b);
 
     /**
      * @brief Export all results to folder structure
