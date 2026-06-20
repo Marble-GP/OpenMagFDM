@@ -24,6 +24,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <omp.h>
 
 using Clock = std::chrono::steady_clock;
 static double secs(Clock::time_point a, Clock::time_point b){ return std::chrono::duration<double>(b-a).count(); }
@@ -329,7 +330,11 @@ int main(int argc,char**argv){
              <<" ("<<100.0*agg_dof/(NTH*NR)<<"% of monolithic, includes overlap)\n";
 
     Eigen::MatrixXd G=Eigen::MatrixXd::Zero(NTH,NR);
-    auto Gat=[&](int gtr,int c)->double{ return G(((gtr%NTH)+NTH)%NTH,c); };
+    const Eigen::MatrixXd* Gsrcp=&G;   // additive(OMP) reads the sweep-start snapshot; multiplicative reads live G
+    auto Gat=[&](int gtr,int c)->double{ return (*Gsrcp)(((gtr%NTH)+NTH)%NTH,c); };
+    bool use_omp=(getenv("DD_OMP")!=nullptr);   // OpenMP patch-parallel (additive Schwarz)
+    if(use_omp){ omp_set_max_active_levels(1);   // inner per-patch solves run single-threaded (no nesting)
+        std::cerr<<"OpenMP patch-parallel additive Schwarz, max_threads="<<omp_get_max_threads()<<"\n"; }
     // ---- optional 2-level theta+r coarse space (DD_COARSE="CR:CTH") to bound outer iters with many
     //      theta-wedges (1-level Schwarz residual grows with sector count; the coarse space fixes it). ----
     int CR=0,CTH=0; bool use_cs=false, cs_nonlin=(getenv("DD_CS_NONLIN")!=nullptr);
@@ -364,8 +369,11 @@ int main(int argc,char**argv){
     auto tloop=Clock::now(); int it=0; double err=1.0;
     for(it=1; it<=maxo; ++it){
         Eigen::MatrixXd Gprev=G;
-        double sumT=0,maxT=0; long sumLI=0,maxLI=0; int maxp=-1, pidx=0;
-        for(auto&q:P){
+        Gsrcp = use_omp ? &Gprev : &G;   // additive: all patches read the snapshot -> independent solves
+        double sumT=0,maxT=0; long sumLI=0,maxLI=0; int maxp=-1;
+        #pragma omp parallel for schedule(dynamic,1) if(use_omp)
+        for(int pi=0; pi<(int)P.size(); ++pi){
+            auto&q=P[pi];
             int cf=q.cf;
             // theta-avg over coarse cell j's fine global theta range; r-avg over coarse cell i's cols
             auto Gth=[&](int j,int c)->double{ double s=0; for(int t=0;t<cf;t++) s+=Gat(q.et0+j*cf+t,c); return s/cf; };
@@ -390,7 +398,8 @@ int main(int argc,char**argv){
             long li0=q.an->getTotalLinearIters(); auto ts=Clock::now();
             q.an->solve();
             double Ti=secs(ts,Clock::now()); long Li=q.an->getTotalLinearIters()-li0;
-            sumT+=Ti; sumLI+=Li; if(Ti>maxT){maxT=Ti;maxp=pidx;} if(Li>maxLI)maxLI=Li; pidx++;
+            #pragma omp critical
+            { sumT+=Ti; sumLI+=Li; if(Ti>maxT){maxT=Ti;maxp=pi;} if(Li>maxLI)maxLI=Li; }
             const Eigen::MatrixXd& sol=q.an->getAz();
             // write CORE back to fine G (PoC-3 conservative mortar: BILINEAR prolongation, not
             // piecewise-constant. A smooth field means neighbour Robin gradients across a coarse cell
