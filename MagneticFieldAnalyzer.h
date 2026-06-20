@@ -72,6 +72,12 @@ public:
     double getRStart() const { return r_start; }
     double getREnd() const { return r_end; }
     std::string getROrientation() const { return r_orientation; }
+    // DD parallelism/conditioning instrumentation: accumulated AMGCL-CG iterations across all linear
+    // solves since construction (proxy for spectral conditioning; read deltas around solve()).
+    long getTotalLinearIters() const { return total_linear_iters_; }
+    int  getNumLinearSolves()  const { return num_linear_solves_; }
+    long total_linear_iters_ = 0;
+    int  num_linear_solves_  = 0;
     // Update a radial (inner/outer, len ntheta) or theta (theta_min/theta_max, len nr) transmission
     // profile in-place between Schwarz sweeps. edge in {inner,outer,theta_min,theta_max}.
     void setBoundaryProfile(const std::string& edge, const std::vector<double>& prof);

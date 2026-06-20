@@ -6902,6 +6902,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
             std::copy(initial_guess.data(), initial_guess.data() + n, x_vec.begin());
         }
         auto [iters, error] = amg(rhs_vec, x_vec);
+        total_linear_iters_ += (long)iters; num_linear_solves_++;   // DD conditioning instrumentation
 
         std::cout << "  [AMGCL] " << iters << " iters, residual="
                   << std::scientific << std::setprecision(2) << error
@@ -13631,6 +13632,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     int amg_iters;
                     double amg_error;
                     std::tie(amg_iters, amg_error) = amg_solve(rhs_vec, x_vec);
+                    total_linear_iters_ += (long)amg_iters; num_linear_solves_++;   // DD instrumentation
                     auto amg_solve_end = std::chrono::high_resolution_clock::now();
                     auto amg_solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(amg_solve_end - amg_solve_start);
 
