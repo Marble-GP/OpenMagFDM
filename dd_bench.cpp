@@ -197,17 +197,42 @@ int main(int argc,char**argv){
             Aclu.analyzePattern(Ac); Aclu.factorize(Ac);
             std::cerr<<"coarse space: CR="<<CR<<" CTH="<<CTH<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
         }
+        // ---- INTERFACE harmonic coarse space (DD_IHARM[_D/_N]): low-pass the EXCHANGED gap-interface
+        //      trace to theta-harmonics k=0..M. Realizes the air-gap reduced Steklov-Poincare idea:
+        //      couple rotor<->stator through only the dominant gap harmonics (Dirichlet/Az few modes,
+        //      Neumann/flux more -- the FFT-measured asymmetry). Unset => full trace (byte-identical). ----
+        int ihD=-1, ihN=-1;
+        if(const char* ih=getenv("DD_IHARM")){ ihD=ihN=atoi(ih); }
+        if(const char* d=getenv("DD_IHARM_D")) ihD=atoi(d);
+        if(const char* nn=getenv("DD_IHARM_N")) ihN=atoi(nn);
+        if(ihD>=0||ihN>=0) std::cerr<<"INTERFACE harmonic coarse space: Dirichlet(Az) k=0.."<<ihD
+                                    <<" Neumann(flux) k=0.."<<ihN<<" (theta low-pass on gap trace)\n";
+        auto harmLP=[&](std::vector<double>& g,int M){ int N=(int)g.size(); if(M<0||2*M+1>=N) return;
+            double a0=0; for(double v:g) a0+=v; a0/=N; std::vector<double> out(N,a0);
+            for(int k=1;k<=M;k++){ double ak=0,bk=0;
+                for(int j=0;j<N;j++){ double th=2.0*M_PI*k*j/N; ak+=g[j]*std::cos(th); bk+=g[j]*std::sin(th); }
+                ak*=2.0/N; bk*=2.0/N;
+                for(int j=0;j<N;j++){ double th=2.0*M_PI*k*j/N; out[j]+=ak*std::cos(th)+bk*std::sin(th); } }
+            g.swap(out); };
+        // ---- outer under-relaxation (damps the 2-cycle that an air-gap-located interface induces) ----
+        double omega = getenv("DD_RELAX") ? atof(getenv("DD_RELAX")) : 1.0;
+        if(omega!=1.0) std::cerr<<"banded under-relaxation omega="<<omega<<"\n";
         auto tl=Clock::now(); int it=0; double err=1.0;
         for(it=1; it<=maxo; ++it){
+            Eigen::MatrixXd Gprev = (omega!=1.0) ? G : Eigen::MatrixXd();
             for(auto&b:B){
-                // ---- mortar gamma: downsample fine G edge traces to band theta ----
-                std::vector<double> gin(b.nth,0),gout(b.nth,0);
+                // ---- mortar gamma: downsample fine G edge traces to band theta (Az and dAz/dn separately
+                //      so the interface harmonic filter can use the Dirichlet/Neumann asymmetry) ----
+                std::vector<double> uin(b.nth,0),din(b.nth,0),uout(b.nth,0),dout(b.nth,0);
                 for(int mb=0;mb<b.nth;mb++){ double ui=0,di=0,uo=0,doo=0; int n=b.cft;
                     for(int t=0;t<b.cft;t++){ int j=mb*b.cft+t;
                         if(b.er0!=0){ ui+=G(j,b.er0); di+=(G(j,b.er0)-G(j,b.er0-1))/DR; }
                         if(b.er1-1!=NR-1){ uo+=G(j,b.er1-1); doo+=(G(j,b.er1)-G(j,b.er1-1))/DR; } }
-                    if(b.er0!=0)      gin[mb]=p*PR*(ui/n)-(di/n);
-                    if(b.er1-1!=NR-1) gout[mb]=p*PR*(uo/n)+(doo/n); }
+                    uin[mb]=ui/n; din[mb]=di/n; uout[mb]=uo/n; dout[mb]=doo/n; }
+                if(ihD>=0){ harmLP(uin,ihD); harmLP(uout,ihD); }   // Dirichlet (Az) harmonic truncation
+                if(ihN>=0){ harmLP(din,ihN); harmLP(dout,ihN); }   // Neumann  (flux) harmonic truncation
+                std::vector<double> gin(b.nth,0),gout(b.nth,0);
+                for(int mb=0;mb<b.nth;mb++){ gin[mb]=p*PR*uin[mb]-din[mb]; gout[mb]=p*PR*uout[mb]+dout[mb]; }
                 if(b.er0!=0)      b.an->setBoundaryProfile("inner",gin);
                 if(b.er1-1!=NR-1) b.an->setBoundaryProfile("outer",gout);
                 // ---- warm start: sample G into band grid ----
@@ -222,6 +247,7 @@ int main(int argc,char**argv){
                     for(int c=b.c0;c<b.c1;c++){ int kb=(int)std::llround((double)(c-b.er0)*(b.nrb-1)/(b.er1-1-b.er0));
                         kb=std::max(0,std::min(kb,b.nrb-1)); G(j,c)=sol(mb,kb); } }
             }
+            if(omega!=1.0) G = Gprev + omega*(G-Gprev);   // outer under-relaxation of the Schwarz sweep
             // ---- 2-level coarse correction: G += P * Ac^-1 * P^T (b - A*G) ----
             if(use_cs){
                 if(cs_nonlin){ full.setAz(G); full.buildPolarOperator(Afull,bvec);
@@ -258,72 +284,71 @@ int main(int argc,char**argv){
     system("mkdir -p dd_tmp");
     long agg_dof=0; int pid=0;
     auto flip=[&](int gt){ return ((NTH-1-(gt%NTH))%NTH+NTH)%NTH; };
-    // Radial band layout. DD_RBANDS="c0:c1:cf:nth,..." gives explicit forbidden-band control: each band
-    // has its r-range, coarsening cf, and theta-sector count nth (nth<=1 => FULL-THETA fine/coarse ring,
-    // no theta cut -> for the slide-gap +/-a and any no-cut band). Else: uniform Nr bands with auto gap
-    // detection (the gap-overlapping band is forced full-theta fine).
-    struct RB{int c0,c1,cf,nth;}; std::vector<RB> rblist;
-    if(const char* rbe=getenv("DD_RBANDS")){ std::string s(rbe); size_t i=0;
-        while(i<s.size()){ int c0,c1,cf2,nth2; if(sscanf(s.c_str()+i,"%d:%d:%d:%d",&c0,&c1,&cf2,&nth2)==4)
-            rblist.push_back({c0,c1,std::max(1,cf2),std::max(1,nth2)});
-            size_t n=s.find(',',i); if(n==std::string::npos)break; i=n+1; }
-        std::cerr<<"DD_RBANDS: "<<rblist.size()<<" custom radial bands\n";
-    } else { for(auto[ra0,ra1]:rcores){ bool gb=(ra1>finelo&&ra0<finehi);
-        rblist.push_back({ra0,ra1, gb?1:std::max(1,GCF), (gb||Nth==1)?1:Nth}); } }
-    // MATERIAL-CONFORMING theta cuts (e.g. tooth-center iron positions) from DD_TCUTS="t0,t1,..." (sorted):
-    // sectored bands cut at these theta indices so cut lines pass through iron, NOT through coils/magnets
-    // (a cut straddling a different material corrupts its flux + stiffens the interface). Else uniform.
-    std::vector<int> tcuts;
-    if(const char* tce=getenv("DD_TCUTS")){ std::string s(tce); size_t i=0;
-        while(i<s.size()){ int t; if(sscanf(s.c_str()+i,"%d",&t)==1) tcuts.push_back(t);
-            size_t n=s.find(',',i); if(n==std::string::npos)break; i=n+1; }
-        std::cerr<<"DD_TCUTS: "<<tcuts.size()<<" material-conforming theta cuts\n"; }
-    for(auto&rbnd:rblist){
-        int ra0=rbnd.c0, ra1=rbnd.c1;
+    // ---- shared patch builder: crop+coarsen [ra0,ra1)x[tb0,tb1) at cf, set Robin/periodic BC, make analyzer ----
+    auto buildPatch=[&](int ra0,int ra1,int tb0,int tb1,int cf){
         int er0=std::max(0,ra0-ov), er1=std::min(NR,ra1+ov);
-        int cf=rbnd.cf;
-        std::vector<std::pair<int,int>> sectors;
-        if(rbnd.nth<=1) sectors={{0,NTH}};
-        else if(!tcuts.empty()){ for(size_t k=0;k<tcuts.size();k++){
-            int a=tcuts[k], b=(k+1<tcuts.size()? tcuts[k+1] : tcuts[0]+NTH); sectors.push_back({a,b}); } }
-        else { auto tc=split(NTH,rbnd.nth); for(auto&pr:tc) sectors.push_back(pr); }
-        for(auto[tb0,tb1]:sectors){
-            Patch q; q.er0=er0;q.er1=er1;q.cr0=ra0;q.cr1=ra1;q.ct0=tb0;q.ct1=tb1; q.cf=cf;
-            q.ft=(tb0==0 && tb1==NTH);   // full-theta (periodic) patch: forbidden-band ring or Nth==1
-            if(q.ft){q.et0=0;q.et1=NTH;} else {q.et0=tb0-ov;q.et1=tb1+ov;}
-            int nthx=q.et1-q.et0, nrx=er1-er0;
-            q.nthc=std::max(2,nthx/cf); q.nrc=std::max(2,nrx/cf);
-            agg_dof += (long)q.nthc*q.nrc;
-            // clean coarse crop: solver grid (mc,cc) <-> global theta [et0+mc*cf..], col [er0+cc*cf..];
-            // bake in the solver's grid<->image flip. cf=1 reduces exactly to the C1 crop.
-            cv::Mat crop(q.nthc,q.nrc,CV_8UC3);
-            for(int r=0;r<q.nthc;r++){ int gt=q.et0+(q.nthc-1-r)*cf+cf/2; int ir=flip(gt);
-                for(int cc=0;cc<q.nrc;cc++){ int gc=std::min(er0+cc*cf+cf/2,er1-1); crop.at<cv::Vec3b>(r,cc)=img.at<cv::Vec3b>(ir,gc); } }
-            cv::Mat cb; cv::cvtColor(crop,cb,cv::COLOR_RGB2BGR);
-            std::string png="dd_tmp/p"+std::to_string(pid)+".png"; cv::imwrite(png,cb);
-            YAML::Node cfg=YAML::Clone(base);
-            cfg["polar_domain"]["r_start"]=RS+er0*DR;
-            cfg["polar_domain"]["r_end"]  =RS+(er1-1)*DR;
-            if(q.ft) cfg["polar_domain"]["theta_range"]="2*pi"; else cfg["polar_domain"]["theta_range"]=nthx*DTH;
-            cfg["polar_domain"]["theta_offset"]=q.et0*DTH;
-            if(cfg["transient"]) cfg["transient"]["enabled"]=false;
-            if(cfg["nonlinear_solver"]) cfg["nonlinear_solver"]["verbose"]=false;
-            YAML::Node bc(YAML::NodeType::Map);
-            auto edge=[&](const char*e,const char*t,double a,double b,double g){
-                YAML::Node n(YAML::NodeType::Map); n["type"]=std::string(t);
-                if(std::string(t)=="robin"){n["alpha"]=a;n["beta"]=b;n["gamma"]=g;}
-                else if(std::string(t)=="dirichlet")n["value"]=0;
-                else if(std::string(t)=="periodic")n["value"]=1;
-                bc[e]=n; };
-            edge("inner", er0==0?"dirichlet":"robin", p*PR,1.0,0.0);
-            edge("outer", er1-1==NR-1?"dirichlet":"robin", p*PR,1.0,0.0);
-            if(q.ft){edge("theta_min","periodic",0,0,0);edge("theta_max","periodic",0,0,0);}
-            else{edge("theta_min","robin",p,1.0,0.0);edge("theta_max","robin",p,1.0,0.0);}
-            cfg["polar_boundary_conditions"]=bc;
-            std::string yp="dd_tmp/p"+std::to_string(pid)+".yaml"; std::ofstream(yp)<<cfg;
-            q.an=std::make_unique<MagneticFieldAnalyzer>(yp,png);
-            q.an->setDDWarmStart(true);   // NK warm-starts from the orchestrator-set Az each sweep
-            P.push_back(std::move(q)); pid++;
+        Patch q; q.er0=er0;q.er1=er1;q.cr0=ra0;q.cr1=ra1;q.ct0=tb0;q.ct1=tb1; q.cf=cf;
+        q.ft=(tb0==0 && tb1==NTH);   // full-theta (periodic) patch: forbidden-band ring / full ring
+        if(q.ft){q.et0=0;q.et1=NTH;} else {q.et0=tb0-ov;q.et1=tb1+ov;}
+        int nthx=q.et1-q.et0, nrx=er1-er0;
+        q.nthc=std::max(2,nthx/cf); q.nrc=std::max(2,nrx/cf);
+        agg_dof += (long)q.nthc*q.nrc;
+        cv::Mat crop(q.nthc,q.nrc,CV_8UC3);
+        for(int r=0;r<q.nthc;r++){ int gt=q.et0+(q.nthc-1-r)*cf+cf/2; int ir=flip(gt);
+            for(int cc=0;cc<q.nrc;cc++){ int gc=std::min(er0+cc*cf+cf/2,er1-1); crop.at<cv::Vec3b>(r,cc)=img.at<cv::Vec3b>(ir,gc); } }
+        cv::Mat cb; cv::cvtColor(crop,cb,cv::COLOR_RGB2BGR);
+        std::string png="dd_tmp/p"+std::to_string(pid)+".png"; cv::imwrite(png,cb);
+        YAML::Node cfg=YAML::Clone(base);
+        cfg["polar_domain"]["r_start"]=RS+er0*DR;
+        cfg["polar_domain"]["r_end"]  =RS+(er1-1)*DR;
+        if(q.ft) cfg["polar_domain"]["theta_range"]="2*pi"; else cfg["polar_domain"]["theta_range"]=nthx*DTH;
+        cfg["polar_domain"]["theta_offset"]=q.et0*DTH;
+        if(cfg["transient"]) cfg["transient"]["enabled"]=false;
+        if(cfg["nonlinear_solver"]) cfg["nonlinear_solver"]["verbose"]=false;
+        YAML::Node bc(YAML::NodeType::Map);
+        auto edge=[&](const char*e,const char*t,double a,double b,double g){
+            YAML::Node n(YAML::NodeType::Map); n["type"]=std::string(t);
+            if(std::string(t)=="robin"){n["alpha"]=a;n["beta"]=b;n["gamma"]=g;}
+            else if(std::string(t)=="dirichlet")n["value"]=0;
+            else if(std::string(t)=="periodic")n["value"]=1;
+            bc[e]=n; };
+        edge("inner", er0==0?"dirichlet":"robin", p*PR,1.0,0.0);
+        edge("outer", er1-1==NR-1?"dirichlet":"robin", p*PR,1.0,0.0);
+        if(q.ft){edge("theta_min","periodic",0,0,0);edge("theta_max","periodic",0,0,0);}
+        else{edge("theta_min","robin",p,1.0,0.0);edge("theta_max","robin",p,1.0,0.0);}
+        cfg["polar_boundary_conditions"]=bc;
+        std::string yp="dd_tmp/p"+std::to_string(pid)+".yaml"; std::ofstream(yp)<<cfg;
+        q.an=std::make_unique<MagneticFieldAnalyzer>(yp,png);
+        q.an->setDDWarmStart(true);
+        P.push_back(std::move(q)); pid++;
+    };
+    if(const char* pf=getenv("DD_PATCHFILE")){
+        // ARBITRARY-RECT path: a COMPLETE material-conforming tiling "t0 t1 c0 c1 cf" (from dd_rectfit.py).
+        std::ifstream f(pf); int t0,t1,c0,c1,cf2; int n=0;
+        while(f>>t0>>t1>>c0>>c1>>cf2){ buildPatch(c0,c1,t0,t1,std::max(1,cf2)); n++; }
+        std::cerr<<"DD_PATCHFILE: "<<n<<" arbitrary-rect patches from "<<pf<<"\n";
+    } else {
+        // STRUCTURED path: DD_RBANDS radial bands x DD_TCUTS theta cuts (or auto Nr/Nth + gap detection).
+        struct RB{int c0,c1,cf,nth;}; std::vector<RB> rblist;
+        if(const char* rbe=getenv("DD_RBANDS")){ std::string s(rbe); size_t i=0;
+            while(i<s.size()){ int c0,c1,cf2,nth2; if(sscanf(s.c_str()+i,"%d:%d:%d:%d",&c0,&c1,&cf2,&nth2)==4)
+                rblist.push_back({c0,c1,std::max(1,cf2),std::max(1,nth2)});
+                size_t nn=s.find(',',i); if(nn==std::string::npos)break; i=nn+1; }
+            std::cerr<<"DD_RBANDS: "<<rblist.size()<<" custom radial bands\n";
+        } else { for(auto[ra0,ra1]:rcores){ bool gb=(ra1>finelo&&ra0<finehi);
+            rblist.push_back({ra0,ra1, gb?1:std::max(1,GCF), (gb||Nth==1)?1:Nth}); } }
+        std::vector<int> tcuts;
+        if(const char* tce=getenv("DD_TCUTS")){ std::string s(tce); size_t i=0;
+            while(i<s.size()){ int t; if(sscanf(s.c_str()+i,"%d",&t)==1) tcuts.push_back(t);
+                size_t nn=s.find(',',i); if(nn==std::string::npos)break; i=nn+1; }
+            std::cerr<<"DD_TCUTS: "<<tcuts.size()<<" material-conforming theta cuts\n"; }
+        for(auto&rbnd:rblist){
+            std::vector<std::pair<int,int>> sectors;
+            if(rbnd.nth<=1) sectors={{0,NTH}};
+            else if(!tcuts.empty()){ for(size_t k=0;k<tcuts.size();k++){
+                int a=tcuts[k], b=(k+1<tcuts.size()? tcuts[k+1] : tcuts[0]+NTH); sectors.push_back({a,b}); } }
+            else { auto tc=split(NTH,rbnd.nth); for(auto&pr:tc) sectors.push_back(pr); }
+            for(auto[tb0,tb1]:sectors) buildPatch(rbnd.c0,rbnd.c1,tb0,tb1,rbnd.cf);
         }
     }
     std::cerr<<"built "<<P.size()<<" patches, aggregate DOF="<<agg_dof
@@ -342,17 +367,30 @@ int main(int argc,char**argv){
     Eigen::SparseLU<Eigen::SparseMatrix<double>> Aclu;
     if(const char* cs=getenv("DD_COARSE")){ sscanf(cs,"%d:%d",&CR,&CTH); use_cs=(CR>0&&CTH>0); }
     if(use_cs){
-        int nrcs=NR/CR, nthcs=NTH/CTH; long Nc=(long)nrcs*nthcs;
+        int harm = getenv("DD_HARM") ? atoi(getenv("DD_HARM")) : 0;   // theta = low Fourier modes k=0..harm (HARMONIC interface coarse space); 0 = legacy bilinear
+        int nrcs=NR/CR; long Nc;
         std::vector<Eigen::Triplet<double>> tp;
-        for(int i=0;i<NR;i++){ double fic=(double)i/CR; int ic0=std::min((int)fic,nrcs-1),ic1=std::min(ic0+1,nrcs-1); double wr=fic-(int)fic;
-            for(int j=0;j<NTH;j++){ double fjc=(double)j/CTH; int jc0=((int)fjc)%nthcs,jc1=(jc0+1)%nthcs; double wt=fjc-(int)fjc; int f=i*NTH+j;
-                tp.push_back({f,(int)(ic0*nthcs+jc0),(1-wr)*(1-wt)}); tp.push_back({f,(int)(ic0*nthcs+jc1),(1-wr)*wt});
-                tp.push_back({f,(int)(ic1*nthcs+jc0),wr*(1-wt)});     tp.push_back({f,(int)(ic1*nthcs+jc1),wr*wt}); } }
+        if(harm>0){
+            int nh=2*harm+1; Nc=(long)nrcs*nh;     // theta = low harmonics (k=0 + cos/sin k=1..harm), r = bilinear
+            for(int i=0;i<NR;i++){ double fic=(double)i/CR; int ic0=std::min((int)fic,nrcs-1),ic1=std::min(ic0+1,nrcs-1); double wr=fic-(int)fic;
+                for(int j=0;j<NTH;j++){ int f=i*NTH+j; double th=2.0*M_PI*j/NTH;
+                    for(int k=0;k<=harm;k++){ double c=std::cos(k*th); int cc=(k==0)?0:(2*k-1);
+                        tp.push_back({f,(int)(ic0*nh+cc),(1-wr)*c}); tp.push_back({f,(int)(ic1*nh+cc),wr*c});
+                        if(k>0){ double s=std::sin(k*th); int sc=2*k;
+                            tp.push_back({f,(int)(ic0*nh+sc),(1-wr)*s}); tp.push_back({f,(int)(ic1*nh+sc),wr*s}); } } } }
+            std::cerr<<"HARMONIC coarse space: CR="<<CR<<" theta-harmonics k=0.."<<harm<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
+        } else {
+            int nthcs=NTH/CTH; Nc=(long)nrcs*nthcs;
+            for(int i=0;i<NR;i++){ double fic=(double)i/CR; int ic0=std::min((int)fic,nrcs-1),ic1=std::min(ic0+1,nrcs-1); double wr=fic-(int)fic;
+                for(int j=0;j<NTH;j++){ double fjc=(double)j/CTH; int jc0=((int)fjc)%nthcs,jc1=(jc0+1)%nthcs; double wt=fjc-(int)fjc; int f=i*NTH+j;
+                    tp.push_back({f,(int)(ic0*nthcs+jc0),(1-wr)*(1-wt)}); tp.push_back({f,(int)(ic0*nthcs+jc1),(1-wr)*wt});
+                    tp.push_back({f,(int)(ic1*nthcs+jc0),wr*(1-wt)});     tp.push_back({f,(int)(ic1*nthcs+jc1),wr*wt}); } }
+            std::cerr<<"grid coarse space: CR="<<CR<<" CTH="<<CTH<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
+        }
         Pcs.resize((long)NTH*NR,Nc); Pcs.setFromTriplets(tp.begin(),tp.end());
         full.setAz(G); full.buildPolarOperator(Afull,bvec);
         Eigen::SparseMatrix<double> Ac=(Eigen::SparseMatrix<double>(Pcs.transpose())*Afull*Pcs).pruned();
         Aclu.analyzePattern(Ac); Aclu.factorize(Ac);
-        std::cerr<<"grid coarse space: CR="<<CR<<" CTH="<<CTH<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
     }
     double relax = getenv("DD_RELAX") ? atof(getenv("DD_RELAX")) : 1.0;   // under-relaxation omega
     if(relax!=1.0) std::cerr<<"under-relaxation omega="<<relax<<"\n";
@@ -439,8 +477,10 @@ int main(int argc,char**argv){
                 Eigen::Map<Eigen::VectorXd>(G.data(),Nn)=xnew;
             }
         }
-        // ---- 2-level coarse correction: G += P * Ac^-1 * P^T (b - A*G) ----
+        // ---- 2-level coarse correction: G += csdamp * P * Ac^-1 * P^T (b - A*G) ----
+        // DD_CS_DAMP<1 damps the coarse correction to stop the post-correction drift/overshoot.
         if(use_cs){
+            double csdamp = getenv("DD_CS_DAMP") ? atof(getenv("DD_CS_DAMP")) : 1.0;
             if(cs_nonlin){ full.setAz(G); full.buildPolarOperator(Afull,bvec);
                 Eigen::SparseMatrix<double> Ac=(Eigen::SparseMatrix<double>(Pcs.transpose())*Afull*Pcs).pruned();
                 Aclu.factorize(Ac); }
@@ -448,25 +488,29 @@ int main(int argc,char**argv){
             for(int i=0;i<NR;i++)for(int j=0;j<NTH;j++) Gv[(long)i*NTH+j]=G(j,i);
             Eigen::VectorXd R=bvec-Afull*Gv;
             Eigen::VectorXd d=Pcs*Aclu.solve(Eigen::VectorXd(Pcs.transpose()*R));
-            for(int i=0;i<NR;i++)for(int j=0;j<NTH;j++) G(j,i)+=d[(long)i*NTH+j];
+            for(int i=0;i<NR;i++)for(int j=0;j<NTH;j++) G(j,i)+=csdamp*d[(long)i*NTH+j];
         }
         err=(G-Gref).cwiseAbs().maxCoeff()/denom;
         // flux from G via the full analyzer's material map
         full.setAz(G);
         double fa=full.fluxLinkageMaterialPair(ph[0].a,ph[0].b);
         double ea=std::abs((fa-fref[0])/ (std::abs(fref[0])+1e-30));
-        double res=(G-Gprev).norm()/(G.norm()+1e-30);   // Schwarz residual (practical, no Gref)
-        if(res<best_res){ best_res=res; Gbest=G; best_it=it; }
+        double res=(G-Gprev).norm()/(G.norm()+1e-30);   // Schwarz residual
+        double qual=res;                                 // best-iterate quality (TRUE residual when coarse space on)
+        if(use_cs){ Eigen::VectorXd Gq((long)NTH*NR);
+            for(int i=0;i<NR;i++)for(int j=0;j<NTH;j++) Gq[(long)i*NTH+j]=G(j,i);
+            qual=(bvec-Afull*Gq).norm()/(bvec.norm()+1e-30); }   // ||b-A*G||: small <=> good solution (no Gref)
+        if(qual<best_res){ best_res=qual; Gbest=G; best_it=it; }
         std::cerr<<"outer "<<it<<": err_vs_mono="<<err<<"  PhiA_err="<<ea
-                 <<"  schwarz_res="<<res<<"  cum_wall="<<secs(tloop,Clock::now())<<"s\n";
+                 <<"  schwarz_res="<<res<<"  true_res="<<qual<<"  cum_wall="<<secs(tloop,Clock::now())<<"s\n";
         if(err<tol) break;
-        if(use_plateau){ if(res>0.9*prev_res){ if(++plateau>=2){
-            std::cerr<<"  [plateau: Schwarz residual stalled -> stop at best iter "<<best_it<<"]\n"; break; } }
+        if(use_plateau){ if(qual>0.95*prev_res){ if(++plateau>=3){
+            std::cerr<<"  [plateau: true residual stalled -> stop at best iter "<<best_it<<"]\n"; break; } }
             else plateau=0; }
-        prev_res=res;
+        prev_res=qual;
     }
     double t_loop=secs(tloop,Clock::now());
-    if(use_plateau){ G=Gbest; std::cerr<<"[plateau: using best iterate it="<<best_it<<" schwarz_res="<<best_res<<"]\n"; }
+    if(use_plateau||use_cs){ G=Gbest; std::cerr<<"[best iterate it="<<best_it<<" true_res="<<best_res<<"]\n"; }
     full.setAz(G);
     std::cerr<<"=== DONE outer="<<it<<" err="<<err<<" ===\n";
     std::cerr<<"flux: ";
