@@ -24,7 +24,9 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
-#include <omp.h>
+#ifdef _OPENMP
+#include <omp.h>   // guarded: Apple Clang ships no omp.h unless OpenMP is enabled
+#endif
 
 using Clock = std::chrono::steady_clock;
 static double secs(Clock::time_point a, Clock::time_point b){ return std::chrono::duration<double>(b-a).count(); }
@@ -358,8 +360,16 @@ int main(int argc,char**argv){
     const Eigen::MatrixXd* Gsrcp=&G;   // additive(OMP) reads the sweep-start snapshot; multiplicative reads live G
     auto Gat=[&](int gtr,int c)->double{ return (*Gsrcp)(((gtr%NTH)+NTH)%NTH,c); };
     bool use_omp=(getenv("DD_OMP")!=nullptr);   // OpenMP patch-parallel (additive Schwarz)
-    if(use_omp){ omp_set_max_active_levels(1);   // inner per-patch solves run single-threaded (no nesting)
-        std::cerr<<"OpenMP patch-parallel additive Schwarz, max_threads="<<omp_get_max_threads()<<"\n"; }
+    if(use_omp){
+#ifdef _OPENMP
+#if _OPENMP >= 200805
+        omp_set_max_active_levels(1);   // OpenMP 3.0+ only (MSVC's OpenMP 2.0 lacks it): inner per-patch solves single-threaded
+#endif
+        std::cerr<<"OpenMP patch-parallel additive Schwarz, max_threads="<<omp_get_max_threads()<<"\n";
+#else
+        std::cerr<<"DD_OMP requested but this build has no OpenMP -> running serial\n";
+#endif
+    }
     // ---- optional 2-level theta+r coarse space (DD_COARSE="CR:CTH") to bound outer iters with many
     //      theta-wedges (1-level Schwarz residual grows with sector count; the coarse space fixes it). ----
     int CR=0,CTH=0; bool use_cs=false, cs_nonlin=(getenv("DD_CS_NONLIN")!=nullptr);
