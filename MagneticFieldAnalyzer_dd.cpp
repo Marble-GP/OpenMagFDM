@@ -31,6 +31,8 @@
 #include <memory>
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
+#include <stdexcept>
 
 void MagneticFieldAnalyzer::solveDomainDecomposition() {
     const int    NTH   = ntheta;
@@ -63,17 +65,22 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         std::unique_ptr<MagneticFieldAnalyzer> an;
     };
     std::vector<Band> B;
-    { int rc = std::system("mkdir -p dd_tmp"); (void)rc; }
+    { std::error_code ec; std::filesystem::create_directories("dd_tmp", ec); }  // portable (Windows + POSIX)
     long agg = 0;
     int bid = 0;
     for (const auto& bd : dd_config.bands) {
         Band b;
-        b.c0  = bd.c0;
-        b.c1  = bd.c1;
+        b.c0  = std::max(0, std::min(NR, bd.c0));  // clamp the core range to [0, NR]
+        b.c1  = std::max(0, std::min(NR, bd.c1));
         b.cfr = std::max(1, bd.cf_r);
         b.cft = std::max(1, bd.cf_theta);
         b.er0 = std::max(0,  b.c0 - ov * b.cfr);
         b.er1 = std::min(NR, b.c1 + ov * b.cfr);
+        if (b.c1 <= b.c0 || b.er1 - b.er0 < 2) {
+            std::cerr << "WARNING: DD band [" << bd.c0 << ", " << bd.c1
+                      << ") is empty/degenerate (radial range is [0, " << NR << ")); skipped." << std::endl;
+            continue;
+        }
         b.nth = NTH / b.cft;
         b.nrb = std::max(2, (b.er1 - b.er0) / b.cfr);
         agg  += (long)b.nth * b.nrb;
@@ -124,6 +131,10 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         b.an->setDDWarmStart(true);  // each sweep NK-warm-starts from the orchestrator-set Az
         B.push_back(std::move(b));
         ++bid;
+    }
+    if (B.empty()) {
+        throw std::runtime_error("domain_decomposition: no valid bands after clamping -- check the "
+                                 "'bands' ranges (each must lie within [0, nr) and be non-empty).");
     }
     std::cout << "  aggregate DOF = " << agg << " ("
               << (100.0 * agg / ((double)NTH * NR)) << "% of monolithic "
@@ -183,7 +194,9 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         std::cout << "  DD sweep " << it << ": residual = " << res << std::endl;
         if (res < tol) break;
     }
-    std::cout << "=== DD done: " << it << " sweep(s), final residual = " << res << " ===" << std::endl;
+    const int sweeps_done = std::min(it, maxo);  // 'it' is maxo+1 if the loop ran to the cap without converging
+    std::cout << "=== DD done: " << sweeps_done << " sweep(s), final residual = " << res
+              << (res < tol ? " (converged)" : " (reached max_outer)") << " ===" << std::endl;
 
     // Composite solution -> member Az, then refresh B/H/mu on the full grid so the
     // Mu/H exports, energy, and Maxwell-stress are consistent with the composite
