@@ -97,6 +97,65 @@
       "example": "gamma: 0.0",
       "validParents": ["left", "right", "top", "bottom", "inner", "outer", "theta_min", "theta_max"]
     },
+    "value_profile": {
+      "description": "v1.6 domain decomposition: path to a CSV of per-θ Dirichlet values (length ntheta, theta-index order) that overrides the scalar 'value' along a polar radial boundary. Used for spatially-varying transmission conditions; empty/absent falls back to the scalar value (backward compatible).",
+      "type": "string",
+      "validParents": ["inner", "outer", "theta_min", "theta_max"],
+      "example": "value_profile: trace_inner.csv"
+    },
+    "gamma_profile": {
+      "description": "v1.6 domain decomposition: path to a CSV of per-θ Robin γ values (length ntheta, theta-index order) that overrides the scalar 'gamma' for a Robin polar boundary (α·Az + β·∂Az/∂n = γ). Empty/absent falls back to the scalar gamma (backward compatible).",
+      "type": "string",
+      "validParents": ["inner", "outer", "theta_min", "theta_max"],
+      "example": "gamma_profile: trace_outer.csv"
+    },
+    "domain_decomposition": {
+      "description": "v1.6 domain decomposition (optimized Schwarz, POLAR only). Opt-in variable-resolution ACCURACY mode: keep the air gap / saturated zone FINE, coarsen smooth radial bands on their own uniform grid, coupled by symmetric Robin transmission iterated to consistency. NOT a speed default — uniform downsampling is faster; use when full-resolution gap accuracy matters (e.g. final-ranking / verification). Disabled unless 'enabled: true' with at least one band.",
+      "children": ["enabled", "bands", "robin_p", "overlap", "max_outer", "tol", "relax"],
+      "example": "domain_decomposition:\n  enabled: true\n  bands:\n    - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)\n    - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE\n    - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)\n  robin_p: 12.0\n  overlap: 4\n  max_outer: 20\n  tol: 1.0e-3"
+    },
+    "bands": {
+      "description": "Radial bands, each [c0, c1, cf_r, cf_theta]: column range [c0,c1) in radial pixel indices, radial coarsen factor cf_r, theta coarsen factor cf_theta. cf=1 keeps the band FINE (use across the air gap / saturated active region). cf_theta=1 = r-only coarsening (preserves theta-varying slots/magnets). RULE: band interfaces (c0/c1) should fall in IRON, and the air gap must stay inside a fine band — interfaces in air or coils diverge.",
+      "type": "array",
+      "validParents": ["domain_decomposition"],
+      "example": "bands:\n  - [0, 52, 4, 4]\n  - [52, 330, 1, 1]\n  - [330, 450, 4, 4]"
+    },
+    "robin_p": {
+      "description": "Robin transmission coefficient α for the inter-band interfaces (α·Az + β·∂Az/∂n = γ, β=1). Default 12.0 (validated). Interfaces should sit in iron for robust convergence.",
+      "type": "number",
+      "validParents": ["domain_decomposition"],
+      "example": "robin_p: 12.0"
+    },
+    "overlap": {
+      "description": "Band overlap in FINE columns: each band is extended ±overlap·cf_r columns past its core before solving. A larger overlap helps convergence when an interface sits near a high-gradient zone (e.g. straddling the air gap, put the gap inside the overlap so the Robin trace lands in iron). Default 4.",
+      "type": "integer",
+      "validParents": ["domain_decomposition"],
+      "example": "overlap: 4"
+    },
+    "max_outer": {
+      "description": "Maximum number of Schwarz outer sweeps. The DD usually reaches its flux accuracy within ~2-5 sweeps (the field error plateaus at the coarsening floor). Default 20.",
+      "type": "integer",
+      "validParents": ["domain_decomposition"],
+      "example": "max_outer: 20"
+    },
+    "tol": {
+      "description": "Convergence tolerance on the relative Schwarz residual ||G - G_prev|| / ||G||. The sweep stops early when the residual falls below tol (or at max_outer). Default 2.0e-3.",
+      "type": "number",
+      "validParents": ["domain_decomposition"],
+      "example": "tol: 1.0e-3"
+    },
+    "relax": {
+      "description": "Outer under-relaxation factor ω in (0,1]. 1.0 = none. Use ω<1 (e.g. 0.7) to damp a 2-cycle oscillation when an interface sits in a high-gradient zone. Default 1.0.",
+      "type": "number",
+      "validParents": ["domain_decomposition"],
+      "example": "relax: 0.7"
+    },
+    "initial_az_path": {
+      "description": "v1.6 warm start: path to a raw float64 Az file used as the initial Newton-Krylov iterate (skips the linear init guess). Mainly for the DD outer loop / restarting a sweep; absent = cold start.",
+      "type": "string",
+      "validParents": ["nonlinear_solver"],
+      "example": "initial_az_path: az_prev.bin"
+    },
     "boundary_conditions": {
       "description": "Boundary conditions for Cartesian coordinates (4 edges)",
       "children": ["left", "right", "top", "bottom"],
@@ -280,7 +339,7 @@
       "description": "Enable feature (true/false)",
       "type": "boolean",
       "example": "enabled: true",
-      "validParents": ["transient", "nonlinear_solver", "anderson", "eisenstat_walker"]
+      "validParents": ["transient", "nonlinear_solver", "anderson", "eisenstat_walker", "domain_decomposition"]
     },
     "enable_sliding": {
       "description": "Enable image sliding for rotor motion simulation (true/false)",
@@ -756,6 +815,11 @@
       "name": "Solver - OpenMP Thread Count",
       "trigger": "solver",
       "snippet": "omp_threads: 4"
+    },
+    "domain_decomposition_template": {
+      "name": "Domain Decomposition - variable-resolution Schwarz (polar, opt-in accuracy mode)",
+      "trigger": "domain_decomposition",
+      "snippet": "enabled: true\nbands:\n  - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)\n  - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE\n  - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)\nrobin_p: 12.0          # Robin transmission coeff (interfaces should sit in iron)\noverlap: 4\nmax_outer: 20\ntol: 1.0e-3\n# relax: 0.7           # under-relaxation if an interface oscillates"
     },
     "lib_file_template": {
       "name": "Material Library Template",

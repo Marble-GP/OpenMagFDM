@@ -201,6 +201,33 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         }
     }
 
+    // v1.6 domain decomposition (optimized Schwarz, polar only; opt-in accuracy
+    // mode). Parsed here so solve() can dispatch to solveDomainDecomposition()
+    // when enabled. See the DDConfig struct + MagneticFieldAnalyzer_dd.cpp.
+    if (config["domain_decomposition"]) {
+        auto dd = config["domain_decomposition"];
+        dd_config.enabled = dd["enabled"].as<bool>(false);
+        if (dd["robin_p"])   dd_config.robin_p   = dd["robin_p"].as<double>(dd_config.robin_p);
+        if (dd["overlap"])   dd_config.overlap   = dd["overlap"].as<int>(dd_config.overlap);
+        if (dd["max_outer"]) dd_config.max_outer = dd["max_outer"].as<int>(dd_config.max_outer);
+        if (dd["tol"])       dd_config.tol       = dd["tol"].as<double>(dd_config.tol);
+        if (dd["relax"])     dd_config.relax     = dd["relax"].as<double>(dd_config.relax);
+        if (dd["bands"]) {
+            for (auto bn : dd["bands"]) {
+                int c0  = bn[0].as<int>();
+                int c1  = bn[1].as<int>();
+                int cfr = bn.size() > 2 ? bn[2].as<int>() : 1;
+                int cft = bn.size() > 3 ? bn[3].as<int>() : cfr;
+                dd_config.bands.push_back({c0, c1, std::max(1, cfr), std::max(1, cft)});
+            }
+        }
+        if (dd_config.enabled && dd_config.bands.empty()) {
+            std::cerr << "WARNING: domain_decomposition.enabled but no 'bands' specified; "
+                         "DD disabled (falling back to the monolithic solve)." << std::endl;
+            dd_config.enabled = false;
+        }
+    }
+
     // [Phase BJ-8 stage 3 / v1.5.1] Global coarsening block is deprecated.
     // All knobs control the now-removed custom Galerkin coarsening; values
     // are parsed (Stage 4 deletes the parse) but unused.
@@ -266,6 +293,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
 void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
     try {
         config = YAML::LoadFile(config_path);
+        this->config_path = config_path;  // retained for DD sub-domain base-config reload
         std::cout << "Configuration loaded from: " << config_path << std::endl;
 
         // Phase N: the transient block is parsed in a deferred pass
@@ -6522,6 +6550,13 @@ double MagneticFieldAnalyzer::getMuAtInterfaceSym(int i, int j, const std::strin
 }
 
 void MagneticFieldAnalyzer::solve() {
+    // v1.6 domain decomposition (opt-in, polar only): banded variable-resolution
+    // optimized Schwarz. Populates Az; downstream stress/energy/export are unchanged.
+    if (coordinate_system == "polar" && dd_config.enabled && !dd_config.bands.empty()) {
+        solveDomainDecomposition();
+        return;
+    }
+
     // Check if nonlinear solver is needed
     if (has_nonlinear_materials && nonlinear_config.enabled) {
         std::cout << "\n=== Nonlinear materials detected ===" << std::endl;

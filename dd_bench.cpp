@@ -367,26 +367,18 @@ int main(int argc,char**argv){
     Eigen::SparseLU<Eigen::SparseMatrix<double>> Aclu;
     if(const char* cs=getenv("DD_COARSE")){ sscanf(cs,"%d:%d",&CR,&CTH); use_cs=(CR>0&&CTH>0); }
     if(use_cs){
-        int harm = getenv("DD_HARM") ? atoi(getenv("DD_HARM")) : 0;   // theta = low Fourier modes k=0..harm (HARMONIC interface coarse space); 0 = legacy bilinear
-        int nrcs=NR/CR; long Nc;
+        // Bilinear (r x theta) Galerkin coarse space. NOTE: the VOLUME theta-harmonic
+        // variant (former DD_HARM) was removed -- proven dead (dense Galerkin: 19GB at
+        // k=30 / too weak at k=4); the negative result is recorded in memory + git
+        // history (commit 1acaf79). The INTERFACE harmonic coarse space (DD_IHARM_D/_N,
+        // banded mode) is the validated harmonic construction.
+        int nrcs=NR/CR, nthcs=NTH/CTH; long Nc=(long)nrcs*nthcs;
         std::vector<Eigen::Triplet<double>> tp;
-        if(harm>0){
-            int nh=2*harm+1; Nc=(long)nrcs*nh;     // theta = low harmonics (k=0 + cos/sin k=1..harm), r = bilinear
-            for(int i=0;i<NR;i++){ double fic=(double)i/CR; int ic0=std::min((int)fic,nrcs-1),ic1=std::min(ic0+1,nrcs-1); double wr=fic-(int)fic;
-                for(int j=0;j<NTH;j++){ int f=i*NTH+j; double th=2.0*M_PI*j/NTH;
-                    for(int k=0;k<=harm;k++){ double c=std::cos(k*th); int cc=(k==0)?0:(2*k-1);
-                        tp.push_back({f,(int)(ic0*nh+cc),(1-wr)*c}); tp.push_back({f,(int)(ic1*nh+cc),wr*c});
-                        if(k>0){ double s=std::sin(k*th); int sc=2*k;
-                            tp.push_back({f,(int)(ic0*nh+sc),(1-wr)*s}); tp.push_back({f,(int)(ic1*nh+sc),wr*s}); } } } }
-            std::cerr<<"HARMONIC coarse space: CR="<<CR<<" theta-harmonics k=0.."<<harm<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
-        } else {
-            int nthcs=NTH/CTH; Nc=(long)nrcs*nthcs;
-            for(int i=0;i<NR;i++){ double fic=(double)i/CR; int ic0=std::min((int)fic,nrcs-1),ic1=std::min(ic0+1,nrcs-1); double wr=fic-(int)fic;
-                for(int j=0;j<NTH;j++){ double fjc=(double)j/CTH; int jc0=((int)fjc)%nthcs,jc1=(jc0+1)%nthcs; double wt=fjc-(int)fjc; int f=i*NTH+j;
-                    tp.push_back({f,(int)(ic0*nthcs+jc0),(1-wr)*(1-wt)}); tp.push_back({f,(int)(ic0*nthcs+jc1),(1-wr)*wt});
-                    tp.push_back({f,(int)(ic1*nthcs+jc0),wr*(1-wt)});     tp.push_back({f,(int)(ic1*nthcs+jc1),wr*wt}); } }
-            std::cerr<<"grid coarse space: CR="<<CR<<" CTH="<<CTH<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
-        }
+        for(int i=0;i<NR;i++){ double fic=(double)i/CR; int ic0=std::min((int)fic,nrcs-1),ic1=std::min(ic0+1,nrcs-1); double wr=fic-(int)fic;
+            for(int j=0;j<NTH;j++){ double fjc=(double)j/CTH; int jc0=((int)fjc)%nthcs,jc1=(jc0+1)%nthcs; double wt=fjc-(int)fjc; int f=i*NTH+j;
+                tp.push_back({f,(int)(ic0*nthcs+jc0),(1-wr)*(1-wt)}); tp.push_back({f,(int)(ic0*nthcs+jc1),(1-wr)*wt});
+                tp.push_back({f,(int)(ic1*nthcs+jc0),wr*(1-wt)});     tp.push_back({f,(int)(ic1*nthcs+jc1),wr*wt}); } }
+        std::cerr<<"grid coarse space: CR="<<CR<<" CTH="<<CTH<<" coarseDOF="<<Nc<<(cs_nonlin?" (rebuilt/iter)":"")<<"\n";
         Pcs.resize((long)NTH*NR,Nc); Pcs.setFromTriplets(tp.begin(),tp.end());
         full.setAz(G); full.buildPolarOperator(Afull,bvec);
         Eigen::SparseMatrix<double> Ac=(Eigen::SparseMatrix<double>(Pcs.transpose())*Afull*Pcs).pruned();

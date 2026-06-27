@@ -10,6 +10,7 @@ add_executable(MagFDMsolver
     MagneticFieldAnalyzer.cpp
     MagneticFieldAnalyzer_nonlinear.cpp
     MagneticFieldAnalyzer_nonlinear_newton.cpp
+    MagneticFieldAnalyzer_dd.cpp
     MagneticFieldAnalyzer.h
     AsyncWriter.cpp
     AsyncWriter.h
@@ -95,6 +96,7 @@ add_executable(dd_bench
     MagneticFieldAnalyzer.cpp
     MagneticFieldAnalyzer_nonlinear.cpp
     MagneticFieldAnalyzer_nonlinear_newton.cpp
+    MagneticFieldAnalyzer_dd.cpp
     AsyncWriter.cpp
     tinyexpr/tinyexpr.cpp
 )

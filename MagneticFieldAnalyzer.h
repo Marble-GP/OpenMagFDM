@@ -578,9 +578,27 @@ private:
                               alpha(1.0), beta(0.0), gamma(0.0) {}
     };
 
+    // v1.6 domain decomposition (optimized Schwarz, polar only). Opt-in
+    // variable-resolution ACCURACY mode: keep the air gap / saturated zone
+    // FINE, coarsen smooth radial bands on their own uniform grid, couple via
+    // symmetric Robin transmission iterated to consistency. NOT a speed default
+    // (uniform downsampling is faster); use when full-res gap accuracy matters.
+    struct DDConfig {
+        struct Band { int c0, c1, cf_r, cf_theta; };  // column range [c0,c1), radial & theta coarsen factors
+        bool   enabled   = false;
+        std::vector<Band> bands;  // radial bands (cf_theta=1 => r-only coarsening, preserves slots/magnets)
+        double robin_p   = 12.0;  // Robin transmission coefficient (alpha); interfaces should sit in iron
+        int    overlap   = 4;     // band overlap in fine columns
+        int    max_outer = 20;    // max Schwarz sweeps
+        double tol       = 2e-3;  // convergence tol on the relative Schwarz residual ||G-Gprev||/||G||
+        double relax     = 1.0;   // outer under-relaxation omega (1.0 = none; <1 damps a 2-cycle)
+    };
+
     // Configuration and input
     YAML::Node config;
+    std::string config_path;        // retained so DD can reload the raw base config for sub-domains
     cv::Mat image;
+    DDConfig dd_config;             // parsed from the 'domain_decomposition' YAML block
     std::string coordinate_system;  // "cartesian" or "polar"
 
     // Mesh parameters (Cartesian)
@@ -1011,6 +1029,13 @@ private:
     void solveNonlinear();  // Main nonlinear Picard iteration solver
     void solveNonlinearWithAnderson();  // Picard with Anderson acceleration
     void solveNonlinearNewtonKrylov();  // Newton-Krylov (Jacobian-free GMRES)
+
+    // v1.6 domain decomposition (polar, opt-in): banded variable-resolution
+    // optimized Schwarz. Builds per-band sub-analyzers (crop + coarsen on their
+    // own uniform grid), iterates symmetric-Robin transmission to consistency,
+    // and writes the composite solution into the member Az. Defined in
+    // MagneticFieldAnalyzer_dd.cpp. (Implementation ported from dd_bench.)
+    void solveDomainDecomposition();
 
     // Unified mu accessors (coordinate-system aware)
     double muAtGrid(int i, int j) const;  // i=col, j=row

@@ -491,6 +491,19 @@ function addContextSnippets(completions, parentContext, grandparentContext, isVa
             });
         }
     }
+
+    // Add domain decomposition template snippet (when parent is domain_decomposition)
+    if (parentContext === 'domain_decomposition') {
+        if (snippets.domain_decomposition_template) {
+            completions.push({
+                caption: '[Snippet] Domain Decomposition Template',
+                value: snippets.domain_decomposition_template.snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: '<b>Snippet: Domain Decomposition</b><br>Variable-resolution optimized Schwarz (polar, opt-in accuracy mode): keep the air gap fine, coarsen smooth radial bands'
+            });
+        }
+    }
 }
 
 // ---- Library editor completer ----
@@ -4144,6 +4157,39 @@ function ensureSolverHintBlock(yamlString) {
     return yamlString + sep + SOLVER_HINT_BLOCK;
 }
 
+// v1.6 domain decomposition: optional, COMMENTED-OUT block appended to the
+// auto-generated POLAR config (polar only -- DD is a polar feature). The user
+// uncomments + tunes the bands to enable a variable-resolution Schwarz solve.
+const DD_HINT_MARKER = '# --- Optional: domain decomposition (polar, variable-resolution accuracy mode) ---';
+const DD_HINT_BLOCK = `
+${DD_HINT_MARKER}
+# Opt-in. Keeps the air gap / saturated zone FINE while coarsening smooth
+# radial bands on their own uniform grid (coupled by symmetric Robin
+# transmission iterated to consistency). NOT faster than the monolithic
+# solve on a dense machine -- use when you need full-resolution gap accuracy
+# (e.g. final-ranking / verification). Band columns below are RADIAL PIXEL
+# INDICES (0 = inner radius .. nr = outer); cf=1 keeps a band FINE (use it
+# across the gap), cf>1 coarsens. Interfaces must sit in IRON, not in the
+# air gap or coils. Uncomment + tune the bands to YOUR geometry:
+# domain_decomposition:
+#   enabled: true
+#   bands:
+#     - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)
+#     - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE
+#     - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)
+#   robin_p: 12.0          # Robin transmission coefficient
+#   overlap: 4             # band overlap in fine columns
+#   max_outer: 20          # max Schwarz sweeps
+#   tol: 1.0e-3            # relative Schwarz-residual stop
+#   # relax: 0.7           # under-relaxation if an interface oscillates
+`;
+function ensureDDHintBlock(yamlString) {
+    if (typeof yamlString !== 'string') return yamlString;
+    if (yamlString.indexOf(DD_HINT_MARKER) !== -1) return yamlString;
+    const sep = yamlString.endsWith('\n') ? '' : '\n';
+    return yamlString + sep + DD_HINT_BLOCK;
+}
+
 // Build the polar coordinate_system / polar_domain / boundary block as a
 // hand-rolled YAML string. `jsyaml.dump` strips comments, so the block
 // has to be assembled as text instead of through the dumper.
@@ -4239,7 +4285,9 @@ function buildPolarYamlBlock(filename, polarDomain) {
     // Phase BA: surface the nonlinear_solver / coarsening knobs even when
     // they aren't active in this template, so a user reading the inserted
     // YAML in Ace sees them as a discoverable optional section.
-    return ensureSolverHintBlock(lines.join('\n') + '\n');
+    // v1.6: also append the optional (commented) domain_decomposition block --
+    // polar only, so the DD accuracy mode is discoverable from the generated YAML.
+    return ensureDDHintBlock(ensureSolverHintBlock(lines.join('\n') + '\n'));
 }
 
 // Build the cartesian coordinate_system / mesh block. mesh.dx and .dy are
