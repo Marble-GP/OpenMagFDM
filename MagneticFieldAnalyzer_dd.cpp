@@ -136,6 +136,20 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         throw std::runtime_error("domain_decomposition: no valid bands after clamping -- check the "
                                  "'bands' ranges (each must lie within [0, nr) and be non-empty).");
     }
+    // (B) Coverage check: the band CORES must tile the full radial range [0, NR). Any uncovered
+    // column stays ZERO in the composite (-> wrong flux/field there). Warn loudly if so.
+    {
+        std::vector<bool> covered(NR, false);
+        for (const auto& b : B)
+            for (int c = std::max(0, b.c0); c < std::min(NR, b.c1); ++c) covered[c] = true;
+        int nuncov = 0, first = -1, last = -1;
+        for (int c = 0; c < NR; ++c) if (!covered[c]) { ++nuncov; if (first < 0) first = c; last = c; }
+        if (nuncov > 0)
+            std::cerr << "WARNING: domain_decomposition bands leave " << nuncov << " radial column(s) "
+                      << "UNCOVERED (e.g. [" << first << ".." << last << "] of [0," << NR << ")); those stay "
+                      << "ZERO in the composite -> flux/field there will be wrong. Make the bands tile [0,"
+                      << NR << ")." << std::endl;
+    }
     std::cout << "  aggregate DOF = " << agg << " ("
               << (100.0 * agg / ((double)NTH * NR)) << "% of monolithic "
               << ((long)NTH * NR) << ")" << std::endl;
@@ -178,7 +192,9 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
             b.an->solve();
             const Eigen::MatrixXd& sol = b.an->getAz();
 
-            // Write the band CORE [c0, c1) back into the composite G (NN upsample).
+            // Write the band CORE [c0, c1) back into the composite G (NN upsample). The Schwarz
+            // ITERATION uses NN (the validated, stable mortar); a BILINEAR smoothing pass is applied
+            // once at the end (see below) for a clean output field without destabilizing convergence.
             for (int j = 0; j < NTH; ++j) {
                 int mb = j / b.cft;
                 if (mb >= b.nth) mb = b.nth - 1;
@@ -192,11 +208,67 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         if (omega != 1.0) G = Gprev + omega * (G - Gprev);   // outer under-relaxation (damps a 2-cycle)
         res = (G - Gprev).norm() / (G.norm() + 1e-30);       // relative Schwarz residual (no reference needed)
         std::cout << "  DD sweep " << it << ": residual = " << res << std::endl;
+        // (A) Divergence guard: bail out with a clear message instead of exporting blown-up garbage.
+        // A healthy radial-band DD drops the residual to O(1e-2) within ~3 sweeps; a residual that
+        // blows up or stays order-1 means the ACTIVE region is being coarsened or an interface sits
+        // in air/coils (the Schwarz iteration is then unstable -- see README band-design rules).
+        if (!std::isfinite(res) || res > 5.0 || (it >= 4 && res > 0.8)) {
+            throw std::runtime_error(
+                "domain_decomposition: the Schwarz iteration is DIVERGING (residual=" +
+                std::to_string(res) + " at sweep " + std::to_string(it) + "). Almost always this means "
+                "the ACTIVE region (air gap / magnets / coils) is being COARSENED, or a band interface "
+                "sits in air/coils. Keep the active band fine (cf_r=cf_theta=1) with the gap inside it, "
+                "and place band interfaces in iron. (A uniform downsample is NOT the same as coarsening "
+                "every DD band -- the latter couples coarse sub-domains and is unstable.)");
+        }
         if (res < tol) break;
     }
     const int sweeps_done = std::min(it, maxo);  // 'it' is maxo+1 if the loop ran to the cap without converging
     std::cout << "=== DD done: " << sweeps_done << " sweep(s), final residual = " << res
               << (res < tol ? " (converged)" : " (reached max_outer)") << " ===" << std::endl;
+
+    // (C) Final BILINEAR + PARTITION-OF-UNITY blend pass (OUTPUT ONLY -- does NOT touch the validated
+    // NN Schwarz iteration above). Each band's converged sub-solution is rendered bilinearly over its
+    // FULL extended range with a taper weight (1 in the core [c0,c1), linearly ramping to 0 across the
+    // overlaps), and overlapping bands are averaged. This removes BOTH the nearest-neighbour staircase
+    // INSIDE coarse bands AND the band-interface B spikes (the fine<->coarse seam becomes a smooth
+    // blend). Interpolation only (theta periodic, radial clamped) -> never extrapolates outside the
+    // domain. The coarse-region B is still approximate; the trustworthy DD output is the flux.
+    auto taper = [](const Band& b, int c) -> double {
+        if (c >= b.c0 && c < b.c1) return 1.0;
+        if (c <  b.c0) return (b.c0 > b.er0)     ? std::max(0.0, (double)(c - b.er0) / (b.c0 - b.er0))         : 0.0;
+        /* c >= c1 */  return (b.er1 - 1 > b.c1) ? std::max(0.0, (double)(b.er1 - 1 - c) / (b.er1 - 1 - b.c1)) : 0.0;
+    };
+    {
+        Eigen::MatrixXd Gacc = Eigen::MatrixXd::Zero(NTH, NR);
+        Eigen::MatrixXd Wacc = Eigen::MatrixXd::Zero(NTH, NR);
+        for (const auto& b : B) {
+            const Eigen::MatrixXd& sol = b.an->getAz();
+            for (int j = 0; j < NTH; ++j) {
+                const double fmb = (double)j / b.cft;
+                int mb0 = (int)std::floor(fmb);
+                const double wt = fmb - mb0;
+                mb0 = ((mb0 % b.nth) + b.nth) % b.nth;
+                const int mb1 = (mb0 + 1) % b.nth;             // periodic wrap in theta
+                for (int c = b.er0; c < b.er1; ++c) {
+                    const double w = taper(b, c);
+                    if (w <= 0.0) continue;
+                    double fkb = (double)(c - b.er0) * (b.nrb - 1) / (b.er1 - 1 - b.er0);
+                    fkb = std::max(0.0, std::min(fkb, (double)(b.nrb - 1)));   // clamp (no radial extrapolation)
+                    const int kb0 = (int)std::floor(fkb);
+                    const int kb1 = std::min(kb0 + 1, b.nrb - 1);
+                    const double wr = fkb - kb0;
+                    const double val = (1.0 - wt) * ((1.0 - wr) * sol(mb0, kb0) + wr * sol(mb0, kb1))
+                                     +        wt  * ((1.0 - wr) * sol(mb1, kb0) + wr * sol(mb1, kb1));
+                    Gacc(j, c) += w * val;
+                    Wacc(j, c) += w;
+                }
+            }
+        }
+        for (int j = 0; j < NTH; ++j)
+            for (int c = 0; c < NR; ++c)
+                if (Wacc(j, c) > 1e-12) G(j, c) = Gacc(j, c) / Wacc(j, c);
+    }
 
     // Composite solution -> member Az, then refresh B/H/mu on the full grid so the
     // Mu/H exports, energy, and Maxwell-stress are consistent with the composite
