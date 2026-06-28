@@ -154,6 +154,19 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
               << (100.0 * agg / ((double)NTH * NR)) << "% of monolithic "
               << ((long)NTH * NR) << ")" << std::endl;
 
+    // In-loop write-back / restriction stability depends on whether a FINE band is present.
+    // With a fine band (the validated mixed case, e.g. fine-active + coarse-rings), nearest-neighbour
+    // write-back is stable -- the fine band feeds smooth interface traces. With ALL bands coarse
+    // (e.g. a uniformly-coarsened domain split into bands), NN traces are staircased and the
+    // coarse<->coarse Robin coupling DIVERGES; BILINEAR write-back smooths the traces and converges to
+    // ~the uniform-downsample solution. So pick the in-loop write-back accordingly. (NOTE: for a true
+    // uniform downsample, a SINGLE band [[0,nr,cf,cf]] is exact + has no coupling -- prefer that.)
+    bool any_fine = false;
+    for (const auto& b : B) if (b.cfr == 1 && b.cft == 1) { any_fine = true; break; }
+    const bool loop_bilinear = !any_fine;
+    if (loop_bilinear)
+        std::cout << "  (all bands coarse -> bilinear in-loop write-back for stability)" << std::endl;
+
     // ---- multiplicative Schwarz outer loop -------------------------------------
     // Composite solution G is indexed (theta, r) to match the analyzer's Az.
     Eigen::MatrixXd G = Eigen::MatrixXd::Zero(NTH, NR);
@@ -192,16 +205,33 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
             b.an->solve();
             const Eigen::MatrixXd& sol = b.an->getAz();
 
-            // Write the band CORE [c0, c1) back into the composite G (NN upsample). The Schwarz
-            // ITERATION uses NN (the validated, stable mortar); a BILINEAR smoothing pass is applied
-            // once at the end (see below) for a clean output field without destabilizing convergence.
+            // Write the band CORE [c0, c1) back into the composite G. Mixed (fine present) -> NN
+            // (validated, stable mortar; a bilinear OUTPUT pass smooths it at the end). All-coarse ->
+            // BILINEAR in-loop (smooth traces so coarse<->coarse coupling converges).
             for (int j = 0; j < NTH; ++j) {
-                int mb = j / b.cft;
-                if (mb >= b.nth) mb = b.nth - 1;
-                for (int c = b.c0; c < b.c1; ++c) {
-                    int kb = (int)std::llround((double)(c - b.er0) * (b.nrb - 1) / (b.er1 - 1 - b.er0));
-                    kb = std::max(0, std::min(kb, b.nrb - 1));
-                    G(j, c) = sol(mb, kb);
+                if (loop_bilinear) {
+                    const double fmb = (double)j / b.cft;
+                    int mb0 = (int)std::floor(fmb);
+                    const double wt = fmb - mb0;
+                    mb0 = ((mb0 % b.nth) + b.nth) % b.nth;
+                    const int mb1 = (mb0 + 1) % b.nth;            // periodic wrap in theta
+                    for (int c = b.c0; c < b.c1; ++c) {
+                        double fkb = (double)(c - b.er0) * (b.nrb - 1) / (b.er1 - 1 - b.er0);
+                        fkb = std::max(0.0, std::min(fkb, (double)(b.nrb - 1)));
+                        const int kb0 = (int)std::floor(fkb);
+                        const int kb1 = std::min(kb0 + 1, b.nrb - 1);
+                        const double wr = fkb - kb0;
+                        G(j, c) = (1.0 - wt) * ((1.0 - wr) * sol(mb0, kb0) + wr * sol(mb0, kb1))
+                                +        wt  * ((1.0 - wr) * sol(mb1, kb0) + wr * sol(mb1, kb1));
+                    }
+                } else {
+                    int mb = j / b.cft;
+                    if (mb >= b.nth) mb = b.nth - 1;
+                    for (int c = b.c0; c < b.c1; ++c) {
+                        int kb = (int)std::llround((double)(c - b.er0) * (b.nrb - 1) / (b.er1 - 1 - b.er0));
+                        kb = std::max(0, std::min(kb, b.nrb - 1));
+                        G(j, c) = sol(mb, kb);
+                    }
                 }
             }
         }
@@ -215,11 +245,10 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         if (!std::isfinite(res) || res > 5.0 || (it >= 4 && res > 0.8)) {
             throw std::runtime_error(
                 "domain_decomposition: the Schwarz iteration is DIVERGING (residual=" +
-                std::to_string(res) + " at sweep " + std::to_string(it) + "). Almost always this means "
-                "the ACTIVE region (air gap / magnets / coils) is being COARSENED, or a band interface "
-                "sits in air/coils. Keep the active band fine (cf_r=cf_theta=1) with the gap inside it, "
-                "and place band interfaces in iron. (A uniform downsample is NOT the same as coarsening "
-                "every DD band -- the latter couples coarse sub-domains and is unstable.)");
+                std::to_string(res) + " at sweep " + std::to_string(it) + "). Likely a band interface "
+                "sits in AIR or COILS, or the coarsening is too aggressive for the geometry. Place band "
+                "interfaces in IRON, keep the air gap inside a fine band, and lower the coarsening factor. "
+                "For a plain uniform downsample use a SINGLE band [[0, nr, cf, cf]] (exact, no coupling).");
         }
         if (res < tol) break;
     }
