@@ -660,6 +660,16 @@ private:
         // every sectored band; when empty, sectors are split uniformly. Cuts must
         // pass through IRON (tooth centers) — never through coils or magnets.
         std::vector<int> theta_cuts;
+        // Two-level Galerkin coarse space (bilinear r x theta prolongation,
+        // Ac = P^T A(mu(G)) P rebuilt each sweep, G += damp*P*Ac^-1*P^T(b-A*G)).
+        // Bounds the outer sweep count for many-sector configs (1-level theta
+        // Schwarz contracts at only ~0.9/sweep). Requires FINE patches under
+        // the correction — coarsened patches cannot smooth the fine-scale
+        // residual the correction injects (dd_bench: diverges). coarse = [CR,
+        // CTH] cell aggregation factors; 0/absent = off.
+        int    coarse_r    = 0;
+        int    coarse_th   = 0;
+        double coarse_damp = 1.0;
         // Cap on NK iterations per band per sweep ("flattened" Schwarz). Nesting a
         // full NK solve inside every Schwarz sweep multiplies the two iteration
         // counts (measured: the fine band re-paid 80-90 NK iterations EVERY sweep

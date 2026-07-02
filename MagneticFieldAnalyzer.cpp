@@ -226,6 +226,12 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         if (dd["theta_cuts"]) {
             for (auto tc : dd["theta_cuts"]) dd_config.theta_cuts.push_back(tc.as<int>());
         }
+        if (dd["coarse"] && dd["coarse"].IsSequence() && dd["coarse"].size() >= 2) {
+            dd_config.coarse_r  = std::max(0, dd["coarse"][0].as<int>(0));
+            dd_config.coarse_th = std::max(0, dd["coarse"][1].as<int>(0));
+        }
+        if (dd["coarse_damp"])
+            dd_config.coarse_damp = dd["coarse_damp"].as<double>(dd_config.coarse_damp);
         if (dd["bands"]) {
             for (auto bn : dd["bands"]) {
                 int c0  = bn[0].as<int>();

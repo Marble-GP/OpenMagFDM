@@ -290,6 +290,88 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
     // (this is the documented uniform-downsample use). Skip the Schwarz loop.
     const bool no_coupling = (B.size() == 1 && B[0].ft && B[0].er0 == 0 && B[0].er1 == NR);
 
+    // ---- Two-level Galerkin coarse space (dd_bench DD_COARSE port) -------------
+    // Bilinear r x theta prolongation P (theta periodic, r clamped); each sweep:
+    // refresh the FULL operator at the current composite (buildPolarOperator uses
+    // the member Az) and apply G += damp * P * (P^T A P)^-1 * P^T (b - A*G).
+    // Intended to bound the outer sweep count for many-sector configs (the
+    // 1-level theta Schwarz only contracts at ~0.9/sweep).
+    //
+    // STATUS (2026-07 benchmark): NEGATIVE on IEEJ-D even with FINE sectors —
+    // the combination the linear coarse_space_poc predicted would work. The
+    // early composite's patch-seam discontinuities poison the NONLINEAR coarse
+    // operator (mu evaluated at the seamy field): its LU solve returns spiky
+    // corrections that blow the field up ~100x/sweep, and warm-up delay, an L2
+    // trust clamp, coarse_damp 0.3 and relax 0.5 all failed to stabilize it.
+    // The base flattened-sector iteration itself also fails to contract
+    // (wanders at res 1.2-2.6 indefinitely), so there is no convergent
+    // iteration for the coarse space to accelerate. Kept as an OFF-by-default
+    // experimental knob with the guards below; do not enable in production.
+    const bool use_cs = (dd_config.coarse_r > 0 && dd_config.coarse_th > 0) && !no_coupling;
+    const double cs_damp = dd_config.coarse_damp;
+    Eigen::SparseMatrix<double> Pcs;
+    Eigen::SparseLU<Eigen::SparseMatrix<double>> cs_lu;
+    bool cs_pattern_done = false;
+    int  cs_nrc = 0, cs_nthc = 0;
+    if (use_cs) {
+        const int CR = dd_config.coarse_r, CTH = dd_config.coarse_th;
+        cs_nrc  = std::max(2, NR  / CR);
+        cs_nthc = std::max(2, NTH / CTH);
+        const long Nc = (long)cs_nrc * cs_nthc;
+        std::vector<Eigen::Triplet<double>> tp;
+        tp.reserve((size_t)NR * NTH * 4);
+        for (int i = 0; i < NR; ++i) {
+            const double fic = (double)i / CR;
+            const int ic0 = std::min((int)fic, cs_nrc - 1), ic1 = std::min(ic0 + 1, cs_nrc - 1);
+            const double wr = fic - (int)fic;
+            for (int j = 0; j < NTH; ++j) {
+                const double fjc = (double)j / CTH;
+                const int jc0 = ((int)fjc) % cs_nthc, jc1 = (jc0 + 1) % cs_nthc;  // theta periodic
+                const double wt = fjc - (int)fjc;
+                const int f = i * NTH + j;   // matches buildMatrixPolar's row ordering
+                tp.push_back({f, ic0 * cs_nthc + jc0, (1 - wr) * (1 - wt)});
+                tp.push_back({f, ic0 * cs_nthc + jc1, (1 - wr) * wt});
+                tp.push_back({f, ic1 * cs_nthc + jc0, wr * (1 - wt)});
+                tp.push_back({f, ic1 * cs_nthc + jc1, wr * wt});
+            }
+        }
+        Pcs.resize((long)NTH * NR, Nc);
+        Pcs.setFromTriplets(tp.begin(), tp.end());
+        std::cout << "  coarse space: CR=" << CR << " CTH=" << CTH
+                  << " coarseDOF=" << Nc << " damp=" << cs_damp
+                  << " (Galerkin, rebuilt each sweep at current mu)" << std::endl;
+    }
+    auto coarse_correct = [&](Eigen::MatrixXd& Gc) {
+        // Refresh the full nonlinear operator at the current composite.
+        Az = Gc;
+        Eigen::SparseMatrix<double> Afull;
+        Eigen::VectorXd bvec;
+        buildPolarOperator(Afull, bvec);
+        Eigen::SparseMatrix<double> Ac =
+            (Eigen::SparseMatrix<double>(Pcs.transpose()) * Afull * Pcs).pruned();
+        if (!cs_pattern_done) { cs_lu.analyzePattern(Ac); cs_pattern_done = true; }
+        cs_lu.factorize(Ac);
+        if (cs_lu.info() != Eigen::Success) {
+            std::cerr << "WARNING: DD coarse-space factorization failed; skipping correction this sweep."
+                      << std::endl;
+            return;
+        }
+        Eigen::VectorXd Gv((long)NTH * NR);
+        for (int i = 0; i < NR; ++i)
+            for (int j = 0; j < NTH; ++j) Gv[(long)i * NTH + j] = Gc(j, i);
+        const Eigen::VectorXd R = bvec - Afull * Gv;
+        Eigen::VectorXd d = Pcs * cs_lu.solve(Eigen::VectorXd(Pcs.transpose() * R));
+        // Trust clamp: early composites carry seam discontinuities, so the
+        // nonlinear operator (mu evaluated at the seamy field) can make the
+        // correction an AMPLIFIER (measured: unclamped corrections grew G
+        // ~100x per sweep). Never let one correction move G by more than half
+        // its own norm.
+        const double dn = d.norm(), gn = Gv.norm() + 1e-30;
+        if (dn > 0.5 * gn) d *= 0.5 * gn / dn;
+        for (int i = 0; i < NR; ++i)
+            for (int j = 0; j < NTH; ++j) Gc(j, i) += cs_damp * d[(long)i * NTH + j];
+    };
+
     auto do_band = [&](Band& b, const Eigen::MatrixXd& Gs) {
         if (b.ft) {
             // ---- full-theta ring (validated banded path; reads Gs, writes G) ----
@@ -405,6 +487,7 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
 
     int it = 0;
     double res = 1.0;
+    double Gnorm_ref = 0.0;
     if (no_coupling) {
         B[0].an->setNKMaxIterations(full_iters[0]);
         do_band(B[0], G);
@@ -418,8 +501,27 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         // Multiplicative (serial): patches read the live composite.
         sweep_all(PAR ? Gprev : G);
         if (omega != 1.0) G = Gprev + omega * (G - Gprev);   // outer under-relaxation (damps a 2-cycle)
+        // 2-level global correction, after a warm-up: the first sweeps' composite
+        // still carries patch-seam discontinuities that poison the nonlinear
+        // coarse operator (measured blow-up when corrected from sweep 1).
+        if (use_cs && it >= 4) coarse_correct(G);
         res = (G - Gprev).norm() / (G.norm() + 1e-30);       // relative Schwarz residual (no reference needed)
         std::cout << "  DD sweep " << it << ": residual = " << res << std::endl;
+        // Magnitude divergence guard: a ratio-constant geometric explosion keeps
+        // the relative Schwarz residual ~1 while the field grows without bound
+        // (seen with an unclamped coarse correction: x100/sweep to |Az|~1e36).
+        // Sweep 1's patch solves already produce physical-scale Az even when the
+        // composite is seamy, so 100x that magnitude is unambiguously divergent
+        // (a relax<1 ramp-up only approaches ~2x of it).
+        if (it == 1) Gnorm_ref = G.cwiseAbs().maxCoeff();
+        if (it > 1 && Gnorm_ref > 0.0 && G.cwiseAbs().maxCoeff() > 100.0 * Gnorm_ref) {
+            throw std::runtime_error(
+                "domain_decomposition: the composite field magnitude grew " +
+                std::to_string(G.cwiseAbs().maxCoeff() / Gnorm_ref) + "x beyond the sweep-1 scale "
+                "-- the iteration is EXPLODING (coarse-space/transmission instability). Reduce "
+                "coarse_damp, disable 'coarse', or check the sector layout (cuts must pass through "
+                "iron; the air gap must stay in a full-theta fine ring).");
+        }
         // (A) Divergence guard: bail out with a clear message instead of exporting blown-up garbage.
         // A healthy radial-band DD drops the residual to O(1e-2) within ~3 sweeps; a residual that
         // blows up or stays order-1 means the ACTIVE region is being coarsened or an interface sits
@@ -427,8 +529,11 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         // Flattened mode legitimately makes larger early moves (the nonlinear relaxation itself
         // happens across sweeps), so give it more sweeps before the stagnation check bites.
         // Sectored configs propagate information ~one patch per sweep around the ring, so scale
-        // the stagnation horizon with the patch count.
-        const int stall_check_from = (cap > 0) ? std::max<int>(8, 2 * (int)B.size()) : 4;
+        // the stagnation horizon with the patch count — but cap it so a non-convergent wander
+        // (measured: flattened theta-sectors oscillate at res 1.2-2.6 indefinitely) still aborts
+        // instead of exporting a garbage composite.
+        const int stall_check_from = (cap > 0)
+            ? std::min<int>(16, std::max<int>(8, 2 * (int)B.size())) : 4;
         if (!std::isfinite(res) || res > 5.0 || (it >= stall_check_from && res > 0.8)) {
             throw std::runtime_error(
                 "domain_decomposition: the Schwarz iteration is DIVERGING (residual=" +

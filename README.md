@@ -623,8 +623,11 @@ fine（cf=1）バンドは第5要素でセクター数を指定でき、`theta_c
 material-safe な theta 行。コイル・磁石を跨ぐと flux が壊れます）で theta 方向に分割されます。
 `parallel: true` で additive Schwarz + OpenMP パッチ並列（内部ソルバはシングルスレッド化）に
 なります。小パッチはキャッシュ常駐するため AMGCL のメモリ帯域律速より並列効率が高い一方、
-**theta 透過の 1-level Schwarz は収束が遅く（ρ≈0.85-0.9/sweep）、現状は粗空間補正なしでは
-実用になりません**（開発継続中）。リング構成（セクターなし）での `parallel: true` は安全です。
+**theta 分割の Schwarz 反復は現状収束しません**: 平坦化（max_inner）併用では発散・徘徊し、
+フル sub-solve（max_inner: 0）では収束するものの実用外の遅さです。2-level Galerkin 粗空間
+（`coarse: [CR, CTH]`）も実装されていますが、**非線形演算子が縫い目の不連続に汚染されて
+補正が増幅器になるため IEEJ-D で発散が実測されており、使用しないでください**（トレーサビリティ
+のため off-by-default で残置）。リング構成（セクターなし）での `parallel: true` は安全です。
 
 ```yaml
 domain_decomposition:
