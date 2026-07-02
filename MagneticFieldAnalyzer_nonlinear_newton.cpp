@@ -324,13 +324,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // A plateau exit is a stall, not true convergence — say so instead
             // of reporting it as converged (solutions accepted at the plateau
             // scatter by a few percent run-to-run; users should know).
-            std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
-                      << std::scientific << std::setprecision(2) << residual_rel << ")";
-            if (plateau_stall) {
-                std::cout << " [PLATEAU STALL: accepted above tolerance "
-                          << std::scientific << std::setprecision(1) << TOL << "]";
+            // quiet_solver_ (parallel DD sub-solves) suppresses it: concurrent
+            // prints from many patches would garble the log.
+            if (!quiet_solver_) {
+                std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
+                          << std::scientific << std::setprecision(2) << residual_rel << ")";
+                if (plateau_stall) {
+                    std::cout << " [PLATEAU STALL: accepted above tolerance "
+                              << std::scientific << std::setprecision(1) << TOL << "]";
+                }
+                std::cout << std::endl;
             }
-            std::cout << std::endl;
 
             // [Stage 1e] Coarse path keeps only active cells current (active-only
             // scatter + coarse curl). Prolong to the full grid ONCE and recompute
@@ -406,6 +410,13 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // (idx = i_r*ntheta+j_theta) but J_matrix is n_active x n_active. The
             // correction is numerically ~negligible anyway (Phase BL: ~3e-19% of
             // ||J v||), so J_coarse = A_coarse.
+            // Energy-LS mode keeps J symmetric POSITIVE DEFINITE so CG from
+            // x0=0 yields a guaranteed energy-descent direction: the raw
+            // diagonal correction goes NEGATIVE where dμ/dH > 0 (the rising-
+            // μ_r branch that early iterates sweep through), making J
+            // indefinite — measured to produce energy-ASCENT directions. In
+            // energy mode the correction is therefore CLAMPED to >= 0 (keeps
+            // the saturated-region stiffening, drops the indefinite part).
             if (!use_coarse && is_polar && !rgb_to_material.empty() && !material_mu.empty()) {
                 cv::Mat image_to_use;
                 cv::flip(image, image_to_use, 0);  // Match setupMaterialProperties()
@@ -467,6 +478,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
                     double correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
                     correction_factor *= (dr_local * dr_local);
+                    if (nonlinear_config.line_search_energy && correction_factor < 0.0)
+                        correction_factor = 0.0;  // keep J SPD in energy-LS mode
                     // J_matrix.coeffRef writes to a unique diagonal entry per
                     // idx — no race even though we are inside a parallel for.
                     J_matrix.coeffRef(idx, idx) += correction_factor;
@@ -583,6 +596,34 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_0 = (dc_R_fine_norm >= 0.0) ? dc_R_fine_norm : residual_norm;
         Eigen::VectorXd Az_vec_0 = Az_vec;
 
+        // Energy-objective line search: Armijo on the CONVEX functional W(Az)
+        // (∇W = R) instead of on ||R||. ||R|| is not monotone along descent
+        // paths of a non-quadratic convex function, so the residual Armijo
+        // rejects legitimate long steps and pins α at ~0.1 (the linear-rate
+        // crawl). Requires the member fields to currently match Az_vec_0
+        // (guaranteed: Step 1 ran updateFieldAndMu for this iterate).
+        const bool LS_ENERGY = nonlinear_config.line_search_energy && !use_coarse;
+        double W0 = 0.0, g0 = 0.0;
+        bool energy_ok = false;
+        if (LS_ENERGY) {
+            W0 = computeEnergyObjective();
+            // Directional derivative dW/dα at α=0 by finite difference. The
+            // assembled residual R is NOT usable here: the FV rows carry
+            // O(1e9) scale factors, so R·δ has neither the scale nor
+            // (numerically) the sign of dW/dα.
+            const double eps = 1e-6 * std::sqrt((Az_vec_0.squaredNorm() + 1e-30) /
+                                                (delta_A.squaredNorm() + 1e-30));
+            Eigen::VectorXd Az_eps = Az_vec_0 + eps * delta_A;
+            syncMemberAz(Az_eps);
+            updateFieldAndMu();
+            const double W_eps = computeEnergyObjective();
+            g0 = (W_eps - W0) / eps;
+            energy_ok = std::isfinite(W0) && std::isfinite(g0) && g0 < 0.0;
+            if (energy_ok) alpha = 1.0;  // always probe the full step first
+            else if (VERBOSE) std::cout << " [energy-LS: g0=" << g0
+                                        << " not a descent direction -> residual LS]";
+        }
+
         // [Phase BJ-8 Path D / v1.5.1] Phase 6 damped Picard + Anderson
         // acceleration block was the alternate update path used when the
         // (now-removed) Galerkin coarse system fed an A(μ_diff) tangent
@@ -601,16 +642,29 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             syncMemberAz(Az_trial);
             updateFieldAndMu();
 
-            double residual_trial_norm;
-            {
-                Eigen::SparseMatrix<double> A_trial;
-                Eigen::VectorXd b_trial;
-                buildMatrixForSolve(A_trial, b_trial);
-                residual_trial_norm = (A_trial * Az_trial - b_trial).norm();
+            bool accept;
+            if (energy_ok) {
+                // Armijo on the convex energy: W(x+αδ) ≤ W(x) + c·α·(∇W·δ).
+                // Skips the per-trial matrix rebuild entirely (the residual is
+                // recomputed at the top of the next NK iteration anyway).
+                const double W_trial = computeEnergyObjective();
+                accept = (std::isfinite(W_trial) &&
+                          W_trial <= W0 + c * alpha * g0) || alpha < alpha_min;
+                if (accept && VERBOSE && ls == 0) std::cout << " [W-LS α=" << alpha << "]";
+            } else {
+                double residual_trial_norm;
+                {
+                    Eigen::SparseMatrix<double> A_trial;
+                    Eigen::VectorXd b_trial;
+                    buildMatrixForSolve(A_trial, b_trial);
+                    residual_trial_norm = (A_trial * Az_trial - b_trial).norm();
+                }
+                // Check Armijo condition: ||R(A + α·δA)|| <= ||R(A)||·(1 - c·α)
+                accept = residual_trial_norm <= residual_0 * (1.0 - c * alpha) ||
+                         alpha < alpha_min;
             }
 
-            // Check Armijo condition: ||R(A + α·δA)|| <= ||R(A)||·(1 - c·α)
-            if (residual_trial_norm <= residual_0 * (1.0 - c * alpha) || alpha < alpha_min) {
+            if (accept) {
                 // Accept step. Member Az already holds this trial's (full) field
                 // from syncMemberAz above, so no extra write is needed.
                 Az_vec = Az_trial;
@@ -710,7 +764,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
     }
 
-    std::cerr << "WARNING: Newton-Krylov solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
+    if (!quiet_solver_)
+        std::cerr << "WARNING: Newton-Krylov solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
 
     // [Stage 1e] As in the converged branch: promote the coarse solution to the
     // full grid for downstream force/flux/export. (Az_vec is loop-scoped, so

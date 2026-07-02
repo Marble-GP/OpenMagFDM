@@ -646,6 +646,17 @@ void MagneticFieldAnalyzer::generateBHTable(const std::string& material_name, co
         }
     }
 
+    // Cumulative co-energy Wc(H_i) = ∫₀^{H_i} B dH (trapezoid; exact for the
+    // piecewise-linear B(H) the fast interpolators use). Consumed by
+    // coenergyFromTable (energy-objective line search).
+    table.Wc_values.resize(table.H_values.size());
+    table.Wc_values[0] = 0.0;
+    for (size_t i = 1; i < table.H_values.size(); i++) {
+        const double dH = table.H_values[i] - table.H_values[i-1];
+        table.Wc_values[i] = table.Wc_values[i-1] +
+            0.5 * (table.B_values[i] + table.B_values[i-1]) * dH;
+    }
+
     table.is_valid = true;
 
     std::cout << "Generated B-H table for '" << material_name << "': "
@@ -771,6 +782,107 @@ double MagneticFieldAnalyzer::interpolateB_from_H(const BHTable& table, double H
  * @param H_magnitude Target magnetic field intensity |H| [A/m]
  * @return Magnetic co-energy density W' [J/m³]
  */
+double MagneticFieldAnalyzer::coenergyFromTable(const BHTable& table, double H) const {
+    // Wc(H) = ∫₀^H B dH from the cumulative table (exact for the piecewise-linear
+    // B(H) the fast interpolators use). O(log n) per call — the per-cell workhorse
+    // of the energy-objective line search (integrateMagneticCoEnergy's 100-point
+    // Simpson is reserved for the one-off co-energy export).
+    const double MU0 = 4.0 * M_PI * 1e-7;
+    if (H <= 0.0) return 0.0;
+    if (!table.is_valid || table.H_values.size() < 2 ||
+        table.Wc_values.size() != table.H_values.size()) {
+        const double mu = table.mu_values.empty() ? MU0 : table.mu_values.front();
+        return 0.5 * mu * H * H;
+    }
+    const auto& Ht = table.H_values;
+    const auto& Bt = table.B_values;
+    const auto& Wt = table.Wc_values;
+    if (H >= Ht.back()) {
+        // Deep saturation: B = B_end + μ0·(H − H_end), matching evaluateMu /
+        // interpolateH_from_B extrapolation.
+        const double dH = H - Ht.back();
+        return Wt.back() + Bt.back() * dH + 0.5 * MU0 * dH * dH;
+    }
+    auto it = std::upper_bound(Ht.begin(), Ht.end(), H);
+    const size_t k = static_cast<size_t>(std::distance(Ht.begin(), it)) - 1;
+    const double t  = (H - Ht[k]) / (Ht[k+1] - Ht[k]);
+    const double Bh = Bt[k] + t * (Bt[k+1] - Bt[k]);
+    return Wt[k] + 0.5 * (Bt[k] + Bh) * (H - Ht[k]);
+}
+
+double MagneticFieldAnalyzer::computeEnergyObjective() {
+    // Discrete magnetostatic energy functional
+    //   W(Az) = Σ_cells w(|B|)·vol − Σ_cells (Jz + Jz_mag)·Az·vol,
+    // where w(B) = ∫₀^B H db = B·H − Wc(H) for B-H (table) materials and
+    // B²/(2μ) for linear ones. Since B(H) is monotone, w is CONVEX, W is convex
+    // in Az, and the Picard residual A(μ(Az))·Az − b is (up to discretization
+    // consistency) its gradient — so W is the correct line-search merit
+    // function: any SPD-preconditioned residual direction is a descent
+    // direction for W, and steps that transiently RAISE ||R|| while lowering W
+    // are legitimate. Assumes calculateMagneticFieldPolar/calculateHField/
+    // updateMuDistribution have run for the current member Az.
+    const bool is_polar = (coordinate_system != "cartesian");
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // match setupMaterialProperties orientation
+
+    const int n_rows = image_to_use.rows;
+    const int n_cols = image_to_use.cols;
+    const bool r_horizontal = is_polar && (r_orientation == "horizontal");
+    const bool has_jmag = (Jz_mag_map.rows() == n_rows && Jz_mag_map.cols() == n_cols);
+    const bool has_jz   = (jz_map.rows()    == n_rows && jz_map.cols()    == n_cols);
+
+    double W = 0.0;
+    #pragma omp parallel
+    {
+        double W_local = 0.0;
+        #pragma omp for schedule(static)
+        for (int k = 0; k < n_rows * n_cols; k++) {
+            const int j = k / n_cols, i = k % n_cols;
+
+            double vol;
+            if (is_polar) {
+                const double r = r_start + (r_horizontal ? i : j) * dr;
+                vol = r * dr * dtheta;
+            } else {
+                vol = dx * dy;
+            }
+
+            double Bx_val, By_val;
+            if (is_polar) { Bx_val = Br(j, i); By_val = Btheta(j, i); }
+            else          { Bx_val = Bx(j, i); By_val = By(j, i);     }
+            const double B_mag = std::sqrt(Bx_val * Bx_val + By_val * By_val);
+
+            // Energy density: table material -> B·H − Wc(H); linear -> B²/(2μ)
+            double w;
+            const cv::Vec3b px = image_to_use.at<cv::Vec3b>(j, i);
+            const int rgb_key = (px[0] << 16) | (px[1] << 8) | px[2];
+            auto lut_it = rgb_to_material.find(rgb_key);
+            const BHTable* bh = nullptr;
+            if (lut_it != rgb_to_material.end()) {
+                auto bh_it = material_bh_tables.find(lut_it->second.name);
+                if (bh_it != material_bh_tables.end() && bh_it->second.is_valid)
+                    bh = &bh_it->second;
+            }
+            if (bh) {
+                const double H_mag = H_map(j, i);
+                w = B_mag * H_mag - coenergyFromTable(*bh, H_mag);
+            } else {
+                const double mu = std::max(mu_map(j, i), 1e-20);
+                w = 0.5 * B_mag * B_mag / mu;
+            }
+
+            double src = 0.0;
+            if (has_jz)   src += jz_map(j, i);
+            if (has_jmag) src += Jz_mag_map(j, i);
+
+            W_local += (w - src * Az(j, i)) * vol;
+        }
+        #pragma omp critical
+        W += W_local;
+    }
+    return W;
+}
+
 double MagneticFieldAnalyzer::integrateMagneticCoEnergy(const BHTable& table, double H_magnitude) {
     if (!table.is_valid || table.H_values.empty()) {
         // Fallback: linear approximation using secant permeability

@@ -86,6 +86,10 @@ public:
     // When true, solveNonlinearNewtonKrylov starts the NK from the current member Az (warm) and
     // SKIPS the linear init guess -- for the DD Schwarz outer loop's per-patch re-solves.
     void setDDWarmStart(bool b) { dd_warm_start_ = b; }
+    // Suppress the per-call "[Solver] AMGCL..." stdout lines (parallel DD runs
+    // many concurrent sub-solves; interleaved prints garble the log).
+    void setQuietSolver(bool b) { quiet_solver_ = b; }
+    bool quiet_solver_ = false;
     // DD flattened-Schwarz control: cap (or restore) this analyzer's NK
     // iteration budget. Used by solveDomainDecomposition to run capped
     // sub-solves during sweeps and one uncapped polish sweep at the end.
@@ -341,6 +345,11 @@ public:
         std::vector<double> B_values;   // |B| [T]
         std::vector<double> mu_values;  // μ [H/m] = μ_r * μ_0
 
+        // Cumulative co-energy Wc_i = ∫₀^{H_i} B dH (trapezoid on the table),
+        // so the energy-objective line search can evaluate W'(H) in O(log n)
+        // per cell instead of the 100-point Simpson in integrateMagneticCoEnergy.
+        std::vector<double> Wc_values;
+
         // Cached for fast interpolation
         bool is_valid;
 
@@ -461,6 +470,16 @@ private:
         double eisenstat_walker_alpha;    // EW α (default 2.0, Choice 2)
         double eisenstat_walker_eta_min;  // floor (default 1e-6, matches SOLVER_TOLERANCE)
         double eisenstat_walker_eta_max;  // initial / cap (default 0.1)
+        // Line-search merit function. "residual" (default) = classic Armijo on
+        // ||A(μ(x))x − b||. "energy" = Armijo on the CONVEX energy functional
+        // W(Az) (see computeEnergyObjective): since B(H) is monotone the
+        // problem is convex minimization with ∇W = R, and ||R|| is NOT
+        // monotone along descent paths of a non-quadratic convex function —
+        // rejecting steps because ||R|| transiently rises is what pins α at
+        // ~0.1 and produces the linear-rate crawl. Energy mode starts every
+        // iteration at α=1 (no ratchet).
+        bool line_search_energy;
+
         // Residual-proportional cap: η ≤ max(eta_min, residual_cap·||R||_rel).
         // The classic ratio formula never tightens in a linear-rate crawl
         // (γ·ratio^α stays ≈0.78 → clamped to eta_max forever). This knob ties
@@ -484,6 +503,7 @@ private:
             eisenstat_walker_enabled(false),
             eisenstat_walker_gamma(0.9), eisenstat_walker_alpha(2.0),
             eisenstat_walker_eta_min(1e-6), eisenstat_walker_eta_max(0.1),
+            line_search_energy(false),
             eisenstat_walker_residual_cap(-1.0) {}
     };
 
@@ -609,7 +629,13 @@ private:
     // symmetric Robin transmission iterated to consistency. NOT a speed default
     // (uniform downsampling is faster); use when full-res gap accuracy matters.
     struct DDConfig {
-        struct Band { int c0, c1, cf_r, cf_theta; };  // column range [c0,c1), radial & theta coarsen factors
+        // Column range [c0,c1), radial & theta coarsen factors, and the number of
+        // theta sectors the band is split into (1 = full-theta ring, the classic
+        // banded mode). Sectoring is only allowed for FINE bands (cf=1): the
+        // sector patches are then exact-resolution (write-back is a plain copy,
+        // no mortar), which is the parallelization configuration — many small
+        // cache-resident patches solved concurrently (additive Schwarz).
+        struct Band { int c0, c1, cf_r, cf_theta, sectors; };
         bool   enabled   = false;
         std::vector<Band> bands;  // radial bands (cf_theta=1 => r-only coarsening, preserves slots/magnets)
         double robin_p   = 12.0;  // Robin transmission coefficient (alpha); interfaces should sit in iron
@@ -617,6 +643,23 @@ private:
         int    max_outer = 20;    // max Schwarz sweeps
         double tol       = 2e-3;  // convergence tol on the relative Schwarz residual ||G-Gprev||/||G||
         double relax     = 1.0;   // outer under-relaxation omega (1.0 = none; <1 damps a 2-cycle)
+        // Additive Schwarz + OpenMP over patches: every patch reads the sweep-
+        // start snapshot (independent solves, disjoint-core write-back) and the
+        // patch loop runs `omp parallel for` with the inner AMGCL solves forced
+        // single-threaded. Small patches are cache-resident, so this scales far
+        // better than AMGCL's memory-bandwidth-bound intra-solve threading
+        // (measured 7.7x vs 3.8x on 24 cores in the dd_bench study). Additive
+        // transmission converges somewhat slower per sweep than multiplicative.
+        bool   parallel  = false;
+        // Robin coefficient for THETA interfaces of sectored patches. The theta
+        // face coupling c=1/(r·μ·dθ) is ~40x the radial c=r/(μ·dr) on this class
+        // of geometry, so the optimal theta alpha is ~robin_p/40 (dd_bench S3
+        // tuning). <0 = auto (robin_p/40).
+        double robin_p_theta = -1.0;
+        // Material-safe theta cut positions (global theta pixel rows). Applied to
+        // every sectored band; when empty, sectors are split uniformly. Cuts must
+        // pass through IRON (tooth centers) — never through coils or magnets.
+        std::vector<int> theta_cuts;
         // Cap on NK iterations per band per sweep ("flattened" Schwarz). Nesting a
         // full NK solve inside every Schwarz sweep multiplies the two iteration
         // counts (measured: the fine band re-paid 80-90 NK iterations EVERY sweep
@@ -1003,6 +1046,10 @@ private:
     double interpolateH_from_B(const BHTable& table, double B_magnitude);
     double interpolateB_from_H(const BHTable& table, double H_magnitude);
     double integrateMagneticCoEnergy(const BHTable& table, double H_magnitude);  // W' = ∫₀^H B(H') dH'
+    double coenergyFromTable(const BHTable& table, double H) const;  // fast O(log n) Wc via cumulative table
+    // Convex energy functional W(Az) = Σ w(|B|)·vol − Σ (Jz+Jz_mag)·Az·vol whose
+    // gradient is the Picard residual — merit function for the energy line search.
+    double computeEnergyObjective();
     double calculateCoEnergyDensity(int j, int i, double B_magnitude);  // Co-energy density w' [J/m³]
     void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
     void updateMuDistribution();  // Update mu_map based on current H_map

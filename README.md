@@ -618,6 +618,23 @@ domain_decomposition:
   ファクトと界面の B スパイクを軽減）。ただし**粗大化領域の B 場は近似**で、界面には残差段差が残ります。
   **DD の信頼できる出力は flux（積分量）**であって、粗化領域の点ごとの B ではありません。
 
+**実験的機能（v1.6+, 開発中）— theta セクター分割 + パッチ並列**:
+fine（cf=1）バンドは第5要素でセクター数を指定でき、`theta_cuts` の位置（**鉄のみを通る**
+material-safe な theta 行。コイル・磁石を跨ぐと flux が壊れます）で theta 方向に分割されます。
+`parallel: true` で additive Schwarz + OpenMP パッチ並列（内部ソルバはシングルスレッド化）に
+なります。小パッチはキャッシュ常駐するため AMGCL のメモリ帯域律速より並列効率が高い一方、
+**theta 透過の 1-level Schwarz は収束が遅く（ρ≈0.85-0.9/sweep）、現状は粗空間補正なしでは
+実用になりません**（開発継続中）。リング構成（セクターなし）での `parallel: true` は安全です。
+
+```yaml
+domain_decomposition:
+  bands:
+    - [52, 203, 1, 1, 8]   # 第5要素 = theta セクター数（fine バンドのみ可）
+  theta_cuts: [321, 427, ...]  # material-safe な切断位置（鉄のみを通る theta 行）
+  parallel: true               # additive Schwarz + OMP パッチ並列
+  # robin_p_theta: 0.3         # theta 界面の Robin 係数（既定 robin_p/40）
+```
+
 WebUI では `domain_decomposition:` のスニペット補完が使え、Polar Preprocess が生成する YAML には
 コメントアウト済みの DD ブロックが付くので、必要なときにコメントを外して調整できます。
 

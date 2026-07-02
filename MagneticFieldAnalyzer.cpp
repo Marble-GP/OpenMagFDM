@@ -162,6 +162,11 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>(0.65);
         nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>(50);
         nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
+        {
+            const std::string lso =
+                nl_config["line_search_objective"].as<std::string>("residual");
+            nonlinear_config.line_search_energy = (lso == "energy");
+        }
 
         // Phase 4: Galerkin coarsening option (for coarsened Newton-Krylov)
         // Default false: FVM (buildMatrixPolarCoarsened/buildMatrixCoarsened) is used for
@@ -215,13 +220,29 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         if (dd["tol"])       dd_config.tol       = dd["tol"].as<double>(dd_config.tol);
         if (dd["relax"])     dd_config.relax     = dd["relax"].as<double>(dd_config.relax);
         if (dd["max_inner"]) dd_config.max_inner = dd["max_inner"].as<int>(dd_config.max_inner);
+        if (dd["parallel"])  dd_config.parallel  = dd["parallel"].as<bool>(false);
+        if (dd["robin_p_theta"])
+            dd_config.robin_p_theta = dd["robin_p_theta"].as<double>(dd_config.robin_p_theta);
+        if (dd["theta_cuts"]) {
+            for (auto tc : dd["theta_cuts"]) dd_config.theta_cuts.push_back(tc.as<int>());
+        }
         if (dd["bands"]) {
             for (auto bn : dd["bands"]) {
                 int c0  = bn[0].as<int>();
                 int c1  = bn[1].as<int>();
                 int cfr = bn.size() > 2 ? bn[2].as<int>() : 1;
                 int cft = bn.size() > 3 ? bn[3].as<int>() : cfr;
-                dd_config.bands.push_back({c0, c1, std::max(1, cfr), std::max(1, cft)});
+                int sec = bn.size() > 4 ? bn[4].as<int>() : 1;
+                if (sec > 1 && (cfr > 1 || cft > 1)) {
+                    std::cerr << "WARNING: domain_decomposition band [" << c0 << "," << c1
+                              << ") requests " << sec << " theta sectors WITH coarsening (cf_r="
+                              << cfr << ", cf_theta=" << cft << "). Sectoring is only stable for "
+                                 "FINE bands (validated: coarsened theta-sector coupling diverges); "
+                                 "forcing sectors=1 (full-theta ring)." << std::endl;
+                    sec = 1;
+                }
+                dd_config.bands.push_back({c0, c1, std::max(1, cfr), std::max(1, cft),
+                                           std::max(1, sec)});
             }
         }
         if (dd_config.enabled && dd_config.bands.empty()) {
@@ -6907,7 +6928,8 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         // ILU(0) is wired in but unused. Keeping the include + comment here
         // so a future bench can A/B them without rummaging through AMGCL
         // headers.
-        std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
+        if (!quiet_solver_)
+            std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
 
         typedef amgcl::make_solver<
             amgcl::amg<
@@ -6950,9 +6972,10 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         auto [iters, error] = amg(rhs_vec, x_vec);
         total_linear_iters_ += (long)iters; num_linear_solves_++;   // DD conditioning instrumentation
 
-        std::cout << "  [AMGCL] " << iters << " iters, residual="
-                  << std::scientific << std::setprecision(2) << error
-                  << std::defaultfloat << std::endl;
+        if (!quiet_solver_)
+            std::cout << "  [AMGCL] " << iters << " iters, residual="
+                      << std::scientific << std::setprecision(2) << error
+                      << std::defaultfloat << std::endl;
 
         Eigen::VectorXd x = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
