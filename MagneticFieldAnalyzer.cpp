@@ -232,6 +232,15 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         }
         if (dd["coarse_damp"])
             dd_config.coarse_damp = dd["coarse_damp"].as<double>(dd_config.coarse_damp);
+        if (dd["gap_link"] && dd["gap_link"].IsSequence() && dd["gap_link"].size() >= 2) {
+            dd_config.gap_r0 = dd["gap_link"][0].as<int>(-1);
+            dd_config.gap_r1 = dd["gap_link"][1].as<int>(-1);
+            if (dd_config.gap_r0 >= 0 && dd_config.gap_r1 <= dd_config.gap_r0) {
+                std::cerr << "WARNING: domain_decomposition.gap_link must satisfy cR < cS; disabled."
+                          << std::endl;
+                dd_config.gap_r0 = dd_config.gap_r1 = -1;
+            }
+        }
         if (dd["bands"]) {
             for (auto bn : dd["bands"]) {
                 int c0  = bn[0].as<int>();

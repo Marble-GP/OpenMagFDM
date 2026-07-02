@@ -629,6 +629,12 @@ material-safe な theta 行。コイル・磁石を跨ぐと flux が壊れま�
 補正が増幅器になるため IEEJ-D で発散が実測されており、使用しないでください**（トレーサビリティ
 のため off-by-default で残置）。リング構成（セクターなし）での `parallel: true` は安全です。
 
+同様に、**解析エアギャップ結合 `gap_link: [cR, cS]`**（ロータ／ステータ 2 分割、間の空気環を
+FD メッシュから外して調和（Laplace）伝達写像で結合 — ギャップ隣接帯の粗大化制約を外すのが狙い）
+も実装済みですが、**平坦化 sub-solve との組合せは IEEJ-D で発散が実測されており、現状使用不可**
+です（スロット高調波の透過が作る大きな per-sweep 変化に反復キャップ付きの非線形 sub-solve が
+追従できない。フル sub-solve なら収束するがモノリシックより遅い）。off-by-default で残置。
+
 ```yaml
 domain_decomposition:
   bands:

@@ -670,6 +670,18 @@ private:
         int    coarse_r    = 0;
         int    coarse_th   = 0;
         double coarse_damp = 1.0;
+        // Analytic air-gap link (rotor|stator split): gap_link = [cR, cS] takes
+        // the annulus BETWEEN radial columns cR and cS OUT of the FD mesh and
+        // couples the two sides through the EXACT harmonic (Laplace) solution
+        // of the source-free air annulus — the derivative term of each side's
+        // Robin gamma comes from the analytic transfer map instead of a finite
+        // difference across the gap. The annulus must be magnetically air
+        // (mu_r=1, jz=0, no magnetization) at every theta. Bands must tile
+        // [0, cR] and [cS, nr) and may be coarsened UNIFORMLY on each side —
+        // the gap, which is what forbids coarsening in the plain banded mode,
+        // is no longer part of any band. -1 = off.
+        int    gap_r0 = -1;   // cR: rotor-side boundary column (its band core must end at cR+1)
+        int    gap_r1 = -1;   // cS: stator-side boundary column (its band core must start at cS)
         // Cap on NK iterations per band per sweep ("flattened" Schwarz). Nesting a
         // full NK solve inside every Schwarz sweep multiplies the two iteration
         // counts (measured: the fine band re-paid 80-90 NK iterations EVERY sweep

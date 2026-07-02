@@ -85,6 +85,8 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         int et0, et1;        // extended global-theta row range (sectors; may wrap)
         int ct0, ct1;        // theta core range [ct0, ct1) (sectors; ct1 may exceed NTH)
         bool ft;             // full-theta ring (periodic theta)
+        bool gap_out = false;  // outer edge sits on the analytic gap circle cR
+        bool gap_in  = false;  // inner edge sits on the analytic gap circle cS
         int nth, nrb;        // band grid size (theta, radial)
         std::unique_ptr<MagneticFieldAnalyzer> an;
     };
@@ -161,12 +163,30 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
             continue;
         }
 
+        // Analytic gap link: a band ending exactly at the rotor circle (c1 ==
+        // gap_r0+1) / starting at the stator circle (c0 == gap_r1) must NOT
+        // extend its overlap into the analytic annulus, and its gap-side Robin
+        // gamma uses the harmonic-map derivative instead of a finite difference.
+        const int gR = dd_config.gap_r0, gS = dd_config.gap_r1;
+        const bool gap_on = (gR >= 0 && gS > gR && gS < NR);
+        const bool b_gap_out = gap_on && (c1 == gR + 1);
+        const bool b_gap_in  = gap_on && (c0 == gS);
+        if (gap_on && c0 < gS && c1 > gR + 1) {
+            throw std::runtime_error(
+                "domain_decomposition: band [" + std::to_string(c0) + ", " + std::to_string(c1) +
+                ") crosses the analytic gap annulus (" + std::to_string(gR) + ", " +
+                std::to_string(gS) + ") — with gap_link, rotor-side bands must end at c1=" +
+                std::to_string(gR + 1) + " and stator-side bands start at c0=" + std::to_string(gS) + ".");
+        }
+
         if (bd.sectors <= 1) {
             // ---- full-theta ring (the validated banded path) ----
             Band b;
             b.c0 = c0; b.c1 = c1; b.cfr = cfr; b.cft = cft;
             b.er0 = std::max(0,  c0 - ov * cfr);
             b.er1 = std::min(NR, c1 + ov * cfr);
+            if (b_gap_out) { b.er1 = c1; b.gap_out = true; }   // do not overlap into the annulus
+            if (b_gap_in)  { b.er0 = c0; b.gap_in  = true; }
             b.et0 = 0; b.et1 = NTH; b.ct0 = 0; b.ct1 = NTH; b.ft = true;
             if (b.er1 - b.er0 < 2) {
                 std::cerr << "WARNING: DD band [" << bd.c0 << ", " << bd.c1
@@ -204,6 +224,8 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
                 b.c0 = c0; b.c1 = c1; b.cfr = 1; b.cft = 1;
                 b.er0 = std::max(0,  c0 - ov);
                 b.er1 = std::min(NR, c1 + ov);
+                if (b_gap_out) { b.er1 = c1; b.gap_out = true; }
+                if (b_gap_in)  { b.er0 = c0; b.gap_in  = true; }
                 b.ct0 = tb0; b.ct1 = tb1;
                 b.et0 = tb0 - ov; b.et1 = tb1 + ov;   // theta overlap (may wrap)
                 b.ft  = false;
@@ -229,10 +251,18 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
     }
     // (B) Coverage check: the band CORES must tile the full radial range [0, NR). Any uncovered
     // column stays ZERO in the composite (-> wrong flux/field there). Warn loudly if so.
+    const int  gapR   = dd_config.gap_r0;
+    const int  gapS   = dd_config.gap_r1;
+    const bool gap_on = (gapR >= 0 && gapS > gapR && gapS < NR);
+    if (gap_on)
+        std::cout << "  analytic gap link: annulus columns (" << gapR << ", " << gapS
+                  << ") solved by the harmonic (Laplace) transfer map, not the FD mesh" << std::endl;
     {
         std::vector<bool> covered(NR, false);
         for (const auto& b : B)
             for (int c = std::max(0, b.c0); c < std::min(NR, b.c1); ++c) covered[c] = true;
+        if (gap_on)  // the annulus interior is analytic by design, not uncovered
+            for (int c = gapR + 1; c < gapS; ++c) covered[c] = true;
         int nuncov = 0, first = -1, last = -1;
         for (int c = 0; c < NR; ++c) if (!covered[c]) { ++nuncov; if (first < 0) first = c; last = c; }
         if (nuncov > 0)
@@ -372,6 +402,111 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
             for (int j = 0; j < NTH; ++j) Gc(j, i) += cs_damp * d[(long)i * NTH + j];
     };
 
+    // ---- Analytic gap transfer map ---------------------------------------------
+    // Source-free air annulus [Ra, Rb]: Az is harmonic, so per theta-harmonic k
+    // the field is a_k*(r/Rb)^k + b_k*(Ra/r)^k (k=0: a + b*ln r). Given the two
+    // circle traces (rows of the composite at columns gapR/gapS), the radial
+    // derivative on each circle follows EXACTLY — this replaces the finite
+    // difference across the gap in the Robin gammas, which is what couples the
+    // two sides. O(K*N) DFT per sweep (~2x 4.4M mul-adds, a few ms).
+    //
+    // STATUS (2026-07 benchmark): NEGATIVE on IEEJ-D under FLATTENED sub-solves.
+    // The map itself is spectrally exact and FD-consistent (difference-quotient
+    // form below), and the fine-fine split contracts early (res 0.38 at sweep 2
+    // with the harmonically-optimal robin_p~300 = sqrt(dtn_min*dtn_max)), but a
+    // gap interface carries strong slot harmonics whose transmission makes large
+    // per-sweep field moves that iteration-capped nonlinear sub-solves cannot
+    // track: every tested combination (robin_p 12/300, relax 0.5-0.7, max_inner
+    // 3/8, cf 1/2) oscillates or explodes by sweep ~6-8. Nested (max_inner: 0)
+    // 2-domain gap splits DO converge (dd_bench, 0.05-0.4% flux) but cost more
+    // than the monolithic solve. Kept OFF-by-default for traceability and for a
+    // future NK that converges fast enough to make nested sub-solves cheap.
+    const double gapRa = RS + gapR * DR, gapRb = RS + gapS * DR;
+    std::vector<double> gap_dRa(gap_on ? NTH : 0, 0.0);   // difference-quotient dAz/dr at the rotor edge
+    std::vector<double> gap_dRb(gap_on ? NTH : 0, 0.0);   // difference-quotient dAz/dr at the stator edge
+    // The FD Robin gammas use one-sided DIFFERENCE QUOTIENTS (the slope over the
+    // first cell outside the boundary node), not point derivatives — a point
+    // derivative on the circle disagrees with the discrete closure by up to
+    // e^{k·dr/R} per harmonic (measured to destabilize the coupling). So the
+    // analytic map supplies the field VALUE at each side's neighbour-node
+    // radius (harmonically exact) and the gamma uses the same quotient the FD
+    // path would; a coarsened side (cfr>1) gets the quotient over ITS spacing.
+    int gap_cfr_out = 1, gap_cfr_in = 1;
+    for (const auto& b : B) {
+        if (b.gap_out) gap_cfr_out = b.cfr;
+        if (b.gap_in)  gap_cfr_in  = b.cfr;
+    }
+    auto computeGapDeriv = [&](const Eigen::MatrixXd& Gs) {
+        if (!gap_on) return;
+        const int N = NTH, K = N / 2;
+        const double lnratio = std::log(gapRa / gapRb);   // < 0
+        const double r_out = std::min(gapRa + gap_cfr_out * DR, gapRb);  // rotor-side face node
+        const double r_in  = std::max(gapRb - gap_cfr_in  * DR, gapRa);  // stator-side face node
+        const double h_out = r_out - gapRa, h_in = gapRb - r_in;
+        // v_out/v_in = harmonic field at the two evaluation radii.
+        std::vector<double> v_out(N, 0.0), v_in(N, 0.0);
+        double ua0 = 0, ub0 = 0;
+        for (int j = 0; j < N; ++j) { ua0 += Gs(j, gapR); ub0 += Gs(j, gapS); }
+        ua0 /= N; ub0 /= N;
+        const double b0 = (ub0 - ua0) / (-lnratio);
+        for (int j = 0; j < N; ++j) {
+            v_out[j] = ua0 + b0 * std::log(r_out / gapRa);
+            v_in[j]  = ua0 + b0 * std::log(r_in  / gapRa);
+        }
+#ifdef _OPENMP
+        #pragma omp parallel
+#endif
+        {
+            std::vector<double> vo_loc(N, 0.0), vi_loc(N, 0.0);
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int k = 1; k <= K; ++k) {
+                // forward DFT of both traces at harmonic k (cos & sin parts)
+                double uac = 0, uas = 0, ubc = 0, ubs = 0;
+                const double dth = 2.0 * M_PI * k / N;
+                const double cstep = std::cos(dth), sstep = std::sin(dth);
+                double cj = 1.0, sj = 0.0;
+                for (int j = 0; j < N; ++j) {
+                    const double ga = Gs(j, gapR), gb = Gs(j, gapS);
+                    uac += ga * cj; uas += ga * sj;
+                    ubc += gb * cj; ubs += gb * sj;
+                    const double cn = cj * cstep - sj * sstep;
+                    sj = cj * sstep + sj * cstep; cj = cn;
+                }
+                const double norm = (2 * k == N) ? 1.0 / N : 2.0 / N;  // Nyquist has no sin partner
+                uac *= norm; uas *= norm; ubc *= norm; ubs *= norm;
+                // annulus transfer: t=(Ra/Rb)^k; basis (r/Rb)^k and (Ra/r)^k
+                const double t = std::exp(k * lnratio);
+                const double det = t * t - 1.0;
+                const double aC = (t * uac - ubc) / det, bC = (t * ubc - uac) / det;
+                const double aS = (t * uas - ubs) / det, bS = (t * ubs - uas) / det;
+                const double phO = std::exp(k * std::log(r_out / gapRb));
+                const double psO = std::exp(k * std::log(gapRa / r_out));
+                const double phI = std::exp(k * std::log(r_in  / gapRb));
+                const double psI = std::exp(k * std::log(gapRa / r_in));
+                const double voc = aC * phO + bC * psO, vos = aS * phO + bS * psO;
+                const double vic = aC * phI + bC * psI, vis = aS * phI + bS * psI;
+                // accumulate the inverse transform
+                cj = 1.0; sj = 0.0;
+                for (int j = 0; j < N; ++j) {
+                    vo_loc[j] += voc * cj + vos * sj;
+                    vi_loc[j] += vic * cj + vis * sj;
+                    const double cn = cj * cstep - sj * sstep;
+                    sj = cj * sstep + sj * cstep; cj = cn;
+                }
+            }
+#ifdef _OPENMP
+            #pragma omp critical
+#endif
+            for (int j = 0; j < N; ++j) { v_out[j] += vo_loc[j]; v_in[j] += vi_loc[j]; }
+        }
+        for (int j = 0; j < N; ++j) {
+            gap_dRa[j] = (v_out[j] - Gs(j, gapR)) / h_out;
+            gap_dRb[j] = (Gs(j, gapS) - v_in[j])  / h_in;
+        }
+    };
+
     auto do_band = [&](Band& b, const Eigen::MatrixXd& Gs) {
         if (b.ft) {
             // ---- full-theta ring (validated banded path; reads Gs, writes G) ----
@@ -383,8 +518,16 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
                 const int n = b.cft;
                 for (int t = 0; t < b.cft; ++t) {
                     const int j = mb * b.cft + t;
-                    if (b.er0     != 0)      { ui += Gs(j, b.er0);     di  += (Gs(j, b.er0)   - Gs(j, b.er0 - 1)) / DR; }
-                    if (b.er1 - 1 != NR - 1) { uo += Gs(j, b.er1 - 1); doo += (Gs(j, b.er1)   - Gs(j, b.er1 - 1)) / DR; }
+                    if (b.er0 != 0) {
+                        ui += Gs(j, b.er0);
+                        di += b.gap_in ? gap_dRb[j]
+                                       : (Gs(j, b.er0) - Gs(j, b.er0 - 1)) / DR;
+                    }
+                    if (b.er1 - 1 != NR - 1) {
+                        uo += Gs(j, b.er1 - 1);
+                        doo += b.gap_out ? gap_dRa[j]
+                                         : (Gs(j, b.er1) - Gs(j, b.er1 - 1)) / DR;
+                    }
                 }
                 if (b.er0     != 0)      gin[mb]  = alpha * (ui / n) - (di / n);   // inner edge: alpha*Az - dAz/dn
                 if (b.er1 - 1 != NR - 1) gout[mb] = alpha * (uo / n) + (doo / n);  // outer edge: alpha*Az + dAz/dn
@@ -440,10 +583,15 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
             auto GS = [&](int gt, int c) -> double { return Gs(wrapTh(gt), c); };
             for (int j = 0; j < b.nth; ++j) {
                 const int gt = b.et0 + j;
+                const int gw = wrapTh(gt);
                 if (b.er0     != 0)
-                    gin[j]  = alpha * GS(gt, b.er0)     - (GS(gt, b.er0)   - GS(gt, b.er0 - 1)) / DR;
+                    gin[j]  = alpha * GS(gt, b.er0)
+                            - (b.gap_in ? gap_dRb[gw]
+                                        : (GS(gt, b.er0) - GS(gt, b.er0 - 1)) / DR);
                 if (b.er1 - 1 != NR - 1)
-                    gout[j] = alpha * GS(gt, b.er1 - 1) + (GS(gt, b.er1)   - GS(gt, b.er1 - 1)) / DR;
+                    gout[j] = alpha * GS(gt, b.er1 - 1)
+                            + (b.gap_out ? gap_dRa[gw]
+                                         : (GS(gt, b.er1) - GS(gt, b.er1 - 1)) / DR);
             }
             if (b.er0     != 0)      b.an->setBoundaryProfile("inner", gin);
             if (b.er1 - 1 != NR - 1) b.an->setBoundaryProfile("outer", gout);
@@ -479,6 +627,7 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
     };
 
     auto sweep_all = [&](const Eigen::MatrixXd& Gs) {
+        computeGapDeriv(Gs);   // analytic gap derivatives for this sweep's gammas
 #ifdef _OPENMP
         #pragma omp parallel for schedule(dynamic, 1) if (PAR)
 #endif
@@ -622,6 +771,53 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         for (int j = 0; j < NTH; ++j)
             for (int c = 0; c < NR; ++c)
                 if (Wacc(j, c) > 1e-12) G(j, c) = Gacc(j, c) / Wacc(j, c);
+    }
+
+    // Fill the analytic annulus interior from the harmonic solution of the FINAL
+    // circle traces so exports/stress see a complete field.
+    if (gap_on && gapS - gapR > 1) {
+        const int N = NTH, K = N / 2;
+        const double lnratio = std::log(gapRa / gapRb);
+        double ua0 = 0, ub0 = 0;
+        for (int j = 0; j < N; ++j) { ua0 += G(j, gapR); ub0 += G(j, gapS); }
+        ua0 /= N; ub0 /= N;
+        const double b0 = (ub0 - ua0) / (-lnratio);
+        const double a0 = ua0;
+        for (int c = gapR + 1; c < gapS; ++c) {
+            const double r = RS + c * DR;
+            const double v0 = a0 + b0 * std::log(r / gapRa);
+            for (int j = 0; j < N; ++j) G(j, c) = v0;
+        }
+        for (int k = 1; k <= K; ++k) {
+            double uac = 0, uas = 0, ubc = 0, ubs = 0;
+            const double dth = 2.0 * M_PI * k / N;
+            const double cstep = std::cos(dth), sstep = std::sin(dth);
+            double cj = 1.0, sj = 0.0;
+            for (int j = 0; j < N; ++j) {
+                const double ga = G(j, gapR), gb = G(j, gapS);
+                uac += ga * cj; uas += ga * sj;
+                ubc += gb * cj; ubs += gb * sj;
+                const double cn = cj * cstep - sj * sstep;
+                sj = cj * sstep + sj * cstep; cj = cn;
+            }
+            const double norm = (2 * k == N) ? 1.0 / N : 2.0 / N;
+            uac *= norm; uas *= norm; ubc *= norm; ubs *= norm;
+            const double t = std::exp(k * lnratio), det = t * t - 1.0;
+            const double aC = (t * uac - ubc) / det, bC = (t * ubc - uac) / det;
+            const double aS = (t * uas - ubs) / det, bS = (t * ubs - uas) / det;
+            for (int c = gapR + 1; c < gapS; ++c) {
+                const double r   = RS + c * DR;
+                const double phi = std::exp(k * std::log(r / gapRb));   // (r/Rb)^k
+                const double psi = std::exp(k * std::log(gapRa / r));   // (Ra/r)^k
+                const double vc = aC * phi + bC * psi, vs = aS * phi + bS * psi;
+                cj = 1.0; sj = 0.0;
+                for (int j = 0; j < N; ++j) {
+                    G(j, c) += vc * cj + vs * sj;
+                    const double cn = cj * cstep - sj * sstep;
+                    sj = cj * sstep + sj * cstep; cj = cn;
+                }
+            }
+        }
     }
 
     // Composite solution -> member Az, then refresh B/H/mu on the full grid so the
