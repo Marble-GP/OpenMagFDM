@@ -318,6 +318,13 @@ public:
         double dmu_r_extrap_const;      // Constant extrapolation value (default: 1.0)
         std::string dmu_r_extrap_formula; // Formula for dμ_r/dH(H) extrapolation
 
+        // Precomputed B(H) samples + PCHIP slopes for the TABLE branch of
+        // evaluateMu. Pure functions of H_table/mu_table, so computed once at
+        // load instead of being reallocated + recomputed per cell per call
+        // (was ~40% of updateFieldAndMu wall on the 1.34M-DOF IEEJ-D case).
+        std::vector<double> B_table_cache;      // B_i = μ₀·mu_table_i·H_table_i
+        std::vector<double> pchip_slopes_cache; // PCHIP slopes of B(H)
+
         MuValue() : type(MuType::STATIC), static_value(1.0),
                     has_dmu_extrapolation(false), dmu_r_extrap_const(1.0),
                     dmu_r_extrap_formula("") {}
@@ -342,6 +349,9 @@ public:
      * @return Effective permeability μ_eff = B/H (dimensionless)
      */
     double evaluateMu(const MuValue& mu_val, double H_magnitude);
+    // Fill MuValue::B_table_cache / pchip_slopes_cache once at material load
+    // (evaluateMu's TABLE branch reads them per cell; see MuValue comment).
+    static void precomputeMuTableCache(MuValue& mu_val);
 
     /**
      * @brief Evaluate derivative dμ_r/dH at given |H| magnitude
@@ -446,6 +456,15 @@ private:
         double eisenstat_walker_alpha;    // EW α (default 2.0, Choice 2)
         double eisenstat_walker_eta_min;  // floor (default 1e-6, matches SOLVER_TOLERANCE)
         double eisenstat_walker_eta_max;  // initial / cap (default 0.1)
+        // Residual-proportional cap: η ≤ max(eta_min, residual_cap·||R||_rel).
+        // The classic ratio formula never tightens in a linear-rate crawl
+        // (γ·ratio^α stays ≈0.78 → clamped to eta_max forever). This knob ties
+        // the cap to the outer residual instead. Benchmarked NEUTRAL-NEGATIVE
+        // on IEEJ-D (iterations unchanged 48→49, wall +64% from the tighter
+        // inner CG, plateau floor unmoved — the floor is set by μ-interpolation
+        // nonsmoothness, not inner accuracy), so it ships DISABLED (-1);
+        // kept as an experimentation knob. ≤0 disables.
+        double eisenstat_walker_residual_cap; // default -1 (off)
 
         NonlinearSolverConfig() :
             enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
@@ -459,7 +478,8 @@ private:
             strict_convergence(false),
             eisenstat_walker_enabled(false),
             eisenstat_walker_gamma(0.9), eisenstat_walker_alpha(2.0),
-            eisenstat_walker_eta_min(1e-6), eisenstat_walker_eta_max(0.1) {}
+            eisenstat_walker_eta_min(1e-6), eisenstat_walker_eta_max(0.1),
+            eisenstat_walker_residual_cap(-1.0) {}
     };
 
     // Maxwell stress and force calculation

@@ -19,6 +19,8 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
 #include <Eigen/Dense>
 #ifdef _OPENMP
 #include <omp.h>
@@ -225,9 +227,20 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         buildAndSolveSystem();
     }
 
+    // [NKPROF] temporary per-iteration phase timing (diagnostic; enabled with
+    // env NK_PROF=1). Measures where the 1.3-1.5 s/iter actually goes.
+    const bool NK_PROF = (std::getenv("NK_PROF") != nullptr);
+    auto nkprof_now = []() { return std::chrono::high_resolution_clock::now(); };
+    auto nkprof_ms  = [](std::chrono::high_resolution_clock::time_point a,
+                         std::chrono::high_resolution_clock::time_point b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
+    };
+
     for (int iter = 0; iter < MAX_ITER; iter++) {
+        auto nkp_t0 = nkprof_now();
         // ===== Step 1: Calculate B and H fields, update μ =====
         updateFieldAndMu();
+        auto nkp_t_mu = nkprof_now();
 
         // ===== Step 2: Build residual and system matrix with current μ =====
         // Coarse-native: buildMatrixForSolve -> FVM coarse operator (n_active),
@@ -237,6 +250,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         Eigen::SparseMatrix<double> A_matrix;
         Eigen::VectorXd b_vec;
         buildMatrixForSolve(A_matrix, b_vec);
+        auto nkp_t_build = nkprof_now();
 
         Eigen::VectorXd Az_vec;
         buildSolveVec(Az_vec);
@@ -274,6 +288,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         // ===== Step 4: Check convergence =====
         bool converged = false;
+        bool plateau_stall = false;  // stopped by stagnation, TOL not reached
 
         if (iter > 0) {
             // Primary convergence criterion: relative residual
@@ -283,11 +298,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
             // Secondary criterion for polar coordinates: residual reduction rate
             // Useful when absolute residual is large but solution is converging
-            if (is_polar && iter >= 3) {
+            if (!converged && is_polar && iter >= 3) {
                 double reduction_rate = std::abs(residual_history[iter] - residual_history[iter-1]) /
                                        (residual_history[iter-1] + 1e-12);
                 if (residual_rel < TOL * 10.0 && reduction_rate < 0.05) {
                     converged = true;
+                    plateau_stall = true;
                     if (VERBOSE) {
                         std::cout << " [Plateau detected: Δr=" << reduction_rate << "]";
                     }
@@ -304,9 +320,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             if (VERBOSE) {
                 std::cout << std::endl;
             }
-            // Always print convergence message (important for user feedback)
+            // Always print convergence message (important for user feedback).
+            // A plateau exit is a stall, not true convergence — say so instead
+            // of reporting it as converged (solutions accepted at the plateau
+            // scatter by a few percent run-to-run; users should know).
             std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
-                      << std::scientific << std::setprecision(2) << residual_rel << ")" << std::endl;
+                      << std::scientific << std::setprecision(2) << residual_rel << ")";
+            if (plateau_stall) {
+                std::cout << " [PLATEAU STALL: accepted above tolerance "
+                          << std::scientific << std::setprecision(1) << TOL << "]";
+            }
+            std::cout << std::endl;
 
             // [Stage 1e] Coarse path keeps only active cells current (active-only
             // scatter + coarse curl). Prolong to the full grid ONCE and recompute
@@ -351,6 +375,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         //   We compute dμ/dH = μ₀ * dμ_eff/dH using numerical differentiation
 
         Eigen::VectorXd delta_A;
+        auto nkp_t_conv = nkprof_now();
 
         // Full-grid frozen-Jacobian residual norm, set by defect correction for use in line search.
         // Negative sentinel = not in defect correction mode (use coarse norm instead).
@@ -484,6 +509,20 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     if (eta > hi) eta = hi;
                     inner_tol = eta;
                 }
+                // Residual-proportional cap: the ratio formula never tightens
+                // while the outer iteration crawls at a ~constant linear rate
+                // (γ·ratio^α ≈ 0.78 → clamped to eta_max forever), which left
+                // the Newton direction 10% inexact even at ||R||~1e-2 and
+                // stalled the plateau. Tie the cap to the outer residual so
+                // inner accuracy follows outer progress. ≤0 disables.
+                {
+                    const double rc = nonlinear_config.eisenstat_walker_residual_cap;
+                    if (rc > 0.0) {
+                        double cap = rc * residual_rel;
+                        if (cap < lo) cap = lo;
+                        if (inner_tol > cap) inner_tol = cap;
+                    }
+                }
                 if (VERBOSE) {
                     std::cout << " [EW: inner_tol=" << std::scientific
                               << std::setprecision(2) << inner_tol << "]";
@@ -492,6 +531,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             delta_A = solveLinearSystem(J_matrix, -residual_coarse,
                                         Eigen::VectorXd(), inner_tol);
         }
+        auto nkp_t_solve = nkprof_now();
 
         // ===== Step 6: Backtracking line search =====
         // Find step length α that ensures sufficient decrease in residual
@@ -549,7 +589,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // Newton step that needed globalisation against the B-H knee. With
         // custom Galerkin coarsening eliminated, the only update path is the
         // classic Armijo backtracking line search below.
+        int nkp_ls_trials = 0;
         for (int ls = 0; ls < max_line_search; ls++) {
+            nkp_ls_trials++;
             // Trial step: A_trial = A + α·δA
             Eigen::VectorXd Az_trial = Az_vec_0 + alpha * delta_A;
 
@@ -593,6 +635,18 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         // Update previous step length for next iteration's adaptive algorithm
         alpha_prev = alpha;
+
+        if (NK_PROF) {
+            auto nkp_t_ls = nkprof_now();
+            std::cout << "\n[NKPROF] iter " << iter + 1
+                      << ": mu=" << nkprof_ms(nkp_t0, nkp_t_mu) << "ms"
+                      << " build=" << nkprof_ms(nkp_t_mu, nkp_t_build) << "ms"
+                      << " resid+conv=" << nkprof_ms(nkp_t_build, nkp_t_conv) << "ms"
+                      << " jcorr+amgcl=" << nkprof_ms(nkp_t_conv, nkp_t_solve) << "ms"
+                      << " ls=" << nkprof_ms(nkp_t_solve, nkp_t_ls) << "ms"
+                      << " (trials=" << nkp_ls_trials << ")"
+                      << " total=" << nkprof_ms(nkp_t0, nkp_t_ls) << "ms" << std::endl;
+        }
 
         // ===== Step 7: Anderson Acceleration =====
         if (USE_ANDERSON && m_AA > 0) {

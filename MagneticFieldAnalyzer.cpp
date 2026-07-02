@@ -198,6 +198,8 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
             nonlinear_config.eisenstat_walker_alpha   = ew_cfg["alpha"].as<double>(2.0);
             nonlinear_config.eisenstat_walker_eta_min = ew_cfg["eta_min"].as<double>(1e-6);
             nonlinear_config.eisenstat_walker_eta_max = ew_cfg["eta_max"].as<double>(0.1);
+            nonlinear_config.eisenstat_walker_residual_cap =
+                ew_cfg["residual_cap"].as<double>(-1.0);
         }
     }
 
@@ -1400,6 +1402,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             }
         }
 
+        precomputeMuTableCache(mu_value);  // one-time PCHIP cache (TABLE type)
         material_mu[name] = mu_value;
 
         // Check if this material is nonlinear
@@ -6924,18 +6927,25 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         std::vector<double> val(A_rm.valuePtr(), A_rm.valuePtr() + A_rm.nonZeros());
         auto A_crs = std::tie(rows, ptr, col, val);
 
-        AMGSolver::params params;
-        params.solver.tol     = tol_effective;  // Phase BC: per-call override
-        params.solver.maxiter = SOLVER_MAX_ITERATIONS;
-
-        AMGSolver amg(A_crs, params);
-
         // Warm-start: use previous solution as initial guess (especially useful in nonlinear iterations)
         std::vector<double> rhs_vec(rhs.data(), rhs.data() + n);
         std::vector<double> x_vec(n, 0.0);
         if (initial_guess.size() == n) {
             std::copy(initial_guess.data(), initial_guess.data() + n, x_vec.begin());
         }
+
+        // NOTE (2026-07 audit): reusing the AMG hierarchy across NK iterations
+        // as a stale preconditioner was implemented and benchmarked here, and
+        // is NEGATIVE for this solver: a hierarchy just ONE Newton iteration
+        // old degrades CG from 2-3 to 73-183 iterations (μ(H) at the B-H knee
+        // moves the operator coefficients too much per iteration), so a fresh
+        // ~200 ms setup every iteration is strictly cheaper. Do not re-attempt
+        // without first checking that per-iteration μ drift has become small.
+        AMGSolver::params params;
+        params.solver.tol     = tol_effective;  // Phase BC: per-call override
+        params.solver.maxiter = SOLVER_MAX_ITERATIONS;
+
+        AMGSolver amg(A_crs, params);
         auto [iters, error] = amg(rhs_vec, x_vec);
         total_linear_iters_ += (long)iters; num_linear_solves_++;   // DD conditioning instrumentation
 

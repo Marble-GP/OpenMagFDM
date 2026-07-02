@@ -240,6 +240,18 @@ MagneticFieldAnalyzer::MuValue MagneticFieldAnalyzer::parseMuValue(const YAML::N
 /**
  * @brief Evaluate mu_r at given |H| magnitude
  */
+void MagneticFieldAnalyzer::precomputeMuTableCache(MuValue& mu_val) {
+    mu_val.B_table_cache.clear();
+    mu_val.pchip_slopes_cache.clear();
+    if (mu_val.type != MuType::TABLE || mu_val.H_table.size() < 2) return;
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+    mu_val.B_table_cache.resize(mu_val.H_table.size());
+    for (size_t i = 0; i < mu_val.H_table.size(); i++) {
+        mu_val.B_table_cache[i] = MU_0 * mu_val.mu_table[i] * mu_val.H_table[i];
+    }
+    mu_val.pchip_slopes_cache = computePCHIPSlopes(mu_val.H_table, mu_val.B_table_cache);
+}
+
 double MagneticFieldAnalyzer::evaluateMu(const MuValue& mu_val, double H_magnitude) {
     switch (mu_val.type) {
         case MuType::STATIC:
@@ -325,20 +337,42 @@ double MagneticFieldAnalyzer::evaluateMu(const MuValue& mu_val, double H_magnitu
                 return mu_tab.front();
             }
             if (H_magnitude >= H_tab.back()) {
-                return mu_tab.back();
+                // Deep-saturation extrapolation: B(H) = B_end + μ₀·(H − H_end),
+                // i.e. dB/dH → μ₀ ⇒ μ_r(H) = 1 + (B_end/μ₀ − H_end)/H → 1.
+                // The previous constant-μ_r extrapolation implied dB/dH =
+                // μ_r_end·μ₀ (wrong beyond saturation) and disagreed with
+                // interpolateH_from_B, which already extrapolates H(B) with
+                // the last-segment slope — the (H(B), μ(H)) pair was
+                // inconsistent whenever an iterate drove H past the table end.
+                // Users who supplied dmu_r_extrapolation keep the old base
+                // value so their derivative spec stays coherent.
+                if (mu_val.has_dmu_extrapolation) {
+                    return mu_tab.back();
+                }
+                const double MU_0_loc = 4.0 * M_PI * 1e-7;
+                const double H_end = H_tab.back();
+                const double B_end = MU_0_loc * mu_tab.back() * H_end;
+                return std::max(1.0, 1.0 + (B_end / MU_0_loc - H_end) / H_magnitude);
             }
 
-            // Compute B values at table points: B_i = μ₀ × μ_r_i × H_i
-            std::vector<double> B_tab(H_tab.size());
-            for (size_t i = 0; i < H_tab.size(); i++) {
-                B_tab[i] = MU_0 * mu_tab[i] * H_tab[i];
+            // B(H) samples + PCHIP slopes are pure functions of the table, so
+            // they are precomputed once at load (precomputeMuTableCache). The
+            // in-place recompute below only remains as a fallback for MuValues
+            // that never went through the load path; it was measured at ~40%
+            // of updateFieldAndMu wall when executed per cell (1.34M DOF).
+            double B_interp;
+            if (mu_val.B_table_cache.size() == H_tab.size() &&
+                mu_val.pchip_slopes_cache.size() == H_tab.size()) {
+                B_interp = pchipInterpolate(H_tab, mu_val.B_table_cache,
+                                            mu_val.pchip_slopes_cache, H_magnitude);
+            } else {
+                std::vector<double> B_tab(H_tab.size());
+                for (size_t i = 0; i < H_tab.size(); i++) {
+                    B_tab[i] = MU_0 * mu_tab[i] * H_tab[i];
+                }
+                std::vector<double> slopes = computePCHIPSlopes(H_tab, B_tab);
+                B_interp = pchipInterpolate(H_tab, B_tab, slopes, H_magnitude);
             }
-
-            // Compute PCHIP slopes for B(H) curve
-            std::vector<double> slopes = computePCHIPSlopes(H_tab, B_tab);
-
-            // PCHIP interpolation to get B at H_magnitude
-            double B_interp = pchipInterpolate(H_tab, B_tab, slopes, H_magnitude);
 
             // Compute μ_r = B / (μ₀ × H)
             double mu_r = B_interp / (MU_0 * H_magnitude);
@@ -415,9 +449,20 @@ double MagneticFieldAnalyzer::evaluateMuDerivative(const MuValue& mu_val, double
                         // Use constant extrapolation
                         return mu_val.dmu_r_extrap_const;
                     }
+                } else if (H_magnitude >= H_tab.back()) {
+                    // Consistent with evaluateMu's deep-saturation extrapolation
+                    // μ_r(H) = 1 + (B_end/μ₀ − H_end)/H:
+                    //   dμ_r/dH = −(B_end/μ₀ − H_end)/H² (small, negative).
+                    // The old default returned +1.0, a dimensionally meaningless
+                    // large positive slope that corrupted the diagonal Jacobian
+                    // correction whenever an iterate drove H past the table end.
+                    const double MU_0_loc = 4.0 * M_PI * 1e-7;
+                    const double H_end = H_tab.back();
+                    const double B_end = MU_0_loc * mu_tab.back() * H_end;
+                    return -(B_end / MU_0_loc - H_end) / (H_magnitude * H_magnitude);
                 } else {
-                    // Default: dμ_r/dH = 1.0 (equivalent to vacuum permeability)
-                    return 1.0;
+                    // Below table start: μ_r is extrapolated as a constant.
+                    return 0.0;
                 }
             }
 
