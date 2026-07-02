@@ -169,13 +169,34 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
 
     // ---- multiplicative Schwarz outer loop -------------------------------------
     // Composite solution G is indexed (theta, r) to match the analyzer's Az.
+    //
+    // FLATTENED mode (max_inner > 0, default): each band solve is capped at
+    // max_inner NK iterations, so the nonlinear relaxation happens ACROSS the
+    // Schwarz sweeps (nonlinear block Gauss-Seidel) instead of being re-paid in
+    // full inside every sweep. Measured motivation: with nested full NK solves
+    // the fine band burned 80-90 NK iterations EVERY sweep (each sweep's
+    // interface wiggle kicks its residual back to O(1), and NK descends at a
+    // fixed ~0.9/iter rate) -> 315 s vs 37 s monolithic on IEEJ-D. A final
+    // UNCAPPED polish sweep runs after the loop so each band still converges
+    // on its own grid with the final transmission data.
     Eigen::MatrixXd G = Eigen::MatrixXd::Zero(NTH, NR);
     Eigen::MatrixXd Gprev;
-    int it = 0;
-    double res = 1.0;
-    for (it = 1; it <= maxo; ++it) {
-        Gprev = G;
-        for (auto& b : B) {
+    const int cap = dd_config.max_inner;
+    std::vector<int> full_iters(B.size());
+    for (size_t i = 0; i < B.size(); ++i) {
+        full_iters[i] = B[i].an->getNKMaxIterations();
+        if (cap > 0) B[i].an->setNKMaxIterations(cap);
+    }
+    if (cap > 0)
+        std::cout << "  flattened Schwarz: sub-solves capped at " << cap
+                  << " NK iteration(s)/sweep + final uncapped polish sweep" << std::endl;
+
+    // One band spanning the full radial range has Dirichlet at both edges and
+    // no transmission to iterate -- a single uncapped solve IS the answer
+    // (this is the documented uniform-downsample use). Skip the Schwarz loop.
+    const bool no_coupling = (B.size() == 1 && B[0].er0 == 0 && B[0].er1 == NR);
+
+    auto do_band = [&](Band& b) {
             // Symmetric-Robin transmission gamma from the composite G's edge traces
             // (Az and dAz/dn averaged over the band's theta-coarsening window).
             std::vector<double> gin(b.nth, 0.0), gout(b.nth, 0.0);
@@ -234,7 +255,19 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
                     }
                 }
             }
-        }
+    };  // do_band
+
+    int it = 0;
+    double res = 1.0;
+    if (no_coupling) {
+        B[0].an->setNKMaxIterations(full_iters[0]);
+        do_band(B[0]);
+        it = 1;
+        res = 0.0;
+        std::cout << "  single full-range band (no transmission): solved once, skipping Schwarz loop" << std::endl;
+    } else for (it = 1; it <= maxo; ++it) {
+        Gprev = G;
+        for (auto& b : B) do_band(b);
         if (omega != 1.0) G = Gprev + omega * (G - Gprev);   // outer under-relaxation (damps a 2-cycle)
         res = (G - Gprev).norm() / (G.norm() + 1e-30);       // relative Schwarz residual (no reference needed)
         std::cout << "  DD sweep " << it << ": residual = " << res << std::endl;
@@ -242,7 +275,10 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         // A healthy radial-band DD drops the residual to O(1e-2) within ~3 sweeps; a residual that
         // blows up or stays order-1 means the ACTIVE region is being coarsened or an interface sits
         // in air/coils (the Schwarz iteration is then unstable -- see README band-design rules).
-        if (!std::isfinite(res) || res > 5.0 || (it >= 4 && res > 0.8)) {
+        // Flattened mode legitimately makes larger early moves (the nonlinear relaxation itself
+        // happens across sweeps), so give it more sweeps before the stagnation check bites.
+        const int stall_check_from = (cap > 0) ? 8 : 4;
+        if (!std::isfinite(res) || res > 5.0 || (it >= stall_check_from && res > 0.8)) {
             throw std::runtime_error(
                 "domain_decomposition: the Schwarz iteration is DIVERGING (residual=" +
                 std::to_string(res) + " at sweep " + std::to_string(it) + "). Likely a band interface "
@@ -255,6 +291,17 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
     const int sweeps_done = std::min(it, maxo);  // 'it' is maxo+1 if the loop ran to the cap without converging
     std::cout << "=== DD done: " << sweeps_done << " sweep(s), final residual = " << res
               << (res < tol ? " (converged)" : " (reached max_outer)") << " ===" << std::endl;
+
+    // Final UNCAPPED polish sweep (flattened mode only): each band converges on
+    // its own grid against the final transmission data, so the composite gets
+    // fully-converged band solutions (the capped sweeps only relaxed them).
+    if (cap > 0 && !no_coupling) {
+        for (size_t i = 0; i < B.size(); ++i) B[i].an->setNKMaxIterations(full_iters[i]);
+        Gprev = G;
+        for (auto& b : B) do_band(b);
+        const double pres = (G - Gprev).norm() / (G.norm() + 1e-30);
+        std::cout << "  DD polish sweep (uncapped): residual = " << pres << std::endl;
+    }
 
     // (C) Final BILINEAR + PARTITION-OF-UNITY blend pass (OUTPUT ONLY -- does NOT touch the validated
     // NN Schwarz iteration above). Each band's converged sub-solution is rendered bilinearly over its

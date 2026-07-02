@@ -86,6 +86,11 @@ public:
     // When true, solveNonlinearNewtonKrylov starts the NK from the current member Az (warm) and
     // SKIPS the linear init guess -- for the DD Schwarz outer loop's per-patch re-solves.
     void setDDWarmStart(bool b) { dd_warm_start_ = b; }
+    // DD flattened-Schwarz control: cap (or restore) this analyzer's NK
+    // iteration budget. Used by solveDomainDecomposition to run capped
+    // sub-solves during sweeps and one uncapped polish sweep at the end.
+    void setNKMaxIterations(int m) { nonlinear_config.max_iterations = m; }
+    int  getNKMaxIterations() const { return nonlinear_config.max_iterations; }
     // v1.6 DD coarse space: update mu from the current member Az and assemble the polar operator A,b
     // (A*Az_solution = b). Used by the orchestrator to form the global residual r = b - A*Az_vec for
     // the 2-level coarse correction. Az_vec ordering matches buildMatrixPolar: idx = i_r*ntheta + j_th.
@@ -612,6 +617,16 @@ private:
         int    max_outer = 20;    // max Schwarz sweeps
         double tol       = 2e-3;  // convergence tol on the relative Schwarz residual ||G-Gprev||/||G||
         double relax     = 1.0;   // outer under-relaxation omega (1.0 = none; <1 damps a 2-cycle)
+        // Cap on NK iterations per band per sweep ("flattened" Schwarz). Nesting a
+        // full NK solve inside every Schwarz sweep multiplies the two iteration
+        // counts (measured: the fine band re-paid 80-90 NK iterations EVERY sweep
+        // because each sweep's interface wiggle kicks the residual back to O(1)
+        // and NK crawls back down at its fixed ~0.9/iter rate -> 315 s vs 37 s
+        // monolithic on IEEJ-D). Capping the inner solve pushes the nonlinear
+        // relaxation into the sweeps themselves (nonlinear block Gauss-Seidel),
+        // making the DD cost ~ aggregate-DOF-proportional. A final uncapped
+        // polish sweep runs after the loop. <=0 = uncapped (legacy nested mode).
+        int    max_inner = 3;
     };
 
     // Configuration and input

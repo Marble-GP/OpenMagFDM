@@ -214,6 +214,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         if (dd["max_outer"]) dd_config.max_outer = dd["max_outer"].as<int>(dd_config.max_outer);
         if (dd["tol"])       dd_config.tol       = dd["tol"].as<double>(dd_config.tol);
         if (dd["relax"])     dd_config.relax     = dd["relax"].as<double>(dd_config.relax);
+        if (dd["max_inner"]) dd_config.max_inner = dd["max_inner"].as<int>(dd_config.max_inner);
         if (dd["bands"]) {
             for (auto bn : dd["bands"]) {
                 int c0  = bn[0].as<int>();
