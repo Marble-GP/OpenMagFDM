@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <algorithm>
 #include <filesystem>
+#include <thread>
+#include <limits>
 #include <tiffio.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -70,6 +72,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
                                              const std::string& image_path) {
     loadConfig(config_path);
     loadImage(image_path);
+    image_path_ = image_path;   // retained so chunked-transient workers can be constructed
 
     // v1.5 / Phase B.1: parse user-defined variables and expand `$name`
     // tokens throughout the YAML tree BEFORE any other parsing pass, so
@@ -716,6 +719,8 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
     transient_config.enabled       = trans["enabled"].as<bool>(false);
     transient_config.enable_sliding = trans["enable_sliding"].as<bool>(true);
     transient_config.total_steps   = evaluateScalarAsInt(trans["total_steps"], 0);
+    transient_config.parallel_chunks =
+        std::max(1, evaluateScalarAsInt(trans["parallel_chunks"], 1));
 
     transient_config.slides.clear();
     if (trans["slides"] && trans["slides"].IsSequence()) {
@@ -13107,18 +13112,43 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         return;
     }
 
+    // Chunked sweep parallelism: split the step range into contiguous chunks
+    // run by concurrent analyzer instances. Dispatch only when this instance
+    // has no explicit chunk range yet (workers and the owner's own chunk have
+    // transient_step_end_ >= 0 and fall through to the loop below).
+    if (transient_config.parallel_chunks > 1 && transient_step_end_ < 0) {
+        runTransientChunks(output_dir);
+        return;
+    }
+
+    const int step_begin = std::max(0, transient_step_begin_);
+    const int step_end   = (transient_step_end_ >= 0)
+                             ? std::min(transient_step_end_, transient_config.total_steps)
+                             : transient_config.total_steps;
+
     std::cout << "\n=== Starting Transient Analysis ===" << std::endl;
-    std::cout << "Total steps: " << transient_config.total_steps << std::endl;
+    std::cout << "Total steps: " << transient_config.total_steps;
+    if (step_begin != 0 || step_end != transient_config.total_steps)
+        std::cout << "  (this chunk: steps " << step_begin + 1 << ".." << step_end << ")";
+    std::cout << std::endl;
     std::cout << "Output directory: " << output_dir << std::endl;
 
     // Optimization: Reuse matrix pattern (analyzePattern only once) for both coordinate systems
     bool use_optimized_solver = true;
     std::cout << "Using optimized transient solver (pattern reuse for " << coordinate_system << " coordinates)" << std::endl;
 
+    // Chunk workers start mid-sweep: advance the sliding image (and
+    // slide_step_counter) to this chunk's first step. Each slide is a cheap
+    // in-memory roll (~ms), negligible against a single nonlinear solve.
+    if (step_begin > 0 && transient_config.enable_sliding) {
+        for (int s = 0; s < step_begin; ++s) slideImageRegion();
+        std::cout << "Chunk pre-advance: applied " << step_begin << " slide step(s)" << std::endl;
+    }
+
     // Start overall timer
     auto analysis_start_time = std::chrono::high_resolution_clock::now();
 
-    for (int step = 0; step < transient_config.total_steps; step++) {
+    for (int step = step_begin; step < step_end; step++) {
         std::cout << "\n--- Step " << step+1 << " / " << transient_config.total_steps << " ---" << std::endl;
 
         // Start step timer
@@ -13934,7 +13964,10 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // Cost: writing a tiny CSV (one row per step × ~3 phases) is
         // O(milliseconds) vs the multi-second NK solve, well below any
         // user-visible budget.
-        exportFluxLinkageCSV(output_dir);
+        // Chunk workers skip it: their history is chunk-local, so the rows
+        // would clobber the shared file — the dispatcher merges all chunks'
+        // histories into the final CSV instead.
+        if (!transient_chunk_worker_) exportFluxLinkageCSV(output_dir);
 
         // <<PROFILING_TIMER_BEGIN>>
         prof_d_flux = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -14018,6 +14051,111 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         std::cout << "Async writer drain time: " << drain_ms << " ms" << std::endl;
     }
 
-    // Export flux linkage results to CSV (if any paths were defined)
-    exportFluxLinkageCSV(output_dir);
+    // Export flux linkage results to CSV (if any paths were defined).
+    // Chunk workers skip it (chunk-local history; the dispatcher merges).
+    if (!transient_chunk_worker_) exportFluxLinkageCSV(output_dir);
+}
+
+// Chunked sweep parallelism (transient.parallel_chunks = K > 1): split the
+// sweep into K contiguous chunks and run them CONCURRENTLY, each on its own
+// analyzer instance (fully independent state; the mu carry-over amortization
+// is preserved within each chunk). Steps keep their GLOBAL numbering, so all
+// per-step exports land in the shared output tree without collisions; the
+// only shared artifact — the flux-linkage CSV — is merged here at the end.
+// Each chunk's first step is cold (no mu carried from the previous chunk),
+// costing a few percent over a long sweep; aggregate speedup is memory-
+// bandwidth-bound (~1.9x measured for 3 concurrent 1.34M-DOF solves).
+void MagneticFieldAnalyzer::runTransientChunks(const std::string& output_dir) {
+    const int T = transient_config.total_steps;
+    const int K = std::max(1, std::min(transient_config.parallel_chunks, T));
+    std::cout << "\n=== Transient sweep: " << K << " parallel chunk(s) over "
+              << T << " steps ===" << std::endl;
+
+#ifdef _OPENMP
+    // Each chunk thread spawns its own OpenMP team inside AMGCL; divide the
+    // team size so K chunks don't oversubscribe the machine. (OpenMP 2.0 API
+    // only — omp_set_num_threads exists everywhere including MSVC.)
+    {
+        const int total = omp_get_max_threads();
+        const int per   = std::max(1, total / K);
+        omp_set_num_threads(per);
+        std::cout << "  OpenMP: " << per << " thread(s) per chunk ("
+                  << total << " total)" << std::endl;
+    }
+#endif
+
+    // Contiguous step ranges [s_k, s_{k+1}).
+    std::vector<int> bounds(K + 1);
+    for (int k = 0; k <= K; ++k) bounds[k] = (int)((long long)T * k / K);
+
+    // Workers for chunks 1..K-1 (fresh instances from the retained config /
+    // image paths); this instance runs chunk 0 so the caller's downstream
+    // (final-step stress/energy on `this`) keeps working unchanged.
+    std::vector<std::unique_ptr<MagneticFieldAnalyzer>> workers;
+    for (int k = 1; k < K; ++k) {
+        auto w = std::make_unique<MagneticFieldAnalyzer>(config_path, image_path_);
+        w->setTransientChunkRange(bounds[k], bounds[k + 1], /*is_worker=*/true);
+        w->setQuietSolver(true);   // concurrent NK/AMGCL prints would garble the log
+        workers.push_back(std::move(w));
+    }
+    setTransientChunkRange(bounds[0], bounds[1], /*is_worker=*/false);
+
+    std::vector<std::thread> threads;
+    threads.reserve(workers.size());
+    std::vector<std::string> worker_errors(workers.size());
+    for (size_t i = 0; i < workers.size(); ++i) {
+        threads.emplace_back([&, i]() {
+            try {
+                workers[i]->performTransientAnalysis(output_dir);
+            } catch (const std::exception& e) {
+                worker_errors[i] = e.what();
+            }
+        });
+    }
+    performTransientAnalysis(output_dir);   // chunk 0 on this instance
+    for (auto& t : threads) t.join();
+    for (size_t i = 0; i < worker_errors.size(); ++i) {
+        if (!worker_errors[i].empty())
+            throw std::runtime_error("transient chunk " + std::to_string(i + 1) +
+                                     " failed: " + worker_errors[i]);
+    }
+
+    // Merge the per-chunk flux-linkage histories into one CSV with global
+    // step numbering (chunk k's local row j corresponds to global step
+    // bounds[k] + j).
+    if (!flux_linkage_paths.empty()) {
+        std::vector<std::vector<double>> rows(T,
+            std::vector<double>(flux_linkage_paths.size(),
+                                std::numeric_limits<double>::quiet_NaN()));
+        auto fold = [&](const std::map<std::string, std::vector<double>>& res, int s0) {
+            for (size_t p = 0; p < flux_linkage_paths.size(); ++p) {
+                auto it = res.find(flux_linkage_paths[p].name);
+                if (it == res.end()) continue;
+                for (size_t j = 0; j < it->second.size(); ++j) {
+                    const size_t g = (size_t)s0 + j;
+                    if (g < rows.size()) rows[g][p] = it->second[j];
+                }
+            }
+        };
+        fold(flux_linkage_results, bounds[0]);
+        for (size_t i = 0; i < workers.size(); ++i)
+            fold(workers[i]->getFluxLinkageResults(), bounds[i + 1]);
+
+        const std::string flux_dir = output_dir + "/FluxLinkage";
+        createDirectory(flux_dir);
+        std::ofstream file(flux_dir + "/flux_linkage.csv");
+        if (file.is_open()) {
+            file << "step";
+            for (const auto& p : flux_linkage_paths) file << "," << p.name;
+            file << "\n";
+            for (int s = 0; s < T; ++s) {
+                file << s;
+                for (size_t p = 0; p < flux_linkage_paths.size(); ++p)
+                    file << "," << std::scientific << std::setprecision(10) << rows[s][p];
+                file << "\n";
+            }
+            std::cout << "Merged flux linkage CSV (" << K << " chunks, " << T
+                      << " steps) written." << std::endl;
+        }
+    }
 }

@@ -113,6 +113,23 @@ public:
      * @param output_dir Output directory for results
      */
     void performTransientAnalysis(const std::string& output_dir);
+    // Chunked sweep parallelism (transient.parallel_chunks > 1): restrict this
+    // instance to global steps [begin, end) as a chunk worker. Also forces the
+    // instance's own parallel_chunks to 1 (no recursive chunking) and flags it
+    // as a worker so per-sweep summary artifacts (flux CSV) are written by the
+    // owning instance only.
+    void setTransientChunkRange(int begin, int end, bool is_worker) {
+        transient_step_begin_ = begin;
+        transient_step_end_   = end;
+        transient_chunk_worker_ = is_worker;
+        transient_config.parallel_chunks = 1;
+    }
+    const std::map<std::string, std::vector<double>>& getFluxLinkageResults() const {
+        return flux_linkage_results;
+    }
+    int transient_step_begin_ = 0;    // global step range [begin, end) run by this instance
+    int transient_step_end_   = -1;   // -1 = full range (dispatcher may split into chunks)
+    bool transient_chunk_worker_ = false;
 
     /**
      * @brief Export Az (vector potential) array to CSV file
@@ -697,6 +714,7 @@ private:
     // Configuration and input
     YAML::Node config;
     std::string config_path;        // retained so DD can reload the raw base config for sub-domains
+    std::string image_path_;        // retained so chunked-transient workers can be constructed
     cv::Mat image;
     DDConfig dd_config;             // parsed from the 'domain_decomposition' YAML block
     std::string coordinate_system;  // "cartesian" or "polar"
@@ -803,9 +821,20 @@ private:
         // Valid names: "Az", "Mu", "H", "Jz", "InputImg", "BoundaryImg", "Forces", "EnergyDensity"
         std::vector<std::string> export_fields;
 
+        // Chunked sweep parallelism: split the step range into K contiguous
+        // chunks and run them CONCURRENTLY, each on its own analyzer instance
+        // (independent state, disjoint global step numbers -> no output
+        // collisions). Within a chunk the mu carry-over amortization is
+        // preserved (measured ~37 iters/step vs ~54 cold); each chunk's first
+        // step is cold, costing ~2-3% over a 124-step sweep. Aggregate
+        // speedup is memory-bandwidth-bound (~1.9x measured on 3 concurrent
+        // 1.34M-DOF solves). 1 = sequential (default, behavior unchanged).
+        int parallel_chunks;
+
         TransientConfig() : enabled(false), enable_sliding(true), total_steps(0),
                            slide_direction("vertical"), slide_region_start(0),
-                           slide_region_end(0), slide_pixels_per_step(0) {}
+                           slide_region_end(0), slide_pixels_per_step(0),
+                           parallel_chunks(1) {}
     };
 
     TransientConfig transient_config;
@@ -1043,6 +1072,9 @@ private:
     void setupPolarSystem();
     void setupMaterialProperties();
     void setupMaterialPropertiesForStep(int step);  // Update Jz for given step
+    // Chunked-transient dispatcher: spawns worker analyzer instances for
+    // chunks 1..K-1, runs chunk 0 on this instance, merges the flux CSV.
+    void runTransientChunks(const std::string& output_dir);
     void validateBoundaryConditions();
 
     // Transient analysis methods

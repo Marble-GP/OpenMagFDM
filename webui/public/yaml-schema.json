@@ -266,7 +266,7 @@
     },
     "transient": {
       "description": "Transient analysis configuration. v1.5/Phase B.2: prefer transient.slides: [...] for multi-region sliding. The legacy single-slide keys still work and are auto-converted into a 1-element slides list.",
-      "children": ["enabled", "enable_sliding", "total_steps", "slides", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
+      "children": ["enabled", "enable_sliding", "total_steps", "parallel_chunks", "slides", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
       "example": "transient:\n  enabled: true\n  total_steps: 100\n  enable_sliding: true\n  slides:\n    - name: rotor_outer\n      direction: vertical\n      region_start: 110\n      region_end: 390\n      pixels_per_step: 5\n    - name: rotor_inner\n      direction: vertical\n      region_start: 50\n      region_end: 100\n      pixels_per_step: -3"
     },
     "slides": {
@@ -350,6 +350,11 @@
       "description": "Number of analysis steps",
       "type": "integer",
       "example": "total_steps: 167"
+    },
+    "parallel_chunks": {
+      "description": "Split the sweep into K contiguous chunks solved concurrently (each chunk keeps the mu warm-start amortization; each chunk's first step is cold). Speedup is memory-bandwidth-bound (~1.9x measured at K=3). 1 = sequential (default).",
+      "type": "integer",
+      "example": "parallel_chunks: 3"
     },
     "slide_direction": {
       "description": "Sliding direction: 'vertical' or 'horizontal'",
