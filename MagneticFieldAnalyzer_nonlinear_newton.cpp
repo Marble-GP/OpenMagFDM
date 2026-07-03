@@ -21,6 +21,8 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <set>
+#include <string>
 #include <Eigen/Dense>
 #ifdef _OPENMP
 #include <omp.h>
@@ -545,6 +547,138 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                                         Eigen::VectorXd(), inner_tol);
         }
         auto nkp_t_solve = nkprof_now();
+
+        // ===== [Stage G gate] OMFDM_PROBE_WNEWTON: true-Newton x energy merit =====
+        // Decides GO/NO-GO for building the consistent tangent (CTSM) WITHOUT
+        // building it: the true Newton direction δ_N = J_true^{-1}(-R) is
+        // computed MATRIX-FREE (central-FD Jv oracle + right-preconditioned
+        // GMRES, precond = the assembled secant A via AMGCL), then evaluated
+        // under the energy merit W. Phase BL measured the true direction under
+        // the ||R|| merit only (Finding 3: full step diverges warm); the CONVEX
+        // energy view says W-Armijo is the correct acceptance — this is the one
+        // untested combination.
+        //   OMFDM_PROBE_WNEWTON=1: at iters in OMFDM_PROBE_WNEWTON_ITERS
+        //     (default "5,10,20") print an alpha/W/||R|| scan along δ_N.
+        //   OMFDM_PROBE_WNEWTON=2: DRIVE mode — replace the step direction with
+        //     δ_N every iteration (matrix-free CTSM); the configured line search
+        //     (use line_search_objective: energy) handles acceptance. The
+        //     resulting iteration count IS the gate: <=~20 iters => building the
+        //     assembled CTSM is worth it.
+        {
+            static const char* wn_env = std::getenv("OMFDM_PROBE_WNEWTON");
+            const int wn_mode = wn_env ? std::atoi(wn_env) : 0;
+            bool wn_probe_this_iter = false;
+            if (wn_mode == 1) {
+                static std::set<int> wn_iters = [] {
+                    std::set<int> s;
+                    const char* e = std::getenv("OMFDM_PROBE_WNEWTON_ITERS");
+                    std::string str = e ? e : "5,10,20";
+                    size_t i = 0;
+                    while (i < str.size()) {
+                        s.insert(std::atoi(str.c_str() + i));
+                        size_t n = str.find(',', i);
+                        if (n == std::string::npos) break;
+                        i = n + 1;
+                    }
+                    return s;
+                }();
+                wn_probe_this_iter = wn_iters.count(iter + 1) > 0;
+            }
+            if (!use_coarse && (wn_mode == 2 || wn_probe_this_iter)) {
+                // ~21 preconditioner solves per NK iteration — silence the
+                // per-call AMGCL banners for the duration of the probe.
+                const bool wn_prev_quiet = quiet_solver_;
+                quiet_solver_ = true;
+                // Residual oracle at arbitrary x (mutates member fields; the
+                // caller below restores them to the current iterate).
+                auto evalResidualVec = [&](const Eigen::VectorXd& x) -> Eigen::VectorXd {
+                    syncMemberAz(x);
+                    updateFieldAndMu();
+                    Eigen::SparseMatrix<double> A_t;
+                    Eigen::VectorXd b_t;
+                    buildMatrixForSolve(A_t, b_t);
+                    return A_t * x - b_t;
+                };
+                const double eps_rel = [] {
+                    const char* e = std::getenv("OMFDM_PROBE_EPS");
+                    return e ? std::atof(e) : 1e-6;
+                }();
+                const double xnorm = Az_vec.norm();
+                auto applyJ = [&](const Eigen::VectorXd& v) -> Eigen::VectorXd {
+                    const double vn = v.norm();
+                    if (vn < 1e-30) return Eigen::VectorXd::Zero(v.size());
+                    const double h = eps_rel * std::max(xnorm, 1.0) / vn;
+                    Eigen::VectorXd Rp = evalResidualVec(Az_vec + h * v);
+                    Eigen::VectorXd Rm = evalResidualVec(Az_vec - h * v);
+                    return (Rp - Rm) / (2.0 * h);
+                };
+                // Right-preconditioned GMRES(m): solve J M^{-1} y = -R, δ_N = M^{-1} y,
+                // M = assembled secant A (AMGCL, loose tol).
+                const int m_kry = 20;
+                auto applyM = [&](const Eigen::VectorXd& v) -> Eigen::VectorXd {
+                    return solveLinearSystem(A_matrix, v, Eigen::VectorXd(), 1e-2);
+                };
+                const Eigen::VectorXd rhs = -residual_coarse;
+                const double bnorm = rhs.norm() + 1e-30;
+                std::vector<Eigen::VectorXd> V;
+                V.reserve(m_kry + 1);
+                Eigen::MatrixXd Hh = Eigen::MatrixXd::Zero(m_kry + 1, m_kry);
+                V.push_back(rhs / bnorm);
+                int kdim = 0;
+                for (int k = 0; k < m_kry; ++k) {
+                    Eigen::VectorXd w = applyJ(applyM(V[k]));
+                    for (int i2 = 0; i2 <= k; ++i2) {
+                        Hh(i2, k) = w.dot(V[i2]);
+                        w -= Hh(i2, k) * V[i2];
+                    }
+                    Hh(k + 1, k) = w.norm();
+                    kdim = k + 1;
+                    if (Hh(k + 1, k) < 1e-12 * bnorm) break;
+                    V.push_back(w / Hh(k + 1, k));
+                }
+                Eigen::VectorXd e1 = Eigen::VectorXd::Zero(kdim + 1);
+                e1(0) = bnorm;
+                const Eigen::VectorXd y =
+                    Hh.topLeftCorner(kdim + 1, kdim).householderQr().solve(e1);
+                Eigen::VectorXd yv = Eigen::VectorXd::Zero(V[0].size());
+                for (int k = 0; k < kdim; ++k) yv += y(k) * V[k];
+                Eigen::VectorXd delta_N = applyM(yv);
+                const double gmres_rel =
+                    (Hh.topLeftCorner(kdim + 1, kdim) * y - e1).norm() / bnorm;
+
+                if (wn_probe_this_iter) {
+                    // alpha scan along δ_N under BOTH merits.
+                    const double W0p = [&] {
+                        syncMemberAz(Az_vec); updateFieldAndMu();
+                        return computeEnergyObjective();
+                    }();
+                    std::cout << "\n[WNEWTON probe iter " << iter + 1
+                              << "] ||R||=" << residual_norm
+                              << " gmres_rel=" << gmres_rel
+                              << " ||dN||/||dP||=" << delta_N.norm() / (delta_A.norm() + 1e-30)
+                              << " cos(dN,dP)=" << delta_N.dot(delta_A) /
+                                     (delta_N.norm() * delta_A.norm() + 1e-30) << std::endl;
+                    for (double a : {1.0, 0.65, 0.42, 0.27, 0.18, 0.12, 0.08}) {
+                        Eigen::VectorXd xt = Az_vec + a * delta_N;
+                        const double Rn = evalResidualVec(xt).norm();
+                        const double Wt = computeEnergyObjective();  // fields already at xt
+                        std::cout << "  alpha=" << a
+                                  << "  dW=" << std::scientific << Wt - W0p
+                                  << "  ||R||/||R0||=" << Rn / (residual_norm + 1e-30)
+                                  << std::endl;
+                    }
+                }
+                if (wn_mode == 2) {
+                    delta_A = delta_N;   // drive the solver along the true direction
+                    if (VERBOSE) std::cout << " [WN drive: gmres_rel=" << std::scientific
+                                           << std::setprecision(1) << gmres_rel << "]";
+                }
+                // Restore member fields to the CURRENT iterate for the line search.
+                syncMemberAz(Az_vec);
+                updateFieldAndMu();
+                quiet_solver_ = wn_prev_quiet;
+            }
+        }
 
         // ===== Step 6: Backtracking line search =====
         // Find step length α that ensures sufficient decrease in residual
