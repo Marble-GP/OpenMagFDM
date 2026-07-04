@@ -240,6 +240,163 @@ MagneticFieldAnalyzer::MuValue MagneticFieldAnalyzer::parseMuValue(const YAML::N
 /**
  * @brief Evaluate mu_r at given |H| magnitude
  */
+double MagneticFieldAnalyzer::dHdB_FromTable(const BHTable& table, double B_magnitude) const {
+    // Differential reluctivity dH/dB from the (piecewise-linear) B-H table.
+    // Beyond the table end B(H) = B_end + mu0*(H - H_end), so dH/dB -> 1/mu0.
+    const double MU0 = 4.0 * M_PI * 1e-7;
+    const auto& Bt = table.B_values;
+    const auto& Ht = table.H_values;
+    if (!table.is_valid || Bt.size() < 2) return 1.0 / MU0;
+    if (B_magnitude >= Bt.back()) return 1.0 / MU0;
+    size_t k;
+    if (B_magnitude <= Bt.front()) {
+        k = 0;
+    } else {
+        auto it = std::upper_bound(Bt.begin(), Bt.end(), B_magnitude);
+        k = static_cast<size_t>(std::distance(Bt.begin(), it)) - 1;
+        if (k + 1 >= Bt.size()) k = Bt.size() - 2;
+    }
+    const double dB = Bt[k + 1] - Bt[k];
+    const double dH = Ht[k + 1] - Ht[k];
+    return (dB > 1e-30) ? (dH / dB) : 1.0 / MU0;
+}
+
+void MagneticFieldAnalyzer::addTangentCorrection(Eigen::SparseMatrix<double>& J) {
+    // Consistent-tangent correction (Stage C of the CTSM x energy program).
+    //
+    // STATUS (2026-07 benchmark): the DIRECTION quality of the assembled
+    // tangent reproduces the matrix-free Stage G gate (alpha=1 accepted for a
+    // third of the iterations under the energy merit, vs the 0.1 crawl), but
+    // the INNER solve cost explodes: BiCGStab on the tangent J preconditioned
+    // by AMG(secant A) needs 100+ iterations where the secant path needs 3-8
+    // CG its, so per-NK-iteration cost is ~6 s vs ~0.5 s and the iteration
+    // savings are eaten (measured 248 s / 40 iters vs 37 s / 48 secant).
+    // NEGATIVE for speed; kept opt-in (jacobian: tangent) because the energy
+    // x tangent pairing is the only configuration that pierces the 5e-3
+    // plateau (gate: 3.6e-4 true convergence) — the identified follow-ups are
+    // a preconditioner FOR the tangent operator, or a hybrid that switches
+    // secant -> tangent only after plateau detection (a true-convergence
+    // QUALITY option, not a speed one).
+    //
+    // The discrete magnetostatic energy is W = sum_c w(|B_c|) vol_c - <j, Az>
+    // with B_c from the central-difference curl (calculateMagneticFieldPolar).
+    // Its Hessian is sum_c vol_c G_c^T [ nu I + (nu_d - nu) bhat bhat^T ] G_c:
+    // the isotropic nu part is (spectrally) the assembled secant operator A,
+    // and the missing curvature is the per-cell RANK-ONE term
+    //     vol_c (nu_d - nu) (G_c^T bhat)(G_c^T bhat)^T,
+    // where g = G_c^T bhat has four entries on the cell's theta/r neighbours:
+    //     +-bhat_r/(2 dtheta r) on Az(i, j+-1),  -+bhat_theta/(2 dr) on Az(i+-1, j).
+    // nu = H/B (secant), nu_d = dH/dB (differential). Linear cells have
+    // nu_d = nu and contribute nothing. The Stage G gate measured this
+    // curvature to be what unlocks alpha = 1 under the energy merit
+    // (25 true-tolerance iterations vs 48 plateau-stalled).
+    //
+    // Safeguards: entries touching the Dirichlet radial boundary rows are
+    // dropped (those rows stay pure BC rows), and the coefficient is floored
+    // at -0.9*nu*vol so a rising-mu region (nu_d < nu) cannot push the
+    // assembled J indefinite (the exact Hessian is SPD since nu, nu_d > 0,
+    // but A only approximates the isotropic part).
+    if (coordinate_system == "cartesian") return;
+    const double MU0 = 4.0 * M_PI * 1e-7;
+    const bool horiz = (r_orientation == "horizontal");
+    const bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);
+
+    std::vector<Eigen::Triplet<double>> trips;
+    trips.reserve((size_t)16 * 1024 * 1024);   // ~860k NL cells x up to 16 entries
+
+    for (int i = 1; i < nr - 1; ++i) {          // skip radial boundary cells (Dirichlet rows)
+        const double r = r_start + i * dr;
+        if (r < 1e-12) continue;
+        for (int j = 0; j < ntheta; ++j) {
+            const int mr = horiz ? j : i;       // map/grid row of cell (theta,r) layout
+            const int mc = horiz ? i : j;
+            const cv::Vec3b px = image_to_use.at<cv::Vec3b>(mr, mc);
+            const int rgb_key = (px[0] << 16) | (px[1] << 8) | px[2];
+            auto lut_it = rgb_to_material.find(rgb_key);
+            if (lut_it == rgb_to_material.end()) continue;
+            auto bh_it = material_bh_tables.find(lut_it->second.name);
+            if (bh_it == material_bh_tables.end() || !bh_it->second.is_valid) continue;
+
+            const double br = Br(mr, mc), bt = Btheta(mr, mc);
+            const double Bmag = std::sqrt(br * br + bt * bt);
+            if (Bmag < 1e-12) continue;
+            const double H_mag = H_map(mr, mc);
+            const double nu   = H_mag / Bmag;
+            const double nu_d = dHdB_FromTable(bh_it->second, Bmag);
+            // dnu_c/dB = (nu_d - nu)/B; no volume factor — the h vector below
+            // already carries the r-weighted FV row scaling of the residual.
+            double coef = (nu_d - nu) / Bmag;
+            if (coef < -0.9 * nu / Bmag) coef = -0.9 * nu / Bmag;   // definiteness floor
+            if (std::abs(coef) < 1e-30) continue;
+
+            const double bhr = br / Bmag, bht = bt / Bmag;
+            // g = d|B_c|/dAz (the central-difference curl stencil, 4 entries).
+            int    gidx[4];
+            double gw[4];
+            int    ng = 0;
+            const int jp = is_periodic ? (j + 1) % ntheta : std::min(j + 1, ntheta - 1);
+            const int jm = is_periodic ? (j - 1 + ntheta) % ntheta : std::max(j - 1, 0);
+            if (jp != jm) {
+                const double wth = bhr / (2.0 * dtheta * r);
+                gidx[ng] = i * ntheta + jp; gw[ng++] = +wth;
+                gidx[ng] = i * ntheta + jm; gw[ng++] = -wth;
+            }
+            const double wr = -bht / (2.0 * dr);
+            gidx[ng] = (i + 1) * ntheta + j; gw[ng++] = +wr;
+            gidx[ng] = (i - 1) * ntheta + j; gw[ng++] = -wr;
+
+            // h = dR/dnu_c: each face f=(c,n) has coefficient s_f*nu_f with
+            // nu_f = (nu_c + nu_n)/2 (harmonic-mu face), so dc_f/dnu_c = s_f/2
+            // and face f contributes (s_f/2)*(Az_n - Az_c) to row c and the
+            // negative to row n. Geometric factors from buildMatrixPolar:
+            // radial s = r_{i +/- 1/2}/dr^2, theta s = 1/(r*dtheta^2).
+            auto AzAt = [&](int ri, int tj) -> double {
+                return horiz ? Az(tj, ri) : Az(ri, tj);
+            };
+            const double Az_c = AzAt(i, j);
+            int    hidx[5];
+            double hw[5];
+            int    nh = 0;
+            double h_center = 0.0;
+            auto addFace = [&](int ni, int nj, double s_f) {
+                const double d = 0.5 * s_f * (AzAt(ni, nj) - Az_c);
+                hidx[nh] = ni * ntheta + nj; hw[nh++] = -d;   // row n gets -(s/2)(Az_n - Az_c)... sign per row-n's face term
+                h_center += d;                                 // row c gets +(s/2)(Az_n - Az_c)
+            };
+            addFace(i + 1, j, (r + 0.5 * dr) / (dr * dr));
+            addFace(i - 1, j, (r - 0.5 * dr) / (dr * dr));
+            if (jp != jm) {
+                addFace(i, jp, 1.0 / (r * dtheta * dtheta));
+                addFace(i, jm, 1.0 / (r * dtheta * dtheta));
+            }
+            hidx[nh] = i * ntheta + j; hw[nh++] = h_center;
+
+            // Scatter the RAW (nonsymmetric) rank-two update coef * h g^T —
+            // this IS dR/dAz restricted to the mu chain rule. (Symmetrizing it
+            // was measured to wreck the inner-solve conditioning: AMGCL-CG went
+            // 3 -> 1800+ iterations. The tangent path therefore solves with
+            // BiCGStab preconditioned by AMG on the SPD secant A, mirroring the
+            // matrix-free Stage G gate.)
+            for (int a2 = 0; a2 < nh; ++a2) {
+                const int ra = hidx[a2] / ntheta;
+                if (ra == 0 || ra == nr - 1) continue;       // keep Dirichlet rows clean
+                for (int b2 = 0; b2 < ng; ++b2) {
+                    const int rb = gidx[b2] / ntheta;
+                    if (rb == 0 || rb == nr - 1) continue;
+                    trips.emplace_back(hidx[a2], gidx[b2], coef * hw[a2] * gw[b2]);
+                }
+            }
+        }
+    }
+    if (trips.empty()) return;
+    Eigen::SparseMatrix<double> dJ(J.rows(), J.cols());
+    dJ.setFromTriplets(trips.begin(), trips.end());
+    J += dJ;
+}
+
 void MagneticFieldAnalyzer::precomputeMuTableCache(MuValue& mu_val) {
     mu_val.B_table_cache.clear();
     mu_val.pchip_slopes_cache.clear();

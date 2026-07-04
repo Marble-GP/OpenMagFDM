@@ -24,6 +24,7 @@
 #include <set>
 #include <string>
 #include <Eigen/Dense>
+#include <amgcl/solver/bicgstab.hpp>   // tangent-Jacobian inner solver (nonsymmetric)
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -412,6 +413,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // (idx = i_r*ntheta+j_theta) but J_matrix is n_active x n_active. The
             // correction is numerically ~negligible anyway (Phase BL: ~3e-19% of
             // ||J v||), so J_coarse = A_coarse.
+            // Consistent tangent (jacobian: tangent): add the per-cell
+            // rank-one (nu_d - nu)(g g^T) curvature of the discrete energy
+            // Hessian — the Stage G gate measured this to be what unlocks
+            // alpha = 1 under the energy merit (25 true-tolerance iterations).
+            // Supersedes the r-weighted diagonal correction below.
+            if (nonlinear_config.jacobian_tangent && !use_coarse && is_polar) {
+                addTangentCorrection(J_matrix);
+            } else
             // Energy-LS mode keeps J symmetric POSITIVE DEFINITE so CG from
             // x0=0 yields a guaranteed energy-descent direction: the raw
             // diagonal correction goes NEGATIVE where dμ/dH > 0 (the rising-
@@ -543,8 +552,48 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                               << std::setprecision(2) << inner_tol << "]";
                 }
             }
-            delta_A = solveLinearSystem(J_matrix, -residual_coarse,
-                                        Eigen::VectorXd(), inner_tol);
+            if (nonlinear_config.jacobian_tangent && !use_coarse && is_polar) {
+                // Tangent path: J is NONSYMMETRIC (raw mu chain rule), so solve
+                // with BiCGStab preconditioned by AMG built on the SPD secant A
+                // — the assembled twin of the Stage G matrix-free gate
+                // (FD-Jv GMRES preconditioned by A), which converged in 25
+                // true-tolerance iterations.
+                typedef amgcl::backend::builtin<double> TBackend;
+                typedef amgcl::amg<TBackend, amgcl::coarsening::smoothed_aggregation,
+                                   amgcl::relaxation::spai0> TPrecond;
+                auto toCrs = [](const Eigen::SparseMatrix<double>& M,
+                                std::vector<ptrdiff_t>& ptr, std::vector<ptrdiff_t>& col,
+                                std::vector<double>& val) {
+                    Eigen::SparseMatrix<double, Eigen::RowMajor> Mr = M;
+                    Mr.makeCompressed();
+                    const ptrdiff_t rows = Mr.rows();
+                    ptr.assign(Mr.outerIndexPtr(), Mr.outerIndexPtr() + rows + 1);
+                    col.assign(Mr.innerIndexPtr(), Mr.innerIndexPtr() + Mr.nonZeros());
+                    val.assign(Mr.valuePtr(), Mr.valuePtr() + Mr.nonZeros());
+                    return rows;
+                };
+                std::vector<ptrdiff_t> ap, ac, jp, jc;
+                std::vector<double> av, jv;
+                ptrdiff_t n_rows = toCrs(A_matrix, ap, ac, av);
+                toCrs(J_matrix, jp, jc, jv);
+                auto A_crs = std::tie(n_rows, ap, ac, av);
+                TPrecond P(A_crs);
+                TBackend::matrix J_b(std::tie(n_rows, jp, jc, jv));
+                amgcl::solver::bicgstab<TBackend>::params sprm;
+                sprm.tol = (inner_tol > 0.0) ? std::min(inner_tol, 1e-2) : 1e-2;
+                sprm.maxiter = 100;
+                amgcl::solver::bicgstab<TBackend> S(n_rows, sprm);
+                std::vector<double> rhs_v(residual_coarse.size());
+                for (int q = 0; q < residual_coarse.size(); ++q) rhs_v[q] = -residual_coarse[q];
+                std::vector<double> x_v(residual_coarse.size(), 0.0);
+                auto [t_it, t_err] = S(J_b, P, rhs_v, x_v);
+                if (VERBOSE) std::cout << " [tangent BiCGStab " << t_it << " its, res="
+                                       << std::scientific << std::setprecision(1) << t_err << "]";
+                delta_A = Eigen::Map<Eigen::VectorXd>(x_v.data(), (Eigen::Index)x_v.size());
+            } else {
+                delta_A = solveLinearSystem(J_matrix, -residual_coarse,
+                                            Eigen::VectorXd(), inner_tol);
+            }
         }
         auto nkp_t_solve = nkprof_now();
 

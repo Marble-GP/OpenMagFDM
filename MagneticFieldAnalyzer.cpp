@@ -170,6 +170,10 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
                 nl_config["line_search_objective"].as<std::string>("residual");
             nonlinear_config.line_search_energy = (lso == "energy");
         }
+        {
+            const std::string jac = nl_config["jacobian"].as<std::string>("secant");
+            nonlinear_config.jacobian_tangent = (jac == "tangent");
+        }
 
         // Phase 4: Galerkin coarsening option (for coarsened Newton-Krylov)
         // Default false: FVM (buildMatrixPolarCoarsened/buildMatrixCoarsened) is used for

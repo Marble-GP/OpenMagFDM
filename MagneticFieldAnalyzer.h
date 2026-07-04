@@ -383,6 +383,12 @@ public:
     // Fill MuValue::B_table_cache / pchip_slopes_cache once at material load
     // (evaluateMu's TABLE branch reads them per cell; see MuValue comment).
     static void precomputeMuTableCache(MuValue& mu_val);
+    // Consistent-tangent correction (jacobian: tangent): adds the per-cell
+    // rank-one (nu_d - nu)(g g^T) terms of the discrete energy Hessian to J.
+    void addTangentCorrection(Eigen::SparseMatrix<double>& J);
+    // Differential reluctivity dH/dB from the B-H table (segment slope;
+    // -> 1/mu0 beyond the table end).
+    double dHdB_FromTable(const BHTable& table, double B_magnitude) const;
 
     /**
      * @brief Evaluate derivative dμ_r/dH at given |H| magnitude
@@ -497,6 +503,16 @@ private:
         // iteration at α=1 (no ratchet).
         bool line_search_energy;
 
+        // Newton matrix: "secant" (default; the frozen-mu operator A plus the
+        // r-weighted diagonal correction — historical behavior) or "tangent"
+        // (consistent tangent: A plus per-cell rank-one (nu_d - nu)(g g^T)
+        // corrections capturing the B-H curve's differential reluctivity;
+        // combine with line_search_objective: energy — the Stage G gate
+        // measured 25 true-tolerance iterations with alpha=1 accepted for the
+        // exact-Jacobian x energy-merit pairing, vs 48 plateau-stalled
+        // iterations for secant x residual).
+        bool jacobian_tangent;
+
         // Residual-proportional cap: η ≤ max(eta_min, residual_cap·||R||_rel).
         // The classic ratio formula never tightens in a linear-rate crawl
         // (γ·ratio^α stays ≈0.78 → clamped to eta_max forever). This knob ties
@@ -521,6 +537,7 @@ private:
             eisenstat_walker_gamma(0.9), eisenstat_walker_alpha(2.0),
             eisenstat_walker_eta_min(1e-6), eisenstat_walker_eta_max(0.1),
             line_search_energy(false),
+            jacobian_tangent(false),
             eisenstat_walker_residual_cap(-1.0) {}
     };
 
