@@ -4179,7 +4179,7 @@ ${DD_HINT_MARKER}
 #     - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)
 #   robin_p: 12.0          # Robin transmission coefficient
 #   overlap: 4             # band overlap in fine columns
-#   max_outer: 20          # max Schwarz sweeps
+#   max_outer: 8           # max Schwarz sweeps (flux converges by ~4)
 #   tol: 1.0e-3            # relative Schwarz-residual stop
 #   # relax: 0.7           # under-relaxation if an interface oscillates
 `;

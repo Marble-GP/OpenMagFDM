@@ -639,31 +639,14 @@ domain_decomposition:
   ファクトと界面の B スパイクを軽減）。ただし**粗大化領域の B 場は近似**で、界面には残差段差が残ります。
   **DD の信頼できる出力は flux（積分量）**であって、粗化領域の点ごとの B ではありません。
 
-**実験的機能（v1.6+, 開発中）— theta セクター分割 + パッチ並列**:
-fine（cf=1）バンドは第5要素でセクター数を指定でき、`theta_cuts` の位置（**鉄のみを通る**
-material-safe な theta 行。コイル・磁石を跨ぐと flux が壊れます）で theta 方向に分割されます。
-`parallel: true` で additive Schwarz + OpenMP パッチ並列（内部ソルバはシングルスレッド化）に
-なります。小パッチはキャッシュ常駐するため AMGCL のメモリ帯域律速より並列効率が高い一方、
-**theta 分割の Schwarz 反復は現状収束しません**: 平坦化（max_inner）併用では発散・徘徊し、
-フル sub-solve（max_inner: 0）では収束するものの実用外の遅さです。2-level Galerkin 粗空間
-（`coarse: [CR, CTH]`）も実装されていますが、**非線形演算子が縫い目の不連続に汚染されて
-補正が増幅器になるため IEEJ-D で発散が実測されており、使用しないでください**（トレーサビリティ
-のため off-by-default で残置）。リング構成（セクターなし）での `parallel: true` は安全です。
-
-同様に、**解析エアギャップ結合 `gap_link: [cR, cS]`**（ロータ／ステータ 2 分割、間の空気環を
-FD メッシュから外して調和（Laplace）伝達写像で結合 — ギャップ隣接帯の粗大化制約を外すのが狙い）
-も実装済みですが、**平坦化 sub-solve との組合せは IEEJ-D で発散が実測されており、現状使用不可**
-です（スロット高調波の透過が作る大きな per-sweep 変化に反復キャップ付きの非線形 sub-solve が
-追従できない。フル sub-solve なら収束するがモノリシックより遅い）。off-by-default で残置。
-
-```yaml
-domain_decomposition:
-  bands:
-    - [52, 203, 1, 1, 8]   # 第5要素 = theta セクター数（fine バンドのみ可）
-  theta_cuts: [321, 427, ...]  # material-safe な切断位置（鉄のみを通る theta 行）
-  parallel: true               # additive Schwarz + OMP パッチ並列
-  # robin_p_theta: 0.3         # theta 界面の Robin 係数（既定 robin_p/40）
-```
+> **研究用の未完成ノブ（非推奨・off-by-default・WebUI 非露出）**: 上記のリング精度モードに加えて、
+> theta セクター分割＋パッチ並列（`parallel` / band 第5要素 / `theta_cuts`）、2-level Galerkin
+> 粗空間（`coarse`）、解析エアギャップ結合（`gap_link`、ロータ／ステータ 2 分割）がコードに
+> 実装されています。**いずれも IEEJ-D で収束しない／発散することが実測されており（非線形
+> sub-solve の収束率が律速）、本番では使用しないでください。** トレーサビリティのため残していますが
+> WebUI からは露出させていません（調査の詳細は `docs/research/` と git 履歴）。DD の実用形は
+> 上記のリング構成の精度モードです。なお **回転スイープの並列化は別機能**（`transient.parallel_chunks`、
+> [過渡解析](#過渡解析回転シミュレーション)節を参照）として実装されており、そちらは実用可能です。
 
 WebUI では `domain_decomposition:` のスニペット補完が使え、Polar Preprocess が生成する YAML には
 コメントアウト済みの DD ブロックが付くので、必要なときにコメントを外して調整できます。
@@ -728,6 +711,8 @@ transient:
 - [x] REST API（外部プログラムからのソルバー制御・自動化）
 - [x] OpenMP 並列化（マルチコア対応）
 - [x] カラー検出 UI（画像から材料色を自動検出）
+- [x] 領域分割（Domain Decomposition）による可変解像度精度モード（極座標、v1.6・任意）
+- [x] チャンク並列スイープ（`transient.parallel_chunks`：回転スイープを複数チャンク同時実行）
 
 ### 将来検討中の機能
 

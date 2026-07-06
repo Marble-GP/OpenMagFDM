@@ -112,7 +112,7 @@
     "domain_decomposition": {
       "description": "v1.6 domain decomposition (optimized Schwarz, POLAR only). Opt-in variable-resolution ACCURACY mode: keep the air gap / saturated zone FINE, coarsen smooth radial bands on their own uniform grid, coupled by symmetric Robin transmission iterated to consistency. NOT a speed default — uniform downsampling is faster; use when full-resolution gap accuracy matters (e.g. final-ranking / verification). Disabled unless 'enabled: true' with at least one band.",
       "children": ["enabled", "bands", "robin_p", "overlap", "max_outer", "tol", "relax"],
-      "example": "domain_decomposition:\n  enabled: true\n  bands:\n    - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)\n    - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE\n    - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)\n  robin_p: 12.0\n  overlap: 4\n  max_outer: 20\n  tol: 1.0e-3"
+      "example": "domain_decomposition:\n  enabled: true\n  bands:\n    - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)\n    - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE\n    - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)\n  robin_p: 12.0\n  overlap: 4\n  max_outer: 8\n  tol: 1.0e-3"
     },
     "bands": {
       "description": "Radial bands, each [c0, c1, cf_r, cf_theta]: column range [c0,c1) in radial pixel indices, radial coarsen factor cf_r, theta coarsen factor cf_theta. cf=1 keeps the band FINE (use across the air gap / saturated active region). cf_theta=1 = r-only coarsening (preserves theta-varying slots/magnets). RULE: band interfaces (c0/c1) should fall in IRON, and the air gap must stay inside a fine band — interfaces in air or coils diverge.",
