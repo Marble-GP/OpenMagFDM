@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <algorithm>
 #include <filesystem>
+#include <thread>
+#include <limits>
 #include <tiffio.h>
 #ifdef _OPENMP
 #include <omp.h>
@@ -70,6 +72,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
                                              const std::string& image_path) {
     loadConfig(config_path);
     loadImage(image_path);
+    image_path_ = image_path;   // retained so chunked-transient workers can be constructed
 
     // v1.5 / Phase B.1: parse user-defined variables and expand `$name`
     // tokens throughout the YAML tree BEFORE any other parsing pass, so
@@ -113,6 +116,36 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.verbose = nl_config["verbose"].as<bool>(false);
         nonlinear_config.export_convergence = nl_config["export_convergence"].as<bool>(false);
 
+        // [Phase BJ-8 stage 3 / v1.5.1] Deprecation warnings for YAML keys
+        // that controlled the now-removed custom Galerkin coarsening
+        // machinery. Each key still parses (no behavioural change) but the
+        // value is unreachable — Stage 4 deletes the parse calls + struct
+        // fields. The warning fires once per startup to tell users which
+        // keys to remove from their YAML.
+        {
+            static const char* kDeprecatedNlKeys[] = {
+                "relaxation",                  // Picard step damping (Picard solver_type unused)
+                "use_galerkin_coarsening",     // Phase 4 Galerkin projection
+                "use_matrix_free_jv",          // Phase 5 matrix-free GMRES on coarse system
+                "use_phase6_precond_jfnk",     // Phase 6 Newton-Picard A(μ_diff) tangent
+                "precond_update_frequency",    // Phase 6 preconditioner refresh policy
+                "precond_verbose",             // Phase 6 diagnostic
+                "fine_finishing_iterations",   // post-coarse full-grid Newton-Picard polish
+                "fine_finishing_tolerance",    // ↑ tolerance
+                "strict_convergence",          // Phase BJ-5 fine-finishing residual gate
+                nullptr
+            };
+            for (int i = 0; kDeprecatedNlKeys[i]; ++i) {
+                if (nl_config[kDeprecatedNlKeys[i]]) {
+                    std::cerr << "WARNING: YAML key 'nonlinear_solver." << kDeprecatedNlKeys[i]
+                              << "' is no longer supported as of v1.5.1 (Phase BJ-8: AMGCL native multigrid). "
+                              << "The custom Galerkin coarsening machinery it controlled has been removed. "
+                              << "The solver runs with full-grid AMGCL+EW which is now the only path. "
+                              << "Remove this key from YAML to silence." << std::endl;
+                }
+            }
+        }
+
         // Picard specific settings
         nonlinear_config.relaxation = nl_config["relaxation"].as<double>(0.7);
 
@@ -132,6 +165,15 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         nonlinear_config.line_search_rho = nl_config["line_search_rho"].as<double>(0.65);
         nonlinear_config.line_search_max_trials = nl_config["line_search_max_trials"].as<int>(50);
         nonlinear_config.line_search_adaptive = nl_config["line_search_adaptive"].as<bool>(true);
+        {
+            const std::string lso =
+                nl_config["line_search_objective"].as<std::string>("residual");
+            nonlinear_config.line_search_energy = (lso == "energy");
+        }
+        {
+            const std::string jac = nl_config["jacobian"].as<std::string>("secant");
+            nonlinear_config.jacobian_tangent = (jac == "tangent");
+        }
 
         // Phase 4: Galerkin coarsening option (for coarsened Newton-Krylov)
         // Default false: FVM (buildMatrixPolarCoarsened/buildMatrixCoarsened) is used for
@@ -150,13 +192,127 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         // Fine finishing: full-grid Picard after coarse convergence
         nonlinear_config.fine_finishing_iterations = nl_config["fine_finishing_iterations"].as<int>(0);
         nonlinear_config.fine_finishing_tolerance = nl_config["fine_finishing_tolerance"].as<double>(-1.0);
+
+        // [Phase BJ-5] Strict convergence enforcement (default off).
+        nonlinear_config.strict_convergence = nl_config["strict_convergence"].as<bool>(false);
+
+        // Phase BC: Eisenstat-Walker forcing for the inner AMGCL solve.
+        // Accept either a flat "eisenstat_walker_enabled" boolean for
+        // quick toggle, or a nested "eisenstat_walker:" block with the
+        // gamma / alpha / eta_min / eta_max tunables.
+        nonlinear_config.eisenstat_walker_enabled =
+            nl_config["eisenstat_walker_enabled"].as<bool>(false);
+        if (nl_config["eisenstat_walker"]) {
+            auto ew_cfg = nl_config["eisenstat_walker"];
+            nonlinear_config.eisenstat_walker_enabled =
+                ew_cfg["enabled"].as<bool>(nonlinear_config.eisenstat_walker_enabled);
+            nonlinear_config.eisenstat_walker_gamma   = ew_cfg["gamma"].as<double>(0.9);
+            nonlinear_config.eisenstat_walker_alpha   = ew_cfg["alpha"].as<double>(2.0);
+            nonlinear_config.eisenstat_walker_eta_min = ew_cfg["eta_min"].as<double>(1e-6);
+            nonlinear_config.eisenstat_walker_eta_max = ew_cfg["eta_max"].as<double>(0.1);
+            nonlinear_config.eisenstat_walker_residual_cap =
+                ew_cfg["residual_cap"].as<double>(-1.0);
+        }
     }
 
-    // Parse global coarsening settings
+    // v1.6 domain decomposition (optimized Schwarz, polar only; opt-in accuracy
+    // mode). Parsed here so solve() can dispatch to solveDomainDecomposition()
+    // when enabled. See the DDConfig struct + MagneticFieldAnalyzer_dd.cpp.
+    if (config["domain_decomposition"]) {
+        auto dd = config["domain_decomposition"];
+        dd_config.enabled = dd["enabled"].as<bool>(false);
+        if (dd["robin_p"])   dd_config.robin_p   = dd["robin_p"].as<double>(dd_config.robin_p);
+        if (dd["overlap"])   dd_config.overlap   = dd["overlap"].as<int>(dd_config.overlap);
+        if (dd["max_outer"]) dd_config.max_outer = dd["max_outer"].as<int>(dd_config.max_outer);
+        if (dd["tol"])       dd_config.tol       = dd["tol"].as<double>(dd_config.tol);
+        if (dd["relax"])     dd_config.relax     = dd["relax"].as<double>(dd_config.relax);
+        if (dd["max_inner"]) dd_config.max_inner = dd["max_inner"].as<int>(dd_config.max_inner);
+        if (dd["parallel"])  dd_config.parallel  = dd["parallel"].as<bool>(false);
+        if (dd["robin_p_theta"])
+            dd_config.robin_p_theta = dd["robin_p_theta"].as<double>(dd_config.robin_p_theta);
+        if (dd["theta_cuts"]) {
+            for (auto tc : dd["theta_cuts"]) dd_config.theta_cuts.push_back(tc.as<int>());
+        }
+        if (dd["coarse"] && dd["coarse"].IsSequence() && dd["coarse"].size() >= 2) {
+            dd_config.coarse_r  = std::max(0, dd["coarse"][0].as<int>(0));
+            dd_config.coarse_th = std::max(0, dd["coarse"][1].as<int>(0));
+        }
+        if (dd["coarse_damp"])
+            dd_config.coarse_damp = dd["coarse_damp"].as<double>(dd_config.coarse_damp);
+        if (dd["gap_link"] && dd["gap_link"].IsSequence() && dd["gap_link"].size() >= 2) {
+            dd_config.gap_r0 = dd["gap_link"][0].as<int>(-1);
+            dd_config.gap_r1 = dd["gap_link"][1].as<int>(-1);
+            if (dd_config.gap_r0 >= 0 && dd_config.gap_r1 <= dd_config.gap_r0) {
+                std::cerr << "WARNING: domain_decomposition.gap_link must satisfy cR < cS; disabled."
+                          << std::endl;
+                dd_config.gap_r0 = dd_config.gap_r1 = -1;
+            }
+        }
+        if (dd["bands"]) {
+            for (auto bn : dd["bands"]) {
+                int c0  = bn[0].as<int>();
+                int c1  = bn[1].as<int>();
+                int cfr = bn.size() > 2 ? bn[2].as<int>() : 1;
+                int cft = bn.size() > 3 ? bn[3].as<int>() : cfr;
+                int sec = bn.size() > 4 ? bn[4].as<int>() : 1;
+                if (sec > 1 && (cfr > 1 || cft > 1)) {
+                    std::cerr << "WARNING: domain_decomposition band [" << c0 << "," << c1
+                              << ") requests " << sec << " theta sectors WITH coarsening (cf_r="
+                              << cfr << ", cf_theta=" << cft << "). Sectoring is only stable for "
+                                 "FINE bands (validated: coarsened theta-sector coupling diverges); "
+                                 "forcing sectors=1 (full-theta ring)." << std::endl;
+                    sec = 1;
+                }
+                dd_config.bands.push_back({c0, c1, std::max(1, cfr), std::max(1, cft),
+                                           std::max(1, sec)});
+            }
+        }
+        if (dd_config.enabled && dd_config.bands.empty()) {
+            std::cerr << "WARNING: domain_decomposition.enabled but no 'bands' specified; "
+                         "DD disabled (falling back to the monolithic solve)." << std::endl;
+            dd_config.enabled = false;
+        }
+    }
+
+    // [Phase BJ-8 stage 3 / v1.5.1] Global coarsening block is deprecated.
+    // All knobs control the now-removed custom Galerkin coarsening; values
+    // are parsed (Stage 4 deletes the parse) but unused.
     if (config["coarsening"]) {
         auto cs_cfg = config["coarsening"];
+        static const char* kDeprecatedCoarseningKeys[] = {
+            "boundary_shell",          // un-coarsened shell width at material edges
+            "smooth_iterations",       // harmonic-mean μ smoothing for coarse cells
+            "auto_bump_skip",          // [Phase BJ-4] silent-no-op fix (now moot)
+            "harmonic_interpolation",  // [Phase BJ-7] μ-weighted P (now moot)
+            nullptr
+        };
+        for (int i = 0; kDeprecatedCoarseningKeys[i]; ++i) {
+            if (cs_cfg[kDeprecatedCoarseningKeys[i]]) {
+                std::cerr << "WARNING: YAML key 'coarsening." << kDeprecatedCoarseningKeys[i]
+                          << "' is no longer supported as of v1.5.1 (Phase BJ-8: AMGCL native multigrid). "
+                          << "The custom Galerkin coarsening machinery it controlled has been removed. "
+                          << "Remove the entire 'coarsening:' block from YAML to silence." << std::endl;
+            }
+        }
         coarsen_boundary_shell = cs_cfg["boundary_shell"].as<int>(1);
         coarsen_smooth_iterations = cs_cfg["smooth_iterations"].as<int>(0);
+        coarsen_auto_bump_skip = cs_cfg["auto_bump_skip"].as<bool>(false);
+    }
+
+    // [v1.6 Stage 2] Field-adaptive coarsening config (polar). Distinct from the
+    // deprecated 'coarsening:' block: this mask is built from the |B| field after
+    // an initial solve (see generateAdaptiveCoarseningMask / the NK loop). The
+    // eligible materials are still those with `coarsen: true` (material_coarsen).
+    if (config["adaptive_mesh"]) {
+        auto am = config["adaptive_mesh"];
+        adaptive_mesh_enabled = am["enabled"].as<bool>(false);
+        adaptive_field_tol    = evaluateScalarAsDouble(am["field_tol"], 0.1);
+        adaptive_coarsen_skip = evaluateScalarAsInt(am["skip"], 2);
+        if (adaptive_mesh_enabled) {
+            std::cout << "Adaptive mesh enabled: field_tol=" << adaptive_field_tol
+                      << " T, block skip=" << adaptive_coarsen_skip
+                      << " (coarsens smooth coarsen:true regions after an initial solve)" << std::endl;
+        }
     }
 
     // Determine coordinate system
@@ -165,6 +321,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
 
     if (coordinate_system == "polar") {
         setupPolarSystem();
+        finalizeSlideRotationForResolution();  // [v1.6 Stage 0] resolve angle->pixels
     } else {
         setupCartesianSystem();
     }
@@ -182,6 +339,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
 void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
     try {
         config = YAML::LoadFile(config_path);
+        this->config_path = config_path;  // retained for DD sub-domain base-config reload
         std::cout << "Configuration loaded from: " << config_path << std::endl;
 
         // Phase N: the transient block is parsed in a deferred pass
@@ -305,6 +463,9 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         r_start = config["polar_domain"]["r_start"].as<double>(0.01);
         r_end = config["polar_domain"]["r_end"].as<double>(1.0);
         r_orientation = config["polar_domain"]["r_orientation"].as<std::string>("horizontal");
+        // v1.6 DD: absolute angle of local theta=0 (radians); lets a theta-sector subdomain
+        // place theta-dependent sources (magnetization atan2) at the correct global angle.
+        theta_offset = config["polar_domain"]["theta_offset"].as<double>(0.0);
 
         // Parse theta_range (supports tinyexpr formula like "2*pi" or "pi/2", or numeric values)
         if (config["polar_domain"]["theta_range"]) {
@@ -438,6 +599,48 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
         if (bc_cfg["theta_max"]) {
             parsePolarRobinParams(bc_cfg["theta_max"], bc_theta_max);
         }
+
+        // v1.6 DD / optimized Schwarz: load optional per-theta boundary
+        // profiles for the RADIAL boundaries (inner / outer). The profile
+        // CSV holds `ntheta` numbers (whitespace/comma/newline separated),
+        // theta-index order. Dirichlet reads `value_profile`, Robin reads
+        // `gamma_profile`. Empty -> the scalar value/gamma is used (back-compat).
+        auto loadProfileCsv = [](const std::string& path, int expected) -> std::vector<double> {
+            std::vector<double> out;
+            std::ifstream f(path);
+            if (!f.is_open()) {
+                throw std::runtime_error("Boundary profile CSV not found: " + path);
+            }
+            std::string content((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+            for (char& c : content) { if (c == ',' || c == ';') c = ' '; }
+            std::stringstream ss(content);
+            double v;
+            while (ss >> v) out.push_back(v);
+            if (static_cast<int>(out.size()) != expected) {
+                throw std::runtime_error("Boundary profile '" + path + "' has " +
+                    std::to_string(out.size()) + " values, expected " +
+                    std::to_string(expected) + " (ntheta)");
+            }
+            return out;
+        };
+        // Radial (inner/outer) profiles are indexed by theta-index j (length ntheta);
+        // theta (theta_min/theta_max) profiles are indexed by radial-index i (length nr).
+        // This lets a 2D rectangular sub-domain take transmission data on ALL four edges
+        // (v1.6 2D patch domain decomposition).
+        auto loadAxisProfile = [&](const YAML::Node& node, BoundaryCondition& bc_out, int expected) {
+            std::string key = (bc_out.type == "robin") ? "gamma_profile" : "value_profile";
+            if (node[key]) {
+                std::string path = node[key].as<std::string>();
+                bc_out.profile = loadProfileCsv(path, expected);
+                std::cout << "Loaded " << key << " (" << bc_out.profile.size()
+                          << " values) from " << path << std::endl;
+            }
+        };
+        if (bc_cfg["inner"])     loadAxisProfile(bc_cfg["inner"],     bc_inner,     ntheta);
+        if (bc_cfg["outer"])     loadAxisProfile(bc_cfg["outer"],     bc_outer,     ntheta);
+        if (bc_cfg["theta_min"]) loadAxisProfile(bc_cfg["theta_min"], bc_theta_min, nr);
+        if (bc_cfg["theta_max"]) loadAxisProfile(bc_cfg["theta_max"], bc_theta_max, nr);
     }
 
     // Determine if theta is periodic (both theta_min and theta_max must be "periodic")
@@ -520,6 +723,8 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
     transient_config.enabled       = trans["enabled"].as<bool>(false);
     transient_config.enable_sliding = trans["enable_sliding"].as<bool>(true);
     transient_config.total_steps   = evaluateScalarAsInt(trans["total_steps"], 0);
+    transient_config.parallel_chunks =
+        std::max(1, evaluateScalarAsInt(trans["parallel_chunks"], 1));
 
     transient_config.slides.clear();
     if (trans["slides"] && trans["slides"].IsSequence()) {
@@ -532,6 +737,15 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
             sr.region_start    = evaluateScalarAsInt(sn["region_start"],    0);
             sr.region_end      = evaluateScalarAsInt(sn["region_end"],      0);
             sr.pixels_per_step = evaluateScalarAsInt(sn["pixels_per_step"], 0);
+            // [v1.6 Stage 0] Resolution-independent rotation: angle_rad takes
+            // precedence over angle_deg; both override pixels_per_step (resolved
+            // to a theta-pixel shift later in finalizeSlideRotationForResolution).
+            if (sn["angle_rad"] || sn["angle_deg"]) {
+                sr.use_angle = true;
+                sr.angle_rad = sn["angle_rad"]
+                    ? evaluateScalarAsDouble(sn["angle_rad"], 0.0)
+                    : evaluateScalarAsDouble(sn["angle_deg"], 0.0) * M_PI / 180.0;
+            }
             sr.wrap_mode = sn["wrap_mode"].as<std::string>("auto");
             if (sn["vacuum_rgb"] && sn["vacuum_rgb"].IsSequence()) {
                 auto v = sn["vacuum_rgb"].as<std::vector<int>>();
@@ -576,7 +790,8 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
             }
         }
     } else if (trans["slide_pixels_per_step"] || trans["slide_region_end"]
-               || trans["slide_region_start"]  || trans["slide_direction"]) {
+               || trans["slide_region_start"]  || trans["slide_direction"]
+               || trans["slide_angle_deg"]     || trans["slide_angle_rad"]) {
         // Legacy single-slide form.
         SlideRegion sr;
         sr.name       = "slide";
@@ -584,6 +799,13 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
         sr.region_start    = evaluateScalarAsInt(trans["slide_region_start"],    0);
         sr.region_end      = evaluateScalarAsInt(trans["slide_region_end"],      0);
         sr.pixels_per_step = evaluateScalarAsInt(trans["slide_pixels_per_step"], 0);
+        // [v1.6 Stage 0] Resolution-independent rotation (see slides[] form).
+        if (trans["slide_angle_rad"] || trans["slide_angle_deg"]) {
+            sr.use_angle = true;
+            sr.angle_rad = trans["slide_angle_rad"]
+                ? evaluateScalarAsDouble(trans["slide_angle_rad"], 0.0)
+                : evaluateScalarAsDouble(trans["slide_angle_deg"], 0.0) * M_PI / 180.0;
+        }
         sr.wrap_mode  = "periodic";
         transient_config.slides.push_back(sr);
     }
@@ -630,6 +852,51 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
                           << "Multi-slide polar is a v1.6 item." << std::endl;
             }
         }
+    }
+}
+
+void MagneticFieldAnalyzer::finalizeSlideRotationForResolution() {
+    // [v1.6 Stage 0] Convert any angle-specified rotor rotation into an integer
+    // theta-pixel shift now that the polar mesh (dtheta, ntheta) is known.
+    // Doing the conversion once here (after setupPolarSystem) means every
+    // downstream consumer keeps reading pixels_per_step and stays mutually
+    // consistent (image slide, computeMagnetizationGrids rotor_angle, warm-start
+    // permutation), while the PHYSICAL rotation per step is resolution-independent:
+    // the same angle maps to proportionally more theta-cells on a finer mesh, so
+    // downsampled / multi-fidelity transient runs represent the same rotation.
+    if (coordinate_system != "polar") {
+        for (const auto& s : transient_config.slides) {
+            if (s.use_angle) {
+                std::cerr << "WARNING: slide '" << s.name << "' angle rotation is only "
+                          << "supported for polar coordinates; ignoring (use pixels_per_step)."
+                          << std::endl;
+            }
+        }
+        return;
+    }
+    if (dtheta <= 0.0) return;
+
+    bool any = false;
+    for (auto& s : transient_config.slides) {
+        if (!s.use_angle) continue;
+        const int shift = static_cast<int>(std::lround(s.angle_rad / dtheta));
+        if (shift == 0 && s.angle_rad != 0.0) {
+            std::cerr << "WARNING: slide '" << s.name << "' rotation "
+                      << (s.angle_rad * 180.0 / M_PI) << " deg rounds to 0 theta-cells at "
+                      << "dtheta=" << dtheta << " (ntheta=" << ntheta
+                      << "); the rotor will not advance. Increase resolution or the angle."
+                      << std::endl;
+        }
+        s.pixels_per_step = shift;
+        any = true;
+        std::cout << "  [slide '" << s.name << "'] rotation "
+                  << (s.angle_rad * 180.0 / M_PI) << " deg -> " << shift
+                  << " theta-cells/step (dtheta=" << dtheta
+                  << ", ntheta=" << ntheta << ")" << std::endl;
+    }
+    // Re-mirror slides[0] into the legacy scalar field the polar paths read.
+    if (any && !transient_config.slides.empty()) {
+        transient_config.slide_pixels_per_step = transient_config.slides.front().pixels_per_step;
     }
 }
 
@@ -1181,6 +1448,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             }
         }
 
+        precomputeMuTableCache(mu_value);  // one-time PCHIP cache (TABLE type)
         material_mu[name] = mu_value;
 
         // Check if this material is nonlinear
@@ -1230,14 +1498,23 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             antialias_materials.push_back(aa_mat);
         }
 
-        // Parse coarsening settings for adaptive mesh
+        // [Phase BJ-8 stage 3 / v1.5.1] Per-material 'coarsen' / 'coarsen_ratio'
+        // are deprecated. Custom Galerkin coarsening was removed; values
+        // still parse + mask generation still fires (Stage 4 cleanup
+        // removes those entry points), but the NK solver routes through
+        // the full-grid AMGCL+EW path regardless of the value.
         CoarsenConfig coarsen_cfg;
-        // std::cerr << "*** COARSEN DEBUG: " << name << " ***" << std::endl;
-        // std::cerr.flush();
-
+        if (props["coarsen"] || props["coarsen_ratio"]) {
+            std::cerr << "WARNING: Material '" << name
+                      << "' uses 'coarsen' / 'coarsen_ratio' which are no longer "
+                      << "supported as of v1.5.1 (Phase BJ-8: AMGCL native multigrid). "
+                      << "The custom Galerkin coarsening machinery has been removed. "
+                      << "The solver runs the NK iteration on the full grid (AMGCL+EW) "
+                      << "regardless of these flags. Remove them from the YAML to silence."
+                      << std::endl;
+        }
         if (props["coarsen"]) {
             coarsen_cfg.enabled = props["coarsen"].as<bool>(false);
-            // std::cout << "  DEBUG [" << name << "] coarsen parsed: " << (coarsen_cfg.enabled ? "true" : "false") << std::endl;
         }
         if (props["coarsen_ratio"]) {
             coarsen_cfg.ratio = props["coarsen_ratio"].as<int>(2);
@@ -1245,7 +1522,7 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         material_coarsen[name] = coarsen_cfg;
         if (coarsen_cfg.enabled) {
             coarsening_enabled = true;
-            std::cout << "  [" << name << "] Coarsening enabled: ratio = " << coarsen_cfg.ratio << std::endl;
+            std::cout << "  [" << name << "] Coarsening enabled (deprecated, no-op): ratio = " << coarsen_cfg.ratio << std::endl;
         }
 
         // Parse Jz value (static, formula, or array)
@@ -1695,7 +1972,7 @@ void MagneticFieldAnalyzer::computeMagnetizationGrids(int step) {
                         int i_r   = (r_orientation == "horizontal") ? i : j;
                         int j_theta = (r_orientation == "horizontal") ? j : i;
                         double r_phys = r_start + i_r * dr;
-                        double theta_phys = j_theta * dtheta;
+                        double theta_phys = j_theta * dtheta + theta_offset;  // v1.6 DD: global angle
                         x_phys = r_phys * std::cos(theta_phys);
                         y_phys = r_phys * std::sin(theta_phys);
                     } else {
@@ -1918,7 +2195,7 @@ void MagneticFieldAnalyzer::computeMagnetizationCurlPolar() {
             int i_r   = horiz ? i : j;
             int j_th  = horiz ? j : i;
             double r     = r_start + i_r * dr;
-            double theta = j_th * dtheta;
+            double theta = j_th * dtheta + theta_offset;  // v1.6 DD: global angle (theta-sector)
 
             // Convert Mx/My to radial/tangential
             double cos_t = std::cos(theta), sin_t = std::sin(theta);
@@ -2507,7 +2784,19 @@ cv::Mat MagneticFieldAnalyzer::detectMaterialBoundaries() {
 void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
     // Calculate skip_x and skip_y from coarsen_ratio to maintain aspect ratio
     // Goal: Make coarsened cells as square as possible
-
+    //
+    // NOTE (v1.5.1 / Phase BJ-1): the round-to-integer step at the bottom of
+    // this function can produce skip_x=1 OR skip_y=1 when the physical cell
+    // aspect ratio is non-1 and coarsen_ratio is small (≤4). This makes
+    // max_skip_iso=min(skip_x, skip_y)=1, which silently disables gradient
+    // coarsening (no cell is ever lifted above level 1). The IEEJ-D polar
+    // IPMSM is the canonical example: aspect = dr / (r_mid · dtheta) ≈ 1.89,
+    // coarsen_ratio=4 → skip_x=1, skip_y=3 → max_skip_iso=1 → no-op.
+    //
+    // generateCoarseningMask* prints a WARNING when this happens (Total
+    // inactive: 0 cells). Phase BJ-4 will revisit the rounding to either
+    // raise max_skip_iso to ≥2 when ratio≥2 is requested, or fail loudly
+    // when the requested ratio is geometrically infeasible.
     for (auto& [mat_name, cfg] : material_coarsen) {
         if (!cfg.enabled || cfg.ratio <= 1) {
             cfg.skip_x = cfg.skip_y = cfg.max_skip_iso = 1;
@@ -2538,20 +2827,83 @@ void MagneticFieldAnalyzer::calculateOptimalSkipRatios() {
         // Round to nearest integer
         cfg.skip_x = std::max(1, (int)std::round(skip_x_float));
         cfg.skip_y = std::max(1, (int)std::round(skip_y_float));
+
+        // [Phase BJ-4] If round-to-integer collapsed one direction to 1
+        // while the user requested ratio >= 2, the isotropic gradient
+        // mask uses min(skip_x, skip_y) as its level cap, so the mask
+        // would silently produce 0 inactive cells (the case that fires
+        // the BJ-1 warning). Optionally bump both directions to at
+        // least 2 so coarsening is actually applied. This overshoots
+        // the requested area ratio to the next isotropic-feasible
+        // value (effective skip is max_skip_iso^2 = 4 minimum):
+        //   - ratio=2 on aspect-1 mesh: was 1×1 silent no-op, now 2×2
+        //     (effective ratio 4, 2× overshoot)
+        //   - ratio=4 on aspect-1.89 mesh (IEEJ-D): was 1×3 silent
+        //     no-op, now 2×3 with max_skip_iso=2 (effective ratio 4)
+        //   - ratio=8 on aspect-1.89 (already-working): 2×4 unchanged
+        //
+        // GATED BY OPT-IN: as of v1.5.1, the Phase 6 + Galerkin path
+        // that the bumped mask routes through has a known accuracy
+        // regression on saturated nonlinear polar problems (IEEJ-D
+        // flux ~1/10 of the Standard-path value, see Phase BJ-5).
+        // To keep the default behaviour safe, auto-bump fires only
+        // when `coarsening.auto_bump_skip: true` is set in the YAML.
+        // Default (off): the BJ-1 warning still surfaces the no-op so
+        // the user can either bump coarsen_ratio manually or accept
+        // that coarsening is a no-op for this geometry.
+        int orig_skip_x = cfg.skip_x;
+        int orig_skip_y = cfg.skip_y;
+        const bool would_be_no_op =
+            (std::min(cfg.skip_x, cfg.skip_y) < 2 && cfg.ratio >= 2);
+        const bool bumped = would_be_no_op && coarsen_auto_bump_skip;
+        if (bumped) {
+            cfg.skip_x = std::max(2, cfg.skip_x);
+            cfg.skip_y = std::max(2, cfg.skip_y);
+        }
         cfg.max_skip_iso = std::min(cfg.skip_x, cfg.skip_y);
 
-        // Log actual reduction ratio
+        // Log actual reduction ratio. Note: the EFFECTIVE coarsening
+        // applied by the gradient mask is max_skip_iso × max_skip_iso
+        // (isotropic step inside the modulo check at the mask site),
+        // not skip_x × skip_y. The latter reflects only the rounding
+        // intent. We keep printing both for transparency.
         int actual_ratio = cfg.skip_x * cfg.skip_y;
         std::cout << "Material '" << mat_name << "': coarsen_ratio=" << cfg.ratio
                   << " -> skip_x=" << cfg.skip_x << ", skip_y=" << cfg.skip_y
                   << " (actual ratio=" << actual_ratio
-                  << ", gradient max_skip=" << cfg.max_skip_iso << ")" << std::endl;
+                  << ", gradient max_skip=" << cfg.max_skip_iso << ")";
+        if (bumped) {
+            std::cout << " [BJ-4: auto-bumped from skip_x=" << orig_skip_x
+                      << ",skip_y=" << orig_skip_y
+                      << " to avoid silent no-op]";
+        } else if (would_be_no_op) {
+            std::cout << " [BJ-4 NOTE: min(skip_x,skip_y)=1 would no-op this "
+                      << "material; set `coarsening.auto_bump_skip: true` to "
+                      << "force isotropic skip 2 (overshoots to ratio "
+                      << (std::max(2, cfg.skip_x) * std::max(2, cfg.skip_y))
+                      << ")]";
+        }
+        std::cout << std::endl;
     }
 }
 
 void MagneticFieldAnalyzer::generateCoarseningMask() {
     // Generate mask of active cells based on material coarsening settings
     // Cells on or near boundaries are always kept active
+
+    // [v1.6 Stage 2] Field-adaptive mode defers mask generation to the NK loop
+    // (the mask needs the |B| field from an initial solve). Start all-active so the
+    // initial guess runs on the full grid; generateAdaptiveCoarseningMask() then
+    // builds the real mask.
+    if (adaptive_mesh_enabled && coordinate_system == "polar") {
+        active_cells.resize(ntheta, nr);
+        active_cells.setConstant(true);
+        cell_skip_level.resize(ntheta, nr);
+        cell_skip_level.setConstant(1);
+        n_active_cells = nr * ntheta;
+        std::cout << "Adaptive mesh: deferring coarsening mask to NK (after initial solve)." << std::endl;
+        return;
+    }
 
     if (!coarsening_enabled) {
         // No coarsening - all cells are active
@@ -2744,6 +3096,20 @@ void MagneticFieldAnalyzer::generateCoarseningMaskCartesian(
         std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
     }
     std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
+    // Phase BJ-1: surface silent-no-op coarsening (every material in the YAML
+    // has coarsen:true but the rounding in calculateOptimalSkipRatios produced
+    // max_skip_iso=1 for all of them, so no cell is ever marked inactive).
+    // Without this warning, users see "coarsening enabled" in their config and
+    // assume the matrix is being reduced — but it isn't, and the NK loop
+    // silently runs the full-grid (Standard) solve path instead of the
+    // coarsened Phase 6 + Galerkin path. See README for the IEEJ-D polar
+    // case where coarsen_ratio=4 produces this exact no-op.
+    if (coarsened_count == 0) {
+        std::cerr << "WARNING: Coarsening enabled in YAML but 0 inactive cells generated. "
+                  << "The full-grid solve path will run (this is silently equivalent to coarsening:disabled). "
+                  << "Try a larger coarsen_ratio (>= 5 for non-square aspect meshes) or set coarsen:false."
+                  << std::endl;
+    }
 }
 
 void MagneticFieldAnalyzer::generateCoarseningMaskPolar(
@@ -2887,6 +3253,19 @@ void MagneticFieldAnalyzer::generateCoarseningMaskPolar(
         std::cout << "  skip=" << level << ": " << count << " cells" << std::endl;
     }
     std::cout << "Total inactive: " << coarsened_count << " cells" << std::endl;
+    // Phase BJ-1: surface silent-no-op coarsening (see Cartesian counterpart
+    // for the rationale). Polar meshes with non-1 physical aspect ratio
+    // (dr / (r_mid · dtheta) ≠ 1) are especially vulnerable: the round-to-
+    // integer in calculateOptimalSkipRatios produces min(skip_x, skip_y)=1
+    // for most coarsen_ratio values, and the gradient coarsening cap then
+    // becomes 1. The IEEJ-D polar bench (nr=450, ntheta=2976, aspect≈1.89)
+    // is documented as silently no-op'ing at coarsen_ratio=4.
+    if (coarsened_count == 0) {
+        std::cerr << "WARNING: Coarsening enabled in YAML but 0 inactive cells generated. "
+                  << "The full-grid solve path will run (this is silently equivalent to coarsening:disabled). "
+                  << "Try a larger coarsen_ratio (>= 5 for non-square aspect meshes) or set coarsen:false."
+                  << std::endl;
+    }
 }
 
 void MagneticFieldAnalyzer::polarToImageIndices(int i_r, int j_theta, int& img_i, int& img_j) const {
@@ -2902,6 +3281,79 @@ void MagneticFieldAnalyzer::polarToImageIndices(int i_r, int j_theta, int& img_i
         img_i = j_theta;
         img_j = i_r;
     }
+}
+
+void MagneticFieldAnalyzer::generateAdaptiveCoarseningMask() {
+    // [v1.6 Stage 2] Build the coarse mask from the current |B| field. A skip-S
+    // block is coarsened only if (a) every cell in it is the SAME material, (b)
+    // that material is coarsen-eligible (coarsen:true), and (c) the |B| variation
+    // within the block is < adaptive_field_tol; blocks touching a radial domain
+    // boundary are kept fine. Hence saturated / high-gradient iron stays fine
+    // (mu well-resolved -> correct flux), the air gap stays fine (air is
+    // coarsen:false), and only smooth bulk iron is coarsened (the DOF reduction).
+    // Requires Br/Btheta -> call after an initial solve + calculateMagneticFieldPolar.
+    active_cells.resize(ntheta, nr);
+    active_cells.setConstant(true);
+    cell_skip_level.resize(ntheta, nr);
+    cell_skip_level.setConstant(1);
+
+    const bool horiz = (r_orientation == "horizontal");
+    auto Bmag = [&](int i_r, int j_th) -> double {
+        double br = horiz ? Br(j_th, i_r) : Br(i_r, j_th);
+        double bt = horiz ? Btheta(j_th, i_r) : Btheta(i_r, j_th);
+        return std::sqrt(br * br + bt * bt);
+    };
+
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // match setupMaterialProperties / rgb_to_material keys
+    auto cellRGB = [&](int i_r, int j_th) -> int {
+        int img_row = horiz ? j_th : i_r;
+        int img_col = horiz ? i_r : j_th;
+        if (img_row < 0 || img_row >= image_to_use.rows ||
+            img_col < 0 || img_col >= image_to_use.cols) return -1;
+        cv::Vec3b px = image_to_use.at<cv::Vec3b>(img_row, img_col);
+        return (px[0] << 16) | (px[1] << 8) | px[2];
+    };
+    auto eligible = [&](int rgb) -> bool {
+        auto lut = rgb_to_material.find(rgb);
+        if (lut == rgb_to_material.end()) return false;
+        auto mc = material_coarsen.find(lut->second.name);
+        return (mc != material_coarsen.end() && mc->second.enabled);
+    };
+
+    const int S = std::max(2, adaptive_coarsen_skip);
+    long coarsened = 0;
+    for (int i0 = 0; i0 + S <= nr; i0 += S) {
+        if (i0 == 0) continue;             // keep inner boundary block fine
+        if (i0 + S > nr - 1) continue;     // keep outer boundary block fine
+        for (int j0 = 0; j0 + S <= ntheta; j0 += S) {
+            int ref_rgb = cellRGB(i0, j0);
+            if (ref_rgb < 0 || !eligible(ref_rgb)) continue;
+            bool ok = true;
+            double bmin = 1e30, bmax = -1e30;
+            for (int ii = i0; ii < i0 + S && ok; ii++) {
+                for (int jj = j0; jj < j0 + S; jj++) {
+                    if (cellRGB(ii, jj) != ref_rgb) { ok = false; break; }
+                    double b = Bmag(ii, jj);
+                    if (b < bmin) bmin = b;
+                    if (b > bmax) bmax = b;
+                }
+            }
+            if (ok && (bmax - bmin) < adaptive_field_tol) {
+                for (int ii = i0; ii < i0 + S; ii++)
+                    for (int jj = j0; jj < j0 + S; jj++)
+                        if (!(ii == i0 && jj == j0)) { active_cells(jj, ii) = false; coarsened++; }
+            }
+        }
+    }
+
+    n_active_cells = static_cast<int>(static_cast<long>(nr) * ntheta - coarsened);
+    coarsening_enabled = (n_active_cells < nr * ntheta);
+    std::cout << "[adaptive mask] active " << n_active_cells << " / " << (nr * ntheta)
+              << " (" << std::fixed << std::setprecision(1)
+              << (100.0 * n_active_cells / (nr * ntheta)) << "%), skip=" << S
+              << ", field_tol=" << adaptive_field_tol << " T" << std::endl;
+    buildCoarseIndexMaps();
 }
 
 void MagneticFieldAnalyzer::buildCoarseIndexMaps() {
@@ -6147,6 +6599,13 @@ double MagneticFieldAnalyzer::getMuAtInterfaceSym(int i, int j, const std::strin
 }
 
 void MagneticFieldAnalyzer::solve() {
+    // v1.6 domain decomposition (opt-in, polar only): banded variable-resolution
+    // optimized Schwarz. Populates Az; downstream stress/energy/export are unchanged.
+    if (coordinate_system == "polar" && dd_config.enabled && !dd_config.bands.empty()) {
+        solveDomainDecomposition();
+        return;
+    }
+
     // Check if nonlinear solver is needed
     if (has_nonlinear_materials && nonlinear_config.enabled) {
         std::cout << "\n=== Nonlinear materials detected ===" << std::endl;
@@ -6179,6 +6638,47 @@ void MagneticFieldAnalyzer::solve() {
             }
         }
     }
+}
+
+// ---- v1.6 domain-decomposition accessors ----
+void MagneticFieldAnalyzer::setBoundaryProfile(const std::string& edge,
+                                               const std::vector<double>& prof) {
+    if      (edge == "inner")     bc_inner.profile     = prof;
+    else if (edge == "outer")     bc_outer.profile     = prof;
+    else if (edge == "theta_min") bc_theta_min.profile = prof;
+    else if (edge == "theta_max") bc_theta_max.profile = prof;
+    else throw std::runtime_error("setBoundaryProfile: unknown edge '" + edge + "'");
+}
+
+void MagneticFieldAnalyzer::buildPolarOperator(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b) {
+    // v1.6 DD coarse space: refresh mu from the current member Az (nonlinear), then assemble A,b.
+    calculateMagneticFieldPolar();
+    calculateHField();
+    updateMuDistribution();
+    buildMatrixPolar(A, b);
+}
+
+double MagneticFieldAnalyzer::fluxLinkageMaterialPair(int key_a, int key_b) const {
+    // Polar r-weighted material-pair flux linkage from the current Az (mirrors
+    // calculateFluxLinkage's polar branch): Phi = <Az>_a - <Az>_b, weight = r.
+    double sum_a = 0.0, sum_b = 0.0, w_a = 0.0, w_b = 0.0;
+    const int img_rows = image.rows, img_cols = image.cols;
+    const bool horiz = (r_orientation == "horizontal");
+    const int grid_rows = horiz ? ntheta : nr;
+    const int grid_cols = horiz ? nr : ntheta;
+    for (int j = 0; j < grid_rows && j < img_rows; ++j) {
+        for (int i = 0; i < grid_cols && i < img_cols; ++i) {
+            const cv::Vec3b& px = image.at<cv::Vec3b>(img_rows - 1 - j, i);
+            const int key = (int(px[0]) << 16) | (int(px[1]) << 8) | int(px[2]);
+            const int i_r = horiz ? i : j;
+            const double r_phys = r_start + i_r * dr;
+            if      (key == key_a) { sum_a += Az(j, i) * r_phys; w_a += r_phys; }
+            else if (key == key_b) { sum_b += Az(j, i) * r_phys; w_b += r_phys; }
+        }
+    }
+    const double ma = (w_a > 0.0) ? sum_a / w_a : 0.0;
+    const double mb = (w_b > 0.0) ? sum_b / w_b : 0.0;
+    return ma - mb;
 }
 
 void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs) {
@@ -6426,15 +6926,34 @@ void MagneticFieldAnalyzer::buildMatrix(Eigen::SparseMatrix<double>& A, Eigen::V
 Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
     const Eigen::SparseMatrix<double>& A,
     const Eigen::VectorXd& rhs,
-    const Eigen::VectorXd& initial_guess)
+    const Eigen::VectorXd& initial_guess,
+    double tolerance)
 {
     int n = A.rows();
+    // Phase BC: caller passes a positive tolerance to override the default
+    // SOLVER_TOLERANCE. The Eisenstat-Walker forcing hook in NK uses this
+    // to slacken AMGCL's stopping criterion when the outer Newton
+    // residual is still loose, avoiding wasteful inner iterations.
+    const double tol_effective = (tolerance > 0.0) ? tolerance : SOLVER_TOLERANCE;
 
     if (n > AMGCL_THRESHOLD) {
         // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems.
         // Uses backend::builtin (OpenMP-parallel SpMV + vector ops) so AMG hierarchy
         // construction and CG iterations run multi-threaded.
-        std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
+        //
+        // Phase BE: smoother choice. SPAI(0) (sparse approximate inverse) is
+        // dirt cheap to construct and applies via two SpMVs per CG iter; ILU(0)
+        // has a more expensive sparse triangular setup but typically halves CG
+        // iter count on Poisson with strong coefficient jumps (μ at iron/air
+        // interfaces, exactly our case). For the IEEJ-D / ISEEJ-D benchmark
+        // where Eisenstat-Walker (Phase BC) has already pushed CG to 2-4
+        // iters/outer, the extra setup cost of ILU(0) probably eats the
+        // remaining inner-iter savings, so SPAI(0) stays the default and
+        // ILU(0) is wired in but unused. Keeping the include + comment here
+        // so a future bench can A/B them without rummaging through AMGCL
+        // headers.
+        if (!quiet_solver_)
+            std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
 
         typedef amgcl::make_solver<
             amgcl::amg<
@@ -6455,28 +6974,41 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         std::vector<double> val(A_rm.valuePtr(), A_rm.valuePtr() + A_rm.nonZeros());
         auto A_crs = std::tie(rows, ptr, col, val);
 
-        AMGSolver::params params;
-        params.solver.tol     = SOLVER_TOLERANCE;
-        params.solver.maxiter = SOLVER_MAX_ITERATIONS;
-
-        AMGSolver amg(A_crs, params);
-
         // Warm-start: use previous solution as initial guess (especially useful in nonlinear iterations)
         std::vector<double> rhs_vec(rhs.data(), rhs.data() + n);
         std::vector<double> x_vec(n, 0.0);
         if (initial_guess.size() == n) {
             std::copy(initial_guess.data(), initial_guess.data() + n, x_vec.begin());
         }
-        auto [iters, error] = amg(rhs_vec, x_vec);
 
-        std::cout << "  [AMGCL] " << iters << " iters, residual="
-                  << std::scientific << std::setprecision(2) << error
-                  << std::defaultfloat << std::endl;
+        // NOTE (2026-07 audit): reusing the AMG hierarchy across NK iterations
+        // as a stale preconditioner was implemented and benchmarked here, and
+        // is NEGATIVE for this solver: a hierarchy just ONE Newton iteration
+        // old degrades CG from 2-3 to 73-183 iterations (μ(H) at the B-H knee
+        // moves the operator coefficients too much per iteration), so a fresh
+        // ~200 ms setup every iteration is strictly cheaper. Do not re-attempt
+        // without first checking that per-iteration μ drift has become small.
+        AMGSolver::params params;
+        params.solver.tol     = tol_effective;  // Phase BC: per-call override
+        params.solver.maxiter = SOLVER_MAX_ITERATIONS;
+
+        AMGSolver amg(A_crs, params);
+        auto [iters, error] = amg(rhs_vec, x_vec);
+        total_linear_iters_ += (long)iters; num_linear_solves_++;   // DD conditioning instrumentation
+
+        if (!quiet_solver_)
+            std::cout << "  [AMGCL] " << iters << " iters, residual="
+                      << std::scientific << std::setprecision(2) << error
+                      << std::defaultfloat << std::endl;
 
         Eigen::VectorXd x = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
-        if (error > SOLVER_TOLERANCE * 1000) {
+        // Phase BC: scale the "did not converge" threshold by tol_effective
+        // so an Eisenstat-Walker loosened call (e.g. tol=0.1) isn't flagged
+        // as a failure when CG legitimately stops at 0.05.
+        if (error > tol_effective * 1000) {
             std::cerr << "WARNING: AMGCL did not converge (error=" << error
+                      << ", tol=" << tol_effective
                       << "). Falling back to SparseLU." << std::endl;
             Eigen::SparseLU<Eigen::SparseMatrix<double>> fallback;
             fallback.compute(A);
@@ -10741,60 +11273,47 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
 
             // Angular boundary conditions (only for non-periodic boundaries)
             if (!is_periodic) {
-                // Handle theta_min boundary (j == 0)
+                // Handle theta_min boundary (j == 0); profile[i] (per-r) overrides scalar
                 if (j == 0 && bc_theta_min.type == "dirichlet") {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                    rhs(idx) = bc_theta_min.value;
+                    rhs(idx) = bc_theta_min.profile.empty() ? bc_theta_min.value
+                                                            : bc_theta_min.profile[i];
                     continue;
                 }
-                // Handle theta_max boundary (j == ntheta - 1)
+                // Handle theta_max boundary (j == ntheta - 1); profile[i] overrides scalar
                 if (j == ntheta - 1 && bc_theta_max.type == "dirichlet") {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                    rhs(idx) = bc_theta_max.value;
+                    rhs(idx) = bc_theta_max.profile.empty() ? bc_theta_max.value
+                                                            : bc_theta_max.profile[i];
                     continue;
                 }
             }
 
             // Radial boundary conditions (Dirichlet only handled here)
             // Neumann boundaries use ghost-elimination in interior stencil below
+            // v1.6 DD: profile[j] overrides the scalar along the boundary if present.
             if (i == 0 && bc_inner.type == "dirichlet") {
                 local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                rhs(idx) = bc_inner.value;
+                rhs(idx) = bc_inner.profile.empty() ? bc_inner.value : bc_inner.profile[j];
                 continue;
             }
 
             if (i == nr - 1 && bc_outer.type == "dirichlet") {
                 local_triplets.push_back(Eigen::Triplet<double>(idx, idx, 1.0));
-                rhs(idx) = bc_outer.value;
+                rhs(idx) = bc_outer.profile.empty() ? bc_outer.value : bc_outer.profile[j];
                 continue;
             }
 
-            // Robin boundary conditions for radial direction
-            // Inner boundary (i=0): outward normal is -r direction
-            // dAz/dn = -dAz/dr ≈ (Az(0,j) - Az(1,j))/dr
-            // => (alpha + beta/dr)*Az(0,j) - (beta/dr)*Az(1,j) = gamma
-            if (i == 0 && bc_inner.type == "robin") {
-                double a = bc_inner.alpha;
-                double b = bc_inner.beta;
-                double g = bc_inner.gamma;
-                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                local_triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
-
-            // Outer boundary (i=nr-1): outward normal is +r direction
-            // dAz/dn = dAz/dr ≈ (Az(nr-1,j) - Az(nr-2,j))/dr
-            // => (alpha + beta/dr)*Az(nr-1,j) - (beta/dr)*Az(nr-2,j) = gamma
-            if (i == nr - 1 && bc_outer.type == "robin") {
-                double a = bc_outer.alpha;
-                double b = bc_outer.beta;
-                double g = bc_outer.gamma;
-                local_triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                local_triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
+            // Radial Robin boundary conditions are assembled SYMMETRICALLY inside
+            // the radial stencil below (v1.6 DD / optimized Schwarz). The boundary
+            // node keeps its full FV balance (kept radial face + theta coupling +
+            // source); only the boundary face flux is replaced by the Robin flux
+            //   r*nu/dr * (gamma - alpha*Az_B)/beta,
+            // which adds a symmetric -c*alpha/beta diagonal term (c=r*nu/dr) and an
+            // -c*gamma/beta RHS term. Off-diagonals then match the interior coupling
+            // -> SPD M-matrix (AMGCL-CG works). The OLD node-replacing form
+            //   (alpha+beta/dr)Az_B-(beta/dr)Az_{B-1}=gamma was non-symmetric +
+            //   badly scaled (CG diverged) and dropped the node's source/theta terms.
 
             // Interior points and Neumann boundary points (using ghost-elimination)
             // Polar Poisson equation with variable permeability (divergence form):
@@ -10844,6 +11363,30 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                     local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_im + a_ip));
                     coeff_center -= (a_im + a_ip);
                 }
+            } else if (i == 0 && bc_inner.type == "robin") {
+                // Symmetric Robin (inner, outward normal -r): keep the OUTER radial
+                // face (-> node i+1, same a_ip as interior) and replace the inner
+                // face flux by the Robin flux r*nu/dr*(gamma-alpha*Az)/beta. Adds a
+                // symmetric -c*alpha/beta diagonal and -c*gamma/beta RHS (c=r*nu/dr).
+                // theta coupling + source are added by the common code below.
+                double a = bc_inner.alpha, b = bc_inner.beta;
+                double g = bc_inner.profile.empty() ? bc_inner.gamma : bc_inner.profile[j];
+                double c = r / (mu_current * dr);   // r_0 * nu_0 / dr
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
+                coeff_center -= a_ip;
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
+            } else if (i == nr - 1 && bc_outer.type == "robin") {
+                // Symmetric Robin (outer, outward normal +r): keep the INNER radial
+                // face (-> node i-1, same a_im as interior) and replace the outer
+                // face flux by the Robin flux. Symmetric -> SPD (AMGCL-CG works).
+                double a = bc_outer.alpha, b = bc_outer.beta;
+                double g = bc_outer.profile.empty() ? bc_outer.gamma : bc_outer.profile[j];
+                double c = r / (mu_current * dr);   // r_B * nu_B / dr
+                local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
+                coeff_center -= a_im;
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
             } else if (i == nr - 1 && bc_outer.type == "neumann") {
                 // Ghost elimination: Az_{nr} = Az_{nr-2}
                 // Stencil: a_im·Az_{nr-2} + a_ip·Az_{nr} → (a_im + a_ip)·Az_{nr-2}
@@ -10858,15 +11401,17 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 if (!inner_neighbor_is_dirichlet) {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, a_im));
                 } else {
-                    // Inner neighbor is Dirichlet: move bc value to RHS
-                    rhs(idx) -= a_im * bc_inner.value;
+                    // Inner neighbor is Dirichlet: move bc value to RHS (profile[j] if present)
+                    double bv = bc_inner.profile.empty() ? bc_inner.value : bc_inner.profile[j];
+                    rhs(idx) -= a_im * bv;
                 }
 
                 if (!outer_neighbor_is_dirichlet) {
                     local_triplets.push_back(Eigen::Triplet<double>(idx, (i + 1) * ntheta + j, a_ip));
                 } else {
-                    // Outer neighbor is Dirichlet: move bc value to RHS
-                    rhs(idx) -= a_ip * bc_outer.value;
+                    // Outer neighbor is Dirichlet: move bc value to RHS (profile[j] if present)
+                    double bv = bc_outer.profile.empty() ? bc_outer.value : bc_outer.profile[j];
+                    rhs(idx) -= a_ip * bv;
                 }
 
                 coeff_center -= (a_im + a_ip);
@@ -10876,6 +11421,34 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
             // Simplified using cell-centered μ (for θ-varying μ, use interface values)
             // double coeff_theta = 1.0 / (r * r * mu_current * dtheta * dtheta);
 
+            // v1.6 DD: symmetric theta-Robin at a theta-sector boundary node. Keep the interior
+            // theta face; replace the boundary theta face by the Robin flux (c_th = 1/(r*mu*dtheta)),
+            // adding a symmetric -c_th*alpha/beta diagonal + -c_th*gamma/beta RHS. profile[i] is per-r.
+            if (!is_periodic && j == 0 && bc_theta_min.type == "robin") {
+                double mu_ij = getMuPolar(mu_map, i, j, r_orientation);
+                double mu_next = getMuPolar(mu_map, i, j + 1, r_orientation);
+                double mu_tn = 2.0 / (1.0 / mu_ij + 1.0 / mu_next);
+                double ct_next = 1.0 / (r * mu_tn * dtheta * dtheta);
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + (j + 1), ct_next));
+                coeff_center -= ct_next;
+                double a = bc_theta_min.alpha, b = bc_theta_min.beta;
+                double g = bc_theta_min.profile.empty() ? bc_theta_min.gamma : bc_theta_min.profile[i];
+                double c_th = 1.0 / (r * mu_current * dtheta);
+                coeff_center -= c_th * a / b;
+                rhs(idx) -= c_th * g / b;
+            } else if (!is_periodic && j == ntheta - 1 && bc_theta_max.type == "robin") {
+                double mu_ij = getMuPolar(mu_map, i, j, r_orientation);
+                double mu_prev = getMuPolar(mu_map, i, j - 1, r_orientation);
+                double mu_tp = 2.0 / (1.0 / mu_ij + 1.0 / mu_prev);
+                double ct_prev = 1.0 / (r * mu_tp * dtheta * dtheta);
+                local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + (j - 1), ct_prev));
+                coeff_center -= ct_prev;
+                double a = bc_theta_max.alpha, b = bc_theta_max.beta;
+                double g = bc_theta_max.profile.empty() ? bc_theta_max.gamma : bc_theta_max.profile[i];
+                double c_th = 1.0 / (r * mu_current * dtheta);
+                coeff_center -= c_th * a / b;
+                rhs(idx) -= c_th * g / b;
+            } else {
             // Determine neighbor indices for angular direction
             // For periodic boundary: use modulo wrapping (% ntheta)
             // For sector domain: boundaries already handled, interior points use simple ±1
@@ -10916,19 +11489,22 @@ void MagneticFieldAnalyzer::buildMatrixPolar(Eigen::SparseMatrix<double>& A, Eig
                 double sign = prev_crosses_boundary ? periodic_sign : 1.0;
                 local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_prev_idx, sign * coeff_theta_prev));
             } else {
-                // Theta_min neighbor is Dirichlet: move bc value to RHS
-                rhs(idx) -= coeff_theta_prev * bc_theta_min.value;
+                // Theta_min neighbor is Dirichlet: move bc value to RHS (profile[i] per-r if present)
+                double bv = bc_theta_min.profile.empty() ? bc_theta_min.value : bc_theta_min.profile[i];
+                rhs(idx) -= coeff_theta_prev * bv;
             }
 
             if (!theta_next_is_dirichlet) {
                 double sign = next_crosses_boundary ? periodic_sign : 1.0;
                 local_triplets.push_back(Eigen::Triplet<double>(idx, i * ntheta + j_next_idx, sign * coeff_theta_next));
             } else {
-                // Theta_max neighbor is Dirichlet: move bc value to RHS
-                rhs(idx) -= coeff_theta_next * bc_theta_max.value;
+                // Theta_max neighbor is Dirichlet: move bc value to RHS (profile[i] per-r if present)
+                double bv = bc_theta_max.profile.empty() ? bc_theta_max.value : bc_theta_max.profile[i];
+                rhs(idx) -= coeff_theta_next * bv;
             }
 
             coeff_center -= (coeff_theta_prev + coeff_theta_next);
+            }  // end else (interior / theta-Dirichlet theta term; theta-Robin handled above)
 
             // Center coefficient
             local_triplets.push_back(Eigen::Triplet<double>(idx, idx, coeff_center));
@@ -11166,139 +11742,104 @@ void MagneticFieldAnalyzer::buildMatrixPolarCoarsened(Eigen::SparseMatrix<double
             continue;
         }
 
-        // Interior points and Neumann boundary points
-        // Non-uniform FDM on polar grid (r-weighted for symmetry):
-        //   Radial: 2 * r_face / (μ · h_r · (h_minus + h_plus))
-        //   Theta:  2 / (r · μ · h_θ · (h_θ_minus + h_θ_plus))
-        //   Source: -Jz * r
-        // For uniform: 2*r_face/(μ·dr·2dr) = r_face/(μ·dr²) → matches buildMatrixPolar()
-        double coeff_center = 0.0;
+        // [v1.6 Stage 1d] FACE-BY-FACE EXACTLY-SYMMETRIC conservative FV assembly.
+        // Each interior face is processed ONCE (as the +r / +theta face of a cell)
+        // and pushes 4 symmetric triplets: K[i][j]=K[j][i]=+c, K[i][i]=K[j][j]-=c.
+        // The resulting coarse operator is an EXACTLY symmetric SPD M-matrix, robust
+        // for AMGCL's CG even under the saturated mu_r contrast (Stages 1b/1c failed
+        // because the cell-by-cell stencil was asymmetric ~2e-4 and CG requires SPD).
+        // Dirichlet neighbours are ELIMINATED into the RHS (no interior<->Dirichlet
+        // column coupling), so the Dirichlet identity rows keep the matrix symmetric.
+        // Neumann boundary faces carry zero flux (skipped = natural BC). Periodic
+        // theta: the +theta seam face is processed once with the (anti)periodic sign.
+        // Conservative face coeff = r_face*(1/mu_face)*dth_cv/h (radial),
+        // dr_cv/(r*mu_face*h_theta) (theta); reduces to buildMatrixPolar x dr*dtheta
+        // on a uniform grid. The per-cell diagonal accumulates across its +/- faces
+        // via setFromTriplets' duplicate summation.
+        double mu_i = getMuPolar(mu_map, i_r, j_theta, r_orientation);
 
-        // --- Radial direction (non-uniform stencil) ---
         int i_prev = findNextActiveRadial(i_r, j_theta, -1);
         int i_next = findNextActiveRadial(i_r, j_theta, +1);
-
         double h_minus = (i_r - i_prev) * dr;
-        double h_plus = (i_next - i_r) * dr;
-
-        // Prevent division by zero
+        double h_plus  = (i_next - i_r) * dr;
         if (h_minus < 1e-15) h_minus = dr;
-        if (h_plus < 1e-15) h_plus = dr;
+        if (h_plus  < 1e-15) h_plus  = dr;
 
-        // --- Theta direction distances (needed for control volume) ---
         int j_prev_theta = findNextActiveTheta(i_r, j_theta, -1);
         int j_next_theta = findNextActiveTheta(i_r, j_theta, +1);
-
         double h_theta_minus = calculateThetaDistance(j_theta, j_prev_theta);
-        double h_theta_plus = calculateThetaDistance(j_next_theta, j_theta);
-
+        double h_theta_plus  = calculateThetaDistance(j_next_theta, j_theta);
         if (h_theta_minus < 1e-15) h_theta_minus = dtheta;
-        if (h_theta_plus < 1e-15) h_theta_plus = dtheta;
+        if (h_theta_plus  < 1e-15) h_theta_plus  = dtheta;
 
-        // Interface positions (r-weighting)
-        double r_imh = r - h_minus / 2.0;  // r_{i-1/2}
-        double r_iph = r + h_plus / 2.0;   // r_{i+1/2}
+        double dr_cv  = 0.5 * (h_minus + h_plus);              // radial CV width
+        double dth_cv = 0.5 * (h_theta_minus + h_theta_plus);  // theta CV width
 
-        // Interface permeabilities (harmonic mean of ACTIVE cells only)
-        // getMuAtInterfacePolar(i_r ± 0.5) uses fine-grid neighbors (i_r ± 1) which
-        // are INACTIVE cells with μ reset to H=0 value (e.g. μ_r=5000) by
-        // interpolateMuToFullGrid(). This causes wrong FVM coefficients and prevents
-        // convergence. Use harmonic mean between the two ACTIVE cells instead,
-        // consistent with how the theta-direction interfaces are computed.
-        double mu_center_r = getMuPolar(mu_map, i_r,    j_theta, r_orientation);
-        double mu_prev_r   = getMuPolar(mu_map, i_prev,  j_theta, r_orientation);
-        double mu_next_r   = getMuPolar(mu_map, i_next,  j_theta, r_orientation);
-        double mu_inner_r = 2.0 / (1.0/mu_center_r + 1.0/mu_prev_r);
-        double mu_outer_r = 2.0 / (1.0/mu_center_r + 1.0/mu_next_r);
-
-        // Non-uniform FDM radial coefficients: 2 * r_face / (μ · h_r · (h_minus + h_plus))
-        double a_im = 2.0 * r_imh / (mu_inner_r * h_minus * (h_minus + h_plus));
-        double a_ip = 2.0 * r_iph / (mu_outer_r * h_plus * (h_minus + h_plus));
-
-        // Handle Neumann boundaries with ghost elimination
-        if (i_r == 0 && bc_inner.type == "neumann") {
-            if (r_imh <= 0.0) {
-                std::cerr << "Warning: r_imh <= 0 at inner Neumann BC, using mirror" << std::endl;
-                double r_imh_eff = r_iph;
-                double a_im_eff = 2.0 * r_imh_eff / (mu_inner_r * h_plus * (h_minus + h_plus));
-                auto it_next = fine_to_coarse.find({i_next, j_theta});
-                if (it_next != fine_to_coarse.end()) {
-                    local_triplets.push_back({idx, it_next->second, a_im_eff + a_ip});
-                }
-                coeff_center -= (a_im_eff + a_ip);
+        // --- Radial +r face (processed once; couples idx <-> i_next) ---
+        if (i_next > i_r && i_next <= nr - 1) {
+            double r_face  = 0.5 * (r_coords[i_r] + r_coords[i_next]);
+            double mu_nb   = getMuPolar(mu_map, i_next, j_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = r_face * dth_cv / (mu_face * h_plus);
+            if (i_next == nr - 1 && bc_outer.type == "dirichlet") {
+                local_triplets.push_back({idx, idx, -c});
+                rhs(idx) -= c * bc_outer.value;
             } else {
-                auto it_next = fine_to_coarse.find({i_next, j_theta});
-                if (it_next != fine_to_coarse.end()) {
-                    local_triplets.push_back({idx, it_next->second, a_im + a_ip});
+                auto it = fine_to_coarse.find({i_next, j_theta});
+                if (it != fine_to_coarse.end()) {
+                    int jdx = it->second;
+                    local_triplets.push_back({idx, jdx,  c});
+                    local_triplets.push_back({jdx, idx,  c});
+                    local_triplets.push_back({idx, idx, -c});
+                    local_triplets.push_back({jdx, jdx, -c});
                 }
-                coeff_center -= (a_im + a_ip);
             }
-        } else if (i_r == nr - 1 && bc_outer.type == "neumann") {
-            auto it_prev = fine_to_coarse.find({i_prev, j_theta});
-            if (it_prev != fine_to_coarse.end()) {
-                local_triplets.push_back({idx, it_prev->second, a_im + a_ip});
-            }
-            coeff_center -= (a_im + a_ip);
-        } else {
-            // Standard interior stencil
-            bool inner_neighbor_is_dirichlet = (i_r == 1) && (bc_inner.type == "dirichlet");
-            bool outer_neighbor_is_dirichlet = (i_r == nr - 2) && (bc_outer.type == "dirichlet");
-
-            auto it_prev = fine_to_coarse.find({i_prev, j_theta});
-            auto it_next = fine_to_coarse.find({i_next, j_theta});
-
-            if (!inner_neighbor_is_dirichlet && it_prev != fine_to_coarse.end()) {
-                local_triplets.push_back({idx, it_prev->second, a_im});
-            } else if (inner_neighbor_is_dirichlet) {
-                rhs(idx) -= a_im * bc_inner.value;
-            }
-
-            if (!outer_neighbor_is_dirichlet && it_next != fine_to_coarse.end()) {
-                local_triplets.push_back({idx, it_next->second, a_ip});
-            } else if (outer_neighbor_is_dirichlet) {
-                rhs(idx) -= a_ip * bc_outer.value;
-            }
-
-            coeff_center -= (a_im + a_ip);
+        }
+        // --- Radial -r face: only ELIMINATE a Dirichlet neighbour (an interior -r
+        //     face is added by that neighbour's +r face; Neumann = zero flux). ---
+        if (i_prev == 0 && i_prev < i_r && bc_inner.type == "dirichlet") {
+            double r_face  = 0.5 * (r_coords[i_r] + r_coords[i_prev]);
+            double mu_nb   = getMuPolar(mu_map, i_prev, j_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = r_face * dth_cv / (mu_face * h_minus);
+            local_triplets.push_back({idx, idx, -c});
+            rhs(idx) -= c * bc_inner.value;
         }
 
-        // --- Theta direction non-uniform FDM coefficients ---
-        // Interface permeabilities (harmonic mean, matching buildMatrixPolar)
-        double mu_ij = getMuPolar(mu_map, i_r, j_theta, r_orientation);
-        double mu_prev_theta = getMuPolar(mu_map, i_r, j_prev_theta, r_orientation);
-        double mu_next_theta = getMuPolar(mu_map, i_r, j_next_theta, r_orientation);
-        double mu_theta_prev = 2.0 / (1.0 / mu_ij + 1.0 / mu_prev_theta);
-        double mu_theta_next = 2.0 / (1.0 / mu_ij + 1.0 / mu_next_theta);
-
-        // Non-uniform FDM theta coefficients: 2 / (r · μ · h_θ · (h_θ_minus + h_θ_plus))
-        double a_theta_m = 2.0 / (r * mu_theta_prev * h_theta_minus * (h_theta_minus + h_theta_plus));
-        double a_theta_p = 2.0 / (r * mu_theta_next * h_theta_plus * (h_theta_minus + h_theta_plus));
-
-        auto it_theta_prev = fine_to_coarse.find({i_r, j_prev_theta});
-        auto it_theta_next = fine_to_coarse.find({i_r, j_next_theta});
-
-        if (it_theta_prev != fine_to_coarse.end()) {
-            bool crosses_boundary = is_periodic &&
-                ((j_theta == 0 && j_prev_theta > j_theta) ||
-                 (j_theta > 0 && j_prev_theta > j_theta));
-            double sign = crosses_boundary ? periodic_sign : 1.0;
-            local_triplets.push_back({idx, it_theta_prev->second, sign * a_theta_m});
+        // --- Theta +theta face (processed once; periodic seam handled once w/ sign) ---
+        if (j_next_theta != j_theta && j_next_theta >= 0 && j_next_theta <= ntheta - 1) {
+            double mu_nb   = getMuPolar(mu_map, i_r, j_next_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = dr_cv / (r * mu_face * h_theta_plus);
+            if (!is_periodic && j_next_theta == ntheta - 1 && bc_theta_max.type == "dirichlet") {
+                local_triplets.push_back({idx, idx, -c});
+                rhs(idx) -= c * bc_theta_max.value;
+            } else {
+                auto it = fine_to_coarse.find({i_r, j_next_theta});
+                if (it != fine_to_coarse.end()) {
+                    int jdx = it->second;
+                    double sgn = (is_periodic && j_next_theta < j_theta) ? periodic_sign : 1.0;
+                    local_triplets.push_back({idx, jdx,  sgn * c});
+                    local_triplets.push_back({jdx, idx,  sgn * c});
+                    local_triplets.push_back({idx, idx, -c});
+                    local_triplets.push_back({jdx, jdx, -c});
+                }
+            }
         }
-        if (it_theta_next != fine_to_coarse.end()) {
-            bool crosses_boundary = is_periodic &&
-                ((j_theta == ntheta-1 && j_next_theta < j_theta) ||
-                 (j_theta < ntheta-1 && j_next_theta < j_theta));
-            double sign = crosses_boundary ? periodic_sign : 1.0;
-            local_triplets.push_back({idx, it_theta_next->second, sign * a_theta_p});
+        // --- Theta -theta face: only ELIMINATE a Dirichlet neighbour ---
+        if (!is_periodic && j_prev_theta == 0 && j_prev_theta != j_theta
+            && bc_theta_min.type == "dirichlet") {
+            double mu_nb   = getMuPolar(mu_map, i_r, j_prev_theta, r_orientation);
+            double mu_face = 2.0 / (1.0/mu_i + 1.0/mu_nb);
+            double c = dr_cv / (r * mu_face * h_theta_minus);
+            local_triplets.push_back({idx, idx, -c});
+            rhs(idx) -= c * bc_theta_min.value;
         }
-        coeff_center -= (a_theta_m + a_theta_p);
 
-        // Center coefficient
-        local_triplets.push_back({idx, idx, coeff_center});
-
-        // Source term: -Jz * r (r-weighted, no area scaling for FDM)
-        double jz = getJzPolar(jz_map, i_r, j_theta, r_orientation);
-        rhs(idx) -= jz * r;
+        // Source term: -(Jz_coil + Jz_magnet) * r * (CV area), matching the full
+        // builder buildMatrixPolar (line ~11189) scaled by the control-volume area.
+        rhs(idx) += -(getJzPolar(jz_map, i_r, j_theta, r_orientation)
+                    + getJzPolar(Jz_mag_map, i_r, j_theta, r_orientation)) * r * dr_cv * dth_cv;
     }  // end omp for
 
         #pragma omp critical
@@ -11319,10 +11860,19 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
     Eigen::SparseMatrix<double> A;
     Eigen::VectorXd rhs;
 
-    // Use Galerkin projection instead of geometric coarsened matrix.
-    // buildMatrixGalerkin() auto-dispatches to Polar via updateFullMatrixCache()
-    // → buildMatrixPolar() and buildProlongationMatrix() → buildProlongationMatrixPolar().
-    buildMatrixGalerkin(A, rhs);
+    // [v1.6 Stage 1] Revive the geometric FVM non-uniform stencil as the default
+    // coarse operator (use_galerkin_coarsening default false). Per the design note
+    // at the flag: FVM's fixed point is the true physical solution, while Galerkin
+    // (A_c = P^T A_f P with bilinear P) converges to a projection fixed point that
+    // does not satisfy the PDE at material interfaces -- the Phase BK flux-1/10
+    // failure. buildMatrixPolarCoarsened builds the n_active x n_active non-uniform
+    // control-volume stencil (consistent with interpolateToFullGridPolar's
+    // coarse_to_fine indexing); buildMatrixGalerkin remains available for A/B tests.
+    if (nonlinear_config.use_galerkin_coarsening) {
+        buildMatrixGalerkin(A, rhs);
+    } else {
+        buildMatrixPolarCoarsened(A, rhs);
+    }
 
     std::cout << "Galerkin matrix size: " << A.rows() << "x" << A.cols() << std::endl;
     std::cout << "Non-zero elements: " << A.nonZeros() << std::endl;
@@ -11413,27 +11963,10 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
                 continue;
             }
 
-            // Handle radial boundaries (Robin)
-            // Inner boundary (i=0): outward normal is -r direction
-            if (i == 0 && bc_inner.type == "robin") {
-                double a = bc_inner.alpha;
-                double b = bc_inner.beta;
-                double g = bc_inner.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, 1 * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
-            // Outer boundary (i=nr-1): outward normal is +r direction
-            if (i == nr - 1 && bc_outer.type == "robin") {
-                double a = bc_outer.alpha;
-                double b = bc_outer.beta;
-                double g = bc_outer.gamma;
-                triplets.push_back(Eigen::Triplet<double>(idx, idx, a + b/dr));
-                triplets.push_back(Eigen::Triplet<double>(idx, (nr - 2) * ntheta + j, -b/dr));
-                rhs(idx) = g;
-                continue;
-            }
+            // Radial Robin BCs assembled SYMMETRICALLY below (kept face + Robin
+            // closure), consistent with buildMatrixPolar (v1.6 DD). The boundary
+            // node keeps its kept radial face + theta + source; the boundary face
+            // is replaced by the Robin flux (nu/dx)*(gamma-alpha*Az)/beta.
 
             // Handle angular boundaries for non-periodic domains
             if (!is_periodic) {
@@ -11494,6 +12027,24 @@ void MagneticFieldAnalyzer::buildAndSolveCartesianPseudoPolar() {
                     triplets.push_back(Eigen::Triplet<double>(idx, (i - 1) * ntheta + j, coeff_ip));
                 }
                 coeff_center -= coeff_ip;
+            }
+
+            // Symmetric Robin radial closure (pseudo-Cartesian: c = nu_B/dx_pseudo).
+            // The kept radial face was added above; here we add the boundary-face
+            // Robin flux as a symmetric -c*alpha/beta diagonal + -c*gamma/beta RHS.
+            if (i == 0 && bc_inner.type == "robin") {
+                double a = bc_inner.alpha, b = bc_inner.beta;
+                double g = bc_inner.profile.empty() ? bc_inner.gamma : bc_inner.profile[j];
+                double c = 1.0 / (mu_c * dx_pseudo);
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
+            }
+            if (i == nr - 1 && bc_outer.type == "robin") {
+                double a = bc_outer.alpha, b = bc_outer.beta;
+                double g = bc_outer.profile.empty() ? bc_outer.gamma : bc_outer.profile[j];
+                double c = 1.0 / (mu_c * dx_pseudo);
+                coeff_center -= c * a / b;
+                rhs(idx) -= c * g / b;
             }
 
             // Angular direction (j ± 1)
@@ -11712,6 +12263,105 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
     // if (nonlinear_config.verbose) {
     //     std::cout << "[DBG] Max |B| = " << bmax << std::endl;
     // }
+}
+
+void MagneticFieldAnalyzer::updateCoarseFieldAndMu() {
+    // [v1.6 Stage 1e / A1] Coarse-consistent B/H/mu at the ACTIVE cells. B is the
+    // COARSE curl of the coarse Az (findNextActive spacing), so mu is consistent
+    // with the coarse FVM operator (which reads mu at active cells) -- this removes
+    // the A2 residual floor that gave wrong/1-of-3 flux. O(n_active) per call.
+    // Mirrors calculateMagneticFieldPolar (curl) + calculateHField + updateMuDistribution
+    // but evaluated only at active cells with the non-uniform coarse spacing.
+    const double MU_0 = 4.0 * M_PI * 1e-7;
+    const bool horiz = (r_orientation == "horizontal");
+    const bool is_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
+    const bool is_antiperiodic = is_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+
+    // Ensure Br/Btheta/H_map are allocated at the full (theta,r)/(r,theta) shape --
+    // the coarse path writes them at active cells but bypasses calculateHField /
+    // calculateMagneticFieldPolar which would otherwise size them (avoids a segfault
+    // when H_map is still empty on the first nonlinear solve).
+    const int rows = horiz ? ntheta : nr;
+    const int cols = horiz ? nr : ntheta;
+    if (Br.rows() != rows || Br.cols() != cols)         Br = Eigen::MatrixXd::Zero(rows, cols);
+    if (Btheta.rows() != rows || Btheta.cols() != cols) Btheta = Eigen::MatrixXd::Zero(rows, cols);
+    if (H_map.rows() != rows || H_map.cols() != cols)   H_map = Eigen::MatrixXd::Zero(rows, cols);
+
+    auto getAz = [&](int i_r, int j_th) -> double {
+        return horiz ? Az(j_th, i_r) : Az(i_r, j_th);
+    };
+
+    cv::Mat image_to_use;
+    cv::flip(image, image_to_use, 0);  // match setupMaterialProperties / rgb_to_material keys
+
+    #pragma omp parallel for schedule(static)
+    for (int idx = 0; idx < n_active_cells; idx++) {
+        const int i_r  = coarse_to_fine[idx].first;
+        const int j_th = coarse_to_fine[idx].second;
+        const double r = r_coords[i_r];
+        const double safe_r = (r > 1e-15) ? r : 1e-15;
+
+        // --- Br = (1/r) dAz/dtheta  (central diff over active theta neighbours) ---
+        int jp = findNextActiveTheta(i_r, j_th, -1);
+        int jn = findNextActiveTheta(i_r, j_th, +1);
+        double Az_jp = getAz(i_r, jp);
+        double Az_jn = getAz(i_r, jn);
+        if (is_antiperiodic) {
+            if (jp > j_th) Az_jp *= -1.0;   // -theta neighbour wrapped across the seam
+            if (jn < j_th) Az_jn *= -1.0;   // +theta neighbour wrapped across the seam
+        }
+        double h_th_m = calculateThetaDistance(j_th, jp);
+        double h_th_p = calculateThetaDistance(jn, j_th);
+        if (h_th_m < 1e-15) h_th_m = dtheta;
+        if (h_th_p < 1e-15) h_th_p = dtheta;
+        const double Br_val = ((Az_jn - Az_jp) / (h_th_m + h_th_p)) / safe_r;
+
+        // --- Btheta = -dAz/dr  (central over active radial neighbours; 1-sided at bnd) ---
+        int ip = findNextActiveRadial(i_r, j_th, -1);
+        int in = findNextActiveRadial(i_r, j_th, +1);
+        double dAz_dr;
+        if (ip == i_r && in == i_r)      dAz_dr = 0.0;
+        else if (ip == i_r)              dAz_dr = (getAz(in, j_th) - getAz(i_r, j_th)) / ((in - i_r) * dr);
+        else if (in == i_r)              dAz_dr = (getAz(i_r, j_th) - getAz(ip, j_th)) / ((i_r - ip) * dr);
+        else                             dAz_dr = (getAz(in, j_th) - getAz(ip, j_th)) / ((in - ip) * dr);
+        const double Bth_val = -dAz_dr;
+
+        if (horiz) { Br(j_th, i_r) = Br_val; Btheta(j_th, i_r) = Bth_val; }
+        else       { Br(i_r, j_th) = Br_val; Btheta(i_r, j_th) = Bth_val; }
+
+        const double B_mag = std::sqrt(Br_val * Br_val + Bth_val * Bth_val);
+
+        // material at this cell
+        const int img_row = horiz ? j_th : i_r;
+        const int img_col = horiz ? i_r : j_th;
+        cv::Vec3b px = image_to_use.at<cv::Vec3b>(img_row, img_col);
+        const int rgb = (px[0] << 16) | (px[1] << 8) | px[2];
+        auto lut = rgb_to_material.find(rgb);
+
+        const double mu_cur = horiz ? mu_map(j_th, i_r) : mu_map(i_r, j_th);
+
+        // H from B-H table or B/mu (mirrors calculateHField)
+        double H_mag;
+        if (lut != rgb_to_material.end()) {
+            auto bh = material_bh_tables.find(lut->second.name);
+            if (bh != material_bh_tables.end() && bh->second.is_valid)
+                H_mag = interpolateH_from_B(bh->second, B_mag);
+            else
+                H_mag = (mu_cur > 1e-20) ? B_mag / mu_cur : 0.0;
+        } else {
+            H_mag = (mu_cur > 1e-20) ? B_mag / mu_cur : 0.0;
+        }
+        if (horiz) H_map(j_th, i_r) = H_mag; else H_map(i_r, j_th) = H_mag;
+
+        // mu update (skip linear/STATIC materials)
+        if (lut != rgb_to_material.end()) {
+            auto mit = material_mu.find(lut->second.name);
+            if (mit != material_mu.end() && mit->second.type != MuType::STATIC) {
+                const double mu_new = evaluateMu(mit->second, H_mag) * MU_0;
+                if (horiz) mu_map(j_th, i_r) = mu_new; else mu_map(i_r, j_th) = mu_new;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -12466,18 +13116,43 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         return;
     }
 
+    // Chunked sweep parallelism: split the step range into contiguous chunks
+    // run by concurrent analyzer instances. Dispatch only when this instance
+    // has no explicit chunk range yet (workers and the owner's own chunk have
+    // transient_step_end_ >= 0 and fall through to the loop below).
+    if (transient_config.parallel_chunks > 1 && transient_step_end_ < 0) {
+        runTransientChunks(output_dir);
+        return;
+    }
+
+    const int step_begin = std::max(0, transient_step_begin_);
+    const int step_end   = (transient_step_end_ >= 0)
+                             ? std::min(transient_step_end_, transient_config.total_steps)
+                             : transient_config.total_steps;
+
     std::cout << "\n=== Starting Transient Analysis ===" << std::endl;
-    std::cout << "Total steps: " << transient_config.total_steps << std::endl;
+    std::cout << "Total steps: " << transient_config.total_steps;
+    if (step_begin != 0 || step_end != transient_config.total_steps)
+        std::cout << "  (this chunk: steps " << step_begin + 1 << ".." << step_end << ")";
+    std::cout << std::endl;
     std::cout << "Output directory: " << output_dir << std::endl;
 
     // Optimization: Reuse matrix pattern (analyzePattern only once) for both coordinate systems
     bool use_optimized_solver = true;
     std::cout << "Using optimized transient solver (pattern reuse for " << coordinate_system << " coordinates)" << std::endl;
 
+    // Chunk workers start mid-sweep: advance the sliding image (and
+    // slide_step_counter) to this chunk's first step. Each slide is a cheap
+    // in-memory roll (~ms), negligible against a single nonlinear solve.
+    if (step_begin > 0 && transient_config.enable_sliding) {
+        for (int s = 0; s < step_begin; ++s) slideImageRegion();
+        std::cout << "Chunk pre-advance: applied " << step_begin << " slide step(s)" << std::endl;
+    }
+
     // Start overall timer
     auto analysis_start_time = std::chrono::high_resolution_clock::now();
 
-    for (int step = 0; step < transient_config.total_steps; step++) {
+    for (int step = step_begin; step < step_end; step++) {
         std::cout << "\n--- Step " << step+1 << " / " << transient_config.total_steps << " ---" << std::endl;
 
         // Start step timer
@@ -13075,6 +13750,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     int amg_iters;
                     double amg_error;
                     std::tie(amg_iters, amg_error) = amg_solve(rhs_vec, x_vec);
+                    total_linear_iters_ += (long)amg_iters; num_linear_solves_++;   // DD instrumentation
                     auto amg_solve_end = std::chrono::high_resolution_clock::now();
                     auto amg_solve_time = std::chrono::duration_cast<std::chrono::milliseconds>(amg_solve_end - amg_solve_start);
 
@@ -13292,7 +13968,10 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // Cost: writing a tiny CSV (one row per step × ~3 phases) is
         // O(milliseconds) vs the multi-second NK solve, well below any
         // user-visible budget.
-        exportFluxLinkageCSV(output_dir);
+        // Chunk workers skip it: their history is chunk-local, so the rows
+        // would clobber the shared file — the dispatcher merges all chunks'
+        // histories into the final CSV instead.
+        if (!transient_chunk_worker_) exportFluxLinkageCSV(output_dir);
 
         // <<PROFILING_TIMER_BEGIN>>
         prof_d_flux = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -13376,6 +14055,111 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         std::cout << "Async writer drain time: " << drain_ms << " ms" << std::endl;
     }
 
-    // Export flux linkage results to CSV (if any paths were defined)
-    exportFluxLinkageCSV(output_dir);
+    // Export flux linkage results to CSV (if any paths were defined).
+    // Chunk workers skip it (chunk-local history; the dispatcher merges).
+    if (!transient_chunk_worker_) exportFluxLinkageCSV(output_dir);
+}
+
+// Chunked sweep parallelism (transient.parallel_chunks = K > 1): split the
+// sweep into K contiguous chunks and run them CONCURRENTLY, each on its own
+// analyzer instance (fully independent state; the mu carry-over amortization
+// is preserved within each chunk). Steps keep their GLOBAL numbering, so all
+// per-step exports land in the shared output tree without collisions; the
+// only shared artifact — the flux-linkage CSV — is merged here at the end.
+// Each chunk's first step is cold (no mu carried from the previous chunk),
+// costing a few percent over a long sweep; aggregate speedup is memory-
+// bandwidth-bound (~1.9x measured for 3 concurrent 1.34M-DOF solves).
+void MagneticFieldAnalyzer::runTransientChunks(const std::string& output_dir) {
+    const int T = transient_config.total_steps;
+    const int K = std::max(1, std::min(transient_config.parallel_chunks, T));
+    std::cout << "\n=== Transient sweep: " << K << " parallel chunk(s) over "
+              << T << " steps ===" << std::endl;
+
+#ifdef _OPENMP
+    // Each chunk thread spawns its own OpenMP team inside AMGCL; divide the
+    // team size so K chunks don't oversubscribe the machine. (OpenMP 2.0 API
+    // only — omp_set_num_threads exists everywhere including MSVC.)
+    {
+        const int total = omp_get_max_threads();
+        const int per   = std::max(1, total / K);
+        omp_set_num_threads(per);
+        std::cout << "  OpenMP: " << per << " thread(s) per chunk ("
+                  << total << " total)" << std::endl;
+    }
+#endif
+
+    // Contiguous step ranges [s_k, s_{k+1}).
+    std::vector<int> bounds(K + 1);
+    for (int k = 0; k <= K; ++k) bounds[k] = (int)((long long)T * k / K);
+
+    // Workers for chunks 1..K-1 (fresh instances from the retained config /
+    // image paths); this instance runs chunk 0 so the caller's downstream
+    // (final-step stress/energy on `this`) keeps working unchanged.
+    std::vector<std::unique_ptr<MagneticFieldAnalyzer>> workers;
+    for (int k = 1; k < K; ++k) {
+        auto w = std::make_unique<MagneticFieldAnalyzer>(config_path, image_path_);
+        w->setTransientChunkRange(bounds[k], bounds[k + 1], /*is_worker=*/true);
+        w->setQuietSolver(true);   // concurrent NK/AMGCL prints would garble the log
+        workers.push_back(std::move(w));
+    }
+    setTransientChunkRange(bounds[0], bounds[1], /*is_worker=*/false);
+
+    std::vector<std::thread> threads;
+    threads.reserve(workers.size());
+    std::vector<std::string> worker_errors(workers.size());
+    for (size_t i = 0; i < workers.size(); ++i) {
+        threads.emplace_back([&, i]() {
+            try {
+                workers[i]->performTransientAnalysis(output_dir);
+            } catch (const std::exception& e) {
+                worker_errors[i] = e.what();
+            }
+        });
+    }
+    performTransientAnalysis(output_dir);   // chunk 0 on this instance
+    for (auto& t : threads) t.join();
+    for (size_t i = 0; i < worker_errors.size(); ++i) {
+        if (!worker_errors[i].empty())
+            throw std::runtime_error("transient chunk " + std::to_string(i + 1) +
+                                     " failed: " + worker_errors[i]);
+    }
+
+    // Merge the per-chunk flux-linkage histories into one CSV with global
+    // step numbering (chunk k's local row j corresponds to global step
+    // bounds[k] + j).
+    if (!flux_linkage_paths.empty()) {
+        std::vector<std::vector<double>> rows(T,
+            std::vector<double>(flux_linkage_paths.size(),
+                                std::numeric_limits<double>::quiet_NaN()));
+        auto fold = [&](const std::map<std::string, std::vector<double>>& res, int s0) {
+            for (size_t p = 0; p < flux_linkage_paths.size(); ++p) {
+                auto it = res.find(flux_linkage_paths[p].name);
+                if (it == res.end()) continue;
+                for (size_t j = 0; j < it->second.size(); ++j) {
+                    const size_t g = (size_t)s0 + j;
+                    if (g < rows.size()) rows[g][p] = it->second[j];
+                }
+            }
+        };
+        fold(flux_linkage_results, bounds[0]);
+        for (size_t i = 0; i < workers.size(); ++i)
+            fold(workers[i]->getFluxLinkageResults(), bounds[i + 1]);
+
+        const std::string flux_dir = output_dir + "/FluxLinkage";
+        createDirectory(flux_dir);
+        std::ofstream file(flux_dir + "/flux_linkage.csv");
+        if (file.is_open()) {
+            file << "step";
+            for (const auto& p : flux_linkage_paths) file << "," << p.name;
+            file << "\n";
+            for (int s = 0; s < T; ++s) {
+                file << s;
+                for (size_t p = 0; p < flux_linkage_paths.size(); ++p)
+                    file << "," << std::scientific << std::setprecision(10) << rows[s][p];
+                file << "\n";
+            }
+            std::cout << "Merged flux linkage CSV (" << K << " chunks, " << T
+                      << " steps) written." << std::endl;
+        }
+    }
 }

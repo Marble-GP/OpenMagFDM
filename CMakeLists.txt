@@ -10,6 +10,7 @@ add_executable(MagFDMsolver
     MagneticFieldAnalyzer.cpp
     MagneticFieldAnalyzer_nonlinear.cpp
     MagneticFieldAnalyzer_nonlinear_newton.cpp
+    MagneticFieldAnalyzer_dd.cpp
     MagneticFieldAnalyzer.h
     AsyncWriter.cpp
     AsyncWriter.h
@@ -88,3 +89,28 @@ target_link_libraries(MagFDMsolver
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
 target_include_directories(MagFDMsolver PRIVATE ${TIFF_INCLUDE_DIRS})
+
+# v1.6 domain-decomposition wall-time benchmark (reuses the analyzer as patch solvers)
+add_executable(dd_bench
+    dd_bench.cpp
+    MagneticFieldAnalyzer.cpp
+    MagneticFieldAnalyzer_nonlinear.cpp
+    MagneticFieldAnalyzer_nonlinear_newton.cpp
+    MagneticFieldAnalyzer_dd.cpp
+    AsyncWriter.cpp
+    tinyexpr/tinyexpr.cpp
+)
+if(MSVC)
+    target_compile_options(dd_bench PRIVATE
+        $<$<CONFIG:Release>:/O2;/arch:AVX2;/fp:fast>
+        $<$<CONFIG:RelWithDebInfo>:/O2;/arch:AVX2;/fp:fast>
+    )
+endif()
+target_link_libraries(dd_bench
+    Eigen3::Eigen
+    ${OpenCV_LIBS}
+    yaml-cpp::yaml-cpp
+    ${TIFF_LIBRARIES}
+    $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
+)
+target_include_directories(dd_bench PRIVATE ${TIFF_INCLUDE_DIRS})

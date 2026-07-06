@@ -248,8 +248,16 @@ async function initializeConfigEditor() {
                     availableKeywords = Object.keys(keywords);
                 }
             } else {
-                // Top level - show root-level keywords
-                availableKeywords = Object.keys(keywords);
+                // Top level - show only keywords that have no validParents
+                // (i.e. genuine root-level keys). Pre-BJ-fix this returned
+                // Object.keys(keywords), which surfaced per-material keys
+                // like `coarsen`/`coarsen_ratio` at the document root and
+                // led users to write `coarsen: true` outside any material
+                // block, where the parser silently ignores it.
+                availableKeywords = Object.keys(keywords).filter(k => {
+                    const info = keywords[k];
+                    return !info || !info.validParents || info.validParents.length === 0;
+                });
             }
 
             // Add keyword completions
@@ -480,6 +488,19 @@ function addContextSnippets(completions, parentContext, grandparentContext, isVa
                 meta: 'snippet',
                 score: 1100,
                 docHTML: '<b>Snippet: Transient Analysis</b><br>Creates full transient configuration'
+            });
+        }
+    }
+
+    // Add domain decomposition template snippet (when parent is domain_decomposition)
+    if (parentContext === 'domain_decomposition') {
+        if (snippets.domain_decomposition_template) {
+            completions.push({
+                caption: '[Snippet] Domain Decomposition Template',
+                value: snippets.domain_decomposition_template.snippet,
+                meta: 'snippet',
+                score: 1100,
+                docHTML: '<b>Snippet: Domain Decomposition</b><br>Variable-resolution optimized Schwarz (polar, opt-in accuracy mode): keep the air gap fine, coarsen smooth radial bands'
             });
         }
     }
@@ -4102,23 +4123,27 @@ ${SOLVER_HINT_MARKER}
 #   enabled: true                   # auto-enabled when a NL material is present
 #   solver_type: newton-krylov      # alt: picard
 #   max_iterations: 50              # raise for tight TOL on 1M+ DOF problems
-#   tolerance: 5.0e-4               # relative residual ||R|| / ||b||
+#   tolerance: 1.0e-3               # relative residual ||R|| / ||b||
 #   verbose: false                  # per-iter mu/H/residual diagnostics
-#   use_phase6_precond_jfnk: true   # Galerkin-preconditioned JFNK -- keep on
-#   fine_finishing_iterations: 0    # 2-5 helps accuracy on coarsened runs
 #   anderson:
-#     enabled: false                # Anderson acceleration (Picard mainly)
+#     enabled: false                # Anderson acceleration
 #     depth: 5
+#   # Phase BC (v1.5.1+): Eisenstat-Walker forcing for inner AMGCL CG tol.
+#   # Headline measured: 377s -> 153s (-59%) on IEEJ-D IPMSM. Turn on for
+#   # any nonlinear run.
+#   eisenstat_walker:
+#     enabled: false
+#     gamma: 0.9
+#     alpha: 2.0
+#     eta_min: 1.0e-6
+#     eta_max: 0.1
 #
-# --- Adaptive mesh coarsening (mark uniform regions for downsampling) ---
-# Per-material opt-in (add inside any material in the materials: block):
-#   coarsen: true
-#   coarsen_ratio: 2                # 2x2 fine cells → 1 active cell
-# Good candidates: air, coil interiors (uniform mu_r, constant jz).
-# Avoid on: nonlinear iron, magnets, fine material interfaces.
-# coarsening:
-#   boundary_shell: 1               # keep N cells fine near material edges
-#   smooth_iterations: 0            # harmonic mu interpolation for coarse cells
+# --- v1.5.1 (Phase BJ-8): custom Galerkin coarsening removed ---
+# The previously documented per-material 'coarsen: true / coarsen_ratio'
+# flags and 'coarsening:' block are no longer supported. AMGCL's internal
+# smoothed_aggregation multigrid now handles multi-resolution natively.
+# Any pre-v1.5.1 YAML containing those knobs still parses but emits a
+# WARNING at startup and the values are ignored. Remove them to silence.
 `;
 
 // Append the SOLVER_HINT_BLOCK to the YAML string iff the marker isn't
@@ -4130,6 +4155,39 @@ function ensureSolverHintBlock(yamlString) {
     if (yamlString.indexOf(SOLVER_HINT_MARKER) !== -1) return yamlString;
     const sep = yamlString.endsWith('\n') ? '' : '\n';
     return yamlString + sep + SOLVER_HINT_BLOCK;
+}
+
+// v1.6 domain decomposition: optional, COMMENTED-OUT block appended to the
+// auto-generated POLAR config (polar only -- DD is a polar feature). The user
+// uncomments + tunes the bands to enable a variable-resolution Schwarz solve.
+const DD_HINT_MARKER = '# --- Optional: domain decomposition (polar, variable-resolution accuracy mode) ---';
+const DD_HINT_BLOCK = `
+${DD_HINT_MARKER}
+# Opt-in. Keeps the air gap / saturated zone FINE while coarsening smooth
+# radial bands on their own uniform grid (coupled by symmetric Robin
+# transmission iterated to consistency). NOT faster than the monolithic
+# solve on a dense machine -- use when you need full-resolution gap accuracy
+# (e.g. final-ranking / verification). Band columns below are RADIAL PIXEL
+# INDICES (0 = inner radius .. nr = outer); cf=1 keeps a band FINE (use it
+# across the gap), cf>1 coarsens. Interfaces must sit in IRON, not in the
+# air gap or coils. Uncomment + tune the bands to YOUR geometry:
+# domain_decomposition:
+#   enabled: true
+#   bands:
+#     - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)
+#     - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE
+#     - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)
+#   robin_p: 12.0          # Robin transmission coefficient
+#   overlap: 4             # band overlap in fine columns
+#   max_outer: 8           # max Schwarz sweeps (flux converges by ~4)
+#   tol: 1.0e-3            # relative Schwarz-residual stop
+#   # relax: 0.7           # under-relaxation if an interface oscillates
+`;
+function ensureDDHintBlock(yamlString) {
+    if (typeof yamlString !== 'string') return yamlString;
+    if (yamlString.indexOf(DD_HINT_MARKER) !== -1) return yamlString;
+    const sep = yamlString.endsWith('\n') ? '' : '\n';
+    return yamlString + sep + DD_HINT_BLOCK;
 }
 
 // Build the polar coordinate_system / polar_domain / boundary block as a
@@ -4227,7 +4285,9 @@ function buildPolarYamlBlock(filename, polarDomain) {
     // Phase BA: surface the nonlinear_solver / coarsening knobs even when
     // they aren't active in this template, so a user reading the inserted
     // YAML in Ace sees them as a discoverable optional section.
-    return ensureSolverHintBlock(lines.join('\n') + '\n');
+    // v1.6: also append the optional (commented) domain_decomposition block --
+    // polar only, so the DD accuracy mode is discoverable from the generated YAML.
+    return ensureDDHintBlock(ensureSolverHintBlock(lines.join('\n') + '\n'));
 }
 
 // Build the cartesian coordinate_system / mesh block. mesh.dx and .dy are

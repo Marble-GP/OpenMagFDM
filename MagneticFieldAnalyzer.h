@@ -34,6 +34,8 @@
 #include <amgcl/amg.hpp>
 #include <amgcl/coarsening/smoothed_aggregation.hpp>
 #include <amgcl/relaxation/spai0.hpp>
+#include <amgcl/relaxation/ilu0.hpp>      // Phase BE candidate: incomplete LU(0)
+#include <amgcl/relaxation/gauss_seidel.hpp> // Phase BE candidate: GS (~SSOR)
 #include <amgcl/solver/cg.hpp>
 
 #define SOLVER_TOLERANCE (1e-6)
@@ -59,6 +61,45 @@ public:
      */
     void solve();
 
+    // ---- v1.6 domain-decomposition accessors (used by the dd_bench orchestrator) ----
+    // Persistent patch instances re-solved per Schwarz sweep: read/write Az, update the
+    // per-edge transmission profile, and query the polar geometry.
+    void setAz(const Eigen::MatrixXd& a) { Az = a; }
+    int getNr() const { return nr; }
+    int getNtheta() const { return ntheta; }
+    double getDr() const { return dr; }
+    double getDtheta() const { return dtheta; }
+    double getRStart() const { return r_start; }
+    double getREnd() const { return r_end; }
+    std::string getROrientation() const { return r_orientation; }
+    // DD parallelism/conditioning instrumentation: accumulated AMGCL-CG iterations across all linear
+    // solves since construction (proxy for spectral conditioning; read deltas around solve()).
+    long getTotalLinearIters() const { return total_linear_iters_; }
+    int  getNumLinearSolves()  const { return num_linear_solves_; }
+    long total_linear_iters_ = 0;
+    int  num_linear_solves_  = 0;
+    // Update a radial (inner/outer, len ntheta) or theta (theta_min/theta_max, len nr) transmission
+    // profile in-place between Schwarz sweeps. edge in {inner,outer,theta_min,theta_max}.
+    void setBoundaryProfile(const std::string& edge, const std::vector<double>& prof);
+    // r-weighted material-pair flux linkage from the CURRENT Az (polar): <Az>_a - <Az>_b.
+    double fluxLinkageMaterialPair(int rgb_key_a, int rgb_key_b) const;
+    // When true, solveNonlinearNewtonKrylov starts the NK from the current member Az (warm) and
+    // SKIPS the linear init guess -- for the DD Schwarz outer loop's per-patch re-solves.
+    void setDDWarmStart(bool b) { dd_warm_start_ = b; }
+    // Suppress the per-call "[Solver] AMGCL..." stdout lines (parallel DD runs
+    // many concurrent sub-solves; interleaved prints garble the log).
+    void setQuietSolver(bool b) { quiet_solver_ = b; }
+    bool quiet_solver_ = false;
+    // DD flattened-Schwarz control: cap (or restore) this analyzer's NK
+    // iteration budget. Used by solveDomainDecomposition to run capped
+    // sub-solves during sweeps and one uncapped polish sweep at the end.
+    void setNKMaxIterations(int m) { nonlinear_config.max_iterations = m; }
+    int  getNKMaxIterations() const { return nonlinear_config.max_iterations; }
+    // v1.6 DD coarse space: update mu from the current member Az and assemble the polar operator A,b
+    // (A*Az_solution = b). Used by the orchestrator to form the global residual r = b - A*Az_vec for
+    // the 2-level coarse correction. Az_vec ordering matches buildMatrixPolar: idx = i_r*ntheta + j_th.
+    void buildPolarOperator(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b);
+
     /**
      * @brief Export all results to folder structure
      * @param base_folder Base folder name (e.g., "output")
@@ -72,6 +113,23 @@ public:
      * @param output_dir Output directory for results
      */
     void performTransientAnalysis(const std::string& output_dir);
+    // Chunked sweep parallelism (transient.parallel_chunks > 1): restrict this
+    // instance to global steps [begin, end) as a chunk worker. Also forces the
+    // instance's own parallel_chunks to 1 (no recursive chunking) and flags it
+    // as a worker so per-sweep summary artifacts (flux CSV) are written by the
+    // owning instance only.
+    void setTransientChunkRange(int begin, int end, bool is_worker) {
+        transient_step_begin_ = begin;
+        transient_step_end_   = end;
+        transient_chunk_worker_ = is_worker;
+        transient_config.parallel_chunks = 1;
+    }
+    const std::map<std::string, std::vector<double>>& getFluxLinkageResults() const {
+        return flux_linkage_results;
+    }
+    int transient_step_begin_ = 0;    // global step range [begin, end) run by this instance
+    int transient_step_end_   = -1;   // -1 = full range (dispatcher may split into chunks)
+    bool transient_chunk_worker_ = false;
 
     /**
      * @brief Export Az (vector potential) array to CSV file
@@ -286,6 +344,13 @@ public:
         double dmu_r_extrap_const;      // Constant extrapolation value (default: 1.0)
         std::string dmu_r_extrap_formula; // Formula for dμ_r/dH(H) extrapolation
 
+        // Precomputed B(H) samples + PCHIP slopes for the TABLE branch of
+        // evaluateMu. Pure functions of H_table/mu_table, so computed once at
+        // load instead of being reallocated + recomputed per cell per call
+        // (was ~40% of updateFieldAndMu wall on the 1.34M-DOF IEEJ-D case).
+        std::vector<double> B_table_cache;      // B_i = μ₀·mu_table_i·H_table_i
+        std::vector<double> pchip_slopes_cache; // PCHIP slopes of B(H)
+
         MuValue() : type(MuType::STATIC), static_value(1.0),
                     has_dmu_extrapolation(false), dmu_r_extrap_const(1.0),
                     dmu_r_extrap_formula("") {}
@@ -296,6 +361,11 @@ public:
         std::vector<double> H_values;   // |H| [A/m]
         std::vector<double> B_values;   // |B| [T]
         std::vector<double> mu_values;  // μ [H/m] = μ_r * μ_0
+
+        // Cumulative co-energy Wc_i = ∫₀^{H_i} B dH (trapezoid on the table),
+        // so the energy-objective line search can evaluate W'(H) in O(log n)
+        // per cell instead of the 100-point Simpson in integrateMagneticCoEnergy.
+        std::vector<double> Wc_values;
 
         // Cached for fast interpolation
         bool is_valid;
@@ -310,6 +380,15 @@ public:
      * @return Effective permeability μ_eff = B/H (dimensionless)
      */
     double evaluateMu(const MuValue& mu_val, double H_magnitude);
+    // Fill MuValue::B_table_cache / pchip_slopes_cache once at material load
+    // (evaluateMu's TABLE branch reads them per cell; see MuValue comment).
+    static void precomputeMuTableCache(MuValue& mu_val);
+    // Consistent-tangent correction (jacobian: tangent): adds the per-cell
+    // rank-one (nu_d - nu)(g g^T) terms of the discrete energy Hessian to J.
+    void addTangentCorrection(Eigen::SparseMatrix<double>& J);
+    // Differential reluctivity dH/dB from the B-H table (segment slope;
+    // -> 1/mu0 beyond the table end).
+    double dHdB_FromTable(const BHTable& table, double B_magnitude) const;
 
     /**
      * @brief Evaluate derivative dμ_r/dH at given |H| magnitude
@@ -389,6 +468,61 @@ private:
         int fine_finishing_iterations;    // Number of full-grid Newton steps after coarse solve (default: 0 = disabled)
         double fine_finishing_tolerance;  // Convergence tolerance for fine finishing (default: -1 = use tolerance)
 
+        // [Phase BJ-5] Strict convergence enforcement.
+        // When using Phase 6 + Galerkin coarsening on saturated polar problems
+        // (e.g. IEEJ-D IPMSM), the coarse plateau detector at residual ~2-4e-1
+        // accepts a solution whose fine residual stays an order of magnitude
+        // above TOL and whose iron region is under-saturated by ~50000x.
+        // The flux magnitude on such a "converged" solve is ~1/10 of the true
+        // (Standard-path) value — see README "適応粗大化が IEEJ-D class motor
+        // で有効でない理由" / Phase BJ-5 note. When this flag is true, the
+        // post-fine-finishing residual check throws std::runtime_error
+        // instead of just warning, so production pipelines can catch the
+        // wrong-answer case loudly. Default false to preserve v1.5.0 behaviour
+        // — users who haven't seen the new diagnostic see only the warning.
+        bool strict_convergence;
+
+        // Phase BC: Eisenstat-Walker inexact-Newton forcing for the inner
+        // AMGCL linear solve. When enabled, eta_k = gamma * (||R_k|| / ||R_{k-1}||)^alpha,
+        // clipped to [eta_min, eta_max]. Lets CG stop early in iterations
+        // where outer Newton residual is still large, avoiding pointless
+        // 1e-6 inner accuracy. Disabled by default to preserve existing
+        // behaviour for users who haven't opted in.
+        bool eisenstat_walker_enabled;
+        double eisenstat_walker_gamma;    // EW γ (default 0.9)
+        double eisenstat_walker_alpha;    // EW α (default 2.0, Choice 2)
+        double eisenstat_walker_eta_min;  // floor (default 1e-6, matches SOLVER_TOLERANCE)
+        double eisenstat_walker_eta_max;  // initial / cap (default 0.1)
+        // Line-search merit function. "residual" (default) = classic Armijo on
+        // ||A(μ(x))x − b||. "energy" = Armijo on the CONVEX energy functional
+        // W(Az) (see computeEnergyObjective): since B(H) is monotone the
+        // problem is convex minimization with ∇W = R, and ||R|| is NOT
+        // monotone along descent paths of a non-quadratic convex function —
+        // rejecting steps because ||R|| transiently rises is what pins α at
+        // ~0.1 and produces the linear-rate crawl. Energy mode starts every
+        // iteration at α=1 (no ratchet).
+        bool line_search_energy;
+
+        // Newton matrix: "secant" (default; the frozen-mu operator A plus the
+        // r-weighted diagonal correction — historical behavior) or "tangent"
+        // (consistent tangent: A plus per-cell rank-one (nu_d - nu)(g g^T)
+        // corrections capturing the B-H curve's differential reluctivity;
+        // combine with line_search_objective: energy — the Stage G gate
+        // measured 25 true-tolerance iterations with alpha=1 accepted for the
+        // exact-Jacobian x energy-merit pairing, vs 48 plateau-stalled
+        // iterations for secant x residual).
+        bool jacobian_tangent;
+
+        // Residual-proportional cap: η ≤ max(eta_min, residual_cap·||R||_rel).
+        // The classic ratio formula never tightens in a linear-rate crawl
+        // (γ·ratio^α stays ≈0.78 → clamped to eta_max forever). This knob ties
+        // the cap to the outer residual instead. Benchmarked NEUTRAL-NEGATIVE
+        // on IEEJ-D (iterations unchanged 48→49, wall +64% from the tighter
+        // inner CG, plateau floor unmoved — the floor is set by μ-interpolation
+        // nonsmoothness, not inner accuracy), so it ships DISABLED (-1);
+        // kept as an experimentation knob. ≤0 disables.
+        double eisenstat_walker_residual_cap; // default -1 (off)
+
         NonlinearSolverConfig() :
             enabled(true), solver_type("newton-krylov"), max_iterations(50), tolerance(5e-4),
             relaxation(0.7), anderson(), gmres_restart(30), line_search_c(1e-4),
@@ -397,7 +531,14 @@ private:
             verbose(false), export_convergence(false), use_galerkin_coarsening(false),
             use_matrix_free_jv(true),
             use_phase6_precond_jfnk(true), precond_update_frequency(1), precond_verbose(false),
-            fine_finishing_iterations(0), fine_finishing_tolerance(-1.0) {}
+            fine_finishing_iterations(0), fine_finishing_tolerance(-1.0),
+            strict_convergence(false),
+            eisenstat_walker_enabled(false),
+            eisenstat_walker_gamma(0.9), eisenstat_walker_alpha(2.0),
+            eisenstat_walker_eta_min(1e-6), eisenstat_walker_eta_max(0.1),
+            line_search_energy(false),
+            jacobian_tangent(false),
+            eisenstat_walker_residual_cap(-1.0) {}
     };
 
     // Maxwell stress and force calculation
@@ -504,13 +645,95 @@ private:
         double beta;          // Coefficient for dAz/dn (default: 0.0)
         double gamma;         // RHS value (default: 0.0)
 
+        // v1.6 domain-decomposition (optimized Schwarz): optional per-cell
+        // boundary profile that overrides the scalar along the boundary.
+        // For a radial boundary (inner/outer) it is indexed by theta-index j
+        // and has length ntheta; if empty the scalar value/gamma is used
+        // (backward compatible). Loaded from a CSV path in YAML:
+        //   dirichlet -> value_profile, robin -> gamma_profile.
+        std::vector<double> profile;
+
         BoundaryCondition() : type("dirichlet"), value(0.0),
                               alpha(1.0), beta(0.0), gamma(0.0) {}
     };
 
+    // v1.6 domain decomposition (optimized Schwarz, polar only). Opt-in
+    // variable-resolution ACCURACY mode: keep the air gap / saturated zone
+    // FINE, coarsen smooth radial bands on their own uniform grid, couple via
+    // symmetric Robin transmission iterated to consistency. NOT a speed default
+    // (uniform downsampling is faster); use when full-res gap accuracy matters.
+    struct DDConfig {
+        // Column range [c0,c1), radial & theta coarsen factors, and the number of
+        // theta sectors the band is split into (1 = full-theta ring, the classic
+        // banded mode). Sectoring is only allowed for FINE bands (cf=1): the
+        // sector patches are then exact-resolution (write-back is a plain copy,
+        // no mortar), which is the parallelization configuration — many small
+        // cache-resident patches solved concurrently (additive Schwarz).
+        struct Band { int c0, c1, cf_r, cf_theta, sectors; };
+        bool   enabled   = false;
+        std::vector<Band> bands;  // radial bands (cf_theta=1 => r-only coarsening, preserves slots/magnets)
+        double robin_p   = 12.0;  // Robin transmission coefficient (alpha); interfaces should sit in iron
+        int    overlap   = 4;     // band overlap in fine columns
+        int    max_outer = 20;    // max Schwarz sweeps
+        double tol       = 2e-3;  // convergence tol on the relative Schwarz residual ||G-Gprev||/||G||
+        double relax     = 1.0;   // outer under-relaxation omega (1.0 = none; <1 damps a 2-cycle)
+        // Additive Schwarz + OpenMP over patches: every patch reads the sweep-
+        // start snapshot (independent solves, disjoint-core write-back) and the
+        // patch loop runs `omp parallel for` with the inner AMGCL solves forced
+        // single-threaded. Small patches are cache-resident, so this scales far
+        // better than AMGCL's memory-bandwidth-bound intra-solve threading
+        // (measured 7.7x vs 3.8x on 24 cores in the dd_bench study). Additive
+        // transmission converges somewhat slower per sweep than multiplicative.
+        bool   parallel  = false;
+        // Robin coefficient for THETA interfaces of sectored patches. The theta
+        // face coupling c=1/(r·μ·dθ) is ~40x the radial c=r/(μ·dr) on this class
+        // of geometry, so the optimal theta alpha is ~robin_p/40 (dd_bench S3
+        // tuning). <0 = auto (robin_p/40).
+        double robin_p_theta = -1.0;
+        // Material-safe theta cut positions (global theta pixel rows). Applied to
+        // every sectored band; when empty, sectors are split uniformly. Cuts must
+        // pass through IRON (tooth centers) — never through coils or magnets.
+        std::vector<int> theta_cuts;
+        // Two-level Galerkin coarse space (bilinear r x theta prolongation,
+        // Ac = P^T A(mu(G)) P rebuilt each sweep, G += damp*P*Ac^-1*P^T(b-A*G)).
+        // Bounds the outer sweep count for many-sector configs (1-level theta
+        // Schwarz contracts at only ~0.9/sweep). Requires FINE patches under
+        // the correction — coarsened patches cannot smooth the fine-scale
+        // residual the correction injects (dd_bench: diverges). coarse = [CR,
+        // CTH] cell aggregation factors; 0/absent = off.
+        int    coarse_r    = 0;
+        int    coarse_th   = 0;
+        double coarse_damp = 1.0;
+        // Analytic air-gap link (rotor|stator split): gap_link = [cR, cS] takes
+        // the annulus BETWEEN radial columns cR and cS OUT of the FD mesh and
+        // couples the two sides through the EXACT harmonic (Laplace) solution
+        // of the source-free air annulus — the derivative term of each side's
+        // Robin gamma comes from the analytic transfer map instead of a finite
+        // difference across the gap. The annulus must be magnetically air
+        // (mu_r=1, jz=0, no magnetization) at every theta. Bands must tile
+        // [0, cR] and [cS, nr) and may be coarsened UNIFORMLY on each side —
+        // the gap, which is what forbids coarsening in the plain banded mode,
+        // is no longer part of any band. -1 = off.
+        int    gap_r0 = -1;   // cR: rotor-side boundary column (its band core must end at cR+1)
+        int    gap_r1 = -1;   // cS: stator-side boundary column (its band core must start at cS)
+        // Cap on NK iterations per band per sweep ("flattened" Schwarz). Nesting a
+        // full NK solve inside every Schwarz sweep multiplies the two iteration
+        // counts (measured: the fine band re-paid 80-90 NK iterations EVERY sweep
+        // because each sweep's interface wiggle kicks the residual back to O(1)
+        // and NK crawls back down at its fixed ~0.9/iter rate -> 315 s vs 37 s
+        // monolithic on IEEJ-D). Capping the inner solve pushes the nonlinear
+        // relaxation into the sweeps themselves (nonlinear block Gauss-Seidel),
+        // making the DD cost ~ aggregate-DOF-proportional. A final uncapped
+        // polish sweep runs after the loop. <=0 = uncapped (legacy nested mode).
+        int    max_inner = 3;
+    };
+
     // Configuration and input
     YAML::Node config;
+    std::string config_path;        // retained so DD can reload the raw base config for sub-domains
+    std::string image_path_;        // retained so chunked-transient workers can be constructed
     cv::Mat image;
+    DDConfig dd_config;             // parsed from the 'domain_decomposition' YAML block
     std::string coordinate_system;  // "cartesian" or "polar"
 
     // Mesh parameters (Cartesian)
@@ -522,8 +745,12 @@ private:
     double dr, dtheta; // Mesh spacing
     double r_start, r_end;  // Radial domain
     double theta_range;     // Angular range [rad] (default: 2*pi, sector: pi/2, etc.)
+    double theta_offset = 0.0;  // v1.6 DD: absolute angle [rad] of local theta=0, so a theta-sector
+                                // subdomain computes theta-dependent sources (magnetization atan2)
+                                // at the correct GLOBAL angle. theta_phys = j_theta*dtheta + theta_offset.
     std::string r_orientation;  // "horizontal" or "vertical"
     std::vector<double> r_coords;  // Radial coordinates
+    bool dd_warm_start_ = false;   // v1.6 DD: NK warm-starts from member Az, skips init guess
 
     // Boundary conditions
     BoundaryCondition bc_left, bc_right, bc_bottom, bc_top;  // Cartesian
@@ -565,6 +792,14 @@ private:
         int region_start = 0;
         int region_end = 0;
         int pixels_per_step = 0;
+        // [v1.6 Stage 0] Resolution-independent rotor rotation (polar only).
+        // If use_angle, the per-step theta shift is computed as
+        // round(angle_rad / dtheta) once the polar mesh is known
+        // (finalizeSlideRotationForResolution), overwriting pixels_per_step, so
+        // the SAME physical rotation is applied at any mesh resolution. This is
+        // what makes downsampled / multi-fidelity transient runs comparable.
+        bool use_angle = false;
+        double angle_rad = 0.0;
         // Common
         std::string wrap_mode = "auto";
         std::vector<int> vacuum_rgb = {255, 255, 255};  // air, used by vacuum mode
@@ -603,9 +838,20 @@ private:
         // Valid names: "Az", "Mu", "H", "Jz", "InputImg", "BoundaryImg", "Forces", "EnergyDensity"
         std::vector<std::string> export_fields;
 
+        // Chunked sweep parallelism: split the step range into K contiguous
+        // chunks and run them CONCURRENTLY, each on its own analyzer instance
+        // (independent state, disjoint global step numbers -> no output
+        // collisions). Within a chunk the mu carry-over amortization is
+        // preserved (measured ~37 iters/step vs ~54 cold); each chunk's first
+        // step is cold, costing ~2-3% over a 124-step sweep. Aggregate
+        // speedup is memory-bandwidth-bound (~1.9x measured on 3 concurrent
+        // 1.34M-DOF solves). 1 = sequential (default, behavior unchanged).
+        int parallel_chunks;
+
         TransientConfig() : enabled(false), enable_sliding(true), total_steps(0),
                            slide_direction("vertical"), slide_region_start(0),
-                           slide_region_end(0), slide_pixels_per_step(0) {}
+                           slide_region_end(0), slide_pixels_per_step(0),
+                           parallel_chunks(1) {}
     };
 
     TransientConfig transient_config;
@@ -712,6 +958,25 @@ private:
     int max_coarsen_skip = 1;  // Maximum skip across all coarsened materials (for locality check)
     int coarsen_boundary_shell = 1;      // Edge dilation radius [pixels] for boundary protection (YAML: coarsening.boundary_shell)
     int coarsen_smooth_iterations = 0;   // Post-interpolation Laplacian smoothing iterations (YAML: coarsening.smooth_iterations)
+    bool coarsen_auto_bump_skip = false; // [Phase BJ-4] When true, calculateOptimalSkipRatios bumps min(skip_x, skip_y) to 2 if the rounding would have produced 1, preventing silent no-op coarsening at the cost of overshooting the requested ratio. Opt-in only because the Phase 6 + Galerkin path that the bumped mask routes through has a known accuracy regression on saturated nonlinear polar problems (see README "適応粗大化が IEEJ-D class motor で有効でない理由"). YAML: coarsening.auto_bump_skip
+
+    // [v1.6 Stage 2] Field-adaptive material-conforming coarsening (polar).
+    // When enabled, the coarse mask is built AFTER an initial full solve from the
+    // |B| field: a block is coarsened only if it is material-homogeneous, the
+    // material is coarsen-eligible, and the |B| variation within it is below
+    // adaptive_field_tol [T] -- so saturated / high-gradient iron + air gap +
+    // boundaries stay fine (correct mu) while smooth bulk iron is coarsened.
+    bool adaptive_mesh_enabled = false;     // YAML: adaptive_mesh.enabled
+    double adaptive_field_tol = 0.1;        // YAML: adaptive_mesh.field_tol  [Tesla]
+    int adaptive_coarsen_skip = 2;          // YAML: adaptive_mesh.skip  (block size S)
+    void generateAdaptiveCoarseningMask();  // builds active_cells/cell_skip_level from |B| + material
+    // [v1.6 Stage 1e / A1] Compute B, H, mu at the ACTIVE cells from the COARSE curl
+    // of the coarse Az (findNextActive spacing), writing Br/Btheta/H_map/mu_map there.
+    // Replaces the per-iter interpolate-to-full + full-grid field/mu in the coarse NK:
+    // makes mu consistent with the coarse operator (correct flux) and is O(n_active)
+    // (per-iteration speedup). Polar only; member Az must hold the coarse values at
+    // active cells.
+    void updateCoarseFieldAndMu();
 
     // Phase 4: Full-grid residual evaluation cache (for coarsened Newton-Krylov convergence)
     Eigen::SparseMatrix<double> A_full_cached;   // Cached full-grid matrix
@@ -798,10 +1063,15 @@ private:
     void writeMatrix(const Eigen::MatrixXd& m, const std::string& base_path,
                      const ExportConfig& opts) const;
 
-    // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small
+    // Unified linear solver: AMGCL for large problems, SparseLU (with pattern reuse) for small.
+    // Phase BC: tolerance > 0 overrides SOLVER_TOLERANCE for this call only. Used by
+    // Eisenstat-Walker forcing in the Newton-Krylov outer loop to loosen the inner
+    // AMGCL CG tolerance when the outer residual is still large -- no point
+    // converging the linear system to 1e-6 when the Newton residual is at 1e+1.
     Eigen::VectorXd solveLinearSystem(const Eigen::SparseMatrix<double>& A,
                                       const Eigen::VectorXd& rhs,
-                                      const Eigen::VectorXd& initial_guess = Eigen::VectorXd());
+                                      const Eigen::VectorXd& initial_guess = Eigen::VectorXd(),
+                                      double tolerance = -1.0);
 
     // Private methods
     void loadConfig(const std::string& config_path);
@@ -819,6 +1089,9 @@ private:
     void setupPolarSystem();
     void setupMaterialProperties();
     void setupMaterialPropertiesForStep(int step);  // Update Jz for given step
+    // Chunked-transient dispatcher: spawns worker analyzer instances for
+    // chunks 1..K-1, runs chunk 0 on this instance, merges the flux CSV.
+    void runTransientChunks(const std::string& output_dir);
     void validateBoundaryConditions();
 
     // Transient analysis methods
@@ -844,6 +1117,10 @@ private:
     double interpolateH_from_B(const BHTable& table, double B_magnitude);
     double interpolateB_from_H(const BHTable& table, double H_magnitude);
     double integrateMagneticCoEnergy(const BHTable& table, double H_magnitude);  // W' = ∫₀^H B(H') dH'
+    double coenergyFromTable(const BHTable& table, double H) const;  // fast O(log n) Wc via cumulative table
+    // Convex energy functional W(Az) = Σ w(|B|)·vol − Σ (Jz+Jz_mag)·Az·vol whose
+    // gradient is the Picard residual — merit function for the energy line search.
+    double computeEnergyObjective();
     double calculateCoEnergyDensity(int j, int i, double B_magnitude);  // Co-energy density w' [J/m³]
     void calculateHField();  // Calculate |H| from Bx, By (or Br, Btheta)
     void updateMuDistribution();  // Update mu_map based on current H_map
@@ -864,6 +1141,10 @@ private:
     // and the per-slide region / pixels_per_step entries resolve
     // through tinyexpr instead of failing the strict .as<int>() path.
     void parseTransientConfig();
+    // [v1.6 Stage 0] Convert any angle-specified rotor rotation (SlideRegion
+    // use_angle) into an integer theta-pixel shift now that dtheta is known.
+    // Called once after setupPolarSystem(); polar only.
+    void finalizeSlideRotationForResolution();
     // Tinyexpr-aware scalar evaluation helpers used by parseTransientConfig.
     double evaluateScalarAsDouble(const YAML::Node& node, double fallback) const;
     int    evaluateScalarAsInt   (const YAML::Node& node, int    fallback) const;
@@ -901,6 +1182,13 @@ private:
     void solveNonlinear();  // Main nonlinear Picard iteration solver
     void solveNonlinearWithAnderson();  // Picard with Anderson acceleration
     void solveNonlinearNewtonKrylov();  // Newton-Krylov (Jacobian-free GMRES)
+
+    // v1.6 domain decomposition (polar, opt-in): banded variable-resolution
+    // optimized Schwarz. Builds per-band sub-analyzers (crop + coarsen on their
+    // own uniform grid), iterates symmetric-Robin transmission to consistency,
+    // and writes the composite solution into the member Az. Defined in
+    // MagneticFieldAnalyzer_dd.cpp. (Implementation ported from dd_bench.)
+    void solveDomainDecomposition();
 
     // Unified mu accessors (coordinate-system aware)
     double muAtGrid(int i, int j) const;  // i=col, j=row

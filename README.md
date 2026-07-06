@@ -134,6 +134,27 @@ transient:
 
 Cartesian は完全対応。Polar は `slides[0]` のみ (Multi-slide polar permutation は v1.6 予定、load 時に警告)。
 
+**チャンク並列スイープ (v1.6, `parallel_chunks`)** — 回転スイープを K 個の連続チャンクに分割し、
+それぞれ独立なソルバーインスタンスで**同時に**解きます。ステップ番号はグローバルのまま同一出力
+ツリーに書かれ、flux CSV は終了時に自動結合されます。
+
+```yaml
+transient:
+  enabled: true
+  total_steps: 124
+  parallel_chunks: 3   # 3 チャンク同時実行 (1 = 従来どおり逐次)
+```
+
+注意点:
+- 各チャンクの**先頭ステップは cold**（μ の持ち越しがない）ため、逐次実行と比べて反復数が
+  数%増えます。長いスイープほど相対損失は小さくなります。解は plateau 許容範囲内で逐次版と
+  一致します（bit 一致はしません）。
+- 高速化はメモリ帯域で頭打ちになります（実測: 1.34M DOF ×3 同時で合計スループット ~1.9×）。
+  K は 2〜4 を推奨。
+- メモリはインスタンスあたり ~0.6-1GB（1.34M DOF 時）× K 消費します。
+- OpenMP スレッドは自動で K 分割されます（合計スレッド数は従来と同じ）。
+- 並列中のログはチャンク間で交互に出力されます（ワーカーのソルバー内部ログは抑制済み）。
+
 **スライド時の wrap モード (Phase B.5)** — スライドして反対側に出ていった領域の扱いを `wrap_mode` で 3 モードから選べます。デフォルトの `auto` は対応する境界条件タイプから物理的に自然なものを選択します:
 
 - `periodic`: 旧仕様。content を環状に巻き戻す。
@@ -449,20 +470,96 @@ WebUI の Material Library Manager から YAML ファイルの管理・B-H カ�
 
 ---
 
-## 適応粗大化メッシュ
+## v1.5.1 → AMGCL native multigrid 移行 (Phase BJ-8)
 
-均一材料領域のメッシュを自動的に粗くし、材料境界は高解像度を維持します。
+v1.5.1 で **OpenMagFDM 自前の Galerkin coarsening machinery は全廃**しました。AMGCL
+の internal smoothed_aggregation multigrid が multi-resolution を natively 処理する
+ため、自前で coarse 行列を構築する二重 coarsening 構造が不要になっています。
+
+### v1.5.0 までの「適応粗大化メッシュ」フィーチャは deprecated
+
+以下の YAML key は v1.5.1 で **parse 段階で WARNING を出して silent ignore** されます。
+削除しても挙動は変わりません:
 
 ```yaml
+# v1.5.0 までの書き方 (deprecated, 残しても動くが WARNING)
 materials:
   iron_stator:
     rgb: [128, 128, 128]
     mu_r: 1000
-    coarsen: true       # 粗大化を有効化
-    coarsen_ratio: 8    # 8×8 → 1セル
+    coarsen: true       # ← 無視
+    coarsen_ratio: 8    # ← 無視
+
+nonlinear_solver:
+  use_galerkin_coarsening: true   # ← 無視
+  use_matrix_free_jv: true        # ← 無視
+  use_phase6_precond_jfnk: true   # ← 無視
+  precond_update_frequency: 1     # ← 無視
+  precond_verbose: false          # ← 無視
+  fine_finishing_iterations: 3    # ← 無視
+  fine_finishing_tolerance: 1e-5  # ← 無視
+  strict_convergence: false       # ← 無視
+  relaxation: 0.7                 # ← 無視 (Picard 残骸)
+
+coarsening:                       # ← block ごと無視
+  boundary_shell: 1
+  smooth_iterations: 0
+  auto_bump_skip: false
 ```
 
-非線形材料でも使用可能（Newton-Krylov の Defect Correction 方式により、物理精度はファイングリッド残差で保証）。
+### 移行理由
+
+v1.5.0 までの自前 Galerkin coarsening (P_prolongation, R_restriction, A_c = R·A_f·P)
+は **saturated 非線形 polar 問題で flux を真値の ~1/10 に過小評価** する根本問題が
+ありました。原因は bilinear 補間がが磁石/iron 界面の急峻な flux conservation を表現
+できず、Galerkin 投影が iron flux highway を smooth out すること (v1.5.1 開発記録の
+Phase BJ-1〜7 参照)。
+
+AMGCL の smoothed_aggregation は **operator-dependent な aggregate** を構築するため、
+iron-iron 強連結 / iron-air 弱連結が自動的に識別され、saturation 領域でも数値的に
+正しい挙動を保ちます。
+
+### 推奨設定 (v1.5.1+)
+
+```yaml
+nonlinear_solver:
+  enabled: true
+  solver_type: newton-krylov
+  max_iterations: 50
+  tolerance: 1.0e-3
+  verbose: false
+  eisenstat_walker:        # Phase BC: 2.5× 高速化の柱
+    enabled: true
+    gamma: 0.9
+    alpha: 2.0
+    eta_min: 1.0e-6
+    eta_max: 0.1
+```
+
+### IEEJ-D class motor での実証値 (BC reference)
+
+```
+3-step transient bench (WSL2 Linux, Ryzen AI 9 HX 370 24T)
+- v1.5.0 baseline (no EW):           377 s
+- v1.5.0 + EW (Phase BC):            153 s
+- v1.5.1 BJ-8 (full grid AMGCL+EW):  150 s
+
+Flux Phi_Coil_A step 2:
+- v1.5.0 baseline:                   -2.476e-3 Wb/m  ← 真値
+- v1.5.1 BJ-8:                       -2.476e-3 Wb/m  ← 真値 (byte-identical)
+- v1.5.1 BJ-4 (Galerkin enabled):    -3.745e-4 Wb/m  ← 真値の 1/10 (削除済 path)
+```
+
+### マイグレーション手順
+
+1. **既存 YAML はそのまま動く**: 移行ガイドだけ確認すれば再実行不要
+2. **WARNING を消したい場合**: stderr に出る `WARNING: YAML key '...' is no longer
+   supported as of v1.5.1` メッセージに従い、該当 key を YAML から削除
+3. **`coarsening:` block 全体削除** + **`materials.*.coarsen` / `coarsen_ratio` 削除**
+4. **`nonlinear_solver` の Phase 4/5/6 関連 knob 削除** (`use_galerkin_coarsening`,
+   `use_matrix_free_jv`, `use_phase6_precond_jfnk`, `precond_*`, `fine_finishing_*`,
+   `strict_convergence`, `relaxation`)
+5. **`eisenstat_walker:` block の追加** (まだ使っていなければ): 2.5× の高速化を得る
 
 ---
 
@@ -485,6 +582,74 @@ polar_boundary_conditions:
   theta_min: { type: periodic }
   theta_max: { type: periodic }
 ```
+
+---
+
+## 領域分割（Domain Decomposition, v1.6・極座標のみ・任意）
+
+**可変解像度の高精度モード**です。エアギャップや磁気飽和部は **fine（高解像度）のまま**残し、
+ヨーク内部やボア空気のような滑らかな半径バンドだけを各バンド固有の一様粗グリッド上で解き、
+バンド間を対称 Robin 透過条件（最適化 Schwarz）で整合するまで反復します。収束解は
+「fine なところは fine、coarse なところは coarse」の合成解で、ギャップ／飽和部の精度を保ちます。
+
+> **注意（位置づけ）**: 密なメッシュのモデルでは、これはモノリシック解法より**大きくは速くなりません**
+> （同程度〜わずかに速い程度）。DD の利点は「ギャップ／飽和部を完全に解像
+> したまま滑らかな領域だけ粗くする」点で、**最終確認・検証用の精度モード**として使います。
+> 既定では無効で、`enabled: true` かつ `bands` を1つ以上指定したときのみ動作します。
+
+```yaml
+domain_decomposition:
+  enabled: true
+  bands:                 # [c0, c1, cf_r, cf_theta]: 半径ピクセル列 [c0,c1) と粗大化率
+    - [0, 52, 4, 4]      # ボア: 4倍粗大化（滑らか）
+    - [52, 330, 1, 1]    # アクティブ帯（ギャップ/歯/コイル/磁石）: fine 固定（cf=1）
+    - [330, 450, 4, 4]   # 深部ヨーク: 4倍粗大化（滑らか）
+  robin_p: 12.0          # Robin 透過係数 α（界面は鉄中に置くこと）
+  overlap: 4             # バンドのオーバーラップ（fine 列数）
+  max_outer: 8           # Schwarz 外部反復の上限（推奨 4〜8: flux は ~4 sweep で収束する）
+  tol: 1.0e-3            # 相対 Schwarz 残差 ||G-Gprev||/||G|| の停止しきい値
+  # relax: 0.7           # 界面が振動する場合の下方緩和（既定 1.0 = なし）
+  # max_inner: 3         # 平坦化 Schwarz: sweep あたりのサブドメイン NK 反復上限（既定 3）。
+                         #   各 sweep でフル NK を回すと反復数が掛け算になり极端に遅くなるため、
+                         #   非線形緩和を sweep 側に分散します（最後に上限なしの polish sweep を実行）。
+                         #   0 以下 = 旧来のネスト動作（非推奨: 実測で ~9 倍遅い）
+```
+
+**バンド設計のルール（収束のため重要）**:
+- **アクティブ帯（ギャップ／磁石／コイルを含む帯）は必ず fine 固定（`cf_r=cf_theta=1`）**。ここを粗く
+  すると Schwarz 反復が**発散**します。
+- バンド境界（`c0`/`c1`）は**鉄の中**に置く。空気ギャップやコイルを跨ぐ界面は発散します。
+- **エアギャップは fine バンド（cf=1）の内側**に収める。
+- `cf_theta=1` は半径方向のみ粗大化（スロット／磁石の θ 構造を保持）。
+- 界面がギャップ近傍の高勾配帯にかかる場合は `overlap` を増やして界面を鉄側に逃がす。
+
+> **一様ダウンサンプリングが目的なら「単一バンド」を使う**: `bands: [[0, nr, 2, 2]]` のように全域を
+> 1バンドにすると、界面（Robin結合）が無い＝1枚の粗グリッドをそのまま解く＝**一様ダウンサンプリング
+> そのもの**になり、安定かつ厳密です（DOF 25%、flux はその解像度の精度）。
+> なお全域を**複数バンドに分けて**全部粗大化した場合も、v1.6 では自動で bilinear 結合に切り替わり
+> **単一バンドとほぼ同じ解（誤差 ~1%）に収束**します（ただし非効率＝粗サブドメインを無駄に結合する
+> ため）。アクティブ帯を fine 固定にした「混在」構成のみ高精度（flux <1%）になります。
+
+**v1.6 安全機構・出力の扱い**:
+- 反復が発散した場合（残差が増大／order-1 で停滞）、**明確なエラーメッセージで停止**します（ゴミの
+  Az を出力しません）。メッセージに従いアクティブ帯を fine に、界面を鉄に置いてください。
+- バンドが半径全域 `[0, nr)` を覆っていない場合、**未被覆列を警告**します（未被覆列は 0 のまま＝flux/
+  場が誤りになるため、必ず全域をタイルしてください）。
+- 出力 Az は反復後に **bilinear + partition-of-unity** で平滑化されます（粗大化バンドの階段状アーティ
+  ファクトと界面の B スパイクを軽減）。ただし**粗大化領域の B 場は近似**で、界面には残差段差が残ります。
+  **DD の信頼できる出力は flux（積分量）**であって、粗化領域の点ごとの B ではありません。
+
+> **研究用の未完成ノブ（非推奨・off-by-default・WebUI 非露出）**: 上記のリング精度モードに加えて、
+> theta セクター分割＋パッチ並列（`parallel` / band 第5要素 / `theta_cuts`）、2-level Galerkin
+> 粗空間（`coarse`）、解析エアギャップ結合（`gap_link`、ロータ／ステータ 2 分割）がコードに
+> 実装されています。**いずれも IEEJ-D で収束しない／発散することが実測されており（非線形
+> sub-solve の収束率が律速）、本番では使用しないでください。** トレーサビリティのため残していますが
+> WebUI からは露出させていません（調査の詳細は `docs/research/` と git 履歴）。DD の実用形は
+> 上記のリング構成の精度モードです。なお **回転スイープの並列化は別機能**（`transient.parallel_chunks`、
+> [過渡解析](#過渡解析回転シミュレーション)節を参照）として実装されており、そちらは実用可能です。
+
+WebUI では `domain_decomposition:` のスニペット補完が使え、Polar Preprocess が生成する YAML には
+コメントアウト済みの DD ブロックが付くので、必要なときにコメントを外して調整できます。
 
 ---
 
@@ -546,6 +711,8 @@ transient:
 - [x] REST API（外部プログラムからのソルバー制御・自動化）
 - [x] OpenMP 並列化（マルチコア対応）
 - [x] カラー検出 UI（画像から材料色を自動検出）
+- [x] 領域分割（Domain Decomposition）による可変解像度精度モード（極座標、v1.6・任意）
+- [x] チャンク並列スイープ（`transient.parallel_chunks`：回転スイープを複数チャンク同時実行）
 
 ### 将来検討中の機能
 
