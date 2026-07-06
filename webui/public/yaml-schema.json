@@ -734,27 +734,27 @@
     "transient_template": {
       "name": "Transient Analysis Template",
       "trigger": "transient",
-      "snippet": "enabled: true\nenable_sliding: true\ntotal_steps: 1\nslide_direction: vertical\nslide_region_start: 0\nslide_region_end: 1\nslide_pixels_per_step: 1"
+      "snippet": "enabled: true\nenable_sliding: true\ntotal_steps: 1\nslide_direction: vertical\nslide_region_start: 0\nslide_region_end: 1\nslide_pixels_per_step: 1\n# parallel_chunks: 3   # optional: run the sweep in N concurrent chunks (~1.3-1.9x, memory-bandwidth-bound)"
     },
     "nonlinear_picard": {
       "name": "Nonlinear Solver - Picard Method",
       "trigger": "nonlinear_solver",
-      "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 50\ntolerance: 1.0e-5\nrelaxation: 0.7\nverbose: false\nexport_convergence: true"
+      "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 100\ntolerance: 1.0e-3\nrelaxation: 0.7\nverbose: false\nexport_convergence: true"
     },
     "nonlinear_picard_anderson": {
       "name": "Nonlinear Solver - Picard with Anderson Acceleration",
       "trigger": "nonlinear_solver",
-      "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 50\ntolerance: 1.0e-5\nrelaxation: 0.7\nanderson:\n  enabled: true\n  depth: 5\n  beta: 1.0\nverbose: false\nexport_convergence: true"
+      "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 100\ntolerance: 1.0e-3\nrelaxation: 0.7\nanderson:\n  enabled: true\n  depth: 5\n  beta: 1.0\nverbose: false\nexport_convergence: true"
     },
     "nonlinear_newton_krylov": {
       "name": "Nonlinear Solver - Newton-Krylov",
       "trigger": "nonlinear_solver",
-      "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 50\ntolerance: 1.0e-5\ngmres_restart: 30\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
+      "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 100\ntolerance: 1.0e-3\ngmres_restart: 30\neisenstat_walker:\n  enabled: true\n  gamma: 0.9\n  alpha: 2.0\n  eta_min: 1.0e-6\n  eta_max: 0.1\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
     },
     "nonlinear_newton_krylov_anderson": {
       "name": "Nonlinear Solver - Newton-Krylov + Anderson (Recommended)",
       "trigger": "nonlinear_solver",
-      "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 50\ntolerance: 1.0e-5\ngmres_restart: 30\nanderson:\n  enabled: true\n  depth: 5\n  beta: 0.3\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
+      "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 100\ntolerance: 1.0e-3\ngmres_restart: 30\neisenstat_walker:\n  enabled: true\n  gamma: 0.9\n  alpha: 2.0\n  eta_min: 1.0e-6\n  eta_max: 0.1\nanderson:\n  enabled: true\n  depth: 5\n  beta: 0.3\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
     },
     "material_bh_curve": {
       "name": "Material - B-H Curve Array (nonlinear iron)",
@@ -874,7 +874,7 @@
     "polar_2d_motor": {
       "name": "Polar 2D Motor Analysis",
       "description": "Template for 2D motor analysis in polar coordinates",
-      "content": "coordinate_system: polar\n\nmesh:\n  dx: 0.2e-3\n  dy: 0.2e-3\n\npolar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # π/3\n\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0.0\n  outer:\n    type: dirichlet\n    value: 0.0\n  theta_min:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n  theta_max:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n\nmaterials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n\n  iron_stator:\n    rgb: [128, 128, 128]\n    mu_r: 100.0\n    jz: 0.0\n    calc_force: false\n\n  iron_rotor:\n    rgb: [100, 100, 100]\n    mu_r: 500.0\n    jz: 0.0\n    calc_force: true\n\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 167\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n"
+      "content": "coordinate_system: polar\n\npolar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # π/3\n\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0.0\n  outer:\n    type: dirichlet\n    value: 0.0\n  theta_min:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n  theta_max:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n\nmaterials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n\n  iron_stator:\n    rgb: [128, 128, 128]\n    mu_r: 100.0\n    jz: 0.0\n    calc_force: false\n\n  iron_rotor:\n    rgb: [100, 100, 100]\n    mu_r: 500.0\n    jz: 0.0\n    calc_force: true\n\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 167\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n"
     }
   }
 }

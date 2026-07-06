@@ -1114,6 +1114,12 @@
                             style="width: 100%; margin-top: 6px; display: none;">
                         Polarize Cross-Section
                     </button>
+                    <button class="btn-secondary" id="cartesianTemplateBtn"
+                            onclick="insertCartesianTemplate()"
+                            style="width: 100%; margin-top: 6px; display: none;"
+                            title="Generate a Cartesian (linear-motor / unwrapped-strip) YAML template directly from this image — no polar detection needed. Emits mesh, periodic-travel / Dirichlet-stack boundary conditions, a commented linear-slide transient skeleton, and the solver defaults.">
+                        Cartesian / Linear Template
+                    </button>
                     <button class="btn-secondary" id="magPreviewBtn"
                             onclick="openMagnetizationPreviewModal()"
                             style="width: 100%; margin-top: 6px; display: none;"
