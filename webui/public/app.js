@@ -4442,16 +4442,192 @@ async function insertCartesianTemplate() {
 // by a browser cookie, and are pruned after long inactivity. Export downloads
 // them all as one JSON file; Import restores them into the current browser's
 // session (useful after clearing the cache or moving to a new device).
-function exportUserData() {
+// ---- Export modal: pick individual files (configs / images / libraries /
+// results) to include in a .zip backup, with per-file sizes, a running total,
+// and incremental rendering so a large results tree stays responsive. ----
+const BACKUP_CAT_LABEL = {
+    configs: 'Configs', images: 'Uploaded images',
+    libraries: 'Material libraries', results: 'Analysis results',
+};
+const BACKUP_RENDER_BATCH = 150;
+
+function fmtBytes(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+}
+
+async function openBackupModal() {
     if (!AppState.userId) { showStatus('solverStatus', 'No user session yet', 'error'); return; }
-    // Trigger a download of the attachment response from GET /api/export.
-    const a = document.createElement('a');
-    a.href = `/api/export?userId=${encodeURIComponent(AppState.userId)}`;
-    a.download = '';   // let the server's Content-Disposition filename win
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    showStatus('solverStatus', 'Preparing your backup download…', 'success');
+    const modal = document.getElementById('backupModal');
+    const list = document.getElementById('backupModalList');
+    list.innerHTML = '<div style="color:#888; padding:12px;">Loading…</div>';
+    modal.style.display = 'flex';
+    let manifest;
+    try {
+        manifest = await fetch(`/api/backup-manifest?userId=${encodeURIComponent(AppState.userId)}`).then(r => r.json());
+        if (!manifest.success) throw new Error(manifest.error || 'failed');
+    } catch (err) {
+        list.innerHTML = `<div style="color:#c00; padding:12px;">Failed to list your content: ${err.message}</div>`;
+        return;
+    }
+    // Build the flat model: ordered rows (category headers + items), a size map,
+    // per-category entry lists, and a selection Set (default = all but results).
+    const rows = [], sizeByEntry = new Map(), catItems = {};
+    const selected = new Set();
+    let totalSize = 0, totalCount = 0;
+    for (const cat of Object.keys(BACKUP_CAT_LABEL)) {
+        const files = (manifest.categories && manifest.categories[cat]) || [];
+        catItems[cat] = [];
+        if (!files.length) continue;
+        rows.push({ type: 'header', cat });
+        for (const f of files) {
+            const entry = `${cat}/${f.path}`;
+            rows.push({ type: 'item', cat, entry, size: f.size });
+            sizeByEntry.set(entry, f.size);
+            catItems[cat].push(entry);
+            totalSize += f.size; totalCount++;
+            if (cat !== 'results') selected.add(entry);   // results default OFF (large)
+        }
+    }
+    AppState.backup = { rows, sizeByEntry, catItems, selected, totalSize, totalCount, rendered: 0 };
+    list.innerHTML = '';
+    list.onscroll = () => {
+        if (list.scrollTop + list.clientHeight >= list.scrollHeight - 120) backupRenderMore();
+    };
+    if (totalCount === 0) {
+        list.innerHTML = '<div style="color:#888; padding:12px;">No saved content yet.</div>';
+    } else {
+        backupRenderMore();
+    }
+    backupUpdateSummary();
+}
+
+function closeBackupModal() { document.getElementById('backupModal').style.display = 'none'; }
+
+function backupRenderMore() {
+    const b = AppState.backup; if (!b) return;
+    const list = document.getElementById('backupModalList');
+    const end = Math.min(b.rendered + BACKUP_RENDER_BATCH, b.rows.length);
+    const frag = document.createDocumentFragment();
+    for (let i = b.rendered; i < end; i++) {
+        const row = b.rows[i];
+        if (row.type === 'header') {
+            const items = b.catItems[row.cat];
+            const catSize = items.reduce((s, e) => s + (b.sizeByEntry.get(e) || 0), 0);
+            const h = document.createElement('div');
+            h.style.cssText = 'margin:8px 0 4px; padding-top:6px; border-top:1px solid #eee; font-weight:600; font-size:0.85rem; display:flex; align-items:center; gap:6px;';
+            h.innerHTML =
+                `<input type="checkbox" data-cat-header="${row.cat}" onchange="backupToggleCategory('${row.cat}', this.checked)"> ` +
+                `${BACKUP_CAT_LABEL[row.cat]} <span style="color:#888; font-weight:400;">(${items.length} file(s), ${fmtBytes(catSize)})</span>`;
+            frag.appendChild(h);
+        } else {
+            const label = document.createElement('label');
+            label.style.cssText = 'display:flex; align-items:center; gap:8px; font-size:0.82rem; padding:1px 0 1px 18px;';
+            const shown = row.entry.slice(row.cat.length + 1);
+            label.innerHTML =
+                `<input type="checkbox" data-entry="${row.entry.replace(/"/g, '&quot;')}" ${b.selected.has(row.entry) ? 'checked' : ''} onchange="backupToggleItem(this)"> ` +
+                `<span style="flex:1; word-break:break-all;">${shown}</span>` +
+                `<span style="color:#888; white-space:nowrap;">${fmtBytes(row.size)}</span>`;
+            frag.appendChild(label);
+        }
+    }
+    list.appendChild(frag);
+    b.rendered = end;
+    backupSyncHeaderChecks();
+}
+
+function backupToggleItem(cb) {
+    const b = AppState.backup; if (!b) return;
+    const entry = cb.getAttribute('data-entry').replace(/&quot;/g, '"');
+    if (cb.checked) b.selected.add(entry); else b.selected.delete(entry);
+    backupSyncHeaderChecks();
+    backupUpdateSummary();
+}
+
+function backupToggleCategory(cat, on) {
+    const b = AppState.backup; if (!b) return;
+    for (const e of b.catItems[cat]) { if (on) b.selected.add(e); else b.selected.delete(e); }
+    // Update any rendered item checkboxes for this category.
+    document.querySelectorAll(`#backupModalList input[data-entry]`).forEach(cb => {
+        const entry = cb.getAttribute('data-entry').replace(/&quot;/g, '"');
+        if (entry.startsWith(cat + '/')) cb.checked = on;
+    });
+    backupSyncHeaderChecks();
+    backupUpdateSummary();
+}
+
+function backupSelectAll(on) {
+    const b = AppState.backup; if (!b) return;
+    b.selected.clear();
+    if (on) for (const row of b.rows) if (row.type === 'item') b.selected.add(row.entry);
+    document.querySelectorAll('#backupModalList input[data-entry]').forEach(cb => { cb.checked = on; });
+    backupSyncHeaderChecks();
+    backupUpdateSummary();
+}
+
+function backupSelectAllExceptResults() {
+    const b = AppState.backup; if (!b) return;
+    b.selected.clear();
+    for (const row of b.rows) if (row.type === 'item' && row.cat !== 'results') b.selected.add(row.entry);
+    document.querySelectorAll('#backupModalList input[data-entry]').forEach(cb => {
+        const entry = cb.getAttribute('data-entry').replace(/&quot;/g, '"');
+        cb.checked = !entry.startsWith('results/');
+    });
+    backupSyncHeaderChecks();
+    backupUpdateSummary();
+}
+
+// Reflect per-category selection state on the (rendered) header checkboxes:
+// checked = all selected, unchecked = none, indeterminate = partial.
+function backupSyncHeaderChecks() {
+    const b = AppState.backup; if (!b) return;
+    document.querySelectorAll('#backupModalList input[data-cat-header]').forEach(h => {
+        const cat = h.getAttribute('data-cat-header');
+        const items = b.catItems[cat] || [];
+        const sel = items.filter(e => b.selected.has(e)).length;
+        h.checked = sel === items.length && items.length > 0;
+        h.indeterminate = sel > 0 && sel < items.length;
+    });
+}
+
+function backupUpdateSummary() {
+    const b = AppState.backup; if (!b) return;
+    let selSize = 0;
+    for (const e of b.selected) selSize += (b.sizeByEntry.get(e) || 0);
+    document.getElementById('backupModalSummary').textContent =
+        `Selected ${b.selected.size} / ${b.totalCount} file(s), ${fmtBytes(selSize)} of ${fmtBytes(b.totalSize)}`;
+    const btn = document.getElementById('backupDownloadBtn');
+    if (btn) btn.disabled = b.selected.size === 0;
+}
+
+async function downloadBackup() {
+    const b = AppState.backup; if (!b) return;
+    const entries = [...b.selected];
+    if (!entries.length) { showStatus('solverStatus', 'Select at least one item', 'error'); return; }
+    const btn = document.getElementById('backupDownloadBtn');
+    const old = btn.textContent; btn.disabled = true; btn.textContent = 'Preparing…';
+    try {
+        const resp = await fetch('/api/export', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, entries }),
+        });
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `omfdm-backup-${new Date().toISOString().slice(0, 10)}.zip`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        closeBackupModal();
+        showStatus('solverStatus', `Backup downloaded (${entries.length} file(s), ${fmtBytes(blob.size)}).`, 'success');
+    } catch (err) {
+        showStatus('solverStatus', `Export failed: ${err.message}`, 'error');
+    } finally {
+        btn.disabled = false; btn.textContent = old;
+    }
 }
 
 async function importUserData(input) {
@@ -4471,7 +4647,8 @@ async function importUserData(input) {
         try { await refreshConfigList(); } catch (_) {}
         try { await refreshImageList(); } catch (_) {}
         showStatus('solverStatus',
-            `Imported ${w.config || 0} config(s), ${w.upload || 0} image(s), ${w.library || 0} library file(s)` +
+            `Imported ${w.configs || 0} config(s), ${w.images || 0} image(s), ` +
+            `${w.libraries || 0} library file(s), ${w.results || 0} result file(s)` +
             (nSkip ? ` (${nSkip} skipped)` : '') +
             `. Material libraries appear in the Library Manager.`,
             'success');

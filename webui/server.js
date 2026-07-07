@@ -142,8 +142,130 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
-// JSONボディパーサー
-app.use(express.json());
+// ===== Minimal ZIP reader/writer (zero-dependency, Node built-in zlib) =====
+// Used by the user-content backup export/import. STORE + DEFLATE only, no
+// data-descriptors, UTF-8 names — enough for a faithful backup archive that
+// standard tools (Explorer / unzip / python zipfile) open, and robust enough
+// to read a zip they produced (we parse the central directory).
+const zlib = require('zlib');
+const ZIP_CRC_TABLE = (() => {
+    const t = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        t[n] = c;
+    }
+    return t;
+})();
+function zipCrc32(buf) {
+    let c = ~0;
+    for (let i = 0; i < buf.length; i++) c = ZIP_CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (~c) >>> 0;
+}
+// entries: [{ name: 'configs/x.yaml', data: Buffer }] -> Buffer (a .zip)
+function zipBuild(entries) {
+    const parts = [], central = [];
+    let offset = 0;
+    for (const e of entries) {
+        const nameBuf = Buffer.from(e.name, 'utf8');
+        const crc = zipCrc32(e.data);
+        const comp = zlib.deflateRawSync(e.data);
+        const lfh = Buffer.alloc(30);
+        lfh.writeUInt32LE(0x04034b50, 0); lfh.writeUInt16LE(20, 4);
+        lfh.writeUInt16LE(0x0800, 6);     lfh.writeUInt16LE(8, 8);   // UTF-8 flag, DEFLATE
+        lfh.writeUInt16LE(0, 10);         lfh.writeUInt16LE(0, 12);
+        lfh.writeUInt32LE(crc, 14);       lfh.writeUInt32LE(comp.length, 18);
+        lfh.writeUInt32LE(e.data.length, 22); lfh.writeUInt16LE(nameBuf.length, 26);
+        lfh.writeUInt16LE(0, 28);
+        parts.push(lfh, nameBuf, comp);
+        const cdh = Buffer.alloc(46);
+        cdh.writeUInt32LE(0x02014b50, 0); cdh.writeUInt16LE(20, 4); cdh.writeUInt16LE(20, 6);
+        cdh.writeUInt16LE(0x0800, 8);     cdh.writeUInt16LE(8, 10);
+        cdh.writeUInt16LE(0, 12);         cdh.writeUInt16LE(0, 14);
+        cdh.writeUInt32LE(crc, 16);       cdh.writeUInt32LE(comp.length, 20);
+        cdh.writeUInt32LE(e.data.length, 24); cdh.writeUInt16LE(nameBuf.length, 28);
+        cdh.writeUInt16LE(0, 30); cdh.writeUInt16LE(0, 32); cdh.writeUInt16LE(0, 34);
+        cdh.writeUInt16LE(0, 36); cdh.writeUInt32LE(0, 38); cdh.writeUInt32LE(offset, 42);
+        central.push(cdh, nameBuf);
+        offset += 30 + nameBuf.length + comp.length;
+    }
+    const centralBuf = Buffer.concat(central);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(entries.length, 8); eocd.writeUInt16LE(entries.length, 10);
+    eocd.writeUInt32LE(centralBuf.length, 12); eocd.writeUInt32LE(offset, 16);
+    return Buffer.concat([...parts, centralBuf, eocd]);
+}
+// Buffer (a .zip) -> [{ name, data: Buffer }] (via the central directory)
+function zipRead(buf) {
+    let eocd = -1;
+    const minStart = Math.max(0, buf.length - 22 - 65535);
+    for (let i = buf.length - 22; i >= minStart; i--) {
+        if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('Not a zip file');
+    const count = buf.readUInt16LE(eocd + 10);
+    let cd = buf.readUInt32LE(eocd + 16);
+    const out = [];
+    for (let n = 0; n < count; n++) {
+        if (buf.readUInt32LE(cd) !== 0x02014b50) throw new Error('Corrupt zip central directory');
+        const method = buf.readUInt16LE(cd + 10);
+        const compSize = buf.readUInt32LE(cd + 20);
+        const nameLen = buf.readUInt16LE(cd + 28);
+        const extraLen = buf.readUInt16LE(cd + 30);
+        const commentLen = buf.readUInt16LE(cd + 32);
+        const lho = buf.readUInt32LE(cd + 42);
+        const name = buf.toString('utf8', cd + 46, cd + 46 + nameLen);
+        const lNameLen = buf.readUInt16LE(lho + 26);
+        const lExtraLen = buf.readUInt16LE(lho + 28);
+        const dataStart = lho + 30 + lNameLen + lExtraLen;
+        const comp = buf.slice(dataStart, dataStart + compSize);
+        const data = (method === 8) ? zlib.inflateRawSync(comp) : Buffer.from(comp);
+        if (!name.endsWith('/')) out.push({ name, data });   // skip directory entries
+        cd += 46 + nameLen + extraLen + commentLen;
+    }
+    return out;
+}
+// Recursively collect files under `dir` as { rel, data } (rel uses forward slashes).
+async function walkFiles(dir, base) {
+    const out = [];
+    let names;
+    try { names = await fs.readdir(dir); } catch { return out; }
+    for (const name of names) {
+        const full = path.join(dir, name);
+        let st;
+        try { st = await fs.stat(full); } catch { continue; }
+        const rel = base ? `${base}/${name}` : name;
+        if (st.isDirectory()) {
+            out.push(...await walkFiles(full, rel));
+        } else if (st.isFile()) {
+            out.push({ rel, data: await fs.readFile(full) });
+        }
+    }
+    return out;
+}
+
+// Like walkFiles but returns { rel, size } via stat only (no file reads) — used
+// by the backup-manifest so listing a large results tree stays cheap.
+async function walkStats(dir, base) {
+    const out = [];
+    let names;
+    try { names = await fs.readdir(dir); } catch { return out; }
+    for (const name of names) {
+        const full = path.join(dir, name);
+        let st;
+        try { st = await fs.stat(full); } catch { continue; }
+        const rel = base ? `${base}/${name}` : name;
+        if (st.isDirectory()) out.push(...await walkStats(full, rel));
+        else if (st.isFile()) out.push({ path: rel, size: st.size });
+    }
+    return out;
+}
+
+// JSONボディパーサー。上限を引き上げるのは /api/export の選択エントリ配列
+// (多数のファイルパス) を受けるため。個々の config 保存は handler 側で
+// MAX_FILE_SIZE (100KB) を別途強制するので、この上限緩和による回帰はない。
+app.use(express.json({ limit: '25mb' }));
 
 // 静的ファイルの提供 (use BASE_DIR for pkg compatibility)
 const PUBLIC_DIR = isPkg ? path.join(BASE_DIR, 'public') : path.join(__dirname, 'public');
@@ -451,98 +573,152 @@ app.post('/api/config', async (req, res) => {
     }
 });
 
-// ===== User content backup: export / import =====
+// ===== User content backup: export / import (ZIP) =====
 // The browser userId is a cookie and server-side user directories are pruned
 // after USER_EXPIRY_DAYS of inactivity, so clearing the browser or a long
-// absence loses access to configs / uploaded images / material libraries.
-// These two endpoints let a user download all of their content as a single
-// self-contained JSON file and restore it later (into whatever userId the
-// current browser has). Zero new dependencies: fs + JSON, multer (already a
+// absence loses access to a user's content. These endpoints let a user
+// download a standard .zip of their content and restore it later (into
+// whatever userId the current browser has). Zero new dependencies: the zip is
+// built/parsed with the helpers above (Node built-in zlib); multer (already a
 // dependency) receives the file on import.
+//
+// Archive layout (top-level folder = category):
+//   configs/<file>            (USER_CONFIGS_DIR/<userId>/)
+//   images/<file>             (UPLOAD_DIR/<userId>/)
+//   libraries/<file>          (USER_LIBS_DIR/<userId>/)
+//   results/<run>/<path...>   (OUTPUTS_DIR/<userId>/ — nested, opt-in: large)
+const BACKUP_CATS = {
+    configs:   { dir: getUserDir,        recursive: false },
+    images:    { dir: getUserUploadsDir, recursive: false },
+    libraries: { dir: getUserLibsDir,    recursive: false },
+    results:   { dir: (u) => path.join(OUTPUTS_DIR, u.replace(/[^a-zA-Z0-9_-]/g, '')), recursive: true },
+};
 
-// Text file extensions are stored inline as UTF-8; everything else (images) as base64.
-const BACKUP_TEXT_EXT = new Set(['.yaml', '.yml', '.json', '.txt', '.csv']);
-const BACKUP_MAX_FILE = 25 * 1024 * 1024;  // 25 MB per file guard
-
-async function readBackupCategory(dir, category, out) {
-    let names;
-    try { names = await fs.readdir(dir); } catch { return; }  // missing dir -> nothing
-    for (const name of names) {
-        const full = path.join(dir, name);
-        let st;
-        try { st = await fs.stat(full); } catch { continue; }
-        if (!st.isFile() || st.size > BACKUP_MAX_FILE) continue;
-        const isText = BACKUP_TEXT_EXT.has(path.extname(name).toLowerCase());
-        const buf = await fs.readFile(full);
-        out.push({
-            category,
-            name: path.basename(name),
-            encoding: isText ? 'utf8' : 'base64',
-            content: isText ? buf.toString('utf8') : buf.toString('base64'),
-        });
-    }
-}
-
-// GET /api/export?userId=X -> downloadable JSON backup of all user content.
-app.get('/api/export', async (req, res) => {
+// GET /api/backup-manifest?userId=X -> per-category file list with sizes (no
+// content), so the export modal can show a checkbox list + a running size total
+// without transferring any file data. Cheap even for a large results tree.
+app.get('/api/backup-manifest', async (req, res) => {
     try {
         const userId = req.query.userId || 'default';
-        const files = [];
-        await readBackupCategory(getUserDir(userId),        'config',  files);
-        await readBackupCategory(getUserUploadsDir(userId), 'upload',  files);
-        await readBackupCategory(getUserLibsDir(userId),    'library', files);
-        const manifest = {
-            format: 'omfdm-backup',
-            version: 1,
-            exportedAt: new Date().toISOString(),
-            counts: {
-                config:  files.filter(f => f.category === 'config').length,
-                upload:  files.filter(f => f.category === 'upload').length,
-                library: files.filter(f => f.category === 'library').length,
-            },
-            files,
-        };
-        const stamp = new Date().toISOString().slice(0, 10);
-        res.setHeader('Content-Type', 'application/json; charset=utf-8');
-        res.setHeader('Content-Disposition', `attachment; filename="omfdm-backup-${stamp}.json"`);
-        res.send(JSON.stringify(manifest));
+        const categories = {};
+        let totalSize = 0;
+        for (const cat of Object.keys(BACKUP_CATS)) {
+            const files = await walkStats(BACKUP_CATS[cat].dir(userId), '');
+            files.sort((a, b) => a.path.localeCompare(b.path));
+            categories[cat] = files;
+            for (const f of files) totalSize += f.size;
+        }
+        res.json({ success: true, categories, totalSize });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// POST /api/import (multipart: field 'backup' = the JSON file, field 'userId')
-// -> writes the backup's files into the current user's directories.
+// Resolve a "<category>/<relative...>" archive entry name to an absolute path
+// inside that category's user directory (or null if invalid / traversal).
+function resolveBackupEntry(userId, entryName) {
+    const parts = String(entryName).split('/').filter(p => p && p !== '.' && p !== '..');
+    if (parts.length < 2) return null;
+    const spec = BACKUP_CATS[parts[0]];
+    if (!spec) return null;
+    if (!spec.recursive && parts.length !== 2) return null;   // flat categories: no subfolders
+    return { cat: parts[0], full: path.join(spec.dir(userId), ...parts.slice(1)) };
+}
+
+// Build + stream a .zip backup. Two forms:
+//   GET  /api/export?userId=X&include=configs,images,libraries[,results]
+//        -> whole categories (default = all except results).
+//   POST /api/export  { userId, entries: ["configs/a.yaml", "results/run1/x.tiff", ...] }
+//        -> exactly the selected files (used by the file-picker modal). Sent as
+//        a blob so the browser can save it (POST can't navigate to a download).
+async function buildBackupZip(userId, entryNames) {
+    const entries = [];
+    for (const name of entryNames) {
+        const r = resolveBackupEntry(userId, name);
+        if (!r) continue;
+        let data;
+        try { data = await fs.readFile(r.full); } catch { continue; }
+        entries.push({ name, data });
+    }
+    return zipBuild(entries);
+}
+function sendBackupZip(res, zip) {
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="omfdm-backup-${stamp}.zip"`);
+    res.send(zip);
+}
+app.get('/api/export', async (req, res) => {
+    try {
+        const userId = req.query.userId || 'default';
+        const include = (req.query.include || 'configs,images,libraries')
+            .split(',').map(s => s.trim()).filter(c => BACKUP_CATS[c]);
+        const names = [];
+        for (const cat of include) {
+            for (const f of await walkStats(BACKUP_CATS[cat].dir(userId), '')) names.push(`${cat}/${f.path}`);
+        }
+        sendBackupZip(res, await buildBackupZip(userId, names));
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+app.post('/api/export', async (req, res) => {
+    try {
+        const { userId, entries } = req.body || {};
+        if (!Array.isArray(entries)) return res.status(400).json({ success: false, error: 'entries[] required' });
+        sendBackupZip(res, await buildBackupZip(userId || 'default', entries));
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /api/import (multipart: field 'backup' = the .zip, field 'userId')
+//   -> restores every entry into the current user's directories, routed by the
+//   top-level folder. Backward compatible: a legacy JSON backup is also accepted.
 app.post('/api/import', upload.single('backup'), async (req, res) => {
-    let tmpPath = req.file && req.file.path;
+    const tmpPath = req.file && req.file.path;
     try {
         const userId = (req.body && req.body.userId) || 'default';
         if (!req.file) return res.status(400).json({ success: false, error: 'No backup file uploaded' });
-        const raw = await fs.readFile(tmpPath, 'utf8');
-        let manifest;
-        try { manifest = JSON.parse(raw); } catch { throw new Error('Not a valid backup file (JSON parse failed)'); }
-        if (!manifest || manifest.format !== 'omfdm-backup' || !Array.isArray(manifest.files)) {
-            throw new Error('Not an OpenMagFDM backup file');
-        }
+        const raw = await fs.readFile(tmpPath);
         await initializeUserDir(userId);
-        const dirFor = {
-            config:  getUserDir(userId),
-            upload:  getUserUploadsDir(userId),
-            library: getUserLibsDir(userId),
+
+        // Sanitize a zip entry path: split into "<category>/<relative...>",
+        // reject traversal, and resolve to an absolute path inside the category dir.
+        const resolveEntry = (entryName) => {
+            const parts = entryName.split('/').filter(p => p && p !== '.' && p !== '..');
+            if (parts.length < 2) return null;
+            const cat = parts[0];
+            const spec = BACKUP_CATS[cat];
+            if (!spec) return null;
+            if (!spec.recursive && parts.length !== 2) return null;   // flat categories: no subfolders
+            const relParts = parts.slice(1);
+            return { cat, full: path.join(spec.dir(userId), ...relParts) };
         };
-        for (const d of Object.values(dirFor)) { await fs.mkdir(d, { recursive: true }).catch(() => {}); }
-        const written = { config: 0, upload: 0, library: 0 }, skipped = [];
-        for (const f of manifest.files) {
-            const dir = dirFor[f.category];
-            if (!dir || typeof f.name !== 'string' || typeof f.content !== 'string') { skipped.push(f && f.name); continue; }
-            const safe = path.basename(f.name);
-            if (!safe || safe === '.' || safe === '..') { skipped.push(f.name); continue; }
-            const buf = (f.encoding === 'base64')
-                ? Buffer.from(f.content, 'base64')
-                : Buffer.from(f.content, 'utf8');
-            if (buf.length > BACKUP_MAX_FILE) { skipped.push(f.name); continue; }
-            await fs.writeFile(path.join(dir, safe), buf);
-            written[f.category] = (written[f.category] || 0) + 1;
+
+        const written = { configs: 0, images: 0, libraries: 0, results: 0 };
+        const skipped = [];
+        let items;
+        // ZIP (starts with 'PK\x03\x04' or 'PK\x05\x06') else try legacy JSON.
+        if (raw.length >= 2 && raw[0] === 0x50 && raw[1] === 0x4b) {
+            items = zipRead(raw).map(e => ({ name: e.name, data: e.data }));
+        } else {
+            const manifest = JSON.parse(raw.toString('utf8'));
+            if (!manifest || manifest.format !== 'omfdm-backup' || !Array.isArray(manifest.files)) {
+                throw new Error('Not an OpenMagFDM backup file');
+            }
+            const catMap = { config: 'configs', upload: 'images', library: 'libraries' };
+            items = manifest.files.map(f => ({
+                name: `${catMap[f.category] || f.category}/${f.name}`,
+                data: f.encoding === 'base64' ? Buffer.from(f.content, 'base64') : Buffer.from(f.content, 'utf8'),
+            }));
+        }
+        for (const it of items) {
+            const r = resolveEntry(it.name);
+            if (!r) { skipped.push(it.name); continue; }
+            await fs.mkdir(path.dirname(r.full), { recursive: true }).catch(() => {});
+            await fs.writeFile(r.full, it.data);
+            written[r.cat] = (written[r.cat] || 0) + 1;
         }
         res.json({ success: true, written, skipped });
     } catch (error) {

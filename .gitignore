@@ -105,6 +105,8 @@ uploads/
 # Node modules
 webui/node_modules/
 configs/
+outputs/
+user-libs/
 
 CLAUDE.md
 technical_report.md

@@ -1051,11 +1051,11 @@
                     <span style="margin-left: 12px; padding-left: 12px; border-left: 1px solid #dee2e6;
                                 display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                         <button class="btn-secondary" onclick="openLibraryManager()">Material Library Manager</button>
-                        <button class="btn-secondary" onclick="exportUserData()"
-                                title="Download all your configs, uploaded images, and material libraries as a single backup file. Your data is tied to a browser cookie and is pruned after long inactivity, so keep a backup to survive cache clears / a new device.">Export My Data</button>
+                        <button class="btn-secondary" onclick="openBackupModal()"
+                                title="Pick exactly which configs / images / material libraries / results to download as a .zip backup. Your data is tied to a browser cookie and is pruned after long inactivity, so keep a backup to survive cache clears / a new device.">Export My Data…</button>
                         <button class="btn-secondary" onclick="document.getElementById('importDataInput').click()"
-                                title="Restore configs / images / material libraries from a backup file downloaded earlier.">Import Data</button>
-                        <input type="file" id="importDataInput" accept="application/json,.json" style="display:none" onchange="importUserData(this)">
+                                title="Restore configs / images / material libraries / results from a .zip backup downloaded earlier.">Import Data</button>
+                        <input type="file" id="importDataInput" accept=".zip,application/zip,application/json,.json" style="display:none" onchange="importUserData(this)">
                         <span id="activeLibraryBadge" style="display: none; background: #e3f2fd; border: 1px solid #90caf9;
                               border-radius: 12px; padding: 3px 10px; font-size: 0.82rem; color: #1565c0; white-space: nowrap;">
                             Library: <strong id="activeLibraryName"></strong>
@@ -1681,6 +1681,37 @@
                 <div style="display: flex; gap: 8px;">
                     <button class="btn-primary"   id="libSaveBtn"   onclick="saveLibrary()"     style="display: none;">Save</button>
                     <button class="btn-secondary" onclick="closeLibraryManager()">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Backup (Export My Data) Modal -->
+    <div id="backupModal" class="modal" style="display: none;">
+        <div class="modal-content" style="max-width: 680px; width: 92%; height: 80vh; max-height: 90vh; display: flex; flex-direction: column;">
+            <div class="modal-header">
+                <h3>Export My Data (.zip)</h3>
+                <button onclick="closeBackupModal()" style="background: none; border: none; font-size: 1.5rem; cursor: pointer;">&times;</button>
+            </div>
+            <div class="modal-body" style="display:flex; flex-direction:column; gap:10px; flex:1; overflow:hidden;">
+                <div style="font-size:0.85rem; color:#555;">
+                    Tick the items to include, then Download. Your content is tied to a browser cookie and pruned after long
+                    inactivity — keep the .zip to restore later (Import Data) on any browser or device.
+                </div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; font-size:0.85rem;">
+                    <button class="btn-secondary" style="padding:3px 10px;" onclick="backupSelectAll(true)">Select all</button>
+                    <button class="btn-secondary" style="padding:3px 10px;" onclick="backupSelectAll(false)">Clear</button>
+                    <button class="btn-secondary" style="padding:3px 10px;" onclick="backupSelectAllExceptResults()">All except results</button>
+                </div>
+                <div id="backupModalList" style="flex:1; overflow-y:auto; border:1px solid #dee2e6; border-radius:6px; padding:6px 10px;">
+                    <div style="color:#888; padding:12px;">Loading…</div>
+                </div>
+            </div>
+            <div class="modal-footer" style="justify-content: space-between; align-items:center;">
+                <span id="backupModalSummary" style="font-size:0.85rem; color:#555;"></span>
+                <div style="display:flex; gap:8px;">
+                    <button class="btn-secondary" onclick="closeBackupModal()">Cancel</button>
+                    <button class="btn-primary" id="backupDownloadBtn" onclick="downloadBackup()">Download .zip</button>
                 </div>
             </div>
         </div>
