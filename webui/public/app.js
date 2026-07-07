@@ -10383,34 +10383,18 @@ async function refreshOutputsList() {
             return;
         }
 
-        // Build output list HTML
-        let html = '';
-        for (const output of result.outputs) {
-            const date = new Date(output.created).toLocaleString('ja-JP');
-            // Escape output name for safe HTML embedding
-            const escapedName = output.name.replace(/'/g, "\\'");
-
-            html += `
-                <div class="output-item" data-folder="${escapedName}" onclick="selectOutput('${escapedName}', event)">
-                    <input type="checkbox" class="output-checkbox"
-                           data-folder="${escapedName}"
-                           onclick="event.stopPropagation(); updateSelectedCount()">
-                    <div class="output-info">
-                        <div class="output-name">${output.name}</div>
-                        <div class="output-details">
-                            Created: ${date} | Size: ${output.sizeFormatted} | Steps: ${output.steps}
-                        </div>
-                    </div>
-                    <div class="output-actions">
-                        <button class="btn-secondary btn-small" onclick="event.stopPropagation(); renameOutput('${escapedName}')">Rename</button>
-                        <button class="btn-secondary btn-small" onclick="event.stopPropagation(); editDescription('${escapedName}')">Memo</button>
-                        <button class="btn-delete btn-small" onclick="event.stopPropagation(); deleteOutput('${escapedName}')">Delete</button>
-                    </div>
-                </div>
-            `;
+        // Render incrementally: keep the full list in state and append rows in
+        // batches as the panel scrolls, so a user with hundreds of result
+        // folders doesn't build (and lay out) every row at once.
+        AppState.fileManager = { outputs: result.outputs, rendered: 0 };
+        outputsList.innerHTML = '';
+        fileManagerRenderMore();
+        const panel = outputsList.closest('.file-list-panel');
+        if (panel) {
+            panel.onscroll = () => {
+                if (panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 150) fileManagerRenderMore();
+            };
         }
-
-        outputsList.innerHTML = html;
 
         // Reset selection count
         updateSelectedCount();
@@ -10419,6 +10403,46 @@ async function refreshOutputsList() {
         console.error('Error loading outputs:', error);
         outputsList.innerHTML = `<p style="color: #dc3545;">Error: ${error.message}</p>`;
     }
+}
+
+// One output-folder row's HTML (extracted so the incremental renderer and any
+// future re-render share the same markup).
+const FILE_MANAGER_BATCH = 60;
+function fileManagerOutputHtml(output) {
+    const date = new Date(output.created).toLocaleString('ja-JP');
+    const escapedName = output.name.replace(/'/g, "\\'");
+    return `
+        <div class="output-item" data-folder="${escapedName}" onclick="selectOutput('${escapedName}', event)">
+            <input type="checkbox" class="output-checkbox"
+                   data-folder="${escapedName}"
+                   onclick="event.stopPropagation(); updateSelectedCount()">
+            <div class="output-info">
+                <div class="output-name">${output.name}</div>
+                <div class="output-details">
+                    Created: ${date} | Size: ${output.sizeFormatted} | Steps: ${output.steps}
+                </div>
+            </div>
+            <div class="output-actions">
+                <button class="btn-secondary btn-small" onclick="event.stopPropagation(); renameOutput('${escapedName}')">Rename</button>
+                <button class="btn-secondary btn-small" onclick="event.stopPropagation(); editDescription('${escapedName}')">Memo</button>
+                <button class="btn-delete btn-small" onclick="event.stopPropagation(); deleteOutput('${escapedName}')">Delete</button>
+            </div>
+        </div>
+    `;
+}
+
+// Append the next batch of output rows (or all remaining) to #outputsList.
+function fileManagerRenderMore() {
+    const fm = AppState.fileManager;
+    if (!fm) return;
+    const list = document.getElementById('outputsList');
+    if (!list) return;
+    const end = Math.min(fm.rendered + FILE_MANAGER_BATCH, fm.outputs.length);
+    if (end <= fm.rendered) return;
+    let html = '';
+    for (let i = fm.rendered; i < end; i++) html += fileManagerOutputHtml(fm.outputs[i]);
+    list.insertAdjacentHTML('beforeend', html);
+    fm.rendered = end;
 }
 
 /**
@@ -10668,11 +10692,15 @@ function updateSelectedCount() {
  */
 function toggleSelectAll() {
     const selectAll = document.getElementById('selectAllOutputs');
-    const checkboxes = document.querySelectorAll('.output-checkbox');
-
     if (!selectAll) return;
 
-    checkboxes.forEach(cb => {
+    // When selecting all, first render every remaining row so unrendered
+    // (lazily-loaded) folders are included in the selection / bulk delete.
+    if (selectAll.checked && AppState.fileManager) {
+        while (AppState.fileManager.rendered < AppState.fileManager.outputs.length) fileManagerRenderMore();
+    }
+
+    document.querySelectorAll('.output-checkbox').forEach(cb => {
         cb.checked = selectAll.checked;
     });
 
