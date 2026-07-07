@@ -379,7 +379,7 @@
     "nonlinear_solver": {
       "description": "Nonlinear solver configuration for materials with field-dependent permeability μ(H)",
       "children": ["enabled", "solver_type", "max_iterations", "tolerance", "anderson", "line_search_c", "line_search_alpha_init", "line_search_alpha_min", "line_search_rho", "line_search_max_trials", "line_search_adaptive", "verbose", "export_convergence", "eisenstat_walker"],
-      "example": "nonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  max_iterations: 50\n  tolerance: 1.0e-3\n  verbose: false\n  eisenstat_walker:\n    enabled: true"
+      "example": "nonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  max_iterations: 100\n  tolerance: 1.0e-3\n  verbose: false\n  eisenstat_walker:\n    enabled: true"
     },
     "eisenstat_walker": {
       "description": "[Phase BC, v1.5.1+] Eisenstat-Walker inexact-Newton forcing for the inner AMGCL CG tolerance. When enabled, η_k = γ·(‖R_k‖/‖R_{k-1}‖)^α clipped to [eta_min, eta_max] — lets the inner CG stop early in outer iters where the Newton residual is still loose, avoiding wasteful 1e-6 inner accuracy. Headline measured win on IEEJ-D IPMSM: 377 s → 153 s (-59 %, 2.5× speedup). Default off; turn on for any nonlinear run.",
@@ -438,13 +438,13 @@
     "max_iterations": {
       "description": "Maximum number of nonlinear iterations",
       "type": "integer",
-      "example": "max_iterations: 50",
+      "example": "max_iterations: 100",
       "validParents": ["nonlinear_solver"]
     },
     "tolerance": {
-      "description": "Convergence tolerance (relative residual norm)",
+      "description": "Convergence tolerance (relative residual norm). On stiff B-H problems the residual plateau floor is ~5e-3, so 1e-3 is a realistic target; tighter values never converge and hit max_iterations.",
       "type": "number",
-      "example": "tolerance: 1.0e-5",
+      "example": "tolerance: 1.0e-3",
       "validParents": ["nonlinear_solver"]
     },
     "line_search_c": {
