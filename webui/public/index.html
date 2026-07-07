@@ -1051,6 +1051,11 @@
                     <span style="margin-left: 12px; padding-left: 12px; border-left: 1px solid #dee2e6;
                                 display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                         <button class="btn-secondary" onclick="openLibraryManager()">Material Library Manager</button>
+                        <button class="btn-secondary" onclick="exportUserData()"
+                                title="Download all your configs, uploaded images, and material libraries as a single backup file. Your data is tied to a browser cookie and is pruned after long inactivity, so keep a backup to survive cache clears / a new device.">Export My Data</button>
+                        <button class="btn-secondary" onclick="document.getElementById('importDataInput').click()"
+                                title="Restore configs / images / material libraries from a backup file downloaded earlier.">Import Data</button>
+                        <input type="file" id="importDataInput" accept="application/json,.json" style="display:none" onchange="importUserData(this)">
                         <span id="activeLibraryBadge" style="display: none; background: #e3f2fd; border: 1px solid #90caf9;
                               border-radius: 12px; padding: 3px 10px; font-size: 0.82rem; color: #1565c0; white-space: nowrap;">
                             Library: <strong id="activeLibraryName"></strong>

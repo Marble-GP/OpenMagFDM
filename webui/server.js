@@ -451,6 +451,107 @@ app.post('/api/config', async (req, res) => {
     }
 });
 
+// ===== User content backup: export / import =====
+// The browser userId is a cookie and server-side user directories are pruned
+// after USER_EXPIRY_DAYS of inactivity, so clearing the browser or a long
+// absence loses access to configs / uploaded images / material libraries.
+// These two endpoints let a user download all of their content as a single
+// self-contained JSON file and restore it later (into whatever userId the
+// current browser has). Zero new dependencies: fs + JSON, multer (already a
+// dependency) receives the file on import.
+
+// Text file extensions are stored inline as UTF-8; everything else (images) as base64.
+const BACKUP_TEXT_EXT = new Set(['.yaml', '.yml', '.json', '.txt', '.csv']);
+const BACKUP_MAX_FILE = 25 * 1024 * 1024;  // 25 MB per file guard
+
+async function readBackupCategory(dir, category, out) {
+    let names;
+    try { names = await fs.readdir(dir); } catch { return; }  // missing dir -> nothing
+    for (const name of names) {
+        const full = path.join(dir, name);
+        let st;
+        try { st = await fs.stat(full); } catch { continue; }
+        if (!st.isFile() || st.size > BACKUP_MAX_FILE) continue;
+        const isText = BACKUP_TEXT_EXT.has(path.extname(name).toLowerCase());
+        const buf = await fs.readFile(full);
+        out.push({
+            category,
+            name: path.basename(name),
+            encoding: isText ? 'utf8' : 'base64',
+            content: isText ? buf.toString('utf8') : buf.toString('base64'),
+        });
+    }
+}
+
+// GET /api/export?userId=X -> downloadable JSON backup of all user content.
+app.get('/api/export', async (req, res) => {
+    try {
+        const userId = req.query.userId || 'default';
+        const files = [];
+        await readBackupCategory(getUserDir(userId),        'config',  files);
+        await readBackupCategory(getUserUploadsDir(userId), 'upload',  files);
+        await readBackupCategory(getUserLibsDir(userId),    'library', files);
+        const manifest = {
+            format: 'omfdm-backup',
+            version: 1,
+            exportedAt: new Date().toISOString(),
+            counts: {
+                config:  files.filter(f => f.category === 'config').length,
+                upload:  files.filter(f => f.category === 'upload').length,
+                library: files.filter(f => f.category === 'library').length,
+            },
+            files,
+        };
+        const stamp = new Date().toISOString().slice(0, 10);
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="omfdm-backup-${stamp}.json"`);
+        res.send(JSON.stringify(manifest));
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// POST /api/import (multipart: field 'backup' = the JSON file, field 'userId')
+// -> writes the backup's files into the current user's directories.
+app.post('/api/import', upload.single('backup'), async (req, res) => {
+    let tmpPath = req.file && req.file.path;
+    try {
+        const userId = (req.body && req.body.userId) || 'default';
+        if (!req.file) return res.status(400).json({ success: false, error: 'No backup file uploaded' });
+        const raw = await fs.readFile(tmpPath, 'utf8');
+        let manifest;
+        try { manifest = JSON.parse(raw); } catch { throw new Error('Not a valid backup file (JSON parse failed)'); }
+        if (!manifest || manifest.format !== 'omfdm-backup' || !Array.isArray(manifest.files)) {
+            throw new Error('Not an OpenMagFDM backup file');
+        }
+        await initializeUserDir(userId);
+        const dirFor = {
+            config:  getUserDir(userId),
+            upload:  getUserUploadsDir(userId),
+            library: getUserLibsDir(userId),
+        };
+        for (const d of Object.values(dirFor)) { await fs.mkdir(d, { recursive: true }).catch(() => {}); }
+        const written = { config: 0, upload: 0, library: 0 }, skipped = [];
+        for (const f of manifest.files) {
+            const dir = dirFor[f.category];
+            if (!dir || typeof f.name !== 'string' || typeof f.content !== 'string') { skipped.push(f && f.name); continue; }
+            const safe = path.basename(f.name);
+            if (!safe || safe === '.' || safe === '..') { skipped.push(f.name); continue; }
+            const buf = (f.encoding === 'base64')
+                ? Buffer.from(f.content, 'base64')
+                : Buffer.from(f.content, 'utf8');
+            if (buf.length > BACKUP_MAX_FILE) { skipped.push(f.name); continue; }
+            await fs.writeFile(path.join(dir, safe), buf);
+            written[f.category] = (written[f.category] || 0) + 1;
+        }
+        res.json({ success: true, written, skipped });
+    } catch (error) {
+        res.status(400).json({ success: false, error: error.message });
+    } finally {
+        if (tmpPath) { fs.unlink(tmpPath).catch(() => {}); }
+    }
+});
+
 // Validate YAML configuration without saving
 app.post('/api/validate-config', async (req, res) => {
     try {

@@ -4437,6 +4437,49 @@ async function insertCartesianTemplate() {
         'success');
 }
 
+// ===== User content backup: export / import =====
+// Your configs, uploaded images, and material libraries live server-side keyed
+// by a browser cookie, and are pruned after long inactivity. Export downloads
+// them all as one JSON file; Import restores them into the current browser's
+// session (useful after clearing the cache or moving to a new device).
+function exportUserData() {
+    if (!AppState.userId) { showStatus('solverStatus', 'No user session yet', 'error'); return; }
+    // Trigger a download of the attachment response from GET /api/export.
+    const a = document.createElement('a');
+    a.href = `/api/export?userId=${encodeURIComponent(AppState.userId)}`;
+    a.download = '';   // let the server's Content-Disposition filename win
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    showStatus('solverStatus', 'Preparing your backup download…', 'success');
+}
+
+async function importUserData(input) {
+    const file = input && input.files && input.files[0];
+    input.value = '';   // reset so re-selecting the same file fires change again
+    if (!file) return;
+    if (!AppState.userId) { showStatus('solverStatus', 'No user session yet', 'error'); return; }
+    try {
+        const fd = new FormData();
+        fd.append('backup', file, file.name);
+        fd.append('userId', AppState.userId);
+        const res = await fetch('/api/import', { method: 'POST', body: fd }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'import failed');
+        const w = res.written || {};
+        const nSkip = (res.skipped || []).filter(Boolean).length;
+        // Refresh the lists so the restored content shows up immediately.
+        try { await refreshConfigList(); } catch (_) {}
+        try { await refreshImageList(); } catch (_) {}
+        showStatus('solverStatus',
+            `Imported ${w.config || 0} config(s), ${w.upload || 0} image(s), ${w.library || 0} library file(s)` +
+            (nSkip ? ` (${nSkip} skipped)` : '') +
+            `. Material libraries appear in the Library Manager.`,
+            'success');
+    } catch (err) {
+        showStatus('solverStatus', `Import failed: ${err.message}`, 'error');
+    }
+}
+
 async function insertPolarYaml() {
     const pp = AppState.polarPreprocess;
     const cur = pp.current;
