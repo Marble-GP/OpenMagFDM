@@ -316,6 +316,7 @@ jobs:
         chmod +x OpenMagFDM-WebUI-Linux/webui-server
         cp -r ../webui/public OpenMagFDM-WebUI-Linux/
         cp -r ../webui/icon OpenMagFDM-WebUI-Linux/
+        cp ../sample_config.yaml OpenMagFDM-WebUI-Linux/   # default config the server loads on startup
         tar -czf OpenMagFDM-WebUI-Linux.tar.gz OpenMagFDM-WebUI-Linux
 
         # Windows
@@ -323,6 +324,7 @@ jobs:
         cp webui-server-win.exe OpenMagFDM-WebUI-Windows/webui-server.exe
         cp -r ../webui/public OpenMagFDM-WebUI-Windows/
         cp -r ../webui/icon OpenMagFDM-WebUI-Windows/
+        cp ../sample_config.yaml OpenMagFDM-WebUI-Windows/   # default config the server loads on startup
         zip -r OpenMagFDM-WebUI-Windows.zip OpenMagFDM-WebUI-Windows
 
         # macOS
@@ -331,6 +333,7 @@ jobs:
         chmod +x OpenMagFDM-WebUI-macOS/webui-server
         cp -r ../webui/public OpenMagFDM-WebUI-macOS/
         cp -r ../webui/icon OpenMagFDM-WebUI-macOS/
+        cp ../sample_config.yaml OpenMagFDM-WebUI-macOS/   # default config the server loads on startup
         tar -czf OpenMagFDM-WebUI-macOS.tar.gz OpenMagFDM-WebUI-macOS
 
     - name: Upload artifacts
