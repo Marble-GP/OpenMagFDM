@@ -325,6 +325,7 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
     } else {
         setupCartesianSystem();
     }
+    finalizeSlideRegionUnits();  // decimal (metre) slide bounds -> pixel indices
 
     // (parseUserVariables + expandUserVariablesGlobally already ran at
     // the top of the constructor; setupMaterialProperties just needs the
@@ -732,6 +733,18 @@ int MagneticFieldAnalyzer::evaluateScalarAsInt(const YAML::Node& node,
         evaluateScalarAsDouble(node, static_cast<double>(fallback))));
 }
 
+// True when the YAML scalar is a DECIMAL literal (contains '.' or an
+// exponent) after $variable expansion — the unit marker that distinguishes
+// physical METRES (0.05) from legacy pixel indices (212) in
+// slide_region_start/end. Integer literals keep the pixel meaning, so every
+// pre-existing config parses unchanged.
+static bool scalarIsDecimalLiteral(const YAML::Node& node) {
+    if (!node || !node.IsScalar()) return false;
+    const std::string& s = node.Scalar();
+    return s.find('.') != std::string::npos ||
+           s.find('e') != std::string::npos || s.find('E') != std::string::npos;
+}
+
 void MagneticFieldAnalyzer::parseTransientConfig() {
     if (!config["transient"]) return;
     auto trans = config["transient"];
@@ -749,8 +762,16 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
             sr.name      = sn["name"].as<std::string>("slide_" + std::to_string(idx));
             sr.kind      = sn["kind"].as<std::string>("band");
             sr.direction = sn["direction"].as<std::string>("vertical");
-            sr.region_start    = evaluateScalarAsInt(sn["region_start"],    0);
-            sr.region_end      = evaluateScalarAsInt(sn["region_end"],      0);
+            if (scalarIsDecimalLiteral(sn["region_start"]) ||
+                scalarIsDecimalLiteral(sn["region_end"])) {
+                // Metre-valued bounds (either one decimal promotes both).
+                sr.region_in_metres = true;
+                sr.region_start_m = evaluateScalarAsDouble(sn["region_start"], 0.0);
+                sr.region_end_m   = evaluateScalarAsDouble(sn["region_end"],   0.0);
+            } else {
+                sr.region_start = evaluateScalarAsInt(sn["region_start"], 0);
+                sr.region_end   = evaluateScalarAsInt(sn["region_end"],   0);
+            }
             sr.pixels_per_step = evaluateScalarAsInt(sn["pixels_per_step"], 0);
             // [v1.6 Stage 0] Resolution-independent rotation: angle_rad takes
             // precedence over angle_deg; both override pixels_per_step (resolved
@@ -811,8 +832,16 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
         SlideRegion sr;
         sr.name       = "slide";
         sr.direction  = trans["slide_direction"].as<std::string>("vertical");
-        sr.region_start    = evaluateScalarAsInt(trans["slide_region_start"],    0);
-        sr.region_end      = evaluateScalarAsInt(trans["slide_region_end"],      0);
+        if (scalarIsDecimalLiteral(trans["slide_region_start"]) ||
+            scalarIsDecimalLiteral(trans["slide_region_end"])) {
+            // Metre-valued bounds (either one decimal promotes both).
+            sr.region_in_metres = true;
+            sr.region_start_m = evaluateScalarAsDouble(trans["slide_region_start"], 0.0);
+            sr.region_end_m   = evaluateScalarAsDouble(trans["slide_region_end"],   0.0);
+        } else {
+            sr.region_start = evaluateScalarAsInt(trans["slide_region_start"], 0);
+            sr.region_end   = evaluateScalarAsInt(trans["slide_region_end"],   0);
+        }
         sr.pixels_per_step = evaluateScalarAsInt(trans["slide_pixels_per_step"], 0);
         // [v1.6 Stage 0] Resolution-independent rotation (see slides[] form).
         if (trans["slide_angle_rad"] || trans["slide_angle_deg"]) {
@@ -857,8 +886,14 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
             for (const auto& s : transient_config.slides) {
                 std::string axis = (s.direction == "vertical") ? "x" : "y";
                 std::cout << "    [" << s.name << "] " << s.direction
-                          << ", region " << axis << " in [" << s.region_start
-                          << ", " << s.region_end << "], pixels/step=" << s.pixels_per_step
+                          << ", region " << axis;
+                if (s.region_in_metres) {
+                    std::cout << " in [" << s.region_start_m << ", " << s.region_end_m
+                              << "] m (pixel range resolved once the mesh is known)";
+                } else {
+                    std::cout << " in [" << s.region_start << ", " << s.region_end << "]";
+                }
+                std::cout << ", pixels/step=" << s.pixels_per_step
                           << ", wrap=" << s.wrap_mode << std::endl;
             }
             const std::string cs = config["coordinate_system"].as<std::string>("cartesian");
@@ -868,6 +903,66 @@ void MagneticFieldAnalyzer::parseTransientConfig() {
             }
         }
     }
+}
+
+void MagneticFieldAnalyzer::finalizeSlideRegionUnits() {
+    // Sub-analyzers (DD bands, previews) parse the slide fields but never
+    // slide — skip them so the conversion log appears once, from the analyzer
+    // that actually runs the transient sweep.
+    if (!transient_config.enabled || !transient_config.enable_sliding) return;
+    if (transient_config.slides.empty()) return;
+    const bool pol = (coordinate_system == "polar");
+    for (auto& sr : transient_config.slides) {
+        if (!sr.region_in_metres || sr.kind != "band") continue;
+        double lo = sr.region_start_m, hi = sr.region_end_m;
+        if (lo > hi) {
+            std::cerr << "WARNING: slide region start (" << lo << " m) > end (" << hi
+                      << " m); swapping." << std::endl;
+            std::swap(lo, hi);
+        }
+        // "vertical" slides bound a COLUMN (x) range; "horizontal" a ROW (y) range.
+        const bool bounds_columns = (sr.direction == "vertical");
+        int i0 = 0, i1 = 0, axis_len = 0;
+        if (pol) {
+            // Metres only make sense along the r axis: columns when
+            // r_orientation == horizontal, rows when vertical. Metre bounds on
+            // the theta axis have no defined conversion — fail with guidance.
+            const bool r_on_columns = (r_orientation == "horizontal");
+            if (bounds_columns != r_on_columns) {
+                throw std::runtime_error(
+                    "slide_region_start/end in metres bound the THETA axis for this "
+                    "slide_direction / r_orientation combination — an angle has no metre "
+                    "coordinate. Use integer pixel indices or slide_angle_deg / slide_angle_rad.");
+            }
+            i0 = static_cast<int>(std::lround((lo - r_start) / dr));
+            i1 = static_cast<int>(std::lround((hi - r_start) / dr));
+            axis_len = nr;
+        } else {
+            const double h = bounds_columns ? dx : dy;
+            i0 = static_cast<int>(std::lround(lo / h));
+            i1 = static_cast<int>(std::lround(hi / h));
+            axis_len = bounds_columns ? nx : ny;
+        }
+        const int i0_raw = i0, i1_raw = i1;
+        i0 = std::max(0, std::min(i0, axis_len - 1));
+        i1 = std::max(0, std::min(i1, axis_len - 1));
+        if (i0 != i0_raw || i1 != i1_raw) {
+            std::cerr << "WARNING: slide region [" << lo << ", " << hi
+                      << "] m exceeds the mesh; clamped to pixel range ["
+                      << i0 << ", " << i1 << "]." << std::endl;
+        }
+        sr.region_start = i0;
+        sr.region_end   = i1;
+        sr.region_in_metres = false;   // resolved — repeated calls are no-ops
+        std::cout << "  [" << sr.name << "] slide region " << lo << "-" << hi << " m -> "
+                  << (bounds_columns ? "columns" : "rows")
+                  << " [" << i0 << ", " << i1 << "]" << std::endl;
+    }
+    // Re-mirror slides[0] into the legacy scalar fields the polar transient
+    // paths read (the parse-time mirror ran before this resolution).
+    const auto& s0 = transient_config.slides.front();
+    transient_config.slide_region_start = s0.region_start;
+    transient_config.slide_region_end   = s0.region_end;
 }
 
 void MagneticFieldAnalyzer::finalizeSlideRotationForResolution() {

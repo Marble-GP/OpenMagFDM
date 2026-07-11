@@ -792,6 +792,14 @@ private:
         int region_start = 0;
         int region_end = 0;
         int pixels_per_step = 0;
+        // Physical-unit region bounds: a DECIMAL literal (0.05) in
+        // slide_region_start/end means METRES; an INTEGER literal (212) keeps
+        // the legacy pixel-index meaning. Metre bounds are resolved to pixel
+        // indices once the mesh spacing is known (finalizeSlideRegionUnits):
+        // polar r-axis via (r - r_start)/dr, cartesian via dx / dy.
+        bool   region_in_metres = false;
+        double region_start_m = 0.0;
+        double region_end_m = 0.0;
         // [v1.6 Stage 0] Resolution-independent rotor rotation (polar only).
         // If use_angle, the per-step theta shift is computed as
         // round(angle_rad / dtheta) once the polar mesh is known
@@ -1145,6 +1153,10 @@ private:
     // use_angle) into an integer theta-pixel shift now that dtheta is known.
     // Called once after setupPolarSystem(); polar only.
     void finalizeSlideRotationForResolution();
+    // Resolve metre-valued slide_region_start/end (decimal YAML literals) to
+    // pixel indices once the mesh spacing (dr / dx / dy) is known. No-op for
+    // legacy integer (pixel) bounds.
+    void finalizeSlideRegionUnits();
     // Tinyexpr-aware scalar evaluation helpers used by parseTransientConfig.
     double evaluateScalarAsDouble(const YAML::Node& node, double fallback) const;
     int    evaluateScalarAsInt   (const YAML::Node& node, int    fallback) const;

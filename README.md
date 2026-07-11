@@ -660,11 +660,16 @@ transient:
   enabled: true
   enable_sliding: true        # 画像スライド有効
   total_steps: 100            # 総ステップ数
-  slide_direction: vertical   # スライド方向
-  slide_region_start: 110     # スライド領域開始 [pixel]
-  slide_region_end: 390       # スライド領域終了 [pixel]
+  slide_direction: vertical   # スライド方向 (vertical=列範囲を指定 / horizontal=行範囲を指定)
+  slide_region_start: 0.005   # スライド領域開始 — 小数リテラル = 物理寸法 [m]
+  slide_region_end: 0.0495    # スライド領域終了 [m]
   slide_pixels_per_step: 1    # ステップあたり移動量 [pixel]
 ```
+
+`slide_region_start` / `slide_region_end` は**小数リテラル**（例 `0.05`）なら物理寸法 [m]、
+**整数リテラル**（例 `212`）なら従来どおり画素インデックスとして解釈されます
+（既存 YAML は無変更で動作）。polar では半径 `(r − r_start)/dr`、cartesian では
+`dx`/`dy` で画素に変換され、解決結果が起動ログに表示されます。
 
 ---
 
