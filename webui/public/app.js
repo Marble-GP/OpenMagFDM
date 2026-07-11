@@ -2936,7 +2936,9 @@ AppState.polarPreprocess = {
         air_gap_offset_px: 0,
         // Phase D.3: when true and save_as === 'polar', Insert YAML emits
         // a transient.slides: skeleton anchored at the effective air gap.
-        air_gap_as_slide: false,
+        // Default ON (user request): the emission is still gated on an
+        // air-gap marker actually existing, so it is a no-op without one.
+        air_gap_as_slide: true,
         air_gap_slide_side: 'outside',     // 'inside' | 'outside'
         air_gap_slide_pixels_per_step: 1,
         theta_start: 0, theta_end: 2 * Math.PI,
@@ -3183,7 +3185,7 @@ function resetPolarPreprocessState() {
         r_inner_px: 0, r_outer_px: 0,
         air_gap_px: 0,
         air_gap_offset_px: 0,
-        air_gap_as_slide: false,
+        air_gap_as_slide: true,   // default ON (no-op until a gap marker exists)
         air_gap_slide_side: 'outside',
         air_gap_slide_pixels_per_step: 1,
         theta_start: 0, theta_end: 2 * Math.PI,
@@ -3389,9 +3391,10 @@ function applyDetectionToCurrent(detection) {
     cur.r_inner_px = 0;
     cur.air_gap_px = (detection.r_inner_px && detection.r_inner_px > 0)
         ? detection.r_inner_px : 0;
-    // Phase D.3: a re-detect invalidates any prior offset / slide choice.
+    // Phase D.3: a re-detect invalidates any prior offset / side choice.
+    // The slide checkbox itself returns to its default (ON).
     cur.air_gap_offset_px = 0;
-    cur.air_gap_as_slide = false;
+    cur.air_gap_as_slide = true;
     cur.air_gap_slide_side = 'outside';
     cur.r_outer_px = detection.r_outer_px;
     cur.theta_start = detection.theta_start;
@@ -4494,8 +4497,12 @@ function buildPolarYamlBlock(filename, polarDomain) {
         lines.push('');
         lines.push('# Slide region inferred from the air-gap marker (Polar Preprocess).');
         lines.push(`# Side: ${inside ? 'inside the air gap' : 'outside the air gap'}`);
-        lines.push('# region bounds are PHYSICAL radii in metres (decimal literal = metres;');
-        lines.push(`# integer literal = pixel index). Pixel equivalents: [${region_start}, ${region_end}] of ${nrWarp}.`);
+        lines.push('# UNITS of slide_region_start / slide_region_end:');
+        lines.push('#   decimal literal (0.05)  = PHYSICAL metres — the solver converts to pixels');
+        lines.push('#                             via the mesh (polar: radius; cartesian: x/y)');
+        lines.push('#   integer literal (212)   = pixel index (legacy)');
+        lines.push('# Inverted bounds are swapped and out-of-mesh bounds clamped, with a warning.');
+        lines.push(`# Pixel equivalents of the values below: [${region_start}, ${region_end}] of ${nrWarp}.`);
         if (sched.exact) {
             lines.push(`# Schedule: N_step * N_slide = ${sched.N_step} * ${sched.N_slide} = ${T} (one full revolution over ntheta).`);
         } else {
@@ -4619,7 +4626,9 @@ function buildCartesianYamlBlock(filename, opts) {
     lines.push('#   enable_sliding: true');
     lines.push('#   total_steps: $N_step');
     lines.push('#   slide_direction: horizontal   # shift columns along the travel axis');
-    lines.push('#   slide_region_start: 0.0       # start of the moving band [m] (decimal = metres, integer = pixel row)');
+    lines.push('#   # UNITS: decimal literal (0.05) = PHYSICAL metres (auto-converted to pixels');
+    lines.push('#   #        via mesh dx/dy); integer literal (110) = pixel index (legacy).');
+    lines.push('#   slide_region_start: 0.0       # start of the moving band [m]');
     lines.push(`#   slide_region_end: ${(opts.heightPx > 0 && opts.dxdy > 0 ? (opts.heightPx * opts.dxdy).toPrecision(6) : '0.1')}    # end of the moving band [m] (= full image height)`);
     lines.push('#   slide_pixels_per_step: $N_slide');
     lines.push('#   # parallel_chunks: 3          # run the sweep in N concurrent chunks (~1.3-1.9x)');
