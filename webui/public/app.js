@@ -70,6 +70,7 @@ function flipVertical(data) {
 document.addEventListener('DOMContentLoaded', async () => {
     initializeUserId();
     initializeTabs();
+    initInputImageViewer();
     await initializeConfigEditor();
     initializeDashboard();
     initCustomSelect();
@@ -2347,6 +2348,14 @@ async function openMagnetizationPreviewModal() {
             onScaleChange: () => { /* arrows are in image-coord space; no rescale needed */ },
         }
     );
+    // Pixel rulers tracking the zoom-pan transform (idempotent).
+    const magRulers = attachPixelRulers({
+        topCanvas: document.getElementById('magPreviewRulerTop'),
+        leftCanvas: document.getElementById('magPreviewRulerLeft'),
+        containerEl: document.getElementById('magPreviewContainer'),
+        stageEl: document.getElementById('magPreviewZoomStage'),
+        imgEl: document.getElementById('magPreviewImg'),
+    });
     // Load image into the preview + into a canvas for pixel sampling
     const imgEl = document.getElementById('magPreviewImg');
     await new Promise((resolve, reject) => {
@@ -2371,6 +2380,8 @@ async function openMagnetizationPreviewModal() {
         imgEl.src = `/uploads/${AppState.userId}/${AppState.uploadedImageFilename}?t=${Date.now()}`;
     });
     renderMagnetizationFieldOverlay();
+    // Rulers need the final layout (image decoded + modal visible).
+    if (magRulers) requestAnimationFrame(() => magRulers.redraw());
 }
 
 function closeMagnetizationPreviewModal() {
@@ -2952,6 +2963,10 @@ function attachZoomPan(containerEl, stageEl, opts = {}) {
     const onScaleChange = typeof opts.onScaleChange === 'function' ? opts.onScaleChange : null;
     const state = { scale: 1, tx: 0, ty: 0, panning: false, panStart: null };
     let indicatorTimer = null;
+    // Full-transform listeners (scale AND pan) — used by the pixel rulers.
+    // Registered via api.addTransformListener so late consumers can hook a
+    // container whose zoom-pan was attached earlier (attach is idempotent).
+    const transformListeners = [];
 
     function apply() {
         stageEl.style.transform =
@@ -2964,6 +2979,7 @@ function attachZoomPan(containerEl, stageEl, opts = {}) {
                 () => indicatorEl.classList.remove('visible'), 1200);
         }
         if (onScaleChange) onScaleChange(state.scale);
+        for (const fn of transformListeners) { try { fn(state); } catch (_) {} }
     }
     function reset() {
         state.scale = 1; state.tx = 0; state.ty = 0;
@@ -3022,9 +3038,122 @@ function attachZoomPan(containerEl, stageEl, opts = {}) {
     containerEl.addEventListener('auxclick', onAuxClick);
     containerEl.addEventListener('dblclick', onDblClick);
     apply();
-    const api = { reset, get scale() { return state.scale; } };
+    const api = {
+        reset,
+        get scale() { return state.scale; },
+        get tx() { return state.tx; },
+        get ty() { return state.ty; },
+        addTransformListener(fn) { if (typeof fn === 'function') transformListeners.push(fn); },
+    };
     containerEl._zoomPan = api;
     return api;
+}
+
+// ===== Pixel rulers =====
+// Canvas rulers (top = x, left = y) in IMAGE PIXEL coordinates that track the
+// container's zoom-pan transform. Works for any zoom-stage viewer: reads the
+// transform from containerEl._zoomPan and maps image px -> screen px through
+// the img's position/CSS-scale inside the stage. Call .redraw() after image
+// or layout changes; transform changes re-draw automatically.
+function attachPixelRulers({ topCanvas, leftCanvas, containerEl, stageEl, imgEl }) {
+    if (!topCanvas || !leftCanvas || !containerEl || !imgEl) return null;
+    if (containerEl._pixelRulers) return containerEl._pixelRulers;
+
+    function drawAxis(canvas, horizontal) {
+        const cw = canvas.clientWidth, ch = canvas.clientHeight;
+        const ctx = canvas.getContext('2d');
+        if (!cw || !ch) return;
+        const dpr = window.devicePixelRatio || 1;
+        if (canvas.width !== Math.round(cw * dpr) || canvas.height !== Math.round(ch * dpr)) {
+            canvas.width = Math.round(cw * dpr);
+            canvas.height = Math.round(ch * dpr);
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cw, ch);
+        const naturalLen = horizontal ? imgEl.naturalWidth : imgEl.naturalHeight;
+        const cssLen = horizontal ? imgEl.clientWidth : imgEl.clientHeight;
+        if (!naturalLen || !cssLen) return;
+        const zp = containerEl._zoomPan;
+        const s = zp ? zp.scale : 1;
+        const t = zp ? (horizontal ? zp.tx : zp.ty) : 0;
+        const off = horizontal ? imgEl.offsetLeft : imgEl.offsetTop;
+        const cssScale = cssLen / naturalLen;             // CSS shrink (max-width etc.)
+        const pxPer = s * cssScale;                       // screen px per image px
+        const toScreen = p => t + s * (off + p * cssScale);
+        const fromScreen = x => ((x - t) / s - off) / cssScale;
+        const axisLen = horizontal ? cw : ch;
+        // Tick step: smallest 1/2/5×10^k giving >= 55 screen px between labels.
+        let step = 1;
+        while (step * pxPer < 55) {
+            const mant = step.toPrecision(1)[0];
+            step = (mant === '1') ? step * 2 : (mant === '2') ? step * 2.5 : step * 2;
+        }
+        const minor = step / 5;
+        const pStart = Math.max(0, Math.floor(fromScreen(0) / minor) * minor);
+        const pEnd = Math.min(naturalLen, fromScreen(axisLen));
+        ctx.strokeStyle = '#adb5bd';
+        ctx.fillStyle = '#495057';
+        ctx.font = '9px monospace';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let p = pStart; p <= pEnd + 1e-9; p += minor) {
+            const x = toScreen(p);
+            if (x < -1 || x > axisLen + 1) continue;
+            const isMajor = Math.abs(p / step - Math.round(p / step)) < 1e-6;
+            const tick = isMajor ? 7 : (minor * pxPer >= 4 ? 4 : 0);
+            if (!tick) continue;
+            const xr = Math.round(x) + 0.5;
+            if (horizontal) { ctx.moveTo(xr, ch); ctx.lineTo(xr, ch - tick); }
+            else            { ctx.moveTo(cw, xr); ctx.lineTo(cw - tick, xr); }
+            if (isMajor) {
+                const label = String(Math.round(p));
+                if (horizontal) ctx.fillText(label, xr + 2, ch - 9);
+                else            ctx.fillText(label, 1, xr - 2);
+            }
+        }
+        ctx.stroke();
+    }
+
+    const api = {
+        redraw() { drawAxis(topCanvas, true); drawAxis(leftCanvas, false); },
+    };
+    if (containerEl._zoomPan) containerEl._zoomPan.addTransformListener(() => api.redraw());
+    if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => api.redraw()).observe(containerEl);
+    }
+    imgEl.addEventListener('load', () => api.redraw());
+    containerEl._pixelRulers = api;
+    return api;
+}
+
+// Wire the Run & Preview tab's Input Image into the zoom-pan viewer with
+// pixel rulers. The wrapper's visibility mirrors the img's 'hidden' class
+// (kept in sync via MutationObserver so the existing show/hide sites work).
+function initInputImageViewer() {
+    const wrap = document.getElementById('inputImageRulerWrap');
+    const container = document.getElementById('inputImageZoomContainer');
+    const stage = document.getElementById('inputImageZoomStage');
+    const img = document.getElementById('uploadedImage');
+    if (!wrap || !container || !stage || !img) return;
+    attachZoomPan(container, stage, {
+        indicatorEl: document.getElementById('inputImageZoomIndicator'),
+    });
+    const rulers = attachPixelRulers({
+        topCanvas: document.getElementById('inputImageRulerTop'),
+        leftCanvas: document.getElementById('inputImageRulerLeft'),
+        containerEl: container, stageEl: stage, imgEl: img,
+    });
+    const sync = () => {
+        const hidden = img.classList.contains('hidden');
+        wrap.style.display = hidden ? 'none' : 'grid';
+        if (!hidden && rulers) requestAnimationFrame(() => rulers.redraw());
+    };
+    new MutationObserver(sync).observe(img, { attributes: true, attributeFilter: ['class'] });
+    img.addEventListener('load', () => {
+        // A newly loaded image gets a fresh viewport.
+        if (container._zoomPan) container._zoomPan.reset();
+    });
+    sync();
 }
 
 function resetPolarPreprocessState() {

@@ -1089,7 +1089,23 @@
                         <p style="font-size: 0.8rem; color: #6c757d; margin-top: 10px;">PNG format recommended</p>
                     </div>
                     <input type="file" id="imageUpload" accept="image/*" style="display: none;" onchange="handleImageUpload(event)">
-                    <img id="uploadedImage" class="preview-image hidden" alt="Uploaded image">
+                    <!-- Zoomable input-image viewer with pixel rulers. The wrapper's
+                         visibility is synced to the img's 'hidden' class by
+                         initInputImageViewer() (a MutationObserver), so the many
+                         existing show/hide call sites keep working untouched. -->
+                    <div id="inputImageRulerWrap" style="display: none; grid-template-columns: 26px 1fr; grid-template-rows: 20px 1fr; margin-top: 15px;">
+                        <div style="background: #f1f3f5; border: 1px solid #dee2e6; border-right: none; border-bottom: none; border-top-left-radius: 5px;"></div>
+                        <canvas id="inputImageRulerTop" style="width: 100%; height: 20px; display: block; border: 1px solid #dee2e6; border-left: none; border-bottom: none; border-top-right-radius: 5px; background: #f8f9fa;"></canvas>
+                        <canvas id="inputImageRulerLeft" style="width: 26px; height: 100%; display: block; border: 1px solid #dee2e6; border-top: none; border-right: none; border-bottom-left-radius: 5px; background: #f8f9fa;"></canvas>
+                        <div id="inputImageZoomContainer" tabindex="0"
+                             title="Wheel: zoom · Middle-button drag: pan · Double-click: reset"
+                             style="position: relative; overflow: hidden; min-height: 120px; background: #fafafa; border: 1px solid #dee2e6; border-bottom-right-radius: 5px;">
+                            <div class="zoom-stage" id="inputImageZoomStage">
+                                <img id="uploadedImage" class="preview-image hidden" alt="Uploaded image" draggable="false" style="margin-top: 0;">
+                            </div>
+                            <div class="zoom-indicator" id="inputImageZoomIndicator">100%</div>
+                        </div>
+                    </div>
                     <!-- AA-noise warning. Populated by checkInputImageNoise()
                          on every image upload / load. Hidden when uniqueColors
                          is below the threshold. -->
@@ -1474,14 +1490,19 @@
                 <!-- Preview pane (left). Reuses .polar-preview-container so the
                      zoom-pan helper from Phase D.1 applies unchanged. -->
                 <div class="qfilter-pane" style="flex: 1; display: flex; flex-direction: column;">
-                    <div class="polar-preview-container" id="magPreviewContainer" tabindex="0"
-                         title="Wheel: zoom · Middle-button drag: pan · Double-click: reset"
-                         style="flex: 1; position: relative;">
-                        <div class="zoom-stage" id="magPreviewZoomStage">
-                            <img id="magPreviewImg" draggable="false" alt="magnetization-preview source"/>
-                            <svg id="magPreviewOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+                    <div style="flex: 1; min-height: 0; display: grid; grid-template-columns: 26px 1fr; grid-template-rows: 20px 1fr;">
+                        <div style="background: #f1f3f5; border-right: 1px solid #dee2e6; border-bottom: 1px solid #dee2e6;"></div>
+                        <canvas id="magPreviewRulerTop" style="width: 100%; height: 20px; display: block; border-bottom: 1px solid #dee2e6; background: #f8f9fa;"></canvas>
+                        <canvas id="magPreviewRulerLeft" style="width: 26px; height: 100%; display: block; border-right: 1px solid #dee2e6; background: #f8f9fa;"></canvas>
+                        <div class="polar-preview-container" id="magPreviewContainer" tabindex="0"
+                             title="Wheel: zoom · Middle-button drag: pan · Double-click: reset"
+                             style="position: relative; min-height: 0;">
+                            <div class="zoom-stage" id="magPreviewZoomStage">
+                                <img id="magPreviewImg" draggable="false" alt="magnetization-preview source"/>
+                                <svg id="magPreviewOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+                            </div>
+                            <div class="zoom-indicator" id="magPreviewZoomIndicator">100%</div>
                         </div>
-                        <div class="zoom-indicator" id="magPreviewZoomIndicator">100%</div>
                     </div>
                     <div id="magPreviewStatus" style="padding: 8px 12px; font-size: 0.83rem; color: #495057; border-top: 1px solid #e9ecef; min-height: 1.4em;"></div>
                 </div>
