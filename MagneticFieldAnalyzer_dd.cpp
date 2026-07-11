@@ -628,10 +628,19 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
 
     auto sweep_all = [&](const Eigen::MatrixXd& Gs) {
         computeGapDeriv(Gs);   // analytic gap derivatives for this sweep's gammas
+        if (PAR) {
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(dynamic, 1) if (PAR)
+            #pragma omp parallel for schedule(dynamic, 1)
 #endif
-        for (int pi = 0; pi < (int)B.size(); ++pi) do_band(B[pi], Gs);
+            for (int pi = 0; pi < (int)B.size(); ++pi) do_band(B[pi], Gs);
+        } else {
+            // Deliberately a plain serial loop, NOT `omp parallel for if(PAR)`:
+            // an if(false) clause still opens an (inactive) parallel region, so
+            // every OpenMP kernel inside the band solves (AMGCL, assembly, mu
+            // updates) becomes NESTED and runs single-threaded — measured 15x
+            // slowdown of the default banded accuracy mode (v1.6.0 regression).
+            for (int pi = 0; pi < (int)B.size(); ++pi) do_band(B[pi], Gs);
+        }
     };
 
     int it = 0;

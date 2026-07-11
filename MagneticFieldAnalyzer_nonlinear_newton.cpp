@@ -383,6 +383,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         Eigen::VectorXd delta_A;
         auto nkp_t_conv = nkprof_now();
+        auto nkp_t_jc = nkp_t_conv;   // re-captured after the J diagonal correction (NK_PROF granularity)
 
         // Full-grid frozen-Jacobian residual norm, set by defect correction for use in line search.
         // Negative sentinel = not in defect correction mode (use coarse norm instead).
@@ -496,6 +497,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     J_matrix.coeffRef(idx, idx) += correction_factor;
                 }
             }
+            nkp_t_jc = nkprof_now();
 
             // Adaptive: SparseLU below the AMGCL threshold, AMGCL above.
             // For full-grid problems (n ~ 250k) this routes through the
@@ -879,7 +881,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                       << ": mu=" << nkprof_ms(nkp_t0, nkp_t_mu) << "ms"
                       << " build=" << nkprof_ms(nkp_t_mu, nkp_t_build) << "ms"
                       << " resid+conv=" << nkprof_ms(nkp_t_build, nkp_t_conv) << "ms"
-                      << " jcorr+amgcl=" << nkprof_ms(nkp_t_conv, nkp_t_solve) << "ms"
+                      << " jcorr=" << nkprof_ms(nkp_t_conv, nkp_t_jc) << "ms"
+                      << " amgcl=" << nkprof_ms(nkp_t_jc, nkp_t_solve) << "ms"
                       << " ls=" << nkprof_ms(nkp_t_solve, nkp_t_ls) << "ms"
                       << " (trials=" << nkp_ls_trials << ")"
                       << " total=" << nkprof_ms(nkp_t0, nkp_t_ls) << "ms" << std::endl;
