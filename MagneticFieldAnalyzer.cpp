@@ -517,9 +517,12 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
 
     std::cout << "Polar mesh (r_orientation=" << r_orientation << "): nr=" << nr << ", ntheta=" << ntheta << std::endl;
 
-    // Validate polar domain
-    if (r_start <= 0.0 || r_start >= r_end) {
-        throw std::runtime_error("Invalid polar domain: must satisfy 0 < r_start < r_end");
+    // Validate polar domain. r_start == 0 (a disc domain including the rotor
+    // axis) is allowed: with a Dirichlet inner BC the axis row is an identity
+    // row (never evaluates the 1/r metric — enforced after BC parsing below),
+    // and post-processing regularizes r -> max(r, dr/2) on the axis row.
+    if (r_start < 0.0 || r_start >= r_end) {
+        throw std::runtime_error("Invalid polar domain: must satisfy 0 <= r_start < r_end");
     }
     if (theta_range <= 0.0 || theta_range > 2.0 * M_PI) {
         throw std::runtime_error("Invalid theta_range: must satisfy 0 < theta_range <= 2*pi");
@@ -589,6 +592,18 @@ void MagneticFieldAnalyzer::setupPolarSystem() {
 
         if (bc_cfg["outer"]) {
             parsePolarRobinParams(bc_cfg["outer"], bc_outer);
+        }
+
+        // r_start == 0 puts the inner boundary ON the rotor axis. The only
+        // well-defined condition there is Dirichlet (axis regularity): the
+        // Neumann ghost elimination and the symmetric Robin flux both need
+        // the 1/r metric at r = 0 and are singular. (bc_inner defaults to
+        // dirichlet, so configs without this block are always safe.)
+        if (r_start == 0.0 && bc_inner.type != "dirichlet") {
+            throw std::runtime_error(
+                "polar_boundary_conditions.inner must be 'dirichlet' when r_start = 0 "
+                "(the inner boundary is the rotor axis; '" + bc_inner.type +
+                "' is singular at r = 0)");
         }
 
         // Theta direction boundary conditions (angular boundaries)
@@ -4639,7 +4654,10 @@ void MagneticFieldAnalyzer::calculateBFieldAtActiveCells(
             // Polar coordinates: i = i_r, j = j_theta
             // Br = (1/r) * ∂Az/∂θ,  Bθ = -∂Az/∂r
             double r = r_start + i * dr;
-            if (r < 1e-10) r = 1e-10;
+            // Axis row (r_start = 0): half-cell regularization. A 1e-10 floor
+            // would make (1/r) explode ~1e10 at the axis; the FV cell centre
+            // dr/2 keeps B finite and physically scaled there.
+            if (r < 0.5 * dr) r = 0.5 * dr;
 
             // θ-direction: find neighboring active cells
             int j_prev = findNextActiveTheta(i, j, -1);
@@ -5801,7 +5819,10 @@ void MagneticFieldAnalyzer::computeBHmuFromAzVector(
 
         for (int i = 0; i < nr; i++) {
             double r = r_start_val + i * dr_val;
-            if (r < 1e-10) r = 1e-10;
+            // Axis row (r_start = 0): half-cell regularization — a 1e-10
+            // floor would export Br ~ 1e10 at the axis instead of a finite,
+            // cell-centred value.
+            if (r < 0.5 * dr_val) r = 0.5 * dr_val;
 
             for (int j = 0; j < ntheta; j++) {
                 int idx = i * ntheta + j;  // Row-major indexing
@@ -12233,7 +12254,10 @@ void MagneticFieldAnalyzer::calculateMagneticFieldPolar() {
             }
 
             double dAz_dtheta = (Az_next - Az_prev) / denom_theta;
-            double safe_r = (r > 1e-15) ? r : 1e-15;
+            // Axis row (r_start = 0): half-cell regularization — a 1e-15
+            // floor would blow Br up ~1e15 there if the inner Dirichlet
+            // profile is non-uniform (DD value_profile).
+            double safe_r = (r > 0.5 * dr) ? r : 0.5 * dr;
             setBr(i, j, dAz_dtheta / safe_r);
 
             // Btheta = -dAz/dr
