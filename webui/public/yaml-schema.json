@@ -362,14 +362,14 @@
       "example": "slide_direction: vertical"
     },
     "slide_region_start": {
-      "description": "Start position of sliding region [pixels]",
-      "type": "integer",
-      "example": "slide_region_start: 110"
+      "description": "Start of the sliding band. DECIMAL literal (e.g. 0.005) = physical METRES, converted via the mesh (polar: radius from r_start; cartesian: x or y). INTEGER literal (e.g. 110) = pixel index (legacy). vertical slide bounds columns, horizontal bounds rows.",
+      "type": "number",
+      "example": "slide_region_start: 0.005"
     },
     "slide_region_end": {
-      "description": "End position of sliding region [pixels]",
-      "type": "integer",
-      "example": "slide_region_end: 390"
+      "description": "End of the sliding band. DECIMAL literal = physical METRES (see slide_region_start); INTEGER literal = pixel index (legacy).",
+      "type": "number",
+      "example": "slide_region_end: 0.0495"
     },
     "slide_pixels_per_step": {
       "description": "Movement per step [pixels] (circular shift amount)",
@@ -734,7 +734,7 @@
     "transient_template": {
       "name": "Transient Analysis Template",
       "trigger": "transient",
-      "snippet": "enabled: true\nenable_sliding: true\ntotal_steps: 1\nslide_direction: vertical\nslide_region_start: 0\nslide_region_end: 1\nslide_pixels_per_step: 1\n# parallel_chunks: 3   # optional: run the sweep in N concurrent chunks (~1.3-1.9x, memory-bandwidth-bound)"
+      "snippet": "enabled: true\nenable_sliding: true\ntotal_steps: 1\nslide_direction: vertical\nslide_region_start: 0.0    # decimal = metres (polar: radius; cartesian: x/y), integer = pixel index\nslide_region_end: 0.05\nslide_pixels_per_step: 1\n# parallel_chunks: 3   # optional: run the sweep in N concurrent chunks (~1.3-1.9x, memory-bandwidth-bound)"
     },
     "nonlinear_picard": {
       "name": "Nonlinear Solver - Picard Method",
@@ -874,7 +874,7 @@
     "polar_2d_motor": {
       "name": "Polar 2D Motor Analysis",
       "description": "Template for 2D motor analysis in polar coordinates",
-      "content": "coordinate_system: polar\n\npolar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # π/3\n\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0.0\n  outer:\n    type: dirichlet\n    value: 0.0\n  theta_min:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n  theta_max:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n\nmaterials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n\n  iron_stator:\n    rgb: [128, 128, 128]\n    mu_r: 100.0\n    jz: 0.0\n    calc_force: false\n\n  iron_rotor:\n    rgb: [100, 100, 100]\n    mu_r: 500.0\n    jz: 0.0\n    calc_force: true\n\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 167\n  slide_direction: vertical\n  slide_region_start: 110\n  slide_region_end: 390\n"
+      "content": "coordinate_system: polar\n\npolar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # π/3\n\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0.0\n  outer:\n    type: dirichlet\n    value: 0.0\n  theta_min:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n  theta_max:\n    type: periodic\n    value: 0.0  # Use value: -1.0 for anti-periodic BC\n\nmaterials:\n  air:\n    rgb: [255, 255, 255]\n    mu_r: 1.0\n    jz: 0.0\n\n  iron_stator:\n    rgb: [128, 128, 128]\n    mu_r: 100.0\n    jz: 0.0\n    calc_force: false\n\n  iron_rotor:\n    rgb: [100, 100, 100]\n    mu_r: 500.0\n    jz: 0.0\n    calc_force: true\n\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 167\n  slide_direction: vertical\n  slide_region_start: 0.222   # decimal = metres (rotor-side band)\n  slide_region_end: 0.25\n"
     }
   }
 }

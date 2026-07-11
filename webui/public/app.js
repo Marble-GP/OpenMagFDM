@@ -4476,6 +4476,11 @@ function buildPolarYamlBlock(filename, polarDomain) {
         const rOuter = Math.max(1, cur.r_outer_px || 0);
         const region_start = inside ? 0   : rAG;
         const region_end   = inside ? rAG : Math.max(rAG + 1, rOuter);
+        // Emit the slide region as PHYSICAL radii in metres (consistent with
+        // polar_domain). Decimal literals are the solver's metre marker;
+        // integer literals keep the legacy pixel meaning.
+        const nrWarp = Math.max(2, Math.round(Number(cur.nr) || 0));
+        const pxToR = (px) => (rs + (re - rs) * (px / (nrWarp - 1))).toPrecision(8);
         // Phase K: derive N_step / N_slide from ntheta so the slide
         // simulates one full rotation in N_step steps of N_slide pixels
         // each (subject to 32 ≤ N_step ≤ 256). The values themselves
@@ -4489,7 +4494,8 @@ function buildPolarYamlBlock(filename, polarDomain) {
         lines.push('');
         lines.push('# Slide region inferred from the air-gap marker (Polar Preprocess).');
         lines.push(`# Side: ${inside ? 'inside the air gap' : 'outside the air gap'}`);
-        lines.push('# region_start / region_end are radial-pixel indices in the warped image.');
+        lines.push('# region bounds are PHYSICAL radii in metres (decimal literal = metres;');
+        lines.push(`# integer literal = pixel index). Pixel equivalents: [${region_start}, ${region_end}] of ${nrWarp}.`);
         if (sched.exact) {
             lines.push(`# Schedule: N_step * N_slide = ${sched.N_step} * ${sched.N_slide} = ${T} (one full revolution over ntheta).`);
         } else {
@@ -4501,8 +4507,8 @@ function buildPolarYamlBlock(filename, polarDomain) {
         lines.push('  enable_sliding: true');
         lines.push('  total_steps: $N_step');
         lines.push(`  slide_direction: ${slideDir}`);
-        lines.push(`  slide_region_start: ${region_start}`);
-        lines.push(`  slide_region_end: ${region_end}`);
+        lines.push(`  slide_region_start: ${pxToR(region_start)}`);
+        lines.push(`  slide_region_end: ${pxToR(region_end)}`);
         lines.push('  slide_pixels_per_step: $N_slide');
         lines.push('  # parallel_chunks: 3   # optional: run the sweep in N concurrent chunks');
         lines.push('  #                      # (~1.3-1.9x, memory-bandwidth-bound; each chunk keeps');
@@ -4613,8 +4619,8 @@ function buildCartesianYamlBlock(filename, opts) {
     lines.push('#   enable_sliding: true');
     lines.push('#   total_steps: $N_step');
     lines.push('#   slide_direction: horizontal   # shift columns along the travel axis');
-    lines.push('#   slide_region_start: 0         # first row of the moving band (pixels)');
-    lines.push(`#   slide_region_end: ${opts.heightPx > 0 ? opts.heightPx : 0}         # last row of the moving band (pixels)`);
+    lines.push('#   slide_region_start: 0.0       # start of the moving band [m] (decimal = metres, integer = pixel row)');
+    lines.push(`#   slide_region_end: ${(opts.heightPx > 0 && opts.dxdy > 0 ? (opts.heightPx * opts.dxdy).toPrecision(6) : '0.1')}    # end of the moving band [m] (= full image height)`);
     lines.push('#   slide_pixels_per_step: $N_slide');
     lines.push('#   # parallel_chunks: 3          # run the sweep in N concurrent chunks (~1.3-1.9x)');
     lines.push('# variables:');
