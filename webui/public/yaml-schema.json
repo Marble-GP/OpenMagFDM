@@ -31,12 +31,12 @@
       "example": "polar_domain:\n  r_start: 0.222\n  r_end: 0.278\n  r_orientation: horizontal\n  theta_range: 1.0471975512  # pi/3"
     },
     "r_start": {
-      "description": "Inner radius [m], must satisfy 0 < r_start < r_end",
+      "description": "Inner radius in METRES (physical, not pixels), 0 <= r_start < r_end. r_start: 0 means the domain includes the rotor axis (a full disc) and requires inner: dirichlet. The image's r-axis pixels map linearly onto [r_start, r_end].",
       "type": "number",
       "example": "r_start: 0.222"
     },
     "r_end": {
-      "description": "Outer radius [m]",
+      "description": "Outer radius in METRES (physical, not pixels)",
       "type": "number",
       "example": "r_end: 0.278"
     },

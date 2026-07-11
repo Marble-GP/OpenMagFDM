@@ -1508,8 +1508,16 @@
                              title="Wheel: zoom · Middle-button drag: pan · Double-click: reset"
                              style="position: relative; min-height: 0;">
                             <div class="zoom-stage" id="magPreviewZoomStage">
-                                <img id="magPreviewImg" draggable="false" alt="magnetization-preview source"/>
-                                <svg id="magPreviewOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet"></svg>
+                                <!-- The svg must EXACTLY cover the img: as flex siblings they
+                                     laid out side by side, drawing the arrows next to (not on)
+                                     the image. The relative wrapper shrink-wraps the img and the
+                                     absolutely-positioned svg stretches over it; with the viewBox
+                                     set to the image's natural pixels the mapping is exact. -->
+                                <div style="position: relative; display: inline-block; line-height: 0;">
+                                    <img id="magPreviewImg" draggable="false" alt="magnetization-preview source"/>
+                                    <svg id="magPreviewOverlay" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="none"
+                                         style="position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none;"></svg>
+                                </div>
                             </div>
                             <div class="zoom-indicator" id="magPreviewZoomIndicator">100%</div>
                         </div>

@@ -3085,16 +3085,18 @@ function attachPixelRulers({ topCanvas, leftCanvas, containerEl, stageEl, imgEl 
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.clearRect(0, 0, cw, ch);
         const naturalLen = horizontal ? imgEl.naturalWidth : imgEl.naturalHeight;
-        const cssLen = horizontal ? imgEl.clientWidth : imgEl.clientHeight;
-        if (!naturalLen || !cssLen) return;
-        const zp = containerEl._zoomPan;
-        const s = zp ? zp.scale : 1;
-        const t = zp ? (horizontal ? zp.tx : zp.ty) : 0;
-        const off = horizontal ? imgEl.offsetLeft : imgEl.offsetTop;
-        const cssScale = cssLen / naturalLen;             // CSS shrink (max-width etc.)
-        const pxPer = s * cssScale;                       // screen px per image px
-        const toScreen = p => t + s * (off + p * cssScale);
-        const fromScreen = x => ((x - t) / s - off) / cssScale;
+        if (!naturalLen) return;
+        // Map image px -> ruler px via bounding rects: rects already include
+        // the zoom-pan transform AND any wrapper elements between the img and
+        // the stage, so this stays correct regardless of DOM structure.
+        const contRect = containerEl.getBoundingClientRect();
+        const imgRect = imgEl.getBoundingClientRect();
+        const rectLen = horizontal ? imgRect.width : imgRect.height;
+        if (!rectLen) return;
+        const off = horizontal ? (imgRect.left - contRect.left) : (imgRect.top - contRect.top);
+        const pxPer = rectLen / naturalLen;               // screen px per image px
+        const toScreen = p => off + p * pxPer;
+        const fromScreen = x => (x - off) / pxPer;
         const axisLen = horizontal ? cw : ch;
         // Tick step: smallest 1/2/5×10^k giving >= 55 screen px between labels.
         let step = 1;
@@ -4437,6 +4439,9 @@ function buildPolarYamlBlock(filename, polarDomain) {
     }
     lines.push('coordinate_system: polar');
     lines.push('polar_domain:');
+    lines.push('  # r_start / r_end are PHYSICAL radii in metres (not pixels): the image r-axis');
+    lines.push('  # maps linearly onto [r_start, r_end]. r_start: 0 = full disc from the rotor');
+    lines.push('  # axis (requires inner: dirichlet).');
     lines.push(`  r_start: ${rs}`);
     lines.push(`  r_end: ${re}`);
     lines.push(`  r_orientation: ${ro}`);
