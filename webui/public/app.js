@@ -2301,11 +2301,19 @@ async function openMagnetizationPreviewModal() {
         if (!Array.isArray(props.rgb) || props.rgb.length < 3) continue;
         const m = props.magnetization;
         if (!m || typeof m !== 'object') continue;
-        if (m.Br == null && m.Hc == null && !isMagnetMaterial(props)) continue;
+        // Preview needs only the DIRECTION field, not the magnitude: accept
+        // any magnetization block that carries a pattern even when Br/Hc are
+        // unknown (e.g. `preset: NdFeB_N40` whose library isn't loaded in
+        // this browser). The unresolved preset is surfaced as a warning so
+        // the user knows the RUN still needs the material library selected.
+        const hasDirectionInfo = (typeof m.pattern === 'string' && m.pattern !== '') ||
+                                 m.Br != null || m.Hc != null;
+        if (!hasDirectionInfo && !isMagnetMaterial(props)) continue;
         magnetMaterials.push({
             name,
             rgb: [Number(props.rgb[0]) | 0, Number(props.rgb[1]) | 0, Number(props.rgb[2]) | 0],
             magnetization: m,
+            unresolvedPreset: (props.preset && !presets[props.preset]) ? props.preset : null,
         });
     }
     AppState.magPreview.materials = magnetMaterials;
@@ -2328,12 +2336,18 @@ async function openMagnetizationPreviewModal() {
         matList.innerHTML = magnetMaterials.map(mm => {
             const hex = '#' + mm.rgb.map(v => v.toString(16).padStart(2, '0')).join('');
             const pat = (mm.magnetization && mm.magnetization.pattern) || '?';
+            const warn = mm.unresolvedPreset
+                ? `<div style="color:#856404; background:#fff3cd; border-radius:3px; padding:2px 6px;
+                        font-size:0.75rem; margin:2px 0 4px 20px;">
+                        preset "${mm.unresolvedPreset}" not found — direction previewed from the inline
+                        pattern; select its material library before running the solver.</div>`
+                : '';
             return `<div style="display:flex; align-items:center; gap:6px; margin-bottom:4px;">
                 <div style="width:14px; height:14px; background:${hex}; border:1px solid #aaa;"></div>
                 <span style="font-family:monospace; font-size:0.78rem;">${hex}</span>
                 <span style="color:#495057;">${mm.name}</span>
                 <span style="color:#6c757d;">(${pat})</span>
-            </div>`;
+            </div>${warn}`;
         }).join('');
     }
     document.getElementById('magPreviewStatus').textContent =
