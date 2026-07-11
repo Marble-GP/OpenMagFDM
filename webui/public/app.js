@@ -985,6 +985,7 @@ async function handleImageUpload(event) {
         document.getElementById('polarizeBtn').style.display = 'block';
         document.getElementById('magPreviewBtn').style.display = 'block';
         document.getElementById('cartesianTemplateBtn').style.display = 'block';
+        document.getElementById('imagePropsBtn').style.display = 'block';
 
         // Refresh image list
         await refreshImageList();
@@ -1038,6 +1039,7 @@ function loadSelectedImage() {
     document.getElementById('polarizeBtn').style.display = 'block';
     document.getElementById('cartesianTemplateBtn').style.display = 'block';
     const _mpb = document.getElementById('magPreviewBtn'); if (_mpb) _mpb.style.display = 'block';
+    const _ipb = document.getElementById('imagePropsBtn'); if (_ipb) _ipb.style.display = 'block';
     showStatus('solverStatus', `Image loaded: ${filename}`, 'success');
     checkInputImageNoise(filename);
 }
@@ -1070,6 +1072,7 @@ async function deleteSelectedImage() {
             document.getElementById('polarizeBtn').style.display = 'none';
             document.getElementById('magPreviewBtn').style.display = 'none';
             document.getElementById('cartesianTemplateBtn').style.display = 'none';
+            document.getElementById('imagePropsBtn').style.display = 'none';
             document.getElementById('quantizeFilterBtn').style.display = 'none';
             document.getElementById('inputImageNoiseBanner').style.display = 'none';
         }
@@ -2217,7 +2220,27 @@ AppState.magPreview = {
     coordSystem: 'cartesian',
     dx: 1e-3,
     dy: 1e-3,
+    rStart: 0,               // polar: annulus inner radius [m]
+    rEnd: 0.1,               // polar: annulus outer radius [m]
+    thetaRange: 2 * Math.PI, // polar: angular extent [rad]
+    rOrientation: 'horizontal',
 };
+
+// Evaluate a YAML numeric field that may be a simple expression such as
+// "2*pi" (only digits, ., + - * / ( ) and `pi` are allowed).
+function evalYamlNumber(v, fallback) {
+    if (typeof v === 'number' && isFinite(v)) return v;
+    if (typeof v === 'string') {
+        const s = v.replace(/\bpi\b/gi, '(' + Math.PI + ')');
+        if (/^[0-9eE+\-*/(). ]+$/.test(s)) {
+            try {
+                const r = Function('"use strict"; return (' + s + ')')();
+                if (isFinite(r)) return r;
+            } catch (_) { /* fall through */ }
+        }
+    }
+    return fallback;
+}
 
 async function openMagnetizationPreviewModal() {
     if (!AppState.uploadedImageFilename) {
@@ -2259,7 +2282,20 @@ async function openMagnetizationPreviewModal() {
     for (const [name, raw] of Object.entries(materials)) {
         let props = raw || {};
         if (props.preset && presets[props.preset]) {
-            props = Object.assign({}, presets[props.preset], props);
+            // Mirror the solver's mergeMaterialPreset: map-valued keys merge
+            // one level deep, so an inline `magnetization: { pattern: ... }`
+            // override keeps the preset's Br/Hc instead of dropping them
+            // (a shallow merge here made such magnets invisible to the preview).
+            const base = presets[props.preset] || {};
+            const merged = Object.assign({}, base, props);
+            for (const k of Object.keys(props)) {
+                const o = props[k], b = base[k];
+                if (o && b && typeof o === 'object' && typeof b === 'object' &&
+                    !Array.isArray(o) && !Array.isArray(b)) {
+                    merged[k] = Object.assign({}, b, o);
+                }
+            }
+            props = merged;
         }
         if (!Array.isArray(props.rgb) || props.rgb.length < 3) continue;
         const m = props.magnetization;
@@ -2275,6 +2311,14 @@ async function openMagnetizationPreviewModal() {
     AppState.magPreview.coordSystem = (doc.coordinate_system === 'polar') ? 'polar' : 'cartesian';
     AppState.magPreview.dx = (doc.mesh && Number(doc.mesh.dx)) || 1e-3;
     AppState.magPreview.dy = (doc.mesh && Number(doc.mesh.dy)) || AppState.magPreview.dx;
+    // Polar runs need the physical annulus to evaluate patterns in the true
+    // rotor frame (r cosθ, r sinθ) like the solver does. theta_range is often
+    // the string "2*pi", so evaluate simple numeric expressions.
+    const pd = doc.polar_domain || {};
+    AppState.magPreview.rStart = evalYamlNumber(pd.r_start, 0);
+    AppState.magPreview.rEnd = evalYamlNumber(pd.r_end, 0.1);
+    AppState.magPreview.thetaRange = evalYamlNumber(pd.theta_range, 2 * Math.PI);
+    AppState.magPreview.rOrientation = (pd.r_orientation === 'vertical') ? 'vertical' : 'horizontal';
     // Populate sidebar list
     const matList = document.getElementById('magPreviewMaterialList');
     if (magnetMaterials.length === 0) {
@@ -2369,15 +2413,32 @@ function renderMagnetizationFieldOverlay() {
             const key = (data[p] << 16) | (data[p + 1] << 8) | data[p + 2];
             const mm = matByRgb.get(key);
             if (!mm) continue;
-            // Convert image pixel (i, j) to a physical (x, y) in
-            // metres. For cartesian: image y is down, analysis y is up
-            // (the solver does cv::flip), so flip j here too.
-            // For polar: the warped image's i,j IS the rotor frame (r
-            // along one axis, θ along the other); we treat them as
-            // direct (x_norm, y_norm) for vector evaluation since the
-            // magnetization block's cx,cy are also rotor-frame.
-            const x_phys = i * dx;
-            const y_phys = (H - 1 - j) * dy;
+            // Convert image pixel (i, j) to the physical (x, y) in metres
+            // that the solver evaluates patterns at.
+            // Cartesian: image y is down, analysis y is up (the solver does
+            // cv::flip), so flip j here too.
+            // Polar: the warped strip's axes are (r, θ); the solver maps
+            // image-up to +θ (horizontal r) / +r (vertical r) and evaluates
+            // at the true rotor-frame point (r cosθ, r sinθ). Mirror that,
+            // and remember θ so the resulting lab-frame vector can be
+            // decomposed into strip-local (r̂, θ̂) components for display.
+            let x_phys, y_phys, thetaAtPixel = 0;
+            if (isPolar) {
+                const mp = AppState.magPreview;
+                let r_idx, th_idx, nR, nTh;
+                if (mp.rOrientation === 'vertical') {
+                    r_idx = H - 1 - j; th_idx = i; nR = H; nTh = W;
+                } else {
+                    r_idx = i; th_idx = H - 1 - j; nR = W; nTh = H;
+                }
+                const r_phys = mp.rStart + (mp.rEnd - mp.rStart) * (r_idx / Math.max(1, nR - 1));
+                thetaAtPixel = mp.thetaRange * (th_idx / Math.max(1, nTh));
+                x_phys = r_phys * Math.cos(thetaAtPixel);
+                y_phys = r_phys * Math.sin(thetaAtPixel);
+            } else {
+                x_phys = i * dx;
+                y_phys = (H - 1 - j) * dy;
+            }
             const m = mm.magnetization;
             const cx = Number(m.cx) || 0;
             const cy = Number(m.cy) || 0;
@@ -2390,7 +2451,16 @@ function renderMagnetizationFieldOverlay() {
             const res = evalMagnetizationDirection(m, theta_local,
                 r_local / (Number(m.R_pc) || Rm_estimate));
             if (!res) continue;
-            const angle = res.angle_rad + (res.sign < 0 ? Math.PI : 0);
+            let angle = res.angle_rad + (res.sign < 0 ? Math.PI : 0);
+            if (isPolar) {
+                // Lab-frame angle φ → strip-local: components (M_r, M_θ) =
+                // (cos(φ−θ), sin(φ−θ)). Horizontal r: x_img = r̂, image-up = θ̂
+                // → display angle = φ−θ. Vertical r: x_img = θ̂, image-up = r̂
+                // → display angle = π/2 − (φ−θ).
+                const rel = angle - thetaAtPixel;
+                angle = (AppState.magPreview.rOrientation === 'vertical')
+                    ? (Math.PI / 2 - rel) : rel;
+            }
             // Render in IMAGE coords (y down) so the arrow visually
             // matches the image. Physical +y is image -y.
             const cos_a = Math.cos(angle);
@@ -4362,9 +4432,31 @@ function buildCartesianYamlBlock(filename, opts) {
     lines.push('# image_path: documentation only. The solver reads the image given on the');
     lines.push('# command line; this field records which file the mesh was authored for.');
     lines.push(`image_path: ${filename}`);
-    // Materials hint: direct the user to Detect Colors to fill this in.
-    lines.push('# materials: run "Detect Colors & Generate YAML Template" on this image to');
-    lines.push('#            populate rgb -> {mu_r | B-H | magnetization | jz} for each region.');
+    // Materials: when the caller supplied a colour-detection result, embed a
+    // materials: entry per detected colour (defaults: mu_r 1.0 / jz 0) so the
+    // template is runnable immediately; the Detect Colors modal (opened right
+    // after) refines these into presets / coils / magnets and its insert
+    // REPLACES this block. Fall back to the old hint comment when detection
+    // was unavailable.
+    const detCols = opts.detectedColors;
+    if (Array.isArray(detCols) && detCols.length > 0) {
+        lines.push('# materials: one entry per detected colour (defaults mu_r 1.0, jz 0).');
+        lines.push('# Assign real presets / coils / magnetization via "Detect Colors".');
+        lines.push('materials:');
+        for (const c of detCols) {
+            const [r, g, b] = c.rgb;
+            const hex = c.rgb.map(v => v.toString(16).padStart(2, '0')).join('');
+            const ratio = (typeof c.ratio === 'number') ? ` (coverage: ${(c.ratio * 100).toFixed(1)}%)` : '';
+            lines.push(`  material_${hex}:`);
+            lines.push(`    rgb: [${r}, ${g}, ${b}]`);
+            lines.push(`    mu_r: 1.0       # Set permeability${ratio}`);
+            lines.push('    jz: 0.0');
+            if (c.antialias === true) lines.push('    anti_aliasing: true');
+        }
+    } else {
+        lines.push('# materials: run "Detect Colors & Generate YAML Template" on this image to');
+        lines.push('#            populate rgb -> {mu_r | B-H | magnetization | jz} for each region.');
+    }
     // Commented LINEAR-slide transient skeleton (the linear-motor analogue of the
     // rotary sweep). Left commented because the slide region is image-specific.
     lines.push('# --- Optional: linear motion (mover translation along the travel axis) ---');
@@ -4401,17 +4493,32 @@ async function insertCartesianTemplate() {
     const widthPx  = (imgEl && imgEl.naturalWidth)  || 0;
     const heightPx = (imgEl && imgEl.naturalHeight) || 0;
     // Physical width sets the mesh scale (the single most important number for
-    // a cartesian run). Prompt with a sensible default; blank/cancel -> 0.2 mm.
+    // a cartesian run). Prompt with a sensible default; blank -> 0.2 mm,
+    // Cancel -> abort without inserting anything.
     let dxdy = 0.2e-3, widthM = 0;
     const ans = window.prompt(
         'Physical width of the image in millimetres?\n' +
         '(sets the mesh: dx = dy = width / pixels. Leave blank for a 0.2 mm default.)',
         '100');
-    if (ans !== null && ans.trim() !== '' && widthPx > 0) {
+    if (ans === null) return;   // user pressed Cancel
+    if (ans.trim() !== '' && widthPx > 0) {
         const mm = Number(ans);
         if (isFinite(mm) && mm > 0) { widthM = mm / 1000; dxdy = widthM / widthPx; }
     }
-    const block = buildCartesianYamlBlock(filename, { dxdy, widthPx, heightPx, widthM });
+    // Colour detection (same engine as the Detect Colors modal) so the
+    // generated template ships with a materials: entry per region — parity
+    // with the polar flow's detection-driven material setup. Best-effort:
+    // on failure the template falls back to the hint comment.
+    showStatus('solverStatus', 'Detecting material colors…', 'info');
+    let detectedColors = null;
+    try {
+        const det = await detectColorsInternal({ rareThreshold: 0.05, blendTolerance: 8 });
+        if (det && Array.isArray(det.colors) && det.colors.length > 0) {
+            detectedColors = det.colors;
+        }
+    } catch (_) { /* fall back to hint comment */ }
+
+    const block = buildCartesianYamlBlock(filename, { dxdy, widthPx, heightPx, widthM, detectedColors });
 
     const baseName = String(filename).replace(/\.[^./\\]+$/, '');
     const newConfigName = `${baseName}_cartesian.yaml`;
@@ -4431,10 +4538,255 @@ async function insertCartesianTemplate() {
     if (select) { select.value = newConfigName; try { await loadConfig(); } catch (_) {} }
     else if (AppState.aceEditor) { AppState.aceEditor.setValue(block, -1); }
     if (typeof switchTab === 'function') switchTab('config');
-    showStatus('solverStatus',
-        `New config "${newConfigName}" created and loaded. ` +
-        `Run Detect Colors to fill in materials, then adjust boundary_conditions / mesh.`,
-        'success');
+    if (detectedColors) {
+        showStatus('solverStatus',
+            `New config "${newConfigName}" created with ${detectedColors.length} detected material(s). ` +
+            `Assign presets / coils / magnetization in the Detect Colors dialog.`,
+            'success');
+        // Open the full assignment UI (library presets, coil groups,
+        // magnetization editors). Its "Insert" REPLACES the placeholder
+        // materials block we just wrote, so there is no duplication.
+        try { await detectColors(); } catch (_) { /* modal is optional */ }
+    } else {
+        showStatus('solverStatus',
+            `New config "${newConfigName}" created and loaded. ` +
+            `Run Detect Colors to fill in materials, then adjust boundary_conditions / mesh.`,
+            'success');
+    }
+}
+
+// ===== Image Properties modal =====
+// Inspect the loaded image: pixel + physical dimensions (pulled from the
+// current YAML; sensible defaults when fields are missing), exact-RGB colour
+// statistics matched against the YAML's materials, and a nearest-neighbour
+// polar <-> cartesian transform preview (client-side canvas, no server call).
+
+function imagePropsFmtM(v) {
+    // metres -> readable mm / µm string
+    if (!isFinite(v)) return '?';
+    const mm = v * 1000;
+    if (Math.abs(mm) >= 0.1 || mm === 0) return `${mm.toPrecision(4)} mm`;
+    return `${(mm * 1000).toPrecision(4)} µm`;
+}
+
+function imagePropsEscape(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function closeImagePropertiesModal() {
+    document.getElementById('imagePropsModal').style.display = 'none';
+}
+
+async function openImagePropertiesModal() {
+    if (!AppState.uploadedImageFilename) {
+        showStatus('solverStatus', 'Select an image first', 'error');
+        return;
+    }
+    const modal = document.getElementById('imagePropsModal');
+    modal.style.display = 'flex';
+    document.getElementById('imagePropsDims').innerHTML = 'Loading…';
+    document.getElementById('imagePropsColorTable').innerHTML = '';
+    document.getElementById('imagePropsColorSummary').textContent = '';
+    document.getElementById('imagePropsXformCaption').textContent = '';
+
+    // Current YAML (best effort — missing/broken YAML falls back to defaults).
+    let doc = {};
+    try {
+        doc = jsyaml.load(AppState.aceEditor ? AppState.aceEditor.getValue() : '') || {};
+    } catch (_) { doc = {}; }
+
+    // Load the image and mirror it onto the source canvas for pixel access.
+    const img = new Image();
+    try {
+        await new Promise((resolve, reject) => {
+            img.onload = resolve;
+            img.onerror = () => reject(new Error('image load failed'));
+            img.src = `/uploads/${AppState.userId}/${AppState.uploadedImageFilename}?t=${Date.now()}`;
+        });
+    } catch (err) {
+        document.getElementById('imagePropsDims').innerHTML =
+            `<span style="color:#c00;">Failed to load image: ${imagePropsEscape(err.message)}</span>`;
+        return;
+    }
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const srcCanvas = document.getElementById('imagePropsSrcCanvas');
+    srcCanvas.width = W; srcCanvas.height = H;
+    const sctx = srcCanvas.getContext('2d');
+    sctx.drawImage(img, 0, 0);
+    let pix = null;
+    try { pix = sctx.getImageData(0, 0, W, H); } catch (_) { pix = null; }
+
+    // ---- Dimensions & representative physical sizes ----
+    const isPolar = (doc.coordinate_system === 'polar');
+    const lines = [];
+    lines.push(`<b>${imagePropsEscape(AppState.uploadedImageFilename)}</b> — ${W} × ${H} px`);
+    const pd = doc.polar_domain || {};
+    const rOrient = (pd.r_orientation === 'vertical') ? 'vertical' : 'horizontal';
+    const rs = evalYamlNumber(pd.r_start, 0);
+    const re_ = evalYamlNumber(pd.r_end, 0.1);
+    const thr = evalYamlNumber(pd.theta_range, 2 * Math.PI);
+    if (isPolar) {
+        const nR = (rOrient === 'vertical') ? H : W;
+        const nTh = (rOrient === 'vertical') ? W : H;
+        const dr = (re_ - rs) / Math.max(1, nR - 1);
+        const dth = thr / Math.max(1, nTh);
+        const defaulted = (pd.r_start == null || pd.r_end == null)
+            ? ' <span style="color:#b58900;">(polar_domain incomplete — defaults substituted)</span>' : '';
+        lines.push(`coordinate_system: <b>polar</b>, r_orientation: ${rOrient}${defaulted}`);
+        lines.push(`annulus: r = ${imagePropsFmtM(rs)} … ${imagePropsFmtM(re_)}` +
+                   ` (radial depth ${imagePropsFmtM(re_ - rs)}), θ range = ${(thr * 180 / Math.PI).toFixed(1)}°`);
+        lines.push(`resolution: Δr ≈ ${imagePropsFmtM(dr)}/px, Δθ ≈ ${(dth * 180 / Math.PI).toFixed(4)}°/px,` +
+                   ` arc length @ mean radius ≈ ${imagePropsFmtM(dth * (rs + re_) / 2)}/px`);
+    } else {
+        const mesh = doc.mesh || {};
+        const dx = evalYamlNumber(mesh.dx, 1e-3);
+        const dy = evalYamlNumber(mesh.dy, dx);
+        const defaulted = (mesh.dx == null)
+            ? ' <span style="color:#b58900;">(mesh missing — default dx = dy = 1 mm)</span>' : '';
+        lines.push(`coordinate_system: <b>cartesian</b>${defaulted}`);
+        lines.push(`mesh: dx = ${imagePropsFmtM(dx)}, dy = ${imagePropsFmtM(dy)}` +
+                   ` → physical ${imagePropsFmtM(W * dx)} × ${imagePropsFmtM(H * dy)}`);
+    }
+    document.getElementById('imagePropsDims').innerHTML = lines.join('<br>');
+
+    // ---- Colour statistics (exact RGB, matched against YAML materials) ----
+    if (pix) {
+        const counts = new Map();
+        const stride = (W * H > 6e6) ? 2 : 1;   // stay responsive on huge images
+        let sampled = 0;
+        for (let j = 0; j < H; j += stride) {
+            for (let i = 0; i < W; i += stride) {
+                const p = (j * W + i) * 4;
+                const key = (pix.data[p] << 16) | (pix.data[p + 1] << 8) | pix.data[p + 2];
+                counts.set(key, (counts.get(key) || 0) + 1);
+                sampled++;
+            }
+        }
+        // Materials in the YAML, by packed RGB, for name badges.
+        const matByKey = new Map();
+        for (const [name, props] of Object.entries(doc.materials || {})) {
+            const rgb = props && props.rgb;
+            if (Array.isArray(rgb) && rgb.length >= 3) {
+                matByKey.set(((rgb[0] & 255) << 16) | ((rgb[1] & 255) << 8) | (rgb[2] & 255), name);
+            }
+        }
+        const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+        const TOP = 30;
+        const rows = [];
+        rows.push('<table style="width:100%; border-collapse:collapse; font-size:0.82rem;">' +
+            '<tr style="background:#f1f3f5;"><th style="padding:4px 8px; text-align:left;">Colour</th>' +
+            '<th style="padding:4px 8px; text-align:left;">RGB</th>' +
+            '<th style="padding:4px 8px; text-align:right;">Pixels</th>' +
+            '<th style="padding:4px 8px; text-align:right;">Share</th>' +
+            '<th style="padding:4px 8px; text-align:left;">Material in YAML</th></tr>');
+        for (const [key, n] of sorted.slice(0, TOP)) {
+            const r = (key >> 16) & 255, g = (key >> 8) & 255, b = key & 255;
+            const hex = '#' + [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('');
+            const share = (100 * n / sampled).toFixed(2);
+            const mat = matByKey.get(key);
+            rows.push(`<tr style="border-top:1px solid #eee;">` +
+                `<td style="padding:3px 8px;"><span style="display:inline-block; width:14px; height:14px;` +
+                ` background:${hex}; border:1px solid #aaa; vertical-align:middle;"></span>` +
+                ` <span style="font-family:monospace;">${hex}</span></td>` +
+                `<td style="padding:3px 8px; font-family:monospace;">${r}, ${g}, ${b}</td>` +
+                `<td style="padding:3px 8px; text-align:right;">${(n * stride * stride).toLocaleString()}</td>` +
+                `<td style="padding:3px 8px; text-align:right;">${share}%</td>` +
+                `<td style="padding:3px 8px;">${mat ? `<span style="background:#e3f2fd; border-radius:8px;` +
+                ` padding:1px 8px;">${imagePropsEscape(mat)}</span>` : '<span style="color:#adb5bd;">—</span>'}</td></tr>`);
+        }
+        rows.push('</table>');
+        document.getElementById('imagePropsColorTable').innerHTML = rows.join('');
+        document.getElementById('imagePropsColorSummary').textContent =
+            ` — ${counts.size.toLocaleString()} unique colour(s)` +
+            (counts.size > TOP ? `, showing top ${TOP}` : '') +
+            (stride > 1 ? ` (sampled every ${stride}px)` : '');
+    } else {
+        document.getElementById('imagePropsColorTable').innerHTML =
+            '<div style="padding:10px; color:#888;">Pixel data unavailable (canvas access blocked).</div>';
+    }
+
+    // ---- Coordinate-transform preview ----
+    if (pix) {
+        renderImagePropsTransform(pix, { isPolar, rs, re_, thr, rOrient });
+    }
+}
+
+// Nearest-neighbour coordinate-transform preview.
+// polar strip -> wrapped annulus (what the machine section looks like), or
+// cartesian section -> unwrapped strip (what the polar solver would see).
+// Conventions mirror the solver: image-up is +θ (horizontal r) / +r (vertical).
+function renderImagePropsTransform(pix, geo) {
+    const W = pix.width, H = pix.height;
+    const dst = document.getElementById('imagePropsDstCanvas');
+    const label = document.getElementById('imagePropsDstLabel');
+    const caption = document.getElementById('imagePropsXformCaption');
+    const dctx = dst.getContext('2d');
+
+    const sample = (x, y) => {
+        const i = Math.round(x), j = Math.round(y);
+        if (i < 0 || i >= W || j < 0 || j >= H) return null;
+        const p = (j * W + i) * 4;
+        return [pix.data[p], pix.data[p + 1], pix.data[p + 2], pix.data[p + 3]];
+    };
+
+    if (geo.isPolar) {
+        // Wrap the (r, θ) strip back into an annulus.
+        label.textContent = 'Wrapped to cartesian (annulus)';
+        const S = 560;
+        dst.width = S; dst.height = S;
+        const out = dctx.createImageData(S, S);
+        const rEndPx = S / 2 - 2;
+        const nR = (geo.rOrient === 'vertical') ? H : W;
+        const nTh = (geo.rOrient === 'vertical') ? W : H;
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const xc = x - S / 2 + 0.5;
+                const yc = (S / 2 - y) - 0.5;   // canvas y down -> physical y up
+                const rr = Math.hypot(xc, yc) / rEndPx * geo.re_;
+                if (rr < geo.rs || rr > geo.re_) continue;
+                let th = Math.atan2(yc, xc);
+                if (th < 0) th += 2 * Math.PI;
+                if (th > geo.thr) continue;     // sector models: leave the rest empty
+                const rIdx = (rr - geo.rs) / Math.max(1e-30, geo.re_ - geo.rs) * (nR - 1);
+                const thIdx = th / geo.thr * nTh;
+                let sx, sy;
+                if (geo.rOrient === 'vertical') { sx = thIdx; sy = H - 1 - rIdx; }
+                else { sx = rIdx; sy = H - 1 - thIdx; }
+                const c = sample(sx, sy);
+                if (!c) continue;
+                const q = (y * S + x) * 4;
+                out.data[q] = c[0]; out.data[q + 1] = c[1]; out.data[q + 2] = c[2]; out.data[q + 3] = 255;
+            }
+        }
+        dctx.putImageData(out, 0, 0);
+        caption.textContent = ` — annulus reconstructed from polar_domain (r ${imagePropsFmtM(geo.rs)} … ${imagePropsFmtM(geo.re_)})`;
+    } else {
+        // Unwrap the section into a (r, θ) strip. Geometry defaults: centre =
+        // image centre, r_out = min(W, H)/2 (no YAML fields describe this for
+        // a cartesian run, so this is a visual aid, not a measurement).
+        label.textContent = 'Unwrapped to polar (r × θ strip)';
+        const cx = W / 2, cy = H / 2;
+        const rOutPx = Math.min(W, H) / 2;
+        const rInPx = 0;
+        const Wo = 280, Ho = 720;
+        dst.width = Wo; dst.height = Ho;
+        const out = dctx.createImageData(Wo, Ho);
+        for (let j = 0; j < Ho; j++) {
+            const th = 2 * Math.PI * (Ho - 1 - j) / Ho;   // image-up = +θ
+            const cth = Math.cos(th), sth = Math.sin(th);
+            for (let i = 0; i < Wo; i++) {
+                const rPx = rInPx + (rOutPx - rInPx) * i / (Wo - 1);
+                const sx = cx + rPx * cth;
+                const sy = cy - rPx * sth;   // canvas y down
+                const c = sample(sx, sy);
+                if (!c) continue;
+                const q = (j * Wo + i) * 4;
+                out.data[q] = c[0]; out.data[q + 1] = c[1]; out.data[q + 2] = c[2]; out.data[q + 3] = 255;
+            }
+        }
+        dctx.putImageData(out, 0, 0);
+        caption.textContent = ' — defaults: centre = image centre, r_out = min(W,H)/2 (visual aid; run Polarize for calibrated geometry)';
+    }
 }
 
 // ===== User content backup: export / import =====
