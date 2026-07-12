@@ -28,7 +28,9 @@ experience. It is backward compatible with integer pixel-based slide regions.
 - Added physical-unit slide templates and default-on detected air-gap slide.
 - Added user-data ZIP export/import, including optional analysis results and a
   lazy file picker suitable for thousands of files.
-- Added lazy File Manager rendering.
+- Unified File Manager listing for YAML configs, uploaded images, material
+  libraries and analysis results, with open/download/delete actions and the
+  user-data import/export controls in their natural location.
 - Added Image Properties, polar/cartesian coordinate previews, improved
   magnetisation preview, zoom/pan and pixel rulers.
 - Fixed preset merge, polar magnetisation orientation, overlay alignment and

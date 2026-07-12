@@ -537,6 +537,67 @@
             font-size: 0.8rem;
         }
 
+        .user-files-toolbar {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+
+        .user-file-item {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 11px 12px;
+            margin-bottom: 8px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .user-file-item:hover {
+            background: #eef4ff;
+            border-color: #90caf9;
+        }
+
+        .user-file-icon {
+            width: 30px;
+            text-align: center;
+            font-size: 1.15rem;
+        }
+
+        .user-file-info {
+            min-width: 0;
+            flex: 1;
+        }
+
+        .user-file-name {
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+
+        .user-file-meta {
+            color: #6c757d;
+            font-size: 0.78rem;
+            margin-top: 3px;
+        }
+
+        .user-file-actions {
+            display: flex;
+            gap: 5px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
+        .file-category-heading {
+            margin: 16px 0 7px;
+            padding-bottom: 5px;
+            border-bottom: 1px solid #dee2e6;
+            color: #495057;
+            font-size: 0.92rem;
+        }
+
         /* Modal Styles */
         .modal {
             position: fixed;
@@ -1055,11 +1116,7 @@
                     <span style="margin-left: 12px; padding-left: 12px; border-left: 1px solid #dee2e6;
                                 display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;">
                         <button class="btn-secondary" onclick="openLibraryManager()">Material Library Manager</button>
-                        <button class="btn-secondary" onclick="openBackupModal()"
-                                title="Pick exactly which configs / images / material libraries / results to download as a .zip backup. Your data is tied to a browser cookie and is pruned after long inactivity, so keep a backup to survive cache clears / a new device.">Export My Data…</button>
-                        <button class="btn-secondary" onclick="document.getElementById('importDataInput').click()"
-                                title="Restore configs / images / material libraries / results from a .zip backup downloaded earlier.">Import Data</button>
-                        <input type="file" id="importDataInput" accept=".zip,application/zip,application/json,.json" style="display:none" onchange="importUserData(this)">
+                        <!-- Backup import/export moved to the File Manager tab. -->
                         <span id="activeLibraryBadge" style="display: none; background: #e3f2fd; border: 1px solid #90caf9;
                               border-radius: 12px; padding: 3px 10px; font-size: 0.82rem; color: #1565c0; white-space: nowrap;">
                             Library: <strong id="activeLibraryName"></strong>
@@ -1369,28 +1426,34 @@
         <!-- Tab 4: File Manager -->
         <div class="tab-content" id="tab-files">
             <div class="file-manager-container">
-                <!-- Left Panel: Results List -->
+                <!-- All user-owned files live here: YAML, input images,
+                     material libraries, and completed analysis results. -->
                 <div class="file-list-panel">
-                    <h2>Output File Manager</h2>
-                    <p style="color: #666; margin-bottom: 15px;">
+                    <h2>File Manager</h2>
+                    <p style="color: #666; margin-bottom: 12px;">
                         User: <strong id="fileManagerUserId"></strong>
                     </p>
-                    <div class="button-group" style="margin-bottom: 15px;">
-                        <button class="btn-primary" onclick="refreshOutputsList()">Refresh</button>
-                        <button class="btn-danger" onclick="bulkDeleteOutputs()" id="bulkDeleteBtn" disabled>
-                            Delete Selected (<span id="selectedCount">0</span>)
-                        </button>
-                        <label style="margin-left: 10px; cursor: pointer;">
-                            <input type="checkbox" id="selectAllOutputs" onchange="toggleSelectAll()" style="margin-right: 5px;">
-                            Select All
-                        </label>
+                    <div class="user-files-toolbar">
+                        <button class="btn-primary" onclick="refreshUserFiles()">Refresh</button>
+                        <button class="btn-secondary" onclick="openBackupModal()">Export selected…</button>
+                        <button class="btn-secondary" onclick="document.getElementById('importDataInput').click()">Import backup</button>
+                        <input type="file" id="importDataInput" accept=".zip,application/zip,application/json,.json"
+                               style="display:none" onchange="importUserData(this)">
+                        <select id="fileManagerFilter" onchange="renderUserFiles()" style="padding: 7px; border:1px solid #dee2e6; border-radius:4px;">
+                            <option value="all">All file types</option>
+                            <option value="configs">YAML configs</option>
+                            <option value="images">Input images</option>
+                            <option value="libraries">Material libraries</option>
+                            <option value="results">Analysis results</option>
+                        </select>
                     </div>
-                    <div id="outputsList">
-                        <p style="color: #666;">Loading...</p>
+                    <div id="fileManagerStatus" style="margin-bottom: 10px;"></div>
+                    <div id="userFilesList">
+                        <p style="color: #666;">Loading…</p>
                     </div>
                 </div>
 
-                <!-- Right Panel: Preview -->
+                <!-- Result preview remains available when a result row is opened. -->
                 <div class="file-preview-panel" id="filePreviewPanel" style="display: none;">
                     <h3>Result Preview</h3>
                     <div id="previewDescription" style="margin-bottom: 15px; padding: 10px; background: white; border-radius: 5px; border: 1px solid #dee2e6;"></div>

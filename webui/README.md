@@ -26,8 +26,10 @@ package or in the configured development paths. Use `GET /api/health` and
 - Preview permanent-magnet directions, including polar coordinate conversion.
 - Launch/stop analyses and follow streaming logs.
 - View TIFF or CSV fields, flux linkage, energy, force and torque timelines.
-- Manage configurations, uploads, material libraries and result folders.
-- Export/import selected user content as a standard ZIP backup.
+- Manage configurations, uploaded analysis images, material libraries and
+  result folders together from the File Manager tab.
+- Export/import selected user content as a standard ZIP backup from File
+  Manager; the YAML editor remains focused on editing configuration content.
 
 ## v1.6.1 behaviours
 
@@ -68,7 +70,7 @@ node -e "JSON.parse(require('fs').readFileSync('public/yaml-schema.json','utf8')
 - Images/preprocess: `/api/images*`, `/api/materials/detect`,
   `/api/preprocess-filter/*`, `/api/preprocess-polar/*`
 - Solver/jobs: `/api/solve*`, `/api/stop-solver`, `/api/jobs*`
-- Results: `/api/results*`, `/api/user-outputs*`, `/api/load-field`,
+- Results/files: `/api/results*`, `/api/user-files`, `/api/user-outputs*`, `/api/load-field`,
   `/api/get-flux-linkage`
 - Libraries/backups: `/api/material-libraries*`, `/api/backup-manifest`,
   `/api/export`, `/api/import`

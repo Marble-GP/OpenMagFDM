@@ -49,7 +49,8 @@ const AppState = {
     selectedLibrary: null,       // Active library filename (null = none)
     libraryAceEditor: null,      // Ace Editor instance inside Library modal
     currentLibraryFile: null,    // Currently selected filename in Library modal
-    currentBHMaterial: null      // Last rendered BH material {name, props} for axis toggle
+    currentBHMaterial: null,     // Last rendered BH material {name, props} for axis toggle
+    userFiles: []                // Unified File Manager listing
 };
 
 // ===== Utility Functions =====
@@ -4954,7 +4955,7 @@ function fmtBytes(n) {
 }
 
 async function openBackupModal() {
-    if (!AppState.userId) { showStatus('solverStatus', 'No user session yet', 'error'); return; }
+    if (!AppState.userId) { fileManagerStatus('No user session yet', 'error'); return; }
     const modal = document.getElementById('backupModal');
     const list = document.getElementById('backupModalList');
     list.innerHTML = '<div style="color:#888; padding:12px;">Loading…</div>';
@@ -5100,7 +5101,7 @@ function backupUpdateSummary() {
 async function downloadBackup() {
     const b = AppState.backup; if (!b) return;
     const entries = [...b.selected];
-    if (!entries.length) { showStatus('solverStatus', 'Select at least one item', 'error'); return; }
+    if (!entries.length) { fileManagerStatus('Select at least one item', 'error'); return; }
     const btn = document.getElementById('backupDownloadBtn');
     const old = btn.textContent; btn.disabled = true; btn.textContent = 'Preparing…';
     try {
@@ -5117,9 +5118,9 @@ async function downloadBackup() {
         document.body.appendChild(a); a.click(); document.body.removeChild(a);
         URL.revokeObjectURL(url);
         closeBackupModal();
-        showStatus('solverStatus', `Backup downloaded (${entries.length} file(s), ${fmtBytes(blob.size)}).`, 'success');
+        fileManagerStatus(`Backup downloaded (${entries.length} file(s), ${fmtBytes(blob.size)}).`, 'success');
     } catch (err) {
-        showStatus('solverStatus', `Export failed: ${err.message}`, 'error');
+        fileManagerStatus(`Export failed: ${err.message}`, 'error');
     } finally {
         btn.disabled = false; btn.textContent = old;
     }
@@ -5129,7 +5130,7 @@ async function importUserData(input) {
     const file = input && input.files && input.files[0];
     input.value = '';   // reset so re-selecting the same file fires change again
     if (!file) return;
-    if (!AppState.userId) { showStatus('solverStatus', 'No user session yet', 'error'); return; }
+    if (!AppState.userId) { fileManagerStatus('No user session yet', 'error'); return; }
     try {
         const fd = new FormData();
         fd.append('backup', file, file.name);
@@ -5141,14 +5142,15 @@ async function importUserData(input) {
         // Refresh the lists so the restored content shows up immediately.
         try { await refreshConfigList(); } catch (_) {}
         try { await refreshImageList(); } catch (_) {}
-        showStatus('solverStatus',
+        try { await refreshUserFiles(); } catch (_) {}
+        fileManagerStatus(
             `Imported ${w.configs || 0} config(s), ${w.images || 0} image(s), ` +
             `${w.libraries || 0} library file(s), ${w.results || 0} result file(s)` +
             (nSkip ? ` (${nSkip} skipped)` : '') +
             `. Material libraries appear in the Library Manager.`,
             'success');
     } catch (err) {
-        showStatus('solverStatus', `Import failed: ${err.message}`, 'error');
+        fileManagerStatus(`Import failed: ${err.message}`, 'error');
     }
 }
 
@@ -10849,8 +10851,177 @@ function initializeFileManager() {
         userIdDisplay.textContent = AppState.userId;
     }
 
-    // Load outputs list
-    refreshOutputsList();
+    // Load every user-owned file, not only completed analysis outputs.
+    refreshUserFiles();
+}
+
+function fileManagerEscape(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function fileManagerStatus(message, type = 'info') {
+    const target = document.getElementById('fileManagerStatus');
+    if (target) {
+        target.className = `status-${type}`;
+        target.textContent = message;
+    } else {
+        showStatus('solverStatus', message, type);
+    }
+}
+
+const USER_FILE_CATEGORY_LABEL = {
+    configs: 'YAML configs',
+    images: 'Input images',
+    libraries: 'Material libraries',
+    results: 'Analysis results',
+};
+const USER_FILE_CATEGORY_ICON = {
+    configs: '📝', images: '🖼️', libraries: '🧱', results: '📊',
+};
+
+function userFileHtml(file) {
+    const category = fileManagerEscape(file.category);
+    const name = fileManagerEscape(file.name);
+    const date = file.modified ? new Date(file.modified).toLocaleString('ja-JP') : '';
+    const size = fmtBytes(Number(file.size) || 0);
+    const detail = file.category === 'results'
+        ? `${file.steps || 0} step(s) · ${size} · ${date}`
+        : `${size} · ${date}`;
+    const openLabel = file.category === 'results' ? 'Preview' : 'Open';
+    const download = file.category === 'results' ? ''
+        : `<button class="btn-secondary btn-small" onclick="fileManagerDownload(this)">Download</button>`;
+    return `<div class="user-file-item" data-category="${category}" data-name="${name}">
+        <div class="user-file-icon" aria-hidden="true">${USER_FILE_CATEGORY_ICON[file.category] || '📄'}</div>
+        <div class="user-file-info">
+            <div class="user-file-name">${name}</div>
+            <div class="user-file-meta">${USER_FILE_CATEGORY_LABEL[file.category] || file.category} · ${detail}</div>
+        </div>
+        <div class="user-file-actions">
+            <button class="btn-secondary btn-small" onclick="fileManagerOpen(this)">${openLabel}</button>
+            ${download}
+            <button class="btn-delete btn-small" onclick="fileManagerDelete(this)">Delete</button>
+        </div>
+    </div>`;
+}
+
+function renderUserFiles() {
+    const list = document.getElementById('userFilesList');
+    if (!list) return;
+    const files = AppState.userFiles || [];
+    const filter = document.getElementById('fileManagerFilter')?.value || 'all';
+    const visible = filter === 'all' ? files : files.filter(f => f.category === filter);
+    if (visible.length === 0) {
+        list.innerHTML = '<p style="color:#666;">No files in this category.</p>';
+        return;
+    }
+    const order = ['configs', 'images', 'libraries', 'results'];
+    let html = '';
+    for (const category of order) {
+        const group = visible.filter(file => file.category === category);
+        if (!group.length) continue;
+        html += `<h4 class="file-category-heading">${USER_FILE_CATEGORY_LABEL[category]} (${group.length})</h4>`;
+        html += group.map(userFileHtml).join('');
+    }
+    list.innerHTML = html;
+}
+
+async function refreshUserFiles() {
+    const list = document.getElementById('userFilesList');
+    if (!list) return;
+    list.innerHTML = '<p style="color:#666;">Loading…</p>';
+    try {
+        const response = await fetch(`/api/user-files?userId=${encodeURIComponent(AppState.userId)}`);
+        const result = await response.json();
+        if (!response.ok || !result.success) throw new Error(result.error || 'Failed to load files');
+        AppState.userFiles = result.files || [];
+        renderUserFiles();
+        fileManagerStatus(`${AppState.userFiles.length} file(s) available.`, 'info');
+    } catch (error) {
+        list.innerHTML = `<p style="color:#dc3545;">Error: ${fileManagerEscape(error.message)}</p>`;
+        fileManagerStatus(error.message, 'error');
+    }
+}
+
+function fileManagerRow(button) {
+    const row = button && button.closest('.user-file-item');
+    return row ? { category: row.dataset.category, name: row.dataset.name } : null;
+}
+
+async function fileManagerOpen(button) {
+    const file = fileManagerRow(button);
+    if (!file) return;
+    try {
+        if (file.category === 'configs') {
+            switchTab('config');
+            await refreshConfigList();
+            const select = document.getElementById('configFileSelect');
+            select.value = file.name;
+            await loadSelectedConfig();
+        } else if (file.category === 'images') {
+            switchTab('run');
+            await refreshImageList();
+            const select = document.getElementById('imageSelect');
+            select.value = file.name;
+            loadSelectedImage();
+        } else if (file.category === 'libraries') {
+            await openLibraryManager();
+            await selectLibraryFile(file.name);
+        } else if (file.category === 'results') {
+            await showOutputPreview(file.name);
+        }
+    } catch (error) {
+        fileManagerStatus(`Open failed: ${error.message}`, 'error');
+    }
+}
+
+async function fileManagerDownload(button) {
+    const file = fileManagerRow(button);
+    if (!file || file.category === 'results') return;
+    let url;
+    if (file.category === 'configs') {
+        url = `/api/config?file=${encodeURIComponent(file.name)}&userId=${encodeURIComponent(AppState.userId)}`;
+    } else if (file.category === 'libraries') {
+        url = `/api/material-libraries/${encodeURIComponent(file.name)}?userId=${encodeURIComponent(AppState.userId)}`;
+    } else {
+        url = `/uploads/${encodeURIComponent(AppState.userId)}/${encodeURIComponent(file.name)}`;
+    }
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = file.name;
+        document.body.appendChild(link); link.click(); link.remove();
+        URL.revokeObjectURL(link.href);
+    } catch (error) {
+        fileManagerStatus(`Download failed: ${error.message}`, 'error');
+    }
+}
+
+async function fileManagerDelete(button) {
+    const file = fileManagerRow(button);
+    if (!file) return;
+    if (!confirm(`Delete ${USER_FILE_CATEGORY_LABEL[file.category]} file "${file.name}"?\n\nThis action cannot be undone.`)) return;
+    try {
+        const response = await fetch('/api/user-files', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: AppState.userId, ...file }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) throw new Error(result.error || 'Delete failed');
+        await refreshUserFiles();
+        if (file.category === 'configs') await refreshConfigList();
+        if (file.category === 'images') await refreshImageList();
+        if (file.category === 'results') await refreshResultsList();
+        fileManagerStatus(`Deleted ${file.name}`, 'success');
+    } catch (error) {
+        fileManagerStatus(`Delete failed: ${error.message}`, 'error');
+    }
 }
 
 /**
@@ -10858,7 +11029,7 @@ function initializeFileManager() {
  */
 async function refreshOutputsList() {
     const outputsList = document.getElementById('outputsList');
-    if (!outputsList) return;
+    if (!outputsList) return refreshUserFiles();
 
     try {
         outputsList.innerHTML = '<p style="color: #666;">Loading...</p>';

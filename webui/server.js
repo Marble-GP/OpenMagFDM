@@ -341,11 +341,13 @@ function getUserConfigPath(userId, fileName) {
 async function initializeUserDir(userId) {
     const userDir = getUserDir(userId);
     const libDir = getUserLibsDir(userId);
+    let created = false;
     try {
         await fs.access(userDir);
         // Directory exists
     } catch {
         // Directory doesn't exist, create it
+        created = true;
         await fs.mkdir(userDir, { recursive: true });
 
         // Copy default config
@@ -355,14 +357,11 @@ async function initializeUserDir(userId) {
         console.log(`Initialized new user directory: ${userId}`);
     }
 
-    // Every user starts with a usable material library.  Keep this separate
-    // from the config-directory existence check so existing users created by
-    // older versions receive the library on their next login as well.
-    await fs.mkdir(libDir, { recursive: true });
-    const defaultLibraryPath = path.join(libDir, 'general_materials.yaml');
-    try {
-        await fs.access(defaultLibraryPath);
-    } catch {
+    // New users receive the starter library once.  Do not recreate it after
+    // the user intentionally deletes or replaces it.
+    if (created) {
+        await fs.mkdir(libDir, { recursive: true });
+        const defaultLibraryPath = path.join(libDir, 'general_materials.yaml');
         const bundledLibrary = path.join(BASE_DIR, 'general_materials.yaml');
         await fs.copyFile(bundledLibrary, defaultLibraryPath);
         console.log(`Installed default material library for user: ${userId}`);
@@ -3410,6 +3409,102 @@ app.get('/api/results', async (req, res) => {
             success: false,
             error: error.message
         });
+    }
+});
+
+// Unified user-file listing for the File Manager.  Config YAML, uploaded
+// analysis images, material libraries, and completed result folders all share
+// one response so the UI does not need to know the server's directory layout.
+app.get('/api/user-files', async (req, res) => {
+    try {
+        const userIdKey = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const files = [];
+        const addRegularFiles = async (dir, category, kind, predicate) => {
+            let names;
+            try { names = await fs.readdir(dir); } catch (error) {
+                if (error.code === 'ENOENT') return;
+                throw error;
+            }
+            for (const name of names) {
+                if (!predicate(name)) continue;
+                const filePath = path.join(dir, name);
+                const stat = await fs.stat(filePath);
+                if (!stat.isFile()) continue;
+                files.push({ category, kind, name, size: stat.size,
+                    modified: stat.mtime.toISOString() });
+            }
+        };
+
+        await addRegularFiles(getUserDir(userIdKey), 'configs', 'yaml',
+            name => /\.ya?ml$/i.test(name));
+        await addRegularFiles(getUserUploadsDir(userIdKey), 'images', 'image',
+            name => /\.(png|jpe?g|bmp)$/i.test(name));
+        await addRegularFiles(getUserLibsDir(userIdKey), 'libraries', 'library',
+            name => /\.ya?ml$/i.test(name));
+
+        const outputDir = path.join(OUTPUTS_DIR, userIdKey);
+        let outputNames = [];
+        try { outputNames = await fs.readdir(outputDir, { withFileTypes: true }); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        for (const entry of outputNames) {
+            if (!entry.isDirectory()) continue;
+            const folderPath = path.join(outputDir, entry.name);
+            if (!await isAnalysisResult(folderPath)) continue;
+            const stat = await fs.stat(folderPath);
+            const azFiles = await fs.readdir(path.join(folderPath, 'Az'));
+            files.push({
+                category: 'results', kind: 'result', name: entry.name,
+                size: await getDirectorySize(folderPath),
+                modified: stat.mtime.toISOString(),
+                steps: countTransientSteps(azFiles),
+                path: `outputs/${userIdKey}/${entry.name}`,
+            });
+        }
+
+        files.sort((a, b) => b.modified.localeCompare(a.modified));
+        res.json({ success: true, files });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// Delete one item from the unified File Manager.  Existing category-specific
+// routes remain available for backwards compatibility with older clients.
+app.delete('/api/user-files', async (req, res) => {
+    try {
+        const userIdKey = (req.body && req.body.userId || 'default')
+            .replace(/[^a-zA-Z0-9_-]/g, '');
+        const category = req.body && req.body.category;
+        const name = path.basename(String(req.body && req.body.name || ''));
+        if (!name || name !== String(req.body && req.body.name || '') ||
+            !['configs', 'images', 'libraries', 'results'].includes(category)) {
+            return res.status(400).json({ success: false, error: 'Invalid file selection' });
+        }
+
+        let target;
+        if (category === 'configs') {
+            if (!/\.ya?ml$/i.test(name)) throw new Error('Only YAML configs can be deleted');
+            target = path.join(getUserDir(userIdKey), name);
+        } else if (category === 'images') {
+            if (!/\.(png|jpe?g|bmp)$/i.test(name)) throw new Error('Unsupported image type');
+            target = path.join(getUserUploadsDir(userIdKey), name);
+        } else if (category === 'libraries') {
+            if (!/\.ya?ml$/i.test(name)) throw new Error('Only YAML libraries can be deleted');
+            target = path.join(getUserLibsDir(userIdKey), name);
+        } else {
+            target = path.join(OUTPUTS_DIR, userIdKey, name);
+            if (!await isAnalysisResult(target)) {
+                return res.status(400).json({ success: false, error: 'Not a completed analysis result' });
+            }
+        }
+
+        await fs.rm(target, { recursive: category === 'results', force: false });
+        res.json({ success: true, category, name });
+    } catch (error) {
+        if (error.code === 'ENOENT') {
+            return res.status(404).json({ success: false, error: 'File not found' });
+        }
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
