@@ -33,6 +33,7 @@
  * @brief Main Newton-Krylov solver
  */
 void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
+    last_nonlinear_iterations_ = 0;
     // [Phase BJ-8 Path D / v1.5.1] All NK iterations and the initial-guess
     // dispatch run on the full grid via AMGCL+EW. The custom Galerkin
     // coarsening machinery (Phase 6 + Galerkin, Phase 5 matrix-free GMRES,
@@ -329,14 +330,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // scatter by a few percent run-to-run; users should know).
             // quiet_solver_ (parallel DD sub-solves) suppresses it: concurrent
             // prints from many patches would garble the log.
+            last_nonlinear_iterations_ = iter + 1;
             if (!quiet_solver_) {
-                std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
-                          << std::scientific << std::setprecision(2) << residual_rel << ")";
-                if (plateau_stall) {
-                    std::cout << " [PLATEAU STALL: accepted above tolerance "
-                              << std::scientific << std::setprecision(1) << TOL << "]";
+                if (VERBOSE) {
+                    std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
+                              << std::scientific << std::setprecision(2) << residual_rel << ")";
+                    if (plateau_stall) {
+                        std::cout << " [PLATEAU STALL: accepted above tolerance "
+                                  << std::scientific << std::setprecision(1) << TOL << "]";
+                    }
+                    std::cout << std::endl;
                 }
-                std::cout << std::endl;
             }
 
             // [Stage 1e] Coarse path keeps only active cells current (active-only
@@ -950,7 +954,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
     }
 
-    if (!quiet_solver_)
+    last_nonlinear_iterations_ = MAX_ITER;
+    if (!quiet_solver_ && VERBOSE)
         std::cerr << "WARNING: Newton-Krylov solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
 
     // [Stage 1e] As in the converged branch: promote the coarse solution to the

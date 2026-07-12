@@ -33,7 +33,16 @@ experience. It is backward compatible with integer pixel-based slide regions.
   magnetisation preview, zoom/pan and pixel rulers.
 - Fixed preset merge, polar magnetisation orientation, overlay alignment and
   viewer repaint issues.
-- Standalone WebUI packages now include `sample_config.yaml`.
+- Standalone WebUI packages now include `sample_config.yaml` and
+  `general_materials.yaml`.
+- Polar slide generation maps the detected source-image air-gap radius through
+  the actual warp interval (so changing output `nr` does not move the band),
+  and defaults to the inner side.
+- With `nonlinear_solver.verbose: false`, implementation-selection and AMGCL
+  residual lines are suppressed; each transient step reports elapsed seconds
+  and iteration count instead. `conditions.json` is written before solver
+  initialization, and full-disc `r_start: 0` is valid in the viewer.
+- New user directories receive the bundled `general_materials.yaml` library.
 
 ## Recommended nonlinear settings
 

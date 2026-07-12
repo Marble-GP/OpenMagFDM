@@ -14,6 +14,12 @@ investigations remain under `docs/research/`.
 - Added selective ZIP backup/import and lazy large-list rendering.
 - Unified version metadata, export defaults, sample configuration and YAML
   specification; added release-contract CI smoke coverage.
+- Polar slide templates now map the detected air-gap radius from source-image
+  pixels to physical metres independently of output `nr`, default to the inner
+  side, and emit concise step time/iteration summaries when `verbose: false`.
+- `conditions.json` is prepared before solver initialization and full-disc
+  polar metadata (`r_start: 0`) is accepted by the WebUI; new users receive
+  `general_materials.yaml` automatically.
 
 See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 

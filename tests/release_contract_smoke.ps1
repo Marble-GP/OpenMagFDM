@@ -9,6 +9,9 @@ $solver = Join-Path $package 'MagFDMsolver.exe'
 if (-not (Test-Path -LiteralPath $solver)) {
     throw "Solver not found: $solver"
 }
+if (-not (Test-Path -LiteralPath (Join-Path $package 'general_materials.yaml'))) {
+    throw 'Bundled general_materials.yaml is missing from the release package'
+}
 
 $version = (& $solver --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $version -ne 'OpenMagFDM 1.6.1') {

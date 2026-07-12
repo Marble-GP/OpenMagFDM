@@ -6724,8 +6724,10 @@ void MagneticFieldAnalyzer::solve() {
 
     // Check if nonlinear solver is needed
     if (has_nonlinear_materials && nonlinear_config.enabled) {
-        std::cout << "\n=== Nonlinear materials detected ===" << std::endl;
-        std::cout << "Using nonlinear solver: " << nonlinear_config.solver_type << std::endl;
+        if (nonlinear_config.verbose) {
+            std::cout << "\n=== Nonlinear materials detected ===" << std::endl;
+            std::cout << "Using nonlinear solver: " << nonlinear_config.solver_type << std::endl;
+        }
 
         // Choose solver based on configuration
         if (nonlinear_config.solver_type == "newton-krylov") {
@@ -7051,6 +7053,11 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
     // to slacken AMGCL's stopping criterion when the outer Newton
     // residual is still loose, avoiding wasteful inner iterations.
     const double tol_effective = (tolerance > 0.0) ? tolerance : SOLVER_TOLERANCE;
+    // nonlinear_solver.verbose is the user-facing diagnostic switch.  The
+    // quiet flag additionally suppresses output from parallel DD workers.
+    // Keep AMGCL's implementation choice and residual out of normal logs;
+    // the caller reports elapsed time and iteration count per transient step.
+    const bool solver_verbose = nonlinear_config.verbose && !quiet_solver_;
 
     if (n > AMGCL_THRESHOLD) {
         // AMGCL: AMG-preconditioned CG — near-linear scaling for 2D Poisson problems.
@@ -7068,7 +7075,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         // ILU(0) is wired in but unused. Keeping the include + comment here
         // so a future bench can A/B them without rummaging through AMGCL
         // headers.
-        if (!quiet_solver_)
+        if (solver_verbose)
             std::cout << "  [Solver] AMGCL AMG-CG (n=" << n << " > " << AMGCL_THRESHOLD << ")" << std::endl;
 
         typedef amgcl::make_solver<
@@ -7112,7 +7119,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         auto [iters, error] = amg(rhs_vec, x_vec);
         total_linear_iters_ += (long)iters; num_linear_solves_++;   // DD conditioning instrumentation
 
-        if (!quiet_solver_)
+        if (solver_verbose)
             std::cout << "  [AMGCL] " << iters << " iters, residual="
                       << std::scientific << std::setprecision(2) << error
                       << std::defaultfloat << std::endl;
@@ -7139,7 +7146,8 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
 
     } else {
         // SparseLU: symbolic factorization reused across nonlinear iterations
-        std::cout << "  [Solver] SparseLU (n=" << n << " <= " << AMGCL_THRESHOLD << ")" << std::endl;
+        if (solver_verbose)
+            std::cout << "  [Solver] SparseLU (n=" << n << " <= " << AMGCL_THRESHOLD << ")" << std::endl;
 
         if (!nl_solver_pattern_valid_ || n != nl_solver_last_n_) {
             nl_solver_.analyzePattern(A);
@@ -13276,6 +13284,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
         // Start step timer
         auto step_start_time = std::chrono::high_resolution_clock::now();
+        const bool solver_verbose = nonlinear_config.verbose && !quiet_solver_;
 
         // <<PROFILING_TIMER_BEGIN>>
         long long prof_d_mat = 0, prof_d_build = 0, prof_d_warm = 0;
@@ -13326,6 +13335,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             // For nonlinear materials, use standard solve() which includes nonlinear iteration
             // This ensures mu_map is updated based on actual H-field at each transient step
             solve();
+            prof_iters = getLastNonlinearIterations();
             // Phase V diagnostic: μ stats AT END of solve (= what gets exported).
             if (nonlinear_config.verbose) {
                 double mu_min = 1e300, mu_max = -1e300, mu_sum = 0.0; long long nc = 0;
@@ -13482,10 +13492,11 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             if (use_iterative_solver) {
                 // Subsequent steps with large problem size: use AMGCL (AMG-preconditioned CG)
                 // AMGCL provides dramatic speedup for Poisson-type problems
-                std::cout << "Step " << step+1 << ": Using AMGCL (AMG-preconditioned CG)..." << std::endl;
-                std::cout << "  (Problem size n=" << n << " > 100k threshold)" << std::endl;
-
-                std::cout << "[AMGCL] AR(1) linear extrapolation warm-start enabled" << std::endl;
+                if (solver_verbose) {
+                    std::cout << "Step " << step+1 << ": Using AMGCL (AMG-preconditioned CG)..." << std::endl;
+                    std::cout << "  (Problem size n=" << n << " > 100k threshold)" << std::endl;
+                    std::cout << "[AMGCL] AR(1) linear extrapolation warm-start enabled" << std::endl;
+                }
 
                 // Start timing
                 auto amgcl_total_start = std::chrono::high_resolution_clock::now();
@@ -13821,13 +13832,14 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                         std::chrono::high_resolution_clock::now() - prof_t_warm).count();
                     // <<PROFILING_TIMER_END>>
 
-                    std::cout << "  Building AMG hierarchy..." << std::endl;
+                    if (solver_verbose) std::cout << "  Building AMG hierarchy..." << std::endl;
                     auto amg_build_start = std::chrono::high_resolution_clock::now();
                     AMGSolver amg_solve(A_crs, amg_params);
                     auto amg_build_end = std::chrono::high_resolution_clock::now();
                     auto amg_build_time = std::chrono::duration_cast<std::chrono::milliseconds>(amg_build_end - amg_build_start);
 
-                    std::cout << "  AMG hierarchy built in " << amg_build_time.count() << " ms" << std::endl;
+                    if (solver_verbose)
+                        std::cout << "  AMG hierarchy built in " << amg_build_time.count() << " ms" << std::endl;
 
                     // ============================================
                     // Warm-start initial guess (AR(1) linear extrapolation)
@@ -13864,7 +13876,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                     }
                     std::vector<double> rhs_vec(rhs.data(), rhs.data() + n);
 
-                    std::cout << "  Solving with AMG-CG..." << std::endl;
+                    if (solver_verbose) std::cout << "  Solving with AMG-CG..." << std::endl;
                     auto amg_solve_start = std::chrono::high_resolution_clock::now();
                     int amg_iters;
                     double amg_error;
@@ -13875,13 +13887,15 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
                     Eigen::VectorXd amg_solution = Eigen::Map<Eigen::VectorXd>(x_vec.data(), n);
 
-                    std::cout << "\n  AMGCL Results:" << std::endl;
-                    std::cout << "    AMG build time: " << amg_build_time.count() << " ms" << std::endl;
-                    std::cout << "    Solver time: " << amg_solve_time.count() << " ms" << std::endl;
-                    std::cout << "    Total time: " << (amg_build_time.count() + amg_solve_time.count()) << " ms" << std::endl;
-                    std::cout << "    Iterations: " << amg_iters << std::endl;
-                    std::cout << "    Residual error: " << amg_error << std::endl;
-                    std::cout << "    Status: " << (amg_error < SOLVER_TOLERANCE ? "SUCCESS" : "FAILED") << std::endl;
+                    if (solver_verbose) {
+                        std::cout << "\n  AMGCL Results:" << std::endl;
+                        std::cout << "    AMG build time: " << amg_build_time.count() << " ms" << std::endl;
+                        std::cout << "    Solver time: " << amg_solve_time.count() << " ms" << std::endl;
+                        std::cout << "    Total time: " << (amg_build_time.count() + amg_solve_time.count()) << " ms" << std::endl;
+                        std::cout << "    Iterations: " << amg_iters << std::endl;
+                        std::cout << "    Residual error: " << amg_error << std::endl;
+                        std::cout << "    Status: " << (amg_error < SOLVER_TOLERANCE ? "SUCCESS" : "FAILED") << std::endl;
+                    }
 
                     // <<PROFILING_TIMER_BEGIN>>
                     prof_d_amgb = amg_build_time.count();
@@ -13976,12 +13990,15 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
             } else {
                 // Small/medium problems (n <= 100k): use direct solver with pattern reuse
-                std::cout << "Step " << step+1 << ": Using direct solver (SparseLU) with pattern reuse..." << std::endl;
-                std::cout << "  (Problem size n=" << n << " <= 100k, direct solver is faster)" << std::endl;
+                if (solver_verbose) {
+                    std::cout << "Step " << step+1 << ": Using direct solver (SparseLU) with pattern reuse..." << std::endl;
+                    std::cout << "  (Problem size n=" << n << " <= 100k, direct solver is faster)" << std::endl;
+                }
+                prof_iters = 1; // direct solve has no iterative residual count
 
                 // Reuse pattern if matrix structure unchanged
                 if (A.nonZeros() != transient_matrix_nnz) {
-                    std::cout << "  Matrix pattern changed, re-analyzing..." << std::endl;
+                    if (solver_verbose) std::cout << "  Matrix pattern changed, re-analyzing..." << std::endl;
                     transient_solver.compute(A);
                     transient_matrix_nnz = A.nonZeros();
                 } else {
@@ -14115,8 +14132,15 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         auto step_duration = std::chrono::duration_cast<std::chrono::milliseconds>(step_end_time - step_start_time);
         auto total_elapsed = std::chrono::duration_cast<std::chrono::seconds>(step_end_time - analysis_start_time);
 
-        std::cout << "Step " << step+1 << " elapsed time: " << step_duration.count() << " ms" << std::endl;
-        std::cout << "Total elapsed time: " << total_elapsed.count() << " s" << std::endl;
+        if (solver_verbose) {
+            std::cout << "Step " << step+1 << " elapsed time: " << step_duration.count() << " ms" << std::endl;
+            std::cout << "Total elapsed time: " << total_elapsed.count() << " s" << std::endl;
+        } else if (!quiet_solver_) {
+            std::cout << "Step " << step+1 << " complete: "
+                      << std::fixed << std::setprecision(3)
+                      << (step_duration.count() / 1000.0) << " s, "
+                      << prof_iters << " iterations" << std::defaultfloat << std::endl;
+        }
 
         // <<PROFILING_TIMER_BEGIN>>
         auto prof_t_slide = std::chrono::high_resolution_clock::now();
@@ -14131,7 +14155,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // <<PROFILING_TIMER_BEGIN>>
         prof_d_slide = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::high_resolution_clock::now() - prof_t_slide).count();
-        std::cout << "TIMING,step=" << (step+1)
+        if (solver_verbose) std::cout << "TIMING,step=" << (step+1)
                   << ",n=" << prof_n
                   << ",nnz=" << prof_nnz
                   << ",iters=" << prof_iters

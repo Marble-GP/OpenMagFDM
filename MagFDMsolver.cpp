@@ -11,6 +11,7 @@
 #include <map>
 #include <algorithm>
 #include <utility>
+#include <filesystem>
 #include <yaml-cpp/yaml.h>
 #include "json.hpp"
 
@@ -613,12 +614,16 @@ int main(int argc, char* argv[]) {
         std::cout << "\nOutput folder not specified. Using timestamp: " << base_folder << std::endl;
     }
 
-    // Create output folder if it doesn't exist (cross-platform)
-#ifdef _WIN32
-    system(("mkdir \"" + base_folder + "\" 2>nul").c_str());
-#else
-    system(("mkdir -p \"" + base_folder + "\"").c_str());
-#endif
+    // Create the output folder before exporting conditions.json.  Native
+    // filesystem APIs handle spaces and nested user paths consistently on
+    // Windows, macOS, and Linux (the old shell mkdir could fail silently).
+    std::error_code mkdir_error;
+    std::filesystem::create_directories(base_folder, mkdir_error);
+    if (mkdir_error) {
+        std::cerr << "Failed to create output folder '" << base_folder
+                  << "': " << mkdir_error.message() << std::endl;
+        return 1;
+    }
 
     // Setup log file output (tee to both console and file)
     std::ofstream log_file(base_folder + "/log.txt");

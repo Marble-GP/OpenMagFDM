@@ -2939,7 +2939,7 @@ AppState.polarPreprocess = {
         // Default ON (user request): the emission is still gated on an
         // air-gap marker actually existing, so it is a no-op without one.
         air_gap_as_slide: true,
-        air_gap_slide_side: 'outside',     // 'inside' | 'outside'
+        air_gap_slide_side: 'inside',      // 'inside' | 'outside'
         air_gap_slide_pixels_per_step: 1,
         theta_start: 0, theta_end: 2 * Math.PI,
         is_sector: false,
@@ -3186,7 +3186,7 @@ function resetPolarPreprocessState() {
         air_gap_px: 0,
         air_gap_offset_px: 0,
         air_gap_as_slide: true,   // default ON (no-op until a gap marker exists)
-        air_gap_slide_side: 'outside',
+        air_gap_slide_side: 'inside',
         air_gap_slide_pixels_per_step: 1,
         theta_start: 0, theta_end: 2 * Math.PI,
         is_sector: false,
@@ -3395,7 +3395,7 @@ function applyDetectionToCurrent(detection) {
     // The slide checkbox itself returns to its default (ON).
     cur.air_gap_offset_px = 0;
     cur.air_gap_as_slide = true;
-    cur.air_gap_slide_side = 'outside';
+    cur.air_gap_slide_side = 'inside';
     cur.r_outer_px = detection.r_outer_px;
     cur.theta_start = detection.theta_start;
     cur.theta_end = detection.theta_end;
@@ -3607,7 +3607,7 @@ function syncPolarInputsFromState() {
     const slideEl = document.getElementById('polarAirGapAddSlide');
     if (slideEl) slideEl.checked = !!cur.air_gap_as_slide;
     document.querySelectorAll('input[name="polarAirGapSide"]').forEach(r => {
-        r.checked = (r.value === (cur.air_gap_slide_side || 'outside'));
+        r.checked = (r.value === (cur.air_gap_slide_side || 'inside'));
     });
 }
 
@@ -4467,8 +4467,16 @@ function buildPolarYamlBlock(filename, polarDomain) {
         // Emit the slide region as PHYSICAL radii in metres (consistent with
         // polar_domain). Decimal literals are the solver's metre marker;
         // integer literals keep the legacy pixel meaning.
-        const nrWarp = Math.max(2, Math.round(Number(cur.nr) || 0));
-        const pxToR = (px) => (rs + (re - rs) * (px / (nrWarp - 1))).toPrecision(8);
+        // The air-gap marker is measured in SOURCE image pixels, while nr is
+        // the user-selected OUTPUT resolution.  Do not divide by nr: that
+        // makes changing nr silently move the physical slide band.  Map the
+        // source radius through the actual warp interval instead.
+        const warpStartPx = Math.max(0, Math.round(Number(cur.r_inner_px) || 0));
+        const warpEndPx = Math.max(warpStartPx + 1, Math.round(Number(cur.r_outer_px) || 0));
+        const pxToR = (px) => {
+            const t = Math.max(0, Math.min(1, (Number(px) - warpStartPx) / (warpEndPx - warpStartPx)));
+            return (rs + (re - rs) * t).toPrecision(8);
+        };
         // Phase K: derive N_step / N_slide from ntheta so the slide
         // simulates one full rotation in N_step steps of N_slide pixels
         // each (subject to 32 ≤ N_step ≤ 256). The values themselves
@@ -5658,7 +5666,9 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
     if (coordSystem === 'polar') {
         // Polar coordinate magnetic field calculation
         const polar = AppState.analysisConditions.polar;
-        if (!polar || !polar.r_start || !polar.r_end || !polar.theta_range) {
+        // r_start=0 is valid for a full-disc polar model; use null checks,
+        // not truthiness, or every such run is reported as missing conditions.
+        if (!polar || polar.r_start == null || polar.r_end == null || polar.theta_range == null) {
             console.error('Polar coordinate parameters missing in analysisConditions:', AppState.analysisConditions);
             throw new Error('Polar coordinate parameters not found in conditions.json');
         }

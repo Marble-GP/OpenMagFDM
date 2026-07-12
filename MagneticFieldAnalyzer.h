@@ -76,8 +76,13 @@ public:
     // solves since construction (proxy for spectral conditioning; read deltas around solve()).
     long getTotalLinearIters() const { return total_linear_iters_; }
     int  getNumLinearSolves()  const { return num_linear_solves_; }
+    // Number of outer nonlinear iterations used by the most recent solve.
+    // The transient logger uses this for a concise per-step summary when
+    // nonlinear_solver.verbose is false.
+    int  getLastNonlinearIterations() const { return last_nonlinear_iterations_; }
     long total_linear_iters_ = 0;
     int  num_linear_solves_  = 0;
+    int  last_nonlinear_iterations_ = 0;
     // Update a radial (inner/outer, len ntheta) or theta (theta_min/theta_max, len nr) transmission
     // profile in-place between Schwarz sweeps. edge in {inner,outer,theta_min,theta_max}.
     void setBoundaryProfile(const std::string& edge, const std::vector<double>& prof);

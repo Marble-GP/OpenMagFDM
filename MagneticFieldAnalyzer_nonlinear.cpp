@@ -1355,6 +1355,7 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
  * 7. Repeat from step 2
  */
 void MagneticFieldAnalyzer::solveNonlinear() {
+    last_nonlinear_iterations_ = 0;
     if (!has_nonlinear_materials) {
         // No nonlinear materials, use standard linear solver
         if (coordinate_system == "cartesian") {
@@ -1365,10 +1366,12 @@ void MagneticFieldAnalyzer::solveNonlinear() {
         return;
     }
 
-    std::cout << "\n=== Nonlinear Solver (Picard Iteration) ===" << std::endl;
-    std::cout << "Max iterations: " << nonlinear_config.max_iterations << std::endl;
-    std::cout << "Tolerance: " << nonlinear_config.tolerance << std::endl;
-    std::cout << "Relaxation: " << nonlinear_config.relaxation << std::endl;
+    if (nonlinear_config.verbose) {
+        std::cout << "\n=== Nonlinear Solver (Picard Iteration) ===" << std::endl;
+        std::cout << "Max iterations: " << nonlinear_config.max_iterations << std::endl;
+        std::cout << "Tolerance: " << nonlinear_config.tolerance << std::endl;
+        std::cout << "Relaxation: " << nonlinear_config.relaxation << std::endl;
+    }
 
     const int MAX_ITER = nonlinear_config.max_iterations;
     const double TOL = nonlinear_config.tolerance;
@@ -1465,7 +1468,9 @@ void MagneticFieldAnalyzer::solveNonlinear() {
 
         // Convergence check (both Az and mu must converge)
         if (Az_residual < TOL && mu_change_rel < TOL) {
-            std::cout << "Nonlinear solver converged in " << iter + 1 << " iterations" << std::endl;
+            last_nonlinear_iterations_ = iter + 1;
+            if (nonlinear_config.verbose)
+                std::cout << "Nonlinear solver converged in " << iter + 1 << " iterations" << std::endl;
 
             // Export convergence history if requested
             if (nonlinear_config.export_convergence) {
@@ -1484,9 +1489,12 @@ void MagneticFieldAnalyzer::solveNonlinear() {
         Az_old = Az_new;
     }
 
-    std::cerr << "WARNING: Nonlinear solver did not converge after "
-              << MAX_ITER << " iterations!" << std::endl;
-    std::cerr << "Final residual: " << residual_history.back() << std::endl;
+    last_nonlinear_iterations_ = MAX_ITER;
+    if (nonlinear_config.verbose) {
+        std::cerr << "WARNING: Nonlinear solver did not converge after "
+                  << MAX_ITER << " iterations!" << std::endl;
+        std::cerr << "Final residual: " << residual_history.back() << std::endl;
+    }
 }
 
 /**
@@ -1498,6 +1506,7 @@ void MagneticFieldAnalyzer::solveNonlinear() {
  * Reference: Walker & Ni, "Anderson Acceleration for Fixed-Point Iterations", SIAM J. Numer. Anal., 2011
  */
 void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
+    last_nonlinear_iterations_ = 0;
     if (!has_nonlinear_materials) {
         // No nonlinear materials, use standard linear solver
         if (coordinate_system == "cartesian") {
@@ -1526,8 +1535,10 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         return;
     }
 
-    std::cout << "\n=== Nonlinear Solver (Picard + Anderson Acceleration) ===" << std::endl;
-    std::cout << "Anderson depth: " << m_AA << ", beta: " << beta_AA << std::endl;
+    if (nonlinear_config.verbose) {
+        std::cout << "\n=== Nonlinear Solver (Picard + Anderson Acceleration) ===" << std::endl;
+        std::cout << "Anderson depth: " << m_AA << ", beta: " << beta_AA << std::endl;
+    }
 
     const int MAX_ITER = nonlinear_config.max_iterations;
     const double TOL = nonlinear_config.tolerance;
@@ -1661,12 +1672,16 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         }
 
         if (Az_res < TOL && mu_res < TOL) {
-            std::cout << "Anderson-accelerated solver converged in " << iter + 1 << " iterations" << std::endl;
+            last_nonlinear_iterations_ = iter + 1;
+            if (nonlinear_config.verbose)
+                std::cout << "Anderson-accelerated solver converged in " << iter + 1 << " iterations" << std::endl;
             return;
         }
 
         Az_old = Az_new;
     }
 
-    std::cerr << "WARNING: Anderson solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
+    last_nonlinear_iterations_ = MAX_ITER;
+    if (nonlinear_config.verbose)
+        std::cerr << "WARNING: Anderson solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
 }

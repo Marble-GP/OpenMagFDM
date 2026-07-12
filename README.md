@@ -499,6 +499,8 @@ materials:
 ```
 
 WebUI の Material Library Manager から YAML ファイルの管理・B-H カーブの可視化が可能です。
+新規ユーザーには、代表的な鉄系材料・永久磁石プリセットを収録した
+`general_materials.yaml` が自動的に同梱されます。実機の材料データで置き換えてください。
 
 ---
 

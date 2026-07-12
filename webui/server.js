@@ -125,6 +125,10 @@ async function prepareUserOutputDirectory(userId) {
     // Generate timestamped folder for this run
     const timestampFolder = generateTimestampFolderName();
     const fullOutputPath = path.join(userOutputBase, timestampFolder);
+    // Create the run directory before spawning the solver.  The solver writes
+    // conditions.json as its first artifact, so the WebUI can poll that file
+    // immediately instead of observing a missing result directory race.
+    await fs.mkdir(fullOutputPath, { recursive: true });
 
     return fullOutputPath;
 }
@@ -336,6 +340,7 @@ function getUserConfigPath(userId, fileName) {
 // Helper: Initialize user directory with default config
 async function initializeUserDir(userId) {
     const userDir = getUserDir(userId);
+    const libDir = getUserLibsDir(userId);
     try {
         await fs.access(userDir);
         // Directory exists
@@ -348,6 +353,19 @@ async function initializeUserDir(userId) {
         const defaultConfigPath = path.join(userDir, 'sample_config.yaml');
         await fs.writeFile(defaultConfigPath, defaultConfig, 'utf8');
         console.log(`Initialized new user directory: ${userId}`);
+    }
+
+    // Every user starts with a usable material library.  Keep this separate
+    // from the config-directory existence check so existing users created by
+    // older versions receive the library on their next login as well.
+    await fs.mkdir(libDir, { recursive: true });
+    const defaultLibraryPath = path.join(libDir, 'general_materials.yaml');
+    try {
+        await fs.access(defaultLibraryPath);
+    } catch {
+        const bundledLibrary = path.join(BASE_DIR, 'general_materials.yaml');
+        await fs.copyFile(bundledLibrary, defaultLibraryPath);
+        console.log(`Installed default material library for user: ${userId}`);
     }
 }
 
@@ -4287,6 +4305,7 @@ app.delete('/api/jobs/:jobId', async (req, res) => {
 app.get('/api/material-libraries', async (req, res) => {
     try {
         const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        await initializeUserDir(userId);
         const libDir = getUserLibsDir(userId);
         await fs.mkdir(libDir, { recursive: true });
 

@@ -45,7 +45,7 @@ jobs:
         cp -r docs release/OpenMagFDM-Linux/
         cp -r webui release/OpenMagFDM-Linux/
         cp -r sample_config.yaml release/OpenMagFDM-Linux/
-        cp sample_material_lib.yaml release/OpenMagFDM-Linux/
+        cp general_materials.yaml release/OpenMagFDM-Linux/
         cd release
         tar -czf OpenMagFDM-Linux-x86_64.tar.gz OpenMagFDM-Linux
 
@@ -116,7 +116,7 @@ jobs:
         Copy-Item -Recurse docs release/OpenMagFDM-Windows/
         Copy-Item -Recurse webui release/OpenMagFDM-Windows/
         Copy-Item sample_config.yaml release/OpenMagFDM-Windows/
-        Copy-Item sample_material_lib.yaml release/OpenMagFDM-Windows/
+        Copy-Item general_materials.yaml release/OpenMagFDM-Windows/
 
         # Debug: Show directory structure
         Write-Host "=== Workspace structure ==="
@@ -227,6 +227,9 @@ jobs:
         $cfg += "materials:`n"
         $cfg += "  air:`n    rgb: [255, 255, 255]`n    mu_r: 1.0`n    jz: 0.0`n"
         $cfg += "  coil:`n    rgb: [255, 0, 0]`n    mu_r: 1.0`n    jz: 1.0e6`n"
+        # Verbose is enabled only for this activation smoke test; normal
+        # user runs keep AMGCL implementation/residual details suppressed.
+        $cfg += "nonlinear_solver:`n  verbose: true`n"
         $cfg | Out-File -FilePath "${{github.workspace}}\release\OpenMagFDM-Windows\test_smoke.yaml" -Encoding utf8
 
         # Run solver
@@ -291,7 +294,7 @@ jobs:
         cp -r docs release/OpenMagFDM-macOS/
         cp -r webui release/OpenMagFDM-macOS/
         cp sample_config.yaml release/OpenMagFDM-macOS/
-        cp sample_material_lib.yaml release/OpenMagFDM-macOS/
+        cp general_materials.yaml release/OpenMagFDM-macOS/
         cd release
         tar -czf OpenMagFDM-macOS-x86_64.tar.gz OpenMagFDM-macOS
 
@@ -338,7 +341,7 @@ jobs:
         cp ../README.md OpenMagFDM-WebUI-Linux/
         cp ../CHANGELOG.md OpenMagFDM-WebUI-Linux/
         cp ../sample_config.yaml OpenMagFDM-WebUI-Linux/   # default config the server loads on startup
-        cp ../sample_material_lib.yaml OpenMagFDM-WebUI-Linux/
+        cp ../general_materials.yaml OpenMagFDM-WebUI-Linux/
         tar -czf OpenMagFDM-WebUI-Linux.tar.gz OpenMagFDM-WebUI-Linux
 
         # Windows
@@ -350,7 +353,7 @@ jobs:
         cp ../README.md OpenMagFDM-WebUI-Windows/
         cp ../CHANGELOG.md OpenMagFDM-WebUI-Windows/
         cp ../sample_config.yaml OpenMagFDM-WebUI-Windows/   # default config the server loads on startup
-        cp ../sample_material_lib.yaml OpenMagFDM-WebUI-Windows/
+        cp ../general_materials.yaml OpenMagFDM-WebUI-Windows/
         zip -r OpenMagFDM-WebUI-Windows.zip OpenMagFDM-WebUI-Windows
 
         # macOS
@@ -363,7 +366,7 @@ jobs:
         cp ../README.md OpenMagFDM-WebUI-macOS/
         cp ../CHANGELOG.md OpenMagFDM-WebUI-macOS/
         cp ../sample_config.yaml OpenMagFDM-WebUI-macOS/   # default config the server loads on startup
-        cp ../sample_material_lib.yaml OpenMagFDM-WebUI-macOS/
+        cp ../general_materials.yaml OpenMagFDM-WebUI-macOS/
         tar -czf OpenMagFDM-WebUI-macOS.tar.gz OpenMagFDM-WebUI-macOS
 
     - name: Upload artifacts
