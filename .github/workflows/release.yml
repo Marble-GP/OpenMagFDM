@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install dependencies
       run: |
@@ -50,7 +50,7 @@ jobs:
         tar -czf OpenMagFDM-Linux-x86_64.tar.gz OpenMagFDM-Linux
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: OpenMagFDM-Linux-x86_64
         path: release/OpenMagFDM-Linux-x86_64.tar.gz
@@ -59,10 +59,10 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Cache vcpkg
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           vcpkg_installed
@@ -252,7 +252,7 @@ jobs:
           -PackageDir "${{github.workspace}}\release\OpenMagFDM-Windows"
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: OpenMagFDM-Windows-x86_64
         path: release/OpenMagFDM-Windows-x86_64.zip
@@ -261,7 +261,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install dependencies
       run: |
@@ -295,7 +295,7 @@ jobs:
         tar -czf OpenMagFDM-macOS-x86_64.tar.gz OpenMagFDM-macOS
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: OpenMagFDM-macOS-x86_64
         path: release/OpenMagFDM-macOS-x86_64.tar.gz
@@ -304,10 +304,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Setup Node.js
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v6
       with:
         node-version: '18'
 
@@ -366,7 +366,7 @@ jobs:
         tar -czf OpenMagFDM-WebUI-macOS.tar.gz OpenMagFDM-WebUI-macOS
 
     - name: Upload artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: OpenMagFDM-WebUI-Standalone
         path: |
@@ -379,16 +379,16 @@ jobs:
     needs: [build-windows, build-webui-standalone]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Download Windows build
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: OpenMagFDM-Windows-x86_64
         path: artifacts
 
     - name: Download WebUI standalone
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         name: OpenMagFDM-WebUI-Standalone
         path: artifacts-webui
@@ -473,7 +473,7 @@ jobs:
         & "C:\Program Files (x86)\NSIS\makensis.exe" installer.nsi
 
     - name: Upload installer
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: OpenMagFDM-Installer-Windows
         path: OpenMagFDM-Installer-Windows-x86_64.exe
@@ -485,12 +485,12 @@ jobs:
 
     steps:
     - name: Download all artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         path: artifacts
 
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: |
           artifacts/OpenMagFDM-Linux-x86_64/OpenMagFDM-Linux-x86_64.tar.gz
