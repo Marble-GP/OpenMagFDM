@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-project(MagFDMsolver LANGUAGES CXX)
+project(MagFDMsolver VERSION 1.6.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,6 +16,9 @@ add_executable(MagFDMsolver
     AsyncWriter.h
     tinyexpr/tinyexpr.cpp
     tinyexpr/tinyexpr.h
+)
+target_compile_definitions(MagFDMsolver PRIVATE
+    OPENMAGFDM_VERSION_STRING="${PROJECT_VERSION}"
 )
 
 include(GNUInstallDirs)

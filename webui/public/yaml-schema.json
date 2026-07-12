@@ -10,6 +10,17 @@
       "acceptsAnyChild": true,
       "example": "variables:\n  freq: 60\n  omega: 2*pi*freq  # Can reference $freq\n  rpm: freq/60      # Quotes optional for formulas"
     },
+    "omp": {
+      "description": "OpenMP runtime configuration. threads <= 0 or omitted uses the runtime/system default.",
+      "children": ["threads"],
+      "example": "omp:\n  threads: 16"
+    },
+    "threads": {
+      "description": "Maximum OpenMP thread count. 0 or omitted uses all threads selected by the OpenMP runtime.",
+      "type": "integer",
+      "example": "threads: 16",
+      "validParents": ["omp"]
+    },
     "mesh": {
       "description": "Mesh configuration for Cartesian coordinates",
       "children": ["dx", "dy"],
@@ -111,8 +122,8 @@
     },
     "domain_decomposition": {
       "description": "v1.6 domain decomposition (optimized Schwarz, POLAR only). Opt-in variable-resolution ACCURACY mode: keep the air gap / saturated zone FINE, coarsen smooth radial bands on their own uniform grid, coupled by symmetric Robin transmission iterated to consistency. NOT a speed default — uniform downsampling is faster; use when full-resolution gap accuracy matters (e.g. final-ranking / verification). Disabled unless 'enabled: true' with at least one band.",
-      "children": ["enabled", "bands", "robin_p", "overlap", "max_outer", "tol", "relax"],
-      "example": "domain_decomposition:\n  enabled: true\n  bands:\n    - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)\n    - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE\n    - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)\n  robin_p: 12.0\n  overlap: 4\n  max_outer: 8\n  tol: 1.0e-3"
+      "children": ["enabled", "bands", "robin_p", "overlap", "max_outer", "max_inner", "tol", "relax"],
+      "example": "domain_decomposition:\n  enabled: true\n  bands:\n    - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)\n    - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE\n    - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)\n  robin_p: 12.0\n  overlap: 4\n  max_outer: 8\n  max_inner: 3\n  tol: 1.0e-3"
     },
     "bands": {
       "description": "Radial bands, each [c0, c1, cf_r, cf_theta]: column range [c0,c1) in radial pixel indices, radial coarsen factor cf_r, theta coarsen factor cf_theta. cf=1 keeps the band FINE (use across the air gap / saturated active region). cf_theta=1 = r-only coarsening (preserves theta-varying slots/magnets). RULE: band interfaces (c0/c1) should fall in IRON, and the air gap must stay inside a fine band — interfaces in air or coils diverge.",
@@ -137,6 +148,12 @@
       "type": "integer",
       "validParents": ["domain_decomposition"],
       "example": "max_outer: 20"
+    },
+    "max_inner": {
+      "description": "Maximum nonlinear subdomain iterations per Schwarz sweep. Default 3 distributes nonlinear relaxation across sweeps; <=0 restores the much slower fully nested legacy behaviour. A final uncapped polish sweep is always run.",
+      "type": "integer",
+      "validParents": ["domain_decomposition"],
+      "example": "max_inner: 3"
     },
     "tol": {
       "description": "Convergence tolerance on the relative Schwarz residual ||G - G_prev|| / ||G||. The sweep stops early when the residual falls below tol (or at max_outer). Default 2.0e-3.",
@@ -265,12 +282,12 @@
       "validParents": ["flux_linkage"]
     },
     "transient": {
-      "description": "Transient analysis configuration. v1.5/Phase B.2: prefer transient.slides: [...] for multi-region sliding. The legacy single-slide keys still work and are auto-converted into a 1-element slides list.",
-      "children": ["enabled", "enable_sliding", "total_steps", "parallel_chunks", "slides", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step"],
-      "example": "transient:\n  enabled: true\n  total_steps: 100\n  enable_sliding: true\n  slides:\n    - name: rotor_outer\n      direction: vertical\n      region_start: 110\n      region_end: 390\n      pixels_per_step: 5\n    - name: rotor_inner\n      direction: vertical\n      region_start: 50\n      region_end: 100\n      pixels_per_step: -3"
+      "description": "v1.6.1 transient analysis. Prefer slides: for motion; legacy single-slide keys remain compatible. Decimal/exponent band bounds are physical metres, integer bounds are pixel indices. Cartesian supports multiple slides; polar currently applies slides[0].",
+      "children": ["enabled", "enable_sliding", "total_steps", "parallel_chunks", "slides", "export_fields", "slide_direction", "slide_region_start", "slide_region_end", "slide_pixels_per_step", "slide_angle_deg", "slide_angle_rad"],
+      "example": "transient:\n  enabled: true\n  total_steps: 100\n  parallel_chunks: 3\n  enable_sliding: true\n  slides:\n    - name: rotor\n      direction: vertical\n      region_start: 0.05\n      region_end: 0.09\n      angle_deg: 0.25\n      pixels_per_step: 1\n      wrap_mode: auto"
     },
     "slides": {
-      "description": "v1.5/Phase B.2 — list of independent sliding regions for the transient solver. Each entry shifts its [region_start, region_end] band by pixels_per_step on every step. Cartesian fully supported; polar uses slides[0] only (multi-slide polar is v1.6).",
+      "description": "v1.6.1 list of independent band/rectangle slides. Cartesian fully supports multiple entries; polar currently applies slides[0] only and warns about additional entries.",
       "type": "array",
       "example": "slides:\n  - name: rotor\n    direction: vertical\n    region_start: 100\n    region_end: 400\n    pixels_per_step: 5",
       "validParents": ["transient"]
@@ -282,21 +299,33 @@
       "validParents": ["slides"]
     },
     "region_start": {
-      "description": "v1.5/Phase B.2 — first pixel index of the sliding band along the axis perpendicular to `direction`",
-      "type": "integer",
-      "example": "region_start: 110",
+      "description": "Sliding-band start. Decimal/exponent literal = physical metres; integer literal = legacy pixel index. In polar coordinates metre bounds must lie on the r axis.",
+      "type": "number",
+      "example": "region_start: 0.05",
       "validParents": ["slides"]
     },
     "region_end": {
-      "description": "v1.5/Phase B.2 — last pixel index (exclusive) of the sliding band",
-      "type": "integer",
-      "example": "region_end: 390",
+      "description": "Sliding-band end in the same authored units as region_start. Inverted metre bounds are swapped and out-of-mesh bounds are clamped with warnings.",
+      "type": "number",
+      "example": "region_end: 0.09",
       "validParents": ["slides"]
     },
     "pixels_per_step": {
       "description": "v1.5/Phase B.2 — circular-shift amount per step. Negative values reverse direction. Different slides in the same yaml can use different magnitudes / signs.",
       "type": "integer",
       "example": "pixels_per_step: 5",
+      "validParents": ["slides"]
+    },
+    "angle_rad": {
+      "description": "Polar physical rotation per step [rad]. Takes precedence over angle_deg and pixels_per_step and is resolved to theta pixels for the current mesh.",
+      "type": "number",
+      "example": "angle_rad: pi/720",
+      "validParents": ["slides"]
+    },
+    "angle_deg": {
+      "description": "Polar physical rotation per step [deg]. Used when angle_rad is absent; overrides pixels_per_step.",
+      "type": "number",
+      "example": "angle_deg: 0.25",
       "validParents": ["slides"]
     },
     "wrap_mode": {
@@ -375,6 +404,24 @@
       "description": "Movement per step [pixels] (circular shift amount)",
       "type": "integer",
       "example": "slide_pixels_per_step: 1"
+    },
+    "slide_angle_rad": {
+      "description": "Legacy single-slide polar rotation per step [rad]. Takes precedence over slide_angle_deg and slide_pixels_per_step.",
+      "type": "number",
+      "example": "slide_angle_rad: pi/720",
+      "validParents": ["transient"]
+    },
+    "slide_angle_deg": {
+      "description": "Legacy single-slide polar rotation per step [deg]. Overrides slide_pixels_per_step when slide_angle_rad is absent.",
+      "type": "number",
+      "example": "slide_angle_deg: 0.25",
+      "validParents": ["transient"]
+    },
+    "export_fields": {
+      "description": "Optional transient output allow-list. Empty/absent exports every field for backward compatibility.",
+      "type": "array",
+      "example": "export_fields: [Az, Mu, H, Jz, InputImg, Forces, EnergyDensity]",
+      "validParents": ["transient"]
     },
     "nonlinear_solver": {
       "description": "Nonlinear solver configuration for materials with field-dependent permeability μ(H)",
@@ -586,19 +633,8 @@
       "example": "My: \"Hc * sin(2 * theta)\"",
       "validParents": ["magnetization"]
     },
-    "solver": {
-      "description": "Solver performance configuration",
-      "children": ["omp_threads"],
-      "example": "solver:\n  omp_threads: 4"
-    },
-    "omp_threads": {
-      "description": "Number of OpenMP threads for parallel computation. 0 or omitted = use system default (all available cores). Overrides OMP_NUM_THREADS environment variable",
-      "type": "integer",
-      "example": "omp_threads: 4",
-      "validParents": ["solver"]
-    },
     "export": {
-      "description": "Result export configuration: file format, numeric precision, async write, and TIFF compression options. Default is format=both/precision=double/async=false during the migration period; defaults will switch to TIFF + async in a future release.",
+      "description": "Result export configuration. v1.6.1 defaults are format=tiff, precision=double, async=true, queue depth=4, DEFLATE and floating-point predictor. Partial export blocks inherit these same defaults.",
       "children": ["format", "precision", "async", "async_queue_depth", "tiff"],
       "example": "export:\n  format: tiff\n  precision: double\n  async: true\n  tiff:\n    compression: deflate\n    predictor: 3"
     },
@@ -615,7 +651,7 @@
       "validParents": ["export"]
     },
     "async": {
-      "description": "Run file writes on a background worker thread so the solver does not wait on disk. Output ordering is preserved. Default false; flipping to true reduces step wall time by 20-40 % on heavy export cases.",
+      "description": "Run file writes on a background worker thread so the solver does not wait on disk. Output ordering is preserved. Default true; set false only for synchronous-I/O diagnostics.",
       "type": "boolean",
       "example": "async: true",
       "validParents": ["export"]
@@ -710,11 +746,6 @@
       "name": "Material with Anti-aliasing",
       "trigger": "material",
       "snippet": "rgb: [128, 128, 128]\nmu_r: 1000.0\njz: 0.0\nanti_aliasing: true"
-    },
-    "material_with_coarsening": {
-      "name": "Material with Adaptive Mesh Coarsening",
-      "trigger": "material",
-      "snippet": "rgb: [255, 255, 255]\nmu_r: 1.0\njz: 0.0\ncoarsen: true\ncoarsen_ratio: 4"
     },
     "material_from_preset": {
       "name": "Material from Preset",
@@ -816,10 +847,10 @@
       "trigger": "magnetization",
       "snippet": "Hc: 900000\npattern: custom\nMx: \"Hc * cos(2 * theta)\"\nMy: \"Hc * sin(2 * theta)\""
     },
-    "solver_omp": {
-      "name": "Solver - OpenMP Thread Count",
-      "trigger": "solver",
-      "snippet": "omp_threads: 4"
+    "omp_threads": {
+      "name": "OpenMP Thread Count",
+      "trigger": "omp",
+      "snippet": "threads: 4"
     },
     "domain_decomposition_template": {
       "name": "Domain Decomposition - variable-resolution Schwarz (polar, opt-in accuracy mode)",
@@ -860,9 +891,9 @@
       "snippet": "format: tiff\nprecision: double\nasync: true\ntiff:\n  compression: deflate\n  predictor: 3"
     },
     "export_both_template": {
-      "name": "Export - both CSV+TIFF (migration safety)",
+      "name": "Export - both CSV+TIFF (legacy interoperability)",
       "trigger": "export",
-      "snippet": "format: both\nprecision: double\nasync: false\ntiff:\n  compression: deflate\n  predictor: 3"
+      "snippet": "format: both\nprecision: double\nasync: true\ntiff:\n  compression: deflate\n  predictor: 3"
     },
     "export_csv_legacy": {
       "name": "Export - CSV only (legacy)",

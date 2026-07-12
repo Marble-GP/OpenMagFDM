@@ -1,5 +1,12 @@
 # v1.6 — Domain Decomposition / Optimized Schwarz for the polar nonlinear solver
 
+> **v1.6.1 status update (2026-07-11):** This is a historical investigation
+> report. The later radial-band C++ DD implementation shipped in v1.6.0, and
+> v1.6.1 fixes its default serial-band OpenMP performance regression. The
+> production contract is now documented in `README.md` and
+> `docs/CONFIGURATION.md`; statements below that the C++ build is deferred
+> describe the earlier checkpoint, not the current implementation.
+
 **Status: investigation COMPLETE and POSITIVE (science) / DEFERRED (the large C++ build).**
 Branch `feature/adaptive-mesh-v1.6`. Date 2026-06-19. Author S.Watanabe + Claude Opus 4.8.
 Working PoC + all results: `../bench_results/superlinear_poc/dd_poc/` (gitignored).

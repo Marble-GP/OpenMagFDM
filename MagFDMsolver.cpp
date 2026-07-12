@@ -10,6 +10,7 @@
 #include <cmath>
 #include <map>
 #include <algorithm>
+#include <utility>
 #include <yaml-cpp/yaml.h>
 #include "json.hpp"
 
@@ -18,6 +19,13 @@
 #endif
 
 using json = nlohmann::json;
+
+namespace {
+#ifndef OPENMAGFDM_VERSION_STRING
+#define OPENMAGFDM_VERSION_STRING "1.6.1"
+#endif
+constexpr const char* OPENMAGFDM_VERSION = OPENMAGFDM_VERSION_STRING;
+}
 
 /**
  * @brief Custom streambuf that writes to both console and file (tee functionality)
@@ -151,6 +159,36 @@ static int evalScalarConditionsAsInt(const YAML::Node& node,
         node, user_vars, static_cast<double>(fallback))));
 }
 
+static bool scalarUsesPhysicalMetres(
+        const YAML::Node& node,
+        const std::map<std::string, double>& user_vars) {
+    if (!node || !node.IsScalar()) return false;
+    std::string s = node.Scalar();
+    if (s.find('$') != std::string::npos) {
+        // Match the analyzer's global $variable expansion: substitute the
+        // numeric value at 17-digit precision before looking for the decimal
+        // unit marker. A variable resolving to 50 stays pixels; one resolving
+        // to 0.05 becomes metres.
+        std::vector<std::pair<std::string, double>> sorted(user_vars.begin(), user_vars.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+        for (const auto& [name, value] : sorted) {
+            const std::string needle = "$" + name;
+            std::size_t pos = 0;
+            while ((pos = s.find(needle, pos)) != std::string::npos) {
+                std::ostringstream oss;
+                oss << std::setprecision(17) << value;
+                const std::string replacement = oss.str();
+                s.replace(pos, needle.size(), replacement);
+                pos += replacement.size();
+            }
+        }
+    }
+    return s.find('.') != std::string::npos
+        || s.find('e') != std::string::npos
+        || s.find('E') != std::string::npos;
+}
+
 void exportConditionsJSON(const std::string& output_path,
                           const std::string& config_path,
                           const std::string& image_path) {
@@ -184,6 +222,7 @@ void exportConditionsJSON(const std::string& output_path,
 
     // Create JSON object
     json j;
+    j["openmagfdm_version"] = OPENMAGFDM_VERSION;
 
     // Coordinate system
     std::string coord_system = config["coordinate_system"]
@@ -318,33 +357,105 @@ void exportConditionsJSON(const std::string& output_path,
     // Transient configuration
     j["transient"] = json::object();
     if (config["transient"] && config["transient"]["enabled"]) {
+        const YAML::Node transient = config["transient"];
         bool enabled = config["transient"]["enabled"].as<bool>();
         j["transient"]["enabled"] = enabled;
 
         if (enabled) {
-            bool enable_sliding = config["transient"]["enable_sliding"]
-                ? config["transient"]["enable_sliding"].as<bool>() : true;
+            bool enable_sliding = transient["enable_sliding"]
+                ? transient["enable_sliding"].as<bool>() : true;
             // Phase Q: tinyexpr-evaluated with $var substitution so
             // `total_steps: $N_step` resolves correctly.
             int total_steps = evalScalarConditionsAsInt(
-                config["transient"]["total_steps"], user_vars, 0);
+                transient["total_steps"], user_vars, 0);
 
             j["transient"]["enable_sliding"] = enable_sliding;
             j["transient"]["total_steps"] = total_steps;
+            j["transient"]["parallel_chunks"] = evalScalarConditionsAsInt(
+                transient["parallel_chunks"], user_vars, 1);
 
             if (enable_sliding) {
-                std::string slide_direction = config["transient"]["slide_direction"].as<std::string>("vertical");
-                int slide_region_start    = evalScalarConditionsAsInt(
-                    config["transient"]["slide_region_start"],    user_vars, 0);
-                int slide_region_end      = evalScalarConditionsAsInt(
-                    config["transient"]["slide_region_end"],      user_vars, 0);
+                const bool has_slides = transient["slides"]
+                    && transient["slides"].IsSequence() && transient["slides"].size() > 0;
+                YAML::Node primary_slide = has_slides
+                    ? transient["slides"][0] : YAML::Node();
+                const std::string primary_kind = has_slides
+                    ? primary_slide["kind"].as<std::string>("band") : "band";
+                std::string slide_direction = has_slides && primary_slide["direction"]
+                    ? primary_slide["direction"].as<std::string>("vertical")
+                    : transient["slide_direction"].as<std::string>("vertical");
+                YAML::Node start_node = has_slides && primary_slide["region_start"]
+                    ? primary_slide["region_start"] : transient["slide_region_start"];
+                YAML::Node end_node = has_slides && primary_slide["region_end"]
+                    ? primary_slide["region_end"] : transient["slide_region_end"];
+                YAML::Node pixels_node = has_slides && primary_slide["pixels_per_step"]
+                    ? primary_slide["pixels_per_step"] : transient["slide_pixels_per_step"];
+                const bool bounds_in_metres =
+                    scalarUsesPhysicalMetres(start_node, user_vars)
+                    || scalarUsesPhysicalMetres(end_node, user_vars);
+                double slide_region_start = evalScalarConditions(
+                    start_node, user_vars, 0.0);
+                double slide_region_end = evalScalarConditions(
+                    end_node, user_vars, 0.0);
                 int slide_pixels_per_step = evalScalarConditionsAsInt(
-                    config["transient"]["slide_pixels_per_step"], user_vars, 0);
+                    pixels_node, user_vars, 0);
 
-                j["transient"]["slide_direction"] = slide_direction;
-                j["transient"]["slide_region_start"] = slide_region_start;
-                j["transient"]["slide_region_end"] = slide_region_end;
-                j["transient"]["slide_pixels_per_step"] = slide_pixels_per_step;
+                j["transient"]["slide_kind"] = primary_kind;
+                if (primary_kind == "band") {
+                    j["transient"]["slide_direction"] = slide_direction;
+                    if (bounds_in_metres) {
+                        j["transient"]["slide_region_start"] = slide_region_start;
+                        j["transient"]["slide_region_end"] = slide_region_end;
+                        j["transient"]["slide_region_units"] = "m";
+                    } else {
+                        j["transient"]["slide_region_start"] = static_cast<int>(std::lround(slide_region_start));
+                        j["transient"]["slide_region_end"] = static_cast<int>(std::lround(slide_region_end));
+                        j["transient"]["slide_region_units"] = "pixel";
+                    }
+                    j["transient"]["slide_pixels_per_step"] = slide_pixels_per_step;
+                }
+
+                // Preserve the complete multi-slide declaration as metadata.
+                // Bounds remain in their authored units; the analyzer logs the
+                // resolved pixel range after the mesh has been initialized.
+                if (transient["slides"] && transient["slides"].IsSequence()) {
+                    j["transient"]["slides"] = json::array();
+                    int slide_index = 0;
+                    for (const auto& slide : transient["slides"]) {
+                        json out;
+                        out["name"] = slide["name"].as<std::string>(
+                            "slide_" + std::to_string(slide_index));
+                        const std::string kind = slide["kind"].as<std::string>("band");
+                        out["kind"] = kind;
+                        out["direction"] = slide["direction"].as<std::string>("vertical");
+                        if (kind == "rectangle") {
+                            if (slide["rect"]) out["rect"] = slide["rect"].as<std::vector<int>>();
+                            out["dx"] = slide["dx"].as<std::string>("0");
+                            out["dy"] = slide["dy"].as<std::string>("0");
+                        } else {
+                            const bool metres = scalarUsesPhysicalMetres(slide["region_start"], user_vars)
+                                || scalarUsesPhysicalMetres(slide["region_end"], user_vars);
+                            const double lo = evalScalarConditions(slide["region_start"], user_vars, 0.0);
+                            const double hi = evalScalarConditions(slide["region_end"], user_vars, 0.0);
+                            out["region_start"] = metres ? json(lo) : json(static_cast<int>(std::lround(lo)));
+                            out["region_end"] = metres ? json(hi) : json(static_cast<int>(std::lround(hi)));
+                            out["region_units"] = metres ? "m" : "pixel";
+                            out["pixels_per_step"] = evalScalarConditionsAsInt(
+                                slide["pixels_per_step"], user_vars, 0);
+                            if (slide["angle_rad"]) {
+                                out["angle_rad"] = evalScalarConditions(slide["angle_rad"], user_vars, 0.0);
+                            } else if (slide["angle_deg"]) {
+                                out["angle_deg"] = evalScalarConditions(slide["angle_deg"], user_vars, 0.0);
+                            }
+                        }
+                        out["wrap_mode"] = slide["wrap_mode"].as<std::string>("auto");
+                        if (slide["vacuum_rgb"]) {
+                            out["vacuum_rgb"] = slide["vacuum_rgb"].as<std::vector<int>>();
+                        }
+                        j["transient"]["slides"].push_back(std::move(out));
+                        ++slide_index;
+                    }
+                }
             }
         }
     } else {
@@ -439,9 +550,9 @@ void exportConditionsJSON(const std::string& output_path,
     j["export"]["async"]     = true;
     if (config["export"]) {
         auto exp = config["export"];
-        if (exp["format"])    j["export"]["format"]    = exp["format"].as<std::string>("both");
+        if (exp["format"])    j["export"]["format"]    = exp["format"].as<std::string>("tiff");
         if (exp["precision"]) j["export"]["precision"] = exp["precision"].as<std::string>("double");
-        if (exp["async"])     j["export"]["async"]     = exp["async"].as<bool>(false);
+        if (exp["async"])     j["export"]["async"]     = exp["async"].as<bool>(true);
         if (exp["tiff"]) {
             j["export"]["tiff"] = json::object();
             if (exp["tiff"]["compression"]) j["export"]["tiff"]["compression"] = exp["tiff"]["compression"].as<std::string>("deflate");
@@ -465,9 +576,14 @@ int main(int argc, char* argv[]) {
     SetConsoleCP(CP_UTF8);
 #endif
 
+    if (argc == 2 && std::string(argv[1]) == "--version") {
+        std::cout << "OpenMagFDM " << OPENMAGFDM_VERSION << std::endl;
+        return 0;
+    }
+
     std::cout << "========================================" << std::endl;
     std::cout << "2D Magnetic Field Analyzer (FDM)" << std::endl;
-    std::cout << "Cartesian Coordinate System" << std::endl;
+    std::cout << "Cartesian / Polar Coordinate Systems" << std::endl;
     std::cout << "========================================" << std::endl;
 
     // Check command-line arguments
@@ -478,10 +594,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "  output_folder  : Output folder name (optional, default: timestamped)" << std::endl;
         std::cerr << "\nOutput structure:" << std::endl;
         std::cerr << "  output_folder/" << std::endl;
-        std::cerr << "    Az/step_0000.csv" << std::endl;
-        std::cerr << "    Mu/step_0000.csv" << std::endl;
-        std::cerr << "    BoundaryImg/step_0000.png" << std::endl;
-        std::cerr << "    Forces/step_0000.csv" << std::endl;
+        std::cerr << "    Az/step_0001.tiff" << std::endl;
+        std::cerr << "    Mu/step_0001.tiff" << std::endl;
+        std::cerr << "    BoundaryImg/step_0001.png" << std::endl;
+        std::cerr << "    Forces/step_0001.csv" << std::endl;
         return 1;
     }
 
@@ -534,8 +650,11 @@ int main(int argc, char* argv[]) {
             // Static analysis: single solve
             analyzer.solve();
 
-            // Calculate Maxwell stress and forces (using edge-based integration)
-            analyzer.calculateMaxwellStressEdgeBased();
+            // Use the same robust default as transient analysis. The legacy
+            // edge-based Maxwell stress path is retained as an explicit
+            // research API, but its result container is not the default
+            // Forces export consumed by the WebUI.
+            analyzer.calculateForceDistributedAmperian(0, 0.0);
 
             // Calculate total magnetic energy
             double total_energy = analyzer.calculateTotalMagneticEnergy();

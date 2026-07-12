@@ -3501,7 +3501,11 @@ app.get('/api/solver/info', async (req, res) => {
             capabilities: {
                 coordinate_systems: ['cartesian', 'polar'],
                 nonlinear_solvers: ['picard', 'newton_krylov'],
-                features: ['coarsening', 'adaptive_mesh', 'transient', 'sliding_mesh', 'force_calculation']
+                features: [
+                    'amgcl_multigrid', 'domain_decomposition',
+                    'transient', 'parallel_chunks', 'sliding_mesh',
+                    'distributed_amperian_force', 'tiff_async_export'
+                ]
             },
             build: {
                 nodeVersion: process.version,

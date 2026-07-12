@@ -192,7 +192,7 @@ materials:
       angle: 90         # 磁化方向 [deg]、0=+x
 ```
 
-詳細は [`permanent_magnet_guide.md`](permanent_magnet_guide.md) を参照してください。
+現行仕様は [`../docs/CONFIGURATION.md`](../docs/CONFIGURATION.md) を参照してください。
 
 ---
 

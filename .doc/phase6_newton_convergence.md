@@ -1,5 +1,9 @@
 # Phase 6 Newton-Krylov 収束改善レポート
 
+> **Historical note:** 本文はpre-v1.5のcustom Galerkin/coarsening経路を
+> 記録した資料です。これらの設定は現行版ではdeprecatedです。v1.6.1の本番仕様は
+> `docs/CONFIGURATION.md`を参照してください。
+
 ## 概要
 
 Galerkin 粗大化 + 非線形材料（35H300 Si-steel）を組み合わせた場合に発生していたソルバー収束失敗問題を解決した。最終的なアルゴリズムでは **粗グリッド Newton-Picard（μ_diff 接線行列 + Anderson m=2）** と **ファイン仕上げ Newton** を組み合わせることで、10回の粗反復 + 2回のファイン反復で R ≈ 8×10⁻⁶ まで収束する。

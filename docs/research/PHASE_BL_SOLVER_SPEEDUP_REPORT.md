@@ -1,5 +1,11 @@
 # OpenMagFDM 非線形ソルバー高速化 最終レポート (Phase BK / BL)
 
+> **v1.6.1 status update (2026-07-11):** This document records the BK/BL
+> experiments at that time. Subsequent v1.6 work shipped Eisenstat-Walker as
+> the recommended template setting, chunk-parallel transient sweeps, DD, and an
+> opt-in assembled tangent path whose measured inner-solve cost did not improve
+> wall time. Use `docs/CONFIGURATION.md` for supported production settings.
+
 **作成日**: 2026-06-15
 **対象**: OpenMagFDM 非線形 Newton-Krylov ソルバー (2D 磁界 FDM, C++17 + Eigen + AMGCL)
 **ブランチ**: `feature/superlinear-newton-v1.6` (調査後 `e05512d` = クリーン v1.5.1 に revert、コード変更 ship なし)

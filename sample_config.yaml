@@ -1,141 +1,124 @@
-# 2次元磁場解析設定ファイル
+# OpenMagFDM v1.6.1 sample configuration
+#
+# This file is intentionally conservative: it runs as a static, linear polar
+# analysis after the RGB values are adjusted to match the input image. For the
+# complete key reference and transient/DD examples, see docs/CONFIGURATION.md.
 
-# OpenMP 並列化設定
-# omp:
-#   threads: 16  # 使用スレッド数（0 または省略で自動 = 全コア使用）
+coordinate_system: polar
 
-# 座標系設定
-coordinate_system: polar  # cartesian (直交座標) or polar (極座標)
+# Optional OpenMP limit. Omit or use 0 to use the runtime default.
+omp:
+  threads: 0
 
-# メッシュ設定（直交座標の場合）
+# Cartesian only. Ignored when coordinate_system is polar.
 mesh:
-  dx: 0.2e-3  # X方向メッシュサイズ [m]
-  dy: 0.2e-3  # Y方向メッシュサイズ [m]
+  dx: 0.2e-3
+  dy: 0.2e-3
 
-# 極座標ドメイン設定（coordinate_system: polar の場合）
+# Physical radii are always metres. Image pixels along the r-axis map linearly
+# to [r_start, r_end]. r_start may be 0 for a full disc, but then the inner
+# boundary must be Dirichlet.
 polar_domain:
-  r_start: 0.2  # 内半径 [m] (0 < r_start < r_end)
-  r_end: 0.3    # 外半径 [m]
-  r_orientation: horizontal  # r方向: horizontal (列方向) or vertical (行方向)
-  theta_range: pi/6  # θ方向の範囲 [rad] (2*pi for full periodic domain)
-  # 数式対応: pi/2, pi/3, 2*pi/3, 3*pi/4, pi*3/4, 3/4*pi など任意の M*pi/N 形式が使用可能
-  # θ方向は r_orientation と垂直な方向で 0 ~ theta_range
+  r_start: 0.2
+  r_end: 0.3
+  r_orientation: horizontal   # horizontal: columns=r; vertical: rows=r
+  theta_range: pi/6
 
-# 極座標境界条件
 polar_boundary_conditions:
-  inner:  # 内側 (r = r_start)
-    type: dirichlet
-    value: 0.0
-  outer:  # 外側 (r = r_end)
-    type: dirichlet
-    value: 0.0
-  # θ方向は自動的に周期境界条件
+  inner: { type: dirichlet, value: 0.0 }
+  outer: { type: dirichlet, value: 0.0 }
+  theta_min: { type: periodic, value: 1.0 }
+  theta_max: { type: periodic, value: 1.0 }
 
-# 直交座標の境界条件（4辺それぞれに設定）
-# type: dirichlet, neumann, periodic
-# 注意: 周期境界条件は対向する辺のペアで設定する必要があります
+# Cartesian boundary example (used only with coordinate_system: cartesian).
 boundary_conditions:
-  left:
-    type: dirichlet
-    value: 0.0
-  right:
-    type: dirichlet
-    value: 0.0
-  bottom:
-    type: periodic
-    value: 0.0
-  top:
-    type: periodic
-    value: 0.0
+  left: { type: dirichlet, value: 0.0 }
+  right: { type: dirichlet, value: 0.0 }
+  bottom: { type: periodic, value: 1.0 }
+  top: { type: periodic, value: 1.0 }
 
-# 材料設定（RGB値と物性値の対応）
+variables:
+  J_peak: 1.0e6
+  N_step: 12
+
+# Exact RGB matching is used unless anti_aliasing is enabled for a material.
 materials:
   air:
-    rgb: [255, 255, 255]  # 白
-    mu_r: 1.0  # 比透磁率
-    jz: 0.0  # 電流密度 [A/m²]
+    rgb: [255, 255, 255]
+    mu_r: 1.0
+    jz: 0.0
     calc_force: false
-  
-  iron_stator:
-    rgb: [128, 128, 128]  # グレー（実際の画像の色）
-    mu_r: 100.0
+
+  iron:
+    rgb: [128, 128, 128]
+    mu_r: 1000.0
     jz: 0.0
-    calc_force: false  # マクスウェル応力による電磁力を計算
+    calc_force: true
 
-  iron_rotor:
-    rgb: [100, 100, 100]  # グレー（実際の画像の色）
-    mu_r: 500.0
-    jz: 0.0
-    calc_force: true  # マクスウェル応力による電磁力を計算
-  
-  coil_positive_U:
-    rgb: [255, 0, 0]  # 赤
+  coil_positive:
+    rgb: [255, 0, 0]
     mu_r: 1.0
-    jz: 1.0e6*cos(2*pi*$step/100) * 0  # 正の電流
+    jz: $J_peak*cos(2*pi*$step/$N_step)
 
-  coil_negative_U:
-    rgb: [128, 0, 0]  # 暗い赤
+  coil_negative:
+    rgb: [128, 0, 0]
     mu_r: 1.0
-    jz: -1.0e6*cos(2*pi*$step/100) * 0  # 負の電流
+    jz: -$J_peak*cos(2*pi*$step/$N_step)
 
-  coil_positive_V:
-    rgb: [0, 255, 0]  # 緑
-    mu_r: 1.0
-    jz: 1.0e6*cos(2*pi*$step/100 - 2*pi/3) * 0  # 正の電流
+# Enable this block when a material uses a B-H curve/formula. Eisenstat-Walker
+# is the v1.6.1 recommendation for nonlinear runs.
+nonlinear_solver:
+  enabled: false
+  solver_type: newton-krylov
+  max_iterations: 100
+  tolerance: 1.0e-3
+  eisenstat_walker:
+    enabled: true
+    gamma: 0.9
+    alpha: 2.0
+    eta_min: 1.0e-6
+    eta_max: 0.1
+  verbose: false
+  export_convergence: true
 
-  coil_negative_V:
-    rgb: [0, 128, 0]  # 暗い緑
-    mu_r: 1.0
-    jz: -1.0e6*cos(2*pi*$step/1002 - 2*pi/3) * 0  # 負の電流
-
-  coil_positive_W:
-    rgb: [0, 0, 255]  # 青
-    mu_r: 1.0
-    jz: 1.0e6*cos(2*pi*$step/100 + 2*pi/3) * 0  # 正の電流
-
-  coil_negative_W:
-    rgb: [0, 0, 128]  # 暗い青
-    mu_r: 1.0
-    jz: -1.0e6*cos(2*pi*$step/100 + 2*pi/3) * 0  # 負の電流
-
-  rotor_field_positive:
-    rgb: [255, 255, 0]  # 黄
-    mu_r: 1.0
-    jz: 1.0e9  # 正の電流
-
-  rotor_field_negative:
-    rgb: [100, 100, 0]  # 暗い黄
-    mu_r: 1.0
-    jz: -1.0e9  # 負の電流
-
-    # 過渡解析時の動的電流密度の例:
-    # jz: 1e6*cos(2*pi*$step/10)  # 数式表記（$step: ステップ番号）
-    # jz: [0, 0.5e6, 1e6, 0.5e6, 0, -0.5e6, -1e6, -0.5e6, 0, 0]  # 配列表記
-
-# 適応粗大化設定（materials に coarsen: true を指定した場合のグローバルパラメータ）
-# 材料側で coarsen: true / coarsen_ratio: N を設定すると粗大化が有効になります。
-# coarsening セクションを省略した場合はすべてデフォルト値が使われます。
-# coarsening:
-#   boundary_shell: 1    # 材料境界を保護するための膨張半径 [pixels] (default: 1, 0=保護なし)
-#                        # 大きいほど境界付近のセルが多く残り精度向上 / 活性セル数増加
-#   smooth_iterations: 0 # 補間後のν重みGauss-Seidel平滑化回数 (default: 0 = 平滑化なし)
-#                        # 非線形材料でのファイン仕上げNewton使用時は 0 を推奨
-
-# 過渡解析設定（静的解析の場合は省略可）
-# enabled: true にすると、画像領域を循環シフトしながら解析を実行します
+# Static by default. For band bounds, a decimal literal means physical metres;
+# an integer literal retains the legacy pixel-index meaning.
 transient:
-  enabled: true  # 過渡解析の有効/無効
-  enable_sliding: true # 画像スライドの有効/無効（falseの場合はJzのみ変化）
-  total_steps: 167 # 解析ステップ数
-  slide_direction: vertical  # スライド方向
-  # vertical: slide_region_start <= x <= slide_region_end の縦帯領域をy方向にスライド
-  # horizontal: slide_region_start <= y <= slide_region_end の横帯領域をx方向にスライド
-  slide_region_start: 110  # スライド領域の開始位置 [ピクセル] (左上が原点[0,0])
-  slide_region_end: 390   # スライド領域の終了位置 [ピクセル]
-  slide_pixels_per_step: 1  # 1ステップあたりの移動量 [ピクセル] (循環シフト量)
+  enabled: false
+  enable_sliding: true
+  total_steps: $N_step
+  parallel_chunks: 1
+  slides:
+    - name: rotor
+      kind: band
+      direction: vertical
+      region_start: 0.22       # [m] because this is a decimal literal
+      region_end: 0.25         # [m]
+      pixels_per_step: 1
+      wrap_mode: auto
+  export_fields: [Az, Mu, H, Jz, InputImg, Forces, EnergyDensity]
 
-  # 出力フィールド指定（省略時は全出力 = 互換動作）。
-  # 大規模問題でI/Oが遅い場合、必要な項目だけ列挙すると 大幅にステップ時間を短縮できる。
-  # 有効値: Az, Mu, H, Jz, InputImg, BoundaryImg, Forces, EnergyDensity
-  # 例: export_fields: [Az, Forces, EnergyDensity]
+# Optional polar accuracy mode. Keep the air gap, magnets, coils and saturated
+# teeth in cf=1 bands; place interfaces inside iron. Disabled unless both
+# enabled=true and at least one band are supplied.
+# domain_decomposition:
+#   enabled: true
+#   bands:
+#     - [0, 52, 4, 4]
+#     - [52, 330, 1, 1]
+#     - [330, 450, 4, 4]
+#   robin_p: 12.0
+#   overlap: 4
+#   max_outer: 8
+#   max_inner: 3
+#   tol: 1.0e-3
 
+# Default result format is lossless float64 TIFF written asynchronously.
+export:
+  format: tiff          # tiff | csv | both
+  precision: double     # double | float
+  async: true
+  async_queue_depth: 2
+  tiff:
+    compression: deflate
+    predictor: 3

@@ -354,7 +354,7 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
         // is set (which is rejected at write time until Phase 2/3 lands).
         if (config["export"]) {
             auto exp = config["export"];
-            std::string fmt = exp["format"].as<std::string>("both");
+            std::string fmt = exp["format"].as<std::string>("tiff");
             if (fmt == "csv")       export_config.format = ExportConfig::Format::CSV;
             else if (fmt == "tiff") export_config.format = ExportConfig::Format::TIFF;
             else                    export_config.format = ExportConfig::Format::BOTH;
@@ -364,7 +364,7 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
                 ? ExportConfig::Precision::F32
                 : ExportConfig::Precision::F64;
 
-            export_config.async = exp["async"].as<bool>(false);
+            export_config.async = exp["async"].as<bool>(export_config.async);
             export_config.async_queue_depth = exp["async_queue_depth"].as<int>(4);
 
             if (exp["tiff"]) {

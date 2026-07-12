@@ -1,163 +1,77 @@
-# MagFDM Visualizer - Web UI
+# OpenMagFDM WebUI v1.6.1
 
-MagFDMsolverの出力CSVファイルをブラウザで可視化するWebアプリケーションです。
+The WebUI is the browser-based editor, preprocessor, solver launcher and result
+viewer for OpenMagFDM. It runs on Node.js/Express and is also distributed as a
+standalone executable built with `pkg`.
 
-## 特徴
-
-- 🌐 **ブラウザベース**: インストール不要、ブラウザで実行
-- 📊 **インタラクティブ**: Plotly.jsによるズーム・パン可能な可視化
-- 🎨 **カラーマップ選択**: 複数のカラーマップから選択可能
-- 📈 **4つの表示**: Az, μ, |B|, |H|を同時表示
-- 💾 **ドラッグ&ドロップ**: CSVファイルを簡単に読み込み
-
-## セットアップ
-
-### 初回のみ
+## Start
 
 ```bash
 cd webui
-npm install
-```
-
-## 起動方法
-
-```bash
+npm ci
 npm start
 ```
 
-または
+Open `http://localhost:3000`. The server locates `MagFDMsolver` beside the
+package or in the configured development paths. Use `GET /api/health` and
+`GET /api/solver/info` to diagnose the runtime.
+
+## Main workflows
+
+- Edit and validate YAML with Ace completion from `public/yaml-schema.json`.
+- Upload an image, inspect physical/image properties and detect material RGBs.
+- Uniformise anti-aliased CAD screenshots before analysis.
+- Detect and interactively correct polar geometry, then warp and insert YAML.
+- Generate a Cartesian/Linear template directly from an existing strip image.
+- Preview permanent-magnet directions, including polar coordinate conversion.
+- Launch/stop analyses and follow streaming logs.
+- View TIFF or CSV fields, flux linkage, energy, force and torque timelines.
+- Manage configurations, uploads, material libraries and result folders.
+- Export/import selected user content as a standard ZIP backup.
+
+## v1.6.1 behaviours
+
+- Polar `r_start/r_end` are physical metres; `r_start: 0` represents a full
+  disc and requires a Dirichlet inner boundary.
+- Decimal slide-region bounds are metres; integers are legacy pixel indices.
+- Generated nonlinear templates enable Eisenstat-Walker and use
+  `max_iterations: 100`, `tolerance: 1.0e-3`.
+- Detected air-gap sliding is enabled by default when an air-gap candidate is
+  available.
+- Input Image and Magnetisation Preview support wheel zoom, middle-drag pan,
+  reset and image-pixel rulers.
+
+The authoritative YAML contract is in `../docs/CONFIGURATION.md`.
+
+## Development rules
+
+- Keep `public/yaml-schema.json`, generated templates in `public/app.js`,
+  `sample_config.yaml`, and `docs/CONFIGURATION.md` synchronized.
+- Add no server dependency without checking Node 18 `pkg` compatibility.
+  ESM-only transitive dependencies have broken standalone builds before.
+- After JavaScript edits run:
 
 ```bash
-node server.js
+node --check server.js
+node --check public/app.js
+node -e "JSON.parse(require('fs').readFileSync('public/yaml-schema.json','utf8'))"
 ```
 
-サーバーが起動したら、ブラウザで以下にアクセス：
+- Prefer browser-side decoding for TIFF; `public/lib/geotiff.js` is the shipped
+  UMD bundle.
+- User data lives under `configs/`, `uploads/`, `user-libs/` and `outputs/` and
+  must never be committed or included unintentionally in packages.
 
-```
-http://localhost:3000
-```
+## API groups
 
-## 使い方
+- Configuration: `/api/config*`, `/api/validate-config`
+- Images/preprocess: `/api/images*`, `/api/materials/detect`,
+  `/api/preprocess-filter/*`, `/api/preprocess-polar/*`
+- Solver/jobs: `/api/solve*`, `/api/stop-solver`, `/api/jobs*`
+- Results: `/api/results*`, `/api/user-outputs*`, `/api/load-field`,
+  `/api/get-flux-linkage`
+- Libraries/backups: `/api/material-libraries*`, `/api/backup-manifest`,
+  `/api/export`, `/api/import`
 
-1. **サーバー起動**
-   ```bash
-   cd webui
-   npm start
-   ```
-
-2. **ブラウザでアクセス**
-   - `http://localhost:3000` を開く
-
-3. **CSVファイルを読み込み**
-   - "ベクトルポテンシャル (Az) CSV" で Az ファイルを選択
-   - "透磁率分布 (μ) CSV" で Mu ファイルを選択
-
-4. **パラメータ設定**
-   - dx, dy: メッシュ間隔（デフォルト: 0.001 m）
-   - カラーマップ: 表示色を選択
-
-5. **可視化実行**
-   - "📊 可視化実行" ボタンをクリック
-
-## 表示される物理量
-
-### 1. ベクトルポテンシャル Az [Wb/m]
-- 等高線表示
-- カラーマップで値を表示
-
-### 2. 透磁率分布 μ [H/m]
-- ヒートマップ表示
-- 材質分布を確認
-
-### 3. 磁束密度 |B| [T]
-- ヒートマップ表示
-- Azから自動計算（Bx = ∂Az/∂y, By = -∂Az/∂x）
-
-### 4. 磁界強度 |H| [A/m]
-- ヒートマップ表示
-- H = B/μ で計算
-
-## インタラクティブ機能
-
-Plotly.jsの機能により、以下が可能：
-
-- **ズーム**: マウスドラッグで範囲選択
-- **パン**: ダブルクリック後ドラッグで移動
-- **リセット**: ホームアイコンでリセット
-- **値の確認**: カーソルを合わせると座標と値を表示
-- **画像保存**: カメラアイコンでPNG保存
-
-## ポート変更
-
-デフォルトはポート3000です。変更する場合：
-
-```bash
-PORT=8080 npm start
-```
-
-## ファイル構成
-
-```
-webui/
-├── package.json          # npm設定
-├── server.js             # Expressサーバー
-├── public/
-│   ├── index.html       # UIのHTML
-│   └── app.js           # 可視化ロジック
-└── README.md            # このファイル
-```
-
-## 技術スタック
-
-- **バックエンド**: Node.js + Express
-- **可視化ライブラリ**: Plotly.js
-- **UI**: HTML5 + CSS3 + Vanilla JavaScript
-
-## トラブルシューティング
-
-### ポートが使用中
-
-```
-Error: listen EADDRINUSE: address already in use :::3000
-```
-
-→ ポート番号を変更：
-```bash
-PORT=8080 npm start
-```
-
-### CSVファイルが読み込めない
-
-- ファイル形式がCSV（カンマ区切り）か確認
-- 数値データのみか確認（ヘッダー行がある場合は除去）
-- ファイルサイズが大きすぎないか確認
-
-### ブラウザで表示されない
-
-- サーバーが起動しているか確認
-- ブラウザのコンソールでエラーを確認（F12キー）
-- キャッシュをクリアして再読み込み（Ctrl+Shift+R）
-
-## 開発者向け
-
-### コードの構造
-
-**app.js の主要関数:**
-- `parseCSV()`: CSV読み込みと2D配列への変換
-- `calculateMagneticField()`: 磁束密度の計算
-- `plotHeatmap()`: ヒートマップ描画
-- `plotContour()`: 等高線描画
-- `visualize()`: メイン可視化処理
-
-### カスタマイズ
-
-カラーマップの追加:
-```javascript
-// app.js の colormap select に追加
-<option value="YourColormap">Your Colormap</option>
-```
-
-利用可能なPlotlyカラーマップ:
-- Viridis, Hot, Jet, Portland, Blackbody, Electric
-- Greys, Blues, Greens, Reds
-- など（Plotly.jsドキュメント参照）
+All user-supplied paths must stay basename/path-normalized and constrained to
+the current user's server directories.

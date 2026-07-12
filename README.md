@@ -3,6 +3,11 @@
 OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対して磁界計算を行うツール群です。
 コアは C++ で書かれた数値ソルバー(MagFDMsolver)と、結果の可視化や操作を行う Node.js ベースの WebUI から構成されています。
 
+> **Current release candidate: v1.6.1** — 正規のYAML仕様は
+> [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)、変更点は
+> [`docs/RELEASE_NOTES_v1.6.1.md`](docs/RELEASE_NOTES_v1.6.1.md)、全体履歴は
+> [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
+
 <!-- <img width="1452" height="914" alt="thumbnail" src="https://github.com/user-attachments/assets/5b6d7e0b-32bf-48f7-bb47-30206aad8b22" /> -->
 [!['チュートリアル動画'](https://github.com/user-attachments/assets/5b6d7e0b-32bf-48f7-bb47-30206aad8b22)](https://youtu.be/YvBkXMhFDTs)
 
@@ -21,7 +26,7 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 - 画像からメッシュを生成して有限差分（FDM）法で磁界解析を行う
 - **非線形透磁率材料対応**（Newton-Krylov法 + Anderson加速による高速収束）
 - **永久磁石磁化モデル**（parallel / Halbach / polar anisotropy / custom）
-- **適応粗大化メッシュ**（均一領域を自動的に粗くし、境界は高解像度を維持）
+- **AMGCL native multigrid** と極座標Domain Decomposition精度モード
 - **複数の電磁力評価手法**（束縛電流法・仮想仕事法など）
 - **材料ライブラリ**（B-Hカーブ等のプリセットを別YAMLで管理・再利用）
 - **ユーザ定義変数**による柔軟な数式記述
@@ -32,6 +37,21 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 - 高速な反復ソルバーに `amgcl` を利用
 - 軽量数式評価に `tinyexpr` を利用
 - WebUI によるインタラクティブな結果確認（REST API による外部制御にも対応）
+
+## v1.6.1 リリース候補
+
+v1.6.1では、v1.6.0のDD性能回帰を修正し、極座標の軸を含む
+`r_start: 0`、物理寸法[m]によるスライド領域、Cartesian/Linearテンプレート、
+ユーザーデータZIPバックアップ、画像／磁化プレビュー改善を統合しました。
+静解析と過渡解析の既定Force計算もDistributed Amperianへ統一しています。
+
+スライド領域は**リテラル表記が単位マーカー**です。
+
+- `slide_region_start: 212` — pixel index（従来互換）
+- `slide_region_start: 0.05` — physical metres
+
+詳細な移行事項と検証状況は
+[`v1.6.1 release notes`](docs/RELEASE_NOTES_v1.6.1.md)を参照してください。
 
 ## v1.4 移行ガイド（出力フォーマット変更）
 
@@ -245,7 +265,7 @@ bash run_test.sh ../../build/MagFDMsolver
 ### 依存関係
 
 プリビルドバイナリを使用する場合、以下のライブラリが必要です：
-- Linux: `libeigen3-dev`, `libopencv-dev`, `libyaml-cpp-dev`（apt経由でインストール）
+- Linux: `libeigen3-dev`, `libopencv-dev`, `libyaml-cpp-dev`, `libtiff-dev`（apt経由でインストール）
 - Windows: インストーラ使用時はDLL同梱
 - macOS: `eigen`, `opencv`, `yaml-cpp`（Homebrew経由でインストール）
 
@@ -258,6 +278,7 @@ bash run_test.sh ../../build/MagFDMsolver
 - Eigen3
 - OpenCV
 - yaml-cpp
+- libtiff
 - Node.js 18.x 以降 (WebUI を使う場合)
 
 ### ビルド方法 (C++ ソルバー)
@@ -274,7 +295,7 @@ make -j$(nproc)
 ### 実行例
 
 ```bash
-./build/MagFDMsolver ./sample_config.yaml ./uploads/sample_PMSM.png
+./build/MagFDMsolver ./sample_config.yaml ./your_material_image.png
 ```
 
 ## Web UI の起動
@@ -291,6 +312,9 @@ node server.js
 ---
 
 ## YAML設定ファイル
+
+以下は概要です。全キー、単位、後方互換規則、推奨値は
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)を正規仕様とします。
 
 ### 基本構造
 
@@ -376,8 +400,15 @@ materials:
 nonlinear_solver:
   enabled: true
   solver_type: newton-krylov  # picard, anderson, newton-krylov
-  max_iterations: 50
-  tolerance: 1.0e-5
+  max_iterations: 100
+  tolerance: 1.0e-3
+
+  eisenstat_walker:
+    enabled: true
+    gamma: 0.9
+    alpha: 2.0
+    eta_min: 1.0e-6
+    eta_max: 0.1
 
   # Anderson加速（Picard法と併用可能）
   anderson:
@@ -439,7 +470,8 @@ materials:
 ```
 
 磁化 **M** から等価磁化電流 `Jz_mag = ∂My/∂x - ∂Mx/∂y` を計算し、ソース項に加算します。
-Cartesian・Polar 両座標系に対応。詳細は [`permanent_magnet_guide.md`](permanent_magnet_guide.md) を参照してください。
+Cartesian・Polar 両座標系に対応。設定キーは
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)とWebUI補完を参照してください。
 
 ---
 
@@ -525,7 +557,7 @@ iron-iron 強連結 / iron-air 弱連結が自動的に識別され、saturation
 nonlinear_solver:
   enabled: true
   solver_type: newton-krylov
-  max_iterations: 50
+  max_iterations: 100
   tolerance: 1.0e-3
   verbose: false
   eisenstat_walker:        # Phase BC: 2.5× 高速化の柱
@@ -679,9 +711,9 @@ transient:
 
 | ファイル | 内容 |
 |----------|------|
-| `Az/step_XXX.csv` | 磁気ベクトルポテンシャル [Wb/m] |
-| `Mu/step_XXX.csv` | 透磁率分布 [H/m] |
-| `H/step_XXX.csv` | 磁界強度 \|H\| [A/m]（非線形時） |
+| `Az/step_XXXX.tiff` | 磁気ベクトルポテンシャル [Wb/m] |
+| `Mu/step_XXXX.tiff` | 透磁率分布 [H/m] |
+| `H/step_XXXX.tiff` | 磁界強度 \|H\| [A/m]（非線形時） |
 | `conditions.json` | 解析条件 |
 | `force_results.json` | 電磁力結果 |
 | `energy_results.json` | 磁気エネルギー |
@@ -710,7 +742,7 @@ transient:
 - [x] 過渡解析（回転機シミュレーション）
 - [x] WebUIダッシュボード
 - [x] 永久磁石磁化モデル（parallel / Halbach / polar anisotropy / custom）
-- [x] 適応粗大化メッシュ（coarsen / coarsen_ratio）
+- [x] AMGCL native multigrid（旧 `coarsen` / `coarsen_ratio` はdeprecated）
 - [x] アンチエイリアス補間（材料境界の調和平均）
 - [x] 材料ライブラリ（B-Hカーブプリセットの管理・再利用）
 - [x] REST API（外部プログラムからのソルバー制御・自動化）
