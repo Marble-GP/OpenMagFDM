@@ -1944,7 +1944,7 @@ function appendMagnetizationBlock(lines, indent, m) {
         const Kn = (Number(m.Kn) > 0) ? Number(m.Kn) : 1.6;
         const R_pc = Kn * Rm;
         lines.push(`${sub}p: ${Math.max(1, Math.round(Number(m.p) || 1))}`);
-        lines.push(`${sub}# R_pc = Kn * Rm  with Kn = ${Kn}, Rm = ${Rm} m  (Kano 2025 §3.2; Kn≈1.6 → THD<1%)`);
+        lines.push(`${sub}# R_pc sets where the polar-anisotropy pattern is anchored; Kn=${Kn} is a starting point.`);
         lines.push(`${sub}R_pc: ${R_pc}`);
         lines.push(`${sub}cx: ${Number(m.cx) || 0}`);
         lines.push(`${sub}cy: ${Number(m.cy) || 0}`);
@@ -2087,8 +2087,8 @@ function buildDetectYamlFromAssignments() {
     }
     if (referencedPresets.length > 0) {
         const lib = AppState.detectLibraryName || '(none)';
-        lines.push(`# Referenced presets (resolved at run time by merging the active`);
-        lines.push(`# material library "${lib}"): ${referencedPresets.join(', ')}.`);
+        lines.push(`# Uses preset(s) ${referencedPresets.join(', ')} from active library "${lib}".`);
+        lines.push('# Change the preset or library to change the assigned material properties.');
         lines.push('');
     }
 
@@ -4336,24 +4336,21 @@ function thetaToTinyExpr(theta_range) {
 const SOLVER_HINT_MARKER = '# --- Optional controls (uncomment + edit as needed) ---';
 const SOLVER_HINT_BLOCK = `
 ${SOLVER_HINT_MARKER}
-# Defaults below are what the solver uses out of the box; listed here so
-# you know which knobs exist when you want to tune. See README for full
-# semantics of each field.
+# These controls matter only when a material has a B-H curve or field-dependent
+# permeability. Uncomment the block when you want to trade accuracy, robustness,
+# and run time explicitly; for linear materials, leaving it commented is best.
 #
-# --- Nonlinear solver tuning (active when any material is nonlinear) ---
 # nonlinear_solver:
-#   enabled: true                   # auto-enabled when a NL material is present
-#   solver_type: newton-krylov      # alt: picard
-#   max_iterations: 100             # 1M+ DOF saturated runs use ~50; leave headroom
-#   tolerance: 1.0e-3               # relative residual ||R|| / ||b|| (the plateau
-#                                   # floor is ~5e-3 on stiff B-H; tighter never converges)
-#   verbose: false                  # per-iter mu/H/residual diagnostics
+#   enabled: true                   # enables the nonlinear material response
+#   solver_type: newton-krylov      # picard is slower but can be more forgiving
+#   max_iterations: 100             # larger may converge difficult cases, but takes longer
+#   tolerance: 1.0e-3               # smaller is stricter/more accurate, but slower
+#   verbose: false                  # true prints iteration diagnostics for troubleshooting
 #   anderson:
-#     enabled: false                # Anderson acceleration
+#     enabled: false                # can reduce iterations for difficult curves
 #     depth: 5
-#   # Phase BC (v1.5.1+): Eisenstat-Walker forcing for inner AMGCL CG tol.
-#   # Headline measured: 377s -> 153s (-59%) on IEEJ-D IPMSM. Recommended ON
-#   # for any nonlinear run (enabled below).
+#   # Eisenstat-Walker adapts the inner linear-solver tolerance: usually faster,
+#   # while preserving the requested outer tolerance. Disable only for diagnostics.
 #   eisenstat_walker:
 #     enabled: true
 #     gamma: 0.9
@@ -4361,12 +4358,7 @@ ${SOLVER_HINT_MARKER}
 #     eta_min: 1.0e-6
 #     eta_max: 0.1
 #
-# --- v1.5.1 (Phase BJ-8): custom Galerkin coarsening removed ---
-# The previously documented per-material 'coarsen: true / coarsen_ratio'
-# flags and 'coarsening:' block are no longer supported. AMGCL's internal
-# smoothed_aggregation multigrid now handles multi-resolution natively.
-# Any pre-v1.5.1 YAML containing those knobs still parses but emits a
-# WARNING at startup and the values are ignored. Remove them to silence.
+# Do not add the old coarsen/coarsening keys: they are ignored in v1.6.1.
 `;
 
 // Append the SOLVER_HINT_BLOCK to the YAML string iff the marker isn't
@@ -4386,25 +4378,20 @@ function ensureSolverHintBlock(yamlString) {
 const DD_HINT_MARKER = '# --- Optional: domain decomposition (polar, variable-resolution accuracy mode) ---';
 const DD_HINT_BLOCK = `
 ${DD_HINT_MARKER}
-# Opt-in. Keeps the air gap / saturated zone FINE while coarsening smooth
-# radial bands on their own uniform grid (coupled by symmetric Robin
-# transmission iterated to consistency). NOT faster than the monolithic
-# solve on a dense machine -- use when you need full-resolution gap accuracy
-# (e.g. final-ranking / verification). Band columns below are RADIAL PIXEL
-# INDICES (0 = inner radius .. nr = outer); cf=1 keeps a band FINE (use it
-# across the gap), cf>1 coarsens. Interfaces must sit in IRON, not in the
-# air gap or coils. Uncomment + tune the bands to YOUR geometry:
+# Opt-in accuracy mode for polar models. It keeps the air gap and coils fine
+# while reducing resolution in smooth iron. This can lower memory, but is not
+# guaranteed to be faster. Band limits are RADIAL PIXEL INDICES (0..nr).
+# Keep every material interface inside a cf=1 band; cf>1 means fewer cells.
 # domain_decomposition:
 #   enabled: true
 #   bands:
-#     - [0, 52, 4, 4]      # bore: coarsen 4x (smooth)
-#     - [52, 330, 1, 1]    # active band (gap/teeth/coils): keep FINE
-#     - [330, 450, 4, 4]   # deep yoke: coarsen 4x (smooth)
-#   robin_p: 12.0          # Robin transmission coefficient
-#   overlap: 4             # band overlap in fine columns
-#   max_outer: 8           # max Schwarz sweeps (flux converges by ~4)
-#   tol: 1.0e-3            # relative Schwarz-residual stop
-#   # relax: 0.7           # under-relaxation if an interface oscillates
+#     - [0, 52, 4, 4]      # example only: replace limits for your image
+#     - [52, 330, 1, 1]    # example active band: preserve full resolution
+#     - [330, 450, 4, 4]   # example smooth yoke
+#   robin_p: 12.0          # larger couples bands more strongly, but costs work
+#   overlap: 4             # larger is more stable, but uses more memory
+#   max_outer: 8           # more sweeps improve agreement between bands
+#   tol: 1.0e-3            # smaller gives a stricter interface match
 `;
 function ensureDDHintBlock(yamlString) {
     if (typeof yamlString !== 'string') return yamlString;
@@ -4430,7 +4417,7 @@ function buildPolarYamlBlock(filename, polarDomain) {
     const re = (polarDomain && polarDomain.r_end    != null) ? polarDomain.r_end    : 1;
     const ro = (polarDomain && polarDomain.r_orientation)    ? polarDomain.r_orientation : 'horizontal';
     const lines = [];
-    lines.push('# Auto-generated by Polar Preprocess.');
+    lines.push('# Auto-generated starting point. Review scale, materials, and boundaries before solving.');
     if (N) {
         const Theta_p_deg = (360 / N).toFixed(3);
         const dtheta_deg = (theta_range * 180 / Math.PI).toFixed(3);
@@ -4442,9 +4429,8 @@ function buildPolarYamlBlock(filename, polarDomain) {
     }
     lines.push('coordinate_system: polar');
     lines.push('polar_domain:');
-    lines.push('  # r_start / r_end are PHYSICAL radii in metres (not pixels): the image r-axis');
-    lines.push('  # maps linearly onto [r_start, r_end]. r_start: 0 = full disc from the rotor');
-    lines.push('  # axis (requires inner: dirichlet).');
+    lines.push('  # Physical radii in metres: changing them changes the image scale and field gradients.');
+    lines.push('  # r_start: 0 models the full disc; use a positive value for an annular cutout.');
     lines.push(`  r_start: ${rs}`);
     lines.push(`  r_end: ${re}`);
     lines.push(`  r_orientation: ${ro}`);
@@ -4460,8 +4446,7 @@ function buildPolarYamlBlock(filename, polarDomain) {
     // We still write the filename so the YAML self-describes which
     // image the polar_domain was authored for, and so re-importing the
     // YAML elsewhere preserves that link.
-    lines.push(`# image_path: documentation only. The solver reads the image given on the`);
-    lines.push(`# command line; this field records which file the polar_domain was authored for.`);
+    lines.push('# The CLI image argument is authoritative; this filename records the image used to size the mesh.');
     lines.push(`image_path: ${filename}`);
 
     // Phase D.3 / Phase F.2: optional transient slide skeleton from the
@@ -4490,25 +4475,16 @@ function buildPolarYamlBlock(filename, polarDomain) {
         // live in the variables: block; this YAML only references the
         // $N_step / $N_slide tokens so the user can retune by editing
         // a single variable.
-        const sched = getPolarSlideSchedule();
-        const T = Math.max(1, Math.round(Number(cur.ntheta) || 0));
         // Slide direction = the warp axis perpendicular to r.
         const slideDir = (ro === 'horizontal') ? 'vertical' : 'horizontal';
         lines.push('');
-        lines.push('# Slide region inferred from the air-gap marker (Polar Preprocess).');
+        lines.push(`# Sliding ${inside ? 'the inner' : 'the outer'} air-gap band changes the field at each transient step.`);
         lines.push(`# Side: ${inside ? 'inside the air gap' : 'outside the air gap'}`);
-        lines.push('# UNITS of slide_region_start / slide_region_end:');
+        lines.push('# Decimal slide bounds are metres; integer bounds are legacy pixel indices.');
         lines.push('#   decimal literal (0.05)  = PHYSICAL metres — the solver converts to pixels');
         lines.push('#                             via the mesh (polar: radius; cartesian: x/y)');
         lines.push('#   integer literal (212)   = pixel index (legacy)');
-        lines.push('# Inverted bounds are swapped and out-of-mesh bounds clamped, with a warning.');
-        lines.push(`# Pixel equivalents of the values below: [${region_start}, ${region_end}] of ${nrWarp}.`);
-        if (sched.exact) {
-            lines.push(`# Schedule: N_step * N_slide = ${sched.N_step} * ${sched.N_slide} = ${T} (one full revolution over ntheta).`);
-        } else {
-            lines.push(`# Schedule: ntheta = ${T} has no clean factorisation in [32, 256], falling back to`);
-            lines.push(`#   N_step = 100, N_slide = ${sched.N_slide} (approximates one revolution).`);
-        }
+        lines.push('# Increase total_steps for smoother motion (longer runtime); increase slide_pixels_per_step for larger jumps.');
         lines.push('transient:');
         lines.push('  enabled: true');
         lines.push('  enable_sliding: true');
@@ -4517,9 +4493,7 @@ function buildPolarYamlBlock(filename, polarDomain) {
         lines.push(`  slide_region_start: ${pxToR(region_start)}`);
         lines.push(`  slide_region_end: ${pxToR(region_end)}`);
         lines.push('  slide_pixels_per_step: $N_slide');
-        lines.push('  # parallel_chunks: 3   # optional: run the sweep in N concurrent chunks');
-        lines.push('  #                      # (~1.3-1.9x, memory-bandwidth-bound; each chunk keeps');
-        lines.push('  #                      # its mu warm-start, first step of each chunk is cold)');
+        lines.push('  # parallel_chunks: 3   # optional: shorter wall time, but roughly 3x memory');
     }
     // Phase BA: surface the nonlinear_solver / coarsening knobs even when
     // they aren't active in this template, so a user reading the inserted
@@ -4549,9 +4523,9 @@ function buildCartesianYamlBlock(filename, opts) {
     if (opts.dxdy != null && opts.dxdy > 0) {
         // Standalone path: mesh sized from a user-supplied physical width.
         dxdy = opts.dxdy;
-        lines.push('# Auto-generated: Cartesian / Linear template.');
+        lines.push('# Auto-generated starting point for a Cartesian/linear model. Review scale and materials before solving.');
         if (opts.widthPx > 0 && opts.widthM > 0) {
-            lines.push('# Mesh sized from the physical width you entered:');
+            lines.push('# Smaller dx/dy resolves finer features but increases memory and runtime:');
             lines.push(`#   dx = dy = width_m / width_px = ${opts.widthM} / ${opts.widthPx} ≈ ${dxdy.toExponential(4)} m`);
         } else {
             lines.push(`# Mesh: dx = dy = ${dxdy.toExponential(4)} m (edit to match your image scale).`);
@@ -4566,7 +4540,7 @@ function buildCartesianYamlBlock(filename, opts) {
         lines.push('# Auto-generated by Polar Preprocess (cartesian save target).');
         if (r_outer_px > 0) {
             dxdy = r_outer_m / r_outer_px;
-            lines.push('# Mesh sized from the auto-detected outer radius:');
+            lines.push('# Initial cell size from the detected physical radius; smaller cells increase resolution and cost:');
             lines.push(`#   dx = dy = r_outer_physical / r_outer_px = ${r_outer_m} / ${r_outer_px} ≈ ${dxdy.toExponential(4)} m`);
         } else {
             dxdy = 0.2e-3;
@@ -4590,8 +4564,7 @@ function buildCartesianYamlBlock(filename, opts) {
     lines.push('  top:    { type: dirichlet, value: 0.0 }');
     lines.push('  bottom: { type: dirichlet, value: 0.0 }');
     // Phase E.2: image_path is documentation only (solver reads argv[2]).
-    lines.push('# image_path: documentation only. The solver reads the image given on the');
-    lines.push('# command line; this field records which file the mesh was authored for.');
+    lines.push('# The CLI image argument is authoritative; this filename records the image used to choose the mesh scale.');
     lines.push(`image_path: ${filename}`);
     // Materials: when the caller supplied a colour-detection result, embed a
     // materials: entry per detected colour (defaults: mu_r 1.0 / jz 0) so the
@@ -4601,8 +4574,7 @@ function buildCartesianYamlBlock(filename, opts) {
     // was unavailable.
     const detCols = opts.detectedColors;
     if (Array.isArray(detCols) && detCols.length > 0) {
-        lines.push('# materials: one entry per detected colour (defaults mu_r 1.0, jz 0).');
-        lines.push('# Assign real presets / coils / magnetization via "Detect Colors".');
+        lines.push('# Detected regions start as air-like (mu_r 1, jz 0). Set steel, coil, and magnet properties before solving.');
         lines.push('materials:');
         for (const c of detCols) {
             const [r, g, b] = c.rgb;
@@ -4631,7 +4603,7 @@ function buildCartesianYamlBlock(filename, opts) {
     lines.push('#   slide_region_start: 0.0       # start of the moving band [m]');
     lines.push(`#   slide_region_end: ${(opts.heightPx > 0 && opts.dxdy > 0 ? (opts.heightPx * opts.dxdy).toPrecision(6) : '0.1')}    # end of the moving band [m] (= full image height)`);
     lines.push('#   slide_pixels_per_step: $N_slide');
-    lines.push('#   # parallel_chunks: 3          # run the sweep in N concurrent chunks (~1.3-1.9x)');
+    lines.push('#   # parallel_chunks: 3          # shorter wall time, but roughly 3x memory');
     lines.push('# variables:');
     lines.push('#   N_step: 100');
     lines.push('#   N_slide: 2');
