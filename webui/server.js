@@ -363,18 +363,9 @@ async function initializeUserDir(userId) {
     try {
         await fs.access(defaultLibraryPath);
     } catch {
-        // Migrate the early prototype name if it exists; otherwise install
-        // the bundled starter library under the user-facing name.
-        const legacyLibraryPath = path.join(libDir, 'aaa.yaml');
-        try {
-            await fs.rename(legacyLibraryPath, defaultLibraryPath);
-            console.log(`Renamed legacy material library for user: ${userId}`);
-        } catch (migrationError) {
-            if (migrationError.code !== 'ENOENT') throw migrationError;
-            const bundledLibrary = path.join(BASE_DIR, 'general_materials.yaml');
-            await fs.copyFile(bundledLibrary, defaultLibraryPath);
-            console.log(`Installed default material library for user: ${userId}`);
-        }
+        const bundledLibrary = path.join(BASE_DIR, 'general_materials.yaml');
+        await fs.copyFile(bundledLibrary, defaultLibraryPath);
+        console.log(`Installed default material library for user: ${userId}`);
     }
 }
 
