@@ -66,6 +66,7 @@ jobs:
       with:
         path: |
           vcpkg_installed
+          build/vcpkg_installed
           vcpkg/installed
           vcpkg/packages
         key: ${{ runner.os }}-vcpkg-${{ hashFiles('**/vcpkg.json') }}-v3
