@@ -27,7 +27,8 @@ package or in the configured development paths. Use `GET /api/health` and
 - Launch/stop analyses and follow streaming logs.
 - View TIFF or CSV fields, flux linkage, energy, force and torque timelines.
 - Manage configurations, uploaded analysis images, material libraries and
-  result folders together from the File Manager tab.
+  result folders together from the File Manager tab, including select-all and
+  bulk deletion across file categories.
 - Export/import selected user content as a standard ZIP backup from File
   Manager; the YAML editor remains focused on editing configuration content.
 

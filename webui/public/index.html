@@ -545,6 +545,26 @@
             margin-bottom: 12px;
         }
 
+        .user-files-select-all {
+            display: inline-flex;
+            gap: 6px;
+            align-items: center;
+            padding: 7px 9px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            background: #fff;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .user-files-select-all input,
+        .user-file-checkbox {
+            width: 17px;
+            height: 17px;
+            margin: 0;
+            cursor: pointer;
+        }
+
         .user-file-item {
             background: #f8f9fa;
             border: 1px solid #dee2e6;
@@ -1435,6 +1455,13 @@
                     </p>
                     <div class="user-files-toolbar">
                         <button class="btn-primary" onclick="refreshUserFiles()">Refresh</button>
+                        <label class="user-files-select-all">
+                            <input type="checkbox" id="selectAllUserFiles"
+                                   onchange="toggleAllUserFiles(this.checked)">
+                            Select all
+                        </label>
+                        <button class="btn-delete" id="deleteSelectedUserFilesBtn"
+                                onclick="deleteSelectedUserFiles()" disabled>Delete selected...</button>
                         <button class="btn-secondary" onclick="openBackupModal()">Export selected…</button>
                         <button class="btn-secondary" onclick="document.getElementById('importDataInput').click()">Import backup</button>
                         <input type="file" id="importDataInput" accept=".zip,application/zip,application/json,.json"
@@ -1446,6 +1473,7 @@
                             <option value="libraries">Material libraries</option>
                             <option value="results">Analysis results</option>
                         </select>
+                        <span id="userFileSelectedCount" style="color:#666; font-size:0.9rem;">0 selected</span>
                     </div>
                     <div id="fileManagerStatus" style="margin-bottom: 10px;"></div>
                     <div id="userFilesList">

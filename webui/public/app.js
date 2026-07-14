@@ -50,7 +50,8 @@ const AppState = {
     libraryAceEditor: null,      // Ace Editor instance inside Library modal
     currentLibraryFile: null,    // Currently selected filename in Library modal
     currentBHMaterial: null,     // Last rendered BH material {name, props} for axis toggle
-    userFiles: []                // Unified File Manager listing
+    userFiles: [],               // Unified File Manager listing
+    userFileSelection: new Set() // category + filename keys selected for bulk actions
 };
 
 // ===== Utility Functions =====
@@ -10882,6 +10883,55 @@ const USER_FILE_CATEGORY_ICON = {
     configs: '📝', images: '🖼️', libraries: '🧱', results: '📊',
 };
 
+function userFileKey(file) {
+    return `${file.category}\u0000${file.name}`;
+}
+
+function visibleUserFiles() {
+    const files = AppState.userFiles || [];
+    const filter = document.getElementById('fileManagerFilter')?.value || 'all';
+    return filter === 'all' ? files : files.filter(file => file.category === filter);
+}
+
+function updateUserFileSelectionControls() {
+    const visible = visibleUserFiles();
+    const selected = AppState.userFileSelection;
+    const visibleSelected = visible.filter(file => selected.has(userFileKey(file))).length;
+    const totalSelected = (AppState.userFiles || [])
+        .filter(file => selected.has(userFileKey(file))).length;
+    const selectAll = document.getElementById('selectAllUserFiles');
+    if (selectAll) {
+        selectAll.checked = visible.length > 0 && visibleSelected === visible.length;
+        selectAll.indeterminate = visibleSelected > 0 && visibleSelected < visible.length;
+        selectAll.disabled = visible.length === 0;
+    }
+    const deleteButton = document.getElementById('deleteSelectedUserFilesBtn');
+    if (deleteButton) deleteButton.disabled = totalSelected === 0;
+    const count = document.getElementById('userFileSelectedCount');
+    if (count) count.textContent = `${totalSelected} selected`;
+}
+
+function userFileSelectionChanged(checkbox) {
+    const file = fileManagerRow(checkbox);
+    if (!file) return;
+    const key = userFileKey(file);
+    if (checkbox.checked) AppState.userFileSelection.add(key);
+    else AppState.userFileSelection.delete(key);
+    updateUserFileSelectionControls();
+}
+
+function toggleAllUserFiles(checked) {
+    for (const file of visibleUserFiles()) {
+        const key = userFileKey(file);
+        if (checked) AppState.userFileSelection.add(key);
+        else AppState.userFileSelection.delete(key);
+    }
+    document.querySelectorAll('.user-file-checkbox').forEach(checkbox => {
+        checkbox.checked = checked;
+    });
+    updateUserFileSelectionControls();
+}
+
 function userFileHtml(file) {
     const category = fileManagerEscape(file.category);
     const name = fileManagerEscape(file.name);
@@ -10893,7 +10943,10 @@ function userFileHtml(file) {
     const openLabel = file.category === 'results' ? 'Preview' : 'Open';
     const download = file.category === 'results' ? ''
         : `<button class="btn-secondary btn-small" onclick="fileManagerDownload(this)">Download</button>`;
+    const checked = AppState.userFileSelection.has(userFileKey(file)) ? ' checked' : '';
     return `<div class="user-file-item" data-category="${category}" data-name="${name}">
+        <input type="checkbox" class="user-file-checkbox"${checked}
+               aria-label="Select ${name}" onchange="userFileSelectionChanged(this)">
         <div class="user-file-icon" aria-hidden="true">${USER_FILE_CATEGORY_ICON[file.category] || '📄'}</div>
         <div class="user-file-info">
             <div class="user-file-name">${name}</div>
@@ -10910,11 +10963,10 @@ function userFileHtml(file) {
 function renderUserFiles() {
     const list = document.getElementById('userFilesList');
     if (!list) return;
-    const files = AppState.userFiles || [];
-    const filter = document.getElementById('fileManagerFilter')?.value || 'all';
-    const visible = filter === 'all' ? files : files.filter(f => f.category === filter);
+    const visible = visibleUserFiles();
     if (visible.length === 0) {
         list.innerHTML = '<p style="color:#666;">No files in this category.</p>';
+        updateUserFileSelectionControls();
         return;
     }
     const order = ['configs', 'images', 'libraries', 'results'];
@@ -10926,6 +10978,7 @@ function renderUserFiles() {
         html += group.map(userFileHtml).join('');
     }
     list.innerHTML = html;
+    updateUserFileSelectionControls();
 }
 
 async function refreshUserFiles() {
@@ -10937,6 +10990,10 @@ async function refreshUserFiles() {
         const result = await response.json();
         if (!response.ok || !result.success) throw new Error(result.error || 'Failed to load files');
         AppState.userFiles = result.files || [];
+        const availableKeys = new Set(AppState.userFiles.map(userFileKey));
+        AppState.userFileSelection = new Set(
+            [...AppState.userFileSelection].filter(key => availableKeys.has(key))
+        );
         renderUserFiles();
         fileManagerStatus(`${AppState.userFiles.length} file(s) available.`, 'info');
     } catch (error) {
@@ -11021,6 +11078,68 @@ async function fileManagerDelete(button) {
         fileManagerStatus(`Deleted ${file.name}`, 'success');
     } catch (error) {
         fileManagerStatus(`Delete failed: ${error.message}`, 'error');
+    }
+}
+
+async function deleteSelectedUserFiles() {
+    const selected = (AppState.userFiles || [])
+        .filter(file => AppState.userFileSelection.has(userFileKey(file)));
+    if (selected.length === 0) return;
+    if (!confirm(`Delete ${selected.length} selected item(s)?\n\nThis action cannot be undone.`)) return;
+
+    const deleteOne = async file => {
+        const response = await fetch('/api/user-files', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                userId: AppState.userId,
+                category: file.category,
+                name: file.name,
+            }),
+        });
+        const result = await response.json();
+        if (!response.ok || !result.success) {
+            throw new Error(`${file.name}: ${result.error || 'Delete failed'}`);
+        }
+        return file;
+    };
+
+    const deleteButton = document.getElementById('deleteSelectedUserFilesBtn');
+    if (deleteButton) deleteButton.disabled = true;
+    fileManagerStatus(`Deleting ${selected.length} selected item(s)...`, 'info');
+    const settled = [];
+    const concurrency = 8;
+    for (let offset = 0; offset < selected.length; offset += concurrency) {
+        const batch = selected.slice(offset, offset + concurrency);
+        settled.push(...await Promise.allSettled(batch.map(deleteOne)));
+        fileManagerStatus(
+            `Deleting selected items... ${Math.min(offset + batch.length, selected.length)}/${selected.length}`,
+            'info'
+        );
+    }
+    const deleted = settled
+        .filter(result => result.status === 'fulfilled')
+        .map(result => result.value);
+    const failures = settled.filter(result => result.status === 'rejected');
+    deleted.forEach(file => AppState.userFileSelection.delete(userFileKey(file)));
+
+    await refreshUserFiles();
+    const categories = new Set(deleted.map(file => file.category));
+    const refreshes = [];
+    if (categories.has('configs')) refreshes.push(refreshConfigList());
+    if (categories.has('images')) refreshes.push(refreshImageList());
+    if (categories.has('results')) refreshes.push(refreshResultsList());
+    await Promise.allSettled(refreshes);
+    updateUserFileSelectionControls();
+
+    if (failures.length > 0) {
+        const firstError = failures[0].reason?.message || 'Unknown error';
+        fileManagerStatus(
+            `Deleted ${deleted.length}; ${failures.length} failed. ${firstError}`,
+            'error'
+        );
+    } else {
+        fileManagerStatus(`Deleted ${deleted.length} selected item(s).`, 'success');
     }
 }
 
