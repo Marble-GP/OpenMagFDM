@@ -36,6 +36,9 @@ jobs:
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(nproc)
 
+    - name: Numerical regression tests
+      run: ctest --test-dir build -C ${{env.BUILD_TYPE}} --output-on-failure
+
     - name: Create release package
       run: |
         mkdir -p release/OpenMagFDM-Linux
@@ -106,6 +109,9 @@ jobs:
       run: |
         $jobs = $env:NUMBER_OF_PROCESSORS
         cmake --build build --config ${{env.BUILD_TYPE}} -j $jobs
+
+    - name: Numerical regression tests
+      run: ctest --test-dir build -C ${{env.BUILD_TYPE}} --output-on-failure
 
     - name: Create release package
       run: |
@@ -284,6 +290,9 @@ jobs:
 
     - name: Build
       run: cmake --build build --config ${{env.BUILD_TYPE}} -j$(sysctl -n hw.ncpu)
+
+    - name: Numerical regression tests
+      run: ctest --test-dir build -C ${{env.BUILD_TYPE}} --output-on-failure
 
     - name: Create release package
       run: |

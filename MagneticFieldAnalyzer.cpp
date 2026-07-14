@@ -1,4 +1,5 @@
 #include "MagneticFieldAnalyzer.h"
+#include "PolarMagnetizationCurl.h"
 #include "tinyexpr/tinyexpr.h"
 #include <iostream>
 #include <fstream>
@@ -2343,66 +2344,27 @@ void MagneticFieldAnalyzer::computeMagnetizationCurl() {
 }
 
 void MagneticFieldAnalyzer::computeMagnetizationCurlPolar() {
-    // Polar: Jz_mag = (1/r)·∂(r·Mθ)/∂r − (1/r)·∂Mr/∂θ
-    // Mr  = Mx·cos(θ) + My·sin(θ)
-    // Mθ  = −Mx·sin(θ) + My·cos(θ)
-    //
-    // Map indexing mirrors mu_map / jz_map:
-    //   horizontal: (ntheta, nr) → (j, i) = (theta_idx, r_idx)
-    //   vertical:   (nr, ntheta) → (j, i) = (r_idx, theta_idx)
-    int rows = (int)Mx_map.rows();
-    int cols = (int)Mx_map.cols();
-    Jz_mag_map = Eigen::MatrixXd::Zero(rows, cols);
+    // Polar: Jz_mag = (1/r)·∂(r·Mθ)/∂r − (1/r)·∂Mr/∂θ.
+    // Anti-periodicity uses the same canonical representation as the polar
+    // matrix assembly: type=periodic with a negative boundary value.
+    const bool theta_periodic =
+        bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic";
+    const bool theta_antiperiodic = theta_periodic
+        && (bc_theta_min.value < 0.0 || bc_theta_max.value < 0.0);
 
-    bool horiz = (r_orientation == "horizontal");
+    openmagfdm::detail::PolarMagnetizationCurlOptions options;
+    options.nr = nr;
+    options.ntheta = ntheta;
+    options.r_start = r_start;
+    options.dr = dr;
+    options.dtheta = dtheta;
+    options.theta_offset = theta_offset;
+    options.radial_axis_is_columns = (r_orientation == "horizontal");
+    options.theta_periodic = theta_periodic;
+    options.theta_antiperiodic = theta_antiperiodic;
 
-    for (int j = 0; j < rows; j++) {
-        for (int i = 0; i < cols; i++) {
-            int i_r   = horiz ? i : j;
-            int j_th  = horiz ? j : i;
-            double r     = r_start + i_r * dr;
-            double theta = j_th * dtheta + theta_offset;  // v1.6 DD: global angle (theta-sector)
-
-            // Convert Mx/My to radial/tangential
-            double cos_t = std::cos(theta), sin_t = std::sin(theta);
-            auto getMr = [&](int ir, int jt) -> double {
-                int row = horiz ? jt : ir, col = horiz ? ir : jt;
-                return Mx_map(row, col) * cos_t + My_map(row, col) * sin_t;
-            };
-            auto getMth = [&](int ir, int jt) -> double {
-                int row = horiz ? jt : ir, col = horiz ? ir : jt;
-                return -Mx_map(row, col) * sin_t + My_map(row, col) * cos_t;
-            };
-
-            // d(r·Mθ)/dr using adjacent r-cells
-            int ir_m = std::max(i_r - 1, 0);
-            int ir_p = std::min(i_r + 1, nr - 1);
-            double r_m = r_start + ir_m * dr;
-            double r_p = r_start + ir_p * dr;
-            double denom_r = (ir_p - ir_m) * dr;
-
-            double d_rMth_dr = 0.0;
-            if (denom_r > 1e-15 && r > 1e-10) {
-                double val_p = r_p * getMth(ir_p, j_th);
-                double val_m = r_m * getMth(ir_m, j_th);
-                d_rMth_dr = (val_p - val_m) / denom_r;
-            }
-
-            // dMr/dθ using adjacent theta-cells
-            int jt_m = std::max(j_th - 1, 0);
-            int jt_p = std::min(j_th + 1, ntheta - 1);
-            double denom_th = (jt_p - jt_m) * dtheta;
-
-            double dMr_dth = 0.0;
-            if (denom_th > 1e-15 && r > 1e-10) {
-                dMr_dth = (getMr(i_r, jt_p) - getMr(i_r, jt_m)) / denom_th;
-            }
-
-            if (r > 1e-10) {
-                Jz_mag_map(j, i) = d_rMth_dr / r - dMr_dth / r;
-            }
-        }
-    }
+    Jz_mag_map = openmagfdm::detail::computePolarMagnetizationCurl(
+        Mx_map, My_map, options);
 }
 
 void MagneticFieldAnalyzer::validateBoundaryConditions() {

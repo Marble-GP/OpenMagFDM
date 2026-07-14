@@ -28,6 +28,16 @@ experience. It is backward compatible with integer pixel-based slide regions.
 - Windows automatic OpenMP selection now uses physical cores while preserving
   explicit `omp.threads` and `OMP_NUM_THREADS` overrides. This avoids SMT
   contention in memory-bound AMG kernels.
+- Corrected the polar permanent-magnet source curl. Cartesian magnetisation at
+  each theta neighbour is now converted with that neighbour's own polar basis,
+  and theta derivatives wrap consistently across periodic and anti-periodic
+  seams. The old source generated an O(M/r) fictitious volume current even for
+  uniform Cartesian magnetisation, which could cause non-physical harmonics in
+  transient flux-linkage and derived EMF waveforms.
+- Added analytic numerical regressions for both polar storage orientations,
+  periodic and anti-periodic seams, second-order angular convergence, radial
+  derivatives and non-periodic endpoint differences. All release-platform
+  builds now execute these tests before packaging.
 
 ## WebUI
 
@@ -84,7 +94,8 @@ nonlinear_solver:
 
 The pre-refresh branch head `dde0b7a` built successfully on Linux, macOS and
 Windows, including standalone WebUI packages, the Windows installer and the
-Windows AMGCL smoke step. The final specification-refresh commit requires a
-fresh CI run. v1.6.1 adds a Windows release-contract smoke for version output,
-static force export, export defaults and slide-unit metadata; broader numerical
-regression remains benchmark-driven.
+Windows AMGCL smoke step. The final release-candidate head requires a fresh CI
+run. v1.6.1 adds a Windows release-contract smoke for version output, static
+force export, export defaults and slide-unit metadata, plus cross-platform
+analytic regression coverage for the polar permanent-magnet source curl;
+broader machine-level numerical regression remains benchmark-driven.

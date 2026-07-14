@@ -20,6 +20,11 @@ investigations remain under `docs/research/`.
 - `conditions.json` is prepared before solver initialization and full-disc
   polar metadata (`r_start: 0`) is accepted by the WebUI; new users receive
   `general_materials.yaml` automatically.
+- Fixed the polar permanent-magnet curl so every theta neighbour is projected
+  in its own local basis and periodic/anti-periodic seams use wrapped central
+  differences. This removes mesh-independent fictitious magnet currents that
+  appeared as non-physical high harmonics in transient flux-linkage and EMF
+  waveforms.
 
 See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 

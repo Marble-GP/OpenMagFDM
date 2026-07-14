@@ -5,6 +5,8 @@ project(MagFDMsolver VERSION 1.6.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+
 add_executable(MagFDMsolver
     MagFDMsolver.cpp
     MagneticFieldAnalyzer.cpp
@@ -117,3 +119,17 @@ target_link_libraries(dd_bench
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
 target_include_directories(dd_bench PRIVATE ${TIFF_INCLUDE_DIRS})
+
+if(BUILD_TESTING)
+    add_executable(polar_magnetization_curl_test
+        tests/polar_magnetization_curl_test.cpp
+        PolarMagnetizationCurl.h
+    )
+    target_include_directories(polar_magnetization_curl_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME polar_magnetization_curl
+        COMMAND polar_magnetization_curl_test
+    )
+endif()
