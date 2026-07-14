@@ -34,6 +34,8 @@
  */
 void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     last_nonlinear_iterations_ = 0;
+    last_nonlinear_residual_ = 0.0;
+    last_nonlinear_converged_ = true;
     // [Phase BJ-8 Path D / v1.5.1] All NK iterations and the initial-guess
     // dispatch run on the full grid via AMGCL+EW. The custom Galerkin
     // coarsening machinery (Phase 6 + Galerkin, Phase 5 matrix-free GMRES,
@@ -271,6 +273,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_norm = residual_coarse_norm;
         double b_vec_norm    = b_vec_coarse_norm;
         double residual_rel  = residual_norm / (b_vec_norm + 1e-12);
+        last_nonlinear_residual_ = residual_rel;
 
         residual_history.push_back(residual_rel);
 
@@ -292,26 +295,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         // ===== Step 4: Check convergence =====
         bool converged = false;
-        bool plateau_stall = false;  // stopped by stagnation, TOL not reached
 
         if (iter > 0) {
             // Primary convergence criterion: relative residual
             if (residual_rel < TOL) {
                 converged = true;
-            }
-
-            // Secondary criterion for polar coordinates: residual reduction rate
-            // Useful when absolute residual is large but solution is converging
-            if (!converged && is_polar && iter >= 3) {
-                double reduction_rate = std::abs(residual_history[iter] - residual_history[iter-1]) /
-                                       (residual_history[iter-1] + 1e-12);
-                if (residual_rel < TOL * 10.0 && reduction_rate < 0.05) {
-                    converged = true;
-                    plateau_stall = true;
-                    if (VERBOSE) {
-                        std::cout << " [Plateau detected: Δr=" << reduction_rate << "]";
-                    }
-                }
             }
 
             // [Phase BJ-8 Path D / v1.5.1] Az-stagnation + Coarse-plateau
@@ -325,20 +313,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 std::cout << std::endl;
             }
             // Always print convergence message (important for user feedback).
-            // A plateau exit is a stall, not true convergence — say so instead
-            // of reporting it as converged (solutions accepted at the plateau
-            // scatter by a few percent run-to-run; users should know).
+            // Only the requested relative-residual tolerance is accepted. The
+            // former polar plateau heuristic accepted residuals up to 10x the
+            // target and could make transient fields differ by several percent.
             // quiet_solver_ (parallel DD sub-solves) suppresses it: concurrent
             // prints from many patches would garble the log.
             last_nonlinear_iterations_ = iter + 1;
+            last_nonlinear_converged_ = true;
             if (!quiet_solver_) {
                 if (VERBOSE) {
                     std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
                               << std::scientific << std::setprecision(2) << residual_rel << ")";
-                    if (plateau_stall) {
-                        std::cout << " [PLATEAU STALL: accepted above tolerance "
-                                  << std::scientific << std::setprecision(1) << TOL << "]";
-                    }
                     std::cout << std::endl;
                 }
             }
@@ -955,8 +940,14 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     }
 
     last_nonlinear_iterations_ = MAX_ITER;
-    if (!quiet_solver_ && VERBOSE)
-        std::cerr << "WARNING: Newton-Krylov solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
+    last_nonlinear_converged_ = false;
+    analysis_convergence_ok_ = false;
+    if (!quiet_solver_) {
+        std::cerr << "WARNING: Newton-Krylov did not converge after " << MAX_ITER
+                  << " iterations (residual=" << std::scientific << std::setprecision(3)
+                  << last_nonlinear_residual_ << ", target=" << TOL << ")."
+                  << std::defaultfloat << std::endl;
+    }
 
     // [Stage 1e] As in the converged branch: promote the coarse solution to the
     // full grid for downstream force/flux/export. (Az_vec is loop-scoped, so

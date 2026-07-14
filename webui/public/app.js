@@ -4345,8 +4345,8 @@ ${SOLVER_HINT_MARKER}
 # nonlinear_solver:
 #   enabled: true                   # enables the nonlinear material response
 #   solver_type: newton-krylov      # picard is slower but can be more forgiving
-#   max_iterations: 100             # larger may converge difficult cases, but takes longer
-#   tolerance: 1.0e-3               # smaller is stricter/more accurate, but slower
+#   max_iterations: 100             # reaching this limit marks the run failed (exit code 2)
+#   tolerance: 1.0e-3               # accept results only when the reported residual is below this
 #   verbose: false                  # true prints iteration diagnostics for troubleshooting
 #   anderson:
 #     enabled: false                # can reduce iterations for difficult curves
@@ -4359,6 +4359,10 @@ ${SOLVER_HINT_MARKER}
 #     alpha: 2.0
 #     eta_min: 1.0e-6
 #     eta_max: 0.1
+#
+# If a step says NOT CONVERGED, its fields are diagnostic only. Increase the
+# iteration limit, justify a looser tolerance, or disable EW for comparison.
+# Never compare field maps from runs unless both satisfy their tolerance.
 #
 # Do not add the old coarsen/coarsening keys: they are ignored in v1.6.1.
 `;

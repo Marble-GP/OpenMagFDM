@@ -483,13 +483,13 @@
       "validParents": ["anderson", "left", "right", "top", "bottom", "inner", "outer", "theta_min", "theta_max"]
     },
     "max_iterations": {
-      "description": "Maximum number of nonlinear iterations",
+      "description": "Maximum number of nonlinear iterations. Reaching this limit retains diagnostic output but marks the analysis failed with exit code 2.",
       "type": "integer",
       "example": "max_iterations: 100",
       "validParents": ["nonlinear_solver"]
     },
     "tolerance": {
-      "description": "Convergence tolerance (relative residual norm). On stiff B-H problems the residual plateau floor is ~5e-3, so 1e-3 is a realistic target; tighter values never converge and hit max_iterations.",
+      "description": "Required relative residual norm. Smaller is stricter and may need substantially more iterations. Results are accepted only below this value; compare field maps only when both runs converged.",
       "type": "number",
       "example": "tolerance: 1.0e-3",
       "validParents": ["nonlinear_solver"]

@@ -671,8 +671,16 @@ int main(int argc, char* argv[]) {
             analyzer.exportActiveOnlyResults(base_folder, 0);
         }
 
+        const bool convergence_ok = analyzer.analysisConverged();
         std::cout << "\n========================================" << std::endl;
-        std::cout << "Analysis completed successfully!" << std::endl;
+        if (convergence_ok) {
+            std::cout << "Analysis completed successfully!" << std::endl;
+        } else {
+            std::cout << "Analysis finished, but the nonlinear solver DID NOT CONVERGE."
+                      << std::endl;
+            std::cout << "Results were retained for diagnostics and must not be treated as converged."
+                      << std::endl;
+        }
         std::cout << "========================================" << std::endl;
 
         // Restore original cout buffer and close log file
@@ -680,7 +688,10 @@ int main(int argc, char* argv[]) {
         log_file.close();
         std::cout << "\nLog file saved to: " << base_folder << "/log.txt" << std::endl;
 
-        return 0;
+        // A distinct non-zero code lets the WebUI/automation reject partial
+        // nonlinear results while keeping exported fields available for
+        // troubleshooting.
+        return convergence_ok ? 0 : 2;
 
     } catch (const std::exception& e) {
         std::cerr << "\n!!! Error occurred !!!" << std::endl;

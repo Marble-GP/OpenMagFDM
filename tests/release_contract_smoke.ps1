@@ -80,6 +80,31 @@ try {
         throw 'A partial export block did not inherit TIFF + async defaults'
     }
 
+    # A nonlinear iteration-limit result must remain available for diagnostics
+    # but must not be reported to automation as a successful analysis.
+    $nonlinearConfig = Join-Path $package 'contract_nonlinear_failure.yaml'
+    $nonlinearLines = Get-Content -LiteralPath $staticConfig
+    $bodyPattern = '  body: \{ rgb: \[128, 128, 128\], mu_r: 2.0, jz: 0.0, calc_force: true \}'
+    $bodyNonlinear = '  body: { rgb: [128, 128, 128], B-H: "mu0 * (1000 / (1 + ($H/1000)^2)) * $H", jz: 0.0, calc_force: true }'
+    $nonlinearLines = $nonlinearLines -replace $bodyPattern, $bodyNonlinear
+    $nonlinearLines += @(
+        'nonlinear_solver:',
+        '  enabled: true',
+        '  solver_type: newton-krylov',
+        '  max_iterations: 1',
+        '  tolerance: 1.0e-12',
+        '  verbose: false'
+    )
+    Set-Content -LiteralPath $nonlinearConfig -Value $nonlinearLines -Encoding UTF8
+    & $solver $nonlinearConfig $imagePath 'contract_nonlinear_failure_out'
+    if ($LASTEXITCODE -ne 2) {
+        throw "Nonlinear nonconvergence returned $LASTEXITCODE instead of 2"
+    }
+    $nonlinearLog = Get-Content -Raw -LiteralPath 'contract_nonlinear_failure_out\log.txt'
+    if ($nonlinearLog -notmatch 'DID NOT CONVERGE') {
+        throw 'Nonlinear nonconvergence was not recorded in log.txt'
+    }
+
     $metreConfig = Join-Path $package 'contract_metres.yaml'
     Write-Config $metreConfig $true '0.05' '0.09'
     & $solver $metreConfig $imagePath 'contract_metres_out'

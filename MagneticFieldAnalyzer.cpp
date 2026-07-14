@@ -10,6 +10,7 @@
 #include <chrono>
 #include <set>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <filesystem>
 #include <thread>
@@ -20,6 +21,10 @@
 #endif
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <direct.h>
 #define MKDIR(path) _mkdir(path)
 #else
@@ -35,6 +40,36 @@ static void createDirectory(const std::string& path) {
     system(("mkdir -p \"" + path + "\"").c_str());
 #endif
 }
+
+#ifdef _WIN32
+// AMGCL's sparse matrix/vector kernels are memory-bandwidth bound.  On Windows,
+// VCOMP defaults to every logical processor; on SMT CPUs that often adds
+// contention without adding bandwidth.  Count physical cores so the automatic
+// setting has a topology-aware baseline. Explicit YAML / OMP_NUM_THREADS still
+// take precedence.
+static int detectWindowsPhysicalCores() {
+    DWORD bytes = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes == 0) return 0;
+
+    std::vector<unsigned char> storage(bytes);
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(storage.data()),
+            &bytes)) return 0;
+
+    int cores = 0;
+    DWORD offset = 0;
+    while (offset < bytes) {
+        auto* entry = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+            storage.data() + offset);
+        if (entry->Relationship == RelationProcessorCore) ++cores;
+        if (entry->Size == 0) break;
+        offset += entry->Size;
+    }
+    return cores;
+}
+#endif
 
 constexpr double MU_0 = 4.0 * M_PI * 1e-7;  // Vacuum permeability [H/m]
 
@@ -400,24 +435,40 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
             std::cout << "Loaded " << material_presets.size() << " material preset(s)" << std::endl;
         }
 
-        // Parse OpenMP thread count (optional)
-        // YAML: omp: { threads: 4 }
-        // Set to 0 or omit to use default (OMP_NUM_THREADS env var or all cores)
-        if (config["omp"] && config["omp"]["threads"]) {
-            int omp_threads = config["omp"]["threads"].as<int>(0);
+        // Parse OpenMP thread count (optional). Sparse AMG kernels saturate
+        // memory bandwidth before SMT reaches 100% CPU utilisation, so on
+        // Windows the automatic mode starts from physical cores. Explicit
+        // omp.threads or OMP_NUM_THREADS always wins.
+        const int omp_threads = (config["omp"] && config["omp"]["threads"])
+            ? config["omp"]["threads"].as<int>(0) : 0;
 #ifdef _OPENMP
-            if (omp_threads > 0) {
-                omp_set_num_threads(omp_threads);
-                std::cout << "OpenMP: thread count set to " << omp_threads << " (via YAML omp.threads)" << std::endl;
-            } else {
-                std::cout << "OpenMP: using default thread count (OMP_NUM_THREADS or all cores)" << std::endl;
-            }
-#else
-            if (omp_threads > 0) {
-                std::cout << "OpenMP: omp.threads=" << omp_threads << " specified, but OpenMP is not enabled in this build." << std::endl;
-            }
+        omp_set_dynamic(0);
+        if (omp_threads > 0) {
+            omp_set_num_threads(omp_threads);
+            std::cout << "OpenMP: " << omp_get_max_threads()
+                      << " thread(s) (YAML omp.threads; dynamic teams disabled)" << std::endl;
+        } else if (std::getenv("OMP_NUM_THREADS")) {
+            std::cout << "OpenMP: " << omp_get_max_threads()
+                      << " thread(s) (OMP_NUM_THREADS; dynamic teams disabled)" << std::endl;
+        } else {
+#ifdef _WIN32
+            const int physical_cores = detectWindowsPhysicalCores();
+            if (physical_cores > 0)
+                omp_set_num_threads(std::min(physical_cores, omp_get_num_procs()));
 #endif
+            std::cout << "OpenMP: " << omp_get_max_threads() << " thread(s) automatic"
+                      << " (" << omp_get_num_procs() << " logical processor(s) available)"
+                      << std::endl;
         }
+#else
+        if (omp_threads > 0) {
+            std::cout << "OpenMP: omp.threads=" << omp_threads
+                      << " specified, but OpenMP is not enabled in this build." << std::endl;
+        } else {
+            std::cout << "OpenMP: not enabled in this build; solver kernels are single-threaded."
+                      << std::endl;
+        }
+#endif
 
         // Parse flux linkage paths
         parseFluxLinkagePaths();
@@ -1971,6 +2022,11 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
             Jz_mag_map = Eigen::MatrixXd::Zero(ny, nx);
         }
     }
+
+    // Baseline for the next transient step's nonlinear μ warm start.  The
+    // image is retained in source coordinates and flipped alongside the live
+    // image when setupMaterialPropertiesForStep compares material identity.
+    previous_material_image = image.clone();
 }
 
 // ============================================================================
@@ -12729,11 +12785,35 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         mu_map_prev = mu_map;  // snapshot pre-reset
     }
 
+    cv::Mat previous_image_flipped;
+    const bool have_previous_material_image = warm_start_mu
+        && !previous_material_image.empty()
+        && previous_material_image.rows == image.rows
+        && previous_material_image.cols == image.cols;
+    if (have_previous_material_image) {
+        cv::flip(previous_material_image, previous_image_flipped, 0);
+    }
+
+    auto warmMuIfSameMaterial = [&](int row, int col, const cv::Vec3b& current_pixel,
+                                    double previous_mu, double cold_mu) {
+        if (!have_previous_material_image) return cold_mu;
+        const cv::Vec3b previous_pixel = previous_image_flipped.at<cv::Vec3b>(row, col);
+        const bool same_material = previous_pixel[0] == current_pixel[0]
+                                && previous_pixel[1] == current_pixel[1]
+                                && previous_pixel[2] == current_pixel[2];
+        return (same_material && previous_mu > 2.0 * MU_0) ? previous_mu : cold_mu;
+    };
+
     // IMPORTANT: Reset mu_map and jz_map to default values (air) before applying materials
     // This ensures that pixels that changed material due to sliding get updated correctly
     // Without this reset, old material values would persist even after the image slides
     mu_map.setConstant(MU_0);  // Default: air (mu_r = 1.0)
     jz_map.setZero();          // Default: no current
+
+    // All field grids use y-up coordinates. Flip once per transient step,
+    // rather than once per material (large models commonly define 10+ colors).
+    cv::Mat image_flipped;
+    cv::flip(image, image_flipped, 0);
 
     for (const auto& material : config["materials"]) {
         std::string name = material.first.as<std::string>();
@@ -12797,12 +12877,11 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         // step-1 will hold the converged μ ≈ operating-point value,
         // which is a vastly better warm-start than the peak seed. Cells
         // whose material identity flipped at this step (the slide just
-        // brought a new color here) won't have anything sensible in
-        // the snapshot, so they fall back to the peak seed via the
-        // `mu_prev > 2·MU_0` gate -- "above air" means whatever was
-        // there was a permeable material, so reuse it; otherwise cold-start.
+        // brought a new color here) must not inherit the old material's μ.
+        // Compare the previous and current RGB explicitly; the historical
+        // `mu_prev > 2·MU_0` test alone could not distinguish two permeable
+        // materials and leaked stale μ across slide boundaries.
         const bool use_warm_for_this_mat = warm_start_mu && is_nl_material;
-        const double mu_warm_floor = 2.0 * MU_0;
 
         // Evaluate Jz for this step (0.0 if not defined)
         double jz = 0.0;
@@ -12812,10 +12891,6 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
 
         // Update mu_map and jz_map for ALL matching pixels
         if (coordinate_system == "polar") {
-            // For polar coordinates, flip image to match analysis coordinates
-            cv::Mat image_flipped;
-            cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
-
             if (r_orientation == "horizontal") {
                 // mu_map shape: (ntheta, nr), indexing: (theta_idx, r_idx) = (j, i)
                 for (int j = 0; j < ntheta; j++) {
@@ -12825,7 +12900,7 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                             jz_map(j, i) = jz;
                             if (use_warm_for_this_mat) {
                                 const double mu_prev = mu_map_prev(j, i);
-                                mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                                mu_map(j, i) = warmMuIfSameMaterial(j, i, pixel, mu_prev, mu_cold);
                             } else {
                                 mu_map(j, i) = mu_cold;
                             }
@@ -12841,7 +12916,7 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                             jz_map(j, i) = jz;
                             if (use_warm_for_this_mat) {
                                 const double mu_prev = mu_map_prev(j, i);
-                                mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                                mu_map(j, i) = warmMuIfSameMaterial(j, i, pixel, mu_prev, mu_cold);
                             } else {
                                 mu_map(j, i) = mu_cold;
                             }
@@ -12851,10 +12926,6 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
             }
         } else {
             // Cartesian coordinates
-            // Create flipped image to match analysis coordinates (y up)
-            cv::Mat image_flipped;
-            cv::flip(image, image_flipped, 0);  // Flip vertically: y down -> y up
-
             for (int j = 0; j < ny; j++) {
                 for (int i = 0; i < nx; i++) {
                     cv::Vec3b pixel = image_flipped.at<cv::Vec3b>(j, i);
@@ -12862,7 +12933,7 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
                         jz_map(j, i) = jz;
                         if (use_warm_for_this_mat) {
                             const double mu_prev = mu_map_prev(j, i);
-                            mu_map(j, i) = (mu_prev > mu_warm_floor) ? mu_prev : mu_cold;
+                            mu_map(j, i) = warmMuIfSameMaterial(j, i, pixel, mu_prev, mu_cold);
                         } else {
                             mu_map(j, i) = mu_cold;
                         }
@@ -12933,6 +13004,8 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
     if (!material_magnetization.empty()) {
         computeMagnetizationGrids(step);
     }
+
+    previous_material_image = image.clone();
 }
 
 double MagneticFieldAnalyzer::evaluateSlideFormula(const std::string& formula, int step) const {
@@ -14139,7 +14212,16 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             std::cout << "Step " << step+1 << " complete: "
                       << std::fixed << std::setprecision(3)
                       << (step_duration.count() / 1000.0) << " s, "
-                      << prof_iters << " iterations" << std::defaultfloat << std::endl;
+                      << prof_iters << " iterations";
+            if (has_nonlinear_materials && nonlinear_config.enabled) {
+                std::cout << ", residual " << std::scientific << std::setprecision(3)
+                          << last_nonlinear_residual_;
+                if (!last_nonlinear_converged_) {
+                    std::cout << ", NOT CONVERGED (target "
+                              << nonlinear_config.tolerance << ")";
+                }
+            }
+            std::cout << std::defaultfloat << std::endl;
         }
 
         // <<PROFILING_TIMER_BEGIN>>
@@ -14265,6 +14347,7 @@ void MagneticFieldAnalyzer::runTransientChunks(const std::string& output_dir) {
         if (!worker_errors[i].empty())
             throw std::runtime_error("transient chunk " + std::to_string(i + 1) +
                                      " failed: " + worker_errors[i]);
+        if (!workers[i]->analysisConverged()) analysis_convergence_ok_ = false;
     }
 
     // Merge the per-chunk flux-linkage histories into one CSV with global

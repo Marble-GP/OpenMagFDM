@@ -147,7 +147,11 @@ void MagneticFieldAnalyzer::solveDomainDecomposition() {
         std::ofstream(yp) << cfg;
         b.an = std::make_unique<MagneticFieldAnalyzer>(yp, png);
         b.an->setDDWarmStart(true);  // each sweep NK-warm-starts from the orchestrator-set Az
-        if (PAR) b.an->setQuietSolver(true);  // concurrent prints would garble the log
+        // DD intentionally caps many inner nonlinear solves. Their individual
+        // max-iteration warnings are therefore not top-level failures, and in
+        // parallel mode concurrent output would also garble the log. The DD
+        // orchestrator reports its own Schwarz residual and convergence state.
+        b.an->setQuietSolver(true);
         B.push_back(std::move(b));
         ++bid;
     };

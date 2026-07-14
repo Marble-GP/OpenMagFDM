@@ -19,6 +19,15 @@ experience. It is backward compatible with integer pixel-based slide regions.
 - `conditions.json` preserves slide bounds in authored units and records the
   unit marker and multi-slide metadata.
 - Added `MagFDMsolver --version` and unified project/package version 1.6.1.
+- Nonlinear transient warm starts now reuse permeability only when the material
+  RGB at that cell is unchanged; sliding one permeable material over another no
+  longer leaks the previous material's permeability across the boundary.
+- Removed the legacy polar plateau rule that accepted residuals up to 10x the
+  requested tolerance. A Newton-Krylov iteration-limit result is retained for
+  diagnostics, clearly marked `NOT CONVERGED`, and returns exit code `2`.
+- Windows automatic OpenMP selection now uses physical cores while preserving
+  explicit `omp.threads` and `OMP_NUM_THREADS` overrides. This avoids SMT
+  contention in memory-bound AMG kernels.
 
 ## WebUI
 
@@ -66,6 +75,9 @@ nonlinear_solver:
   Galerkin/JFNK keys from new configurations.
 - DD remains optional and polar-only. Treat it as an accuracy mode; keep the
   active electromagnetic band at full resolution.
+- Automation should treat solver exit code `2` as nonlinear nonconvergence.
+  Eisenstat-Walker accelerates inner solves but does not loosen the configured
+  outer tolerance; compare exported fields only after both runs converge.
 - See `docs/CONFIGURATION.md` for the normative configuration contract.
 
 ## Validation status

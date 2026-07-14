@@ -103,8 +103,17 @@ nonlinear_solver:
 
 The stiff reference B-H model has a residual plateau around `5e-3`; requesting
 `1e-5` commonly exhausts the iteration limit without improving engineering
-accuracy. The assembled tangent Jacobian remains an opt-in research path; it
-did not reduce wall time on the IEEJ-D reference case.
+accuracy. OpenMagFDM nevertheless treats only the authored `tolerance` as
+convergence: reaching `max_iterations` retains diagnostic fields but exits with
+code `2`, so an unconverged sweep cannot silently appear successful.
+
+Eisenstat-Walker reduces the work of early inner AMGCL solves; it does not relax
+the outer `tolerance`. With `eta_max: 0.1`, difficult B-H curves can need more
+than 60 outer iterations. Increase `max_iterations`, choose a tolerance justified
+by the model, or disable Eisenstat-Walker for a slower comparison run. Do not
+compare fields from two runs unless both report convergence. The assembled
+tangent Jacobian remains an opt-in research path; it did not reduce wall time
+on the IEEJ-D reference case.
 
 ## Transient motion
 
@@ -139,6 +148,17 @@ transient:
 - `wrap_mode`: `auto`, `periodic`, `antiperiodic`, or `vacuum`.
 - `parallel_chunks: 2..4` improves long-sweep throughput but creates one cold
   first step per chunk and multiplies memory use by the chunk count.
+
+## Windows CPU use
+
+The packaged Windows solver uses the current MSVC OpenMP runtime. Sparse AMG
+matrix-vector products are usually limited by memory bandwidth, so all logical
+processors need not remain at 100%. In automatic mode OpenMagFDM uses physical
+cores on Windows; `omp.threads` or `OMP_NUM_THREADS` can override this. On the
+12-core/24-thread Ryzen reference machine, 12 threads completed the 1.34M-DOF
+nonlinear step about 5% faster than 24 threads. For long independent sweeps,
+`parallel_chunks: 2..4` is normally a larger throughput improvement than forcing
+SMT, at the cost of multiplying solver memory use.
 
 Rectangle motion is Cartesian-only:
 

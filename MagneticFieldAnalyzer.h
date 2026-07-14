@@ -80,9 +80,15 @@ public:
     // The transient logger uses this for a concise per-step summary when
     // nonlinear_solver.verbose is false.
     int  getLastNonlinearIterations() const { return last_nonlinear_iterations_; }
+    double getLastNonlinearResidual() const { return last_nonlinear_residual_; }
+    bool lastNonlinearConverged() const { return last_nonlinear_converged_; }
+    bool analysisConverged() const { return analysis_convergence_ok_; }
     long total_linear_iters_ = 0;
     int  num_linear_solves_  = 0;
     int  last_nonlinear_iterations_ = 0;
+    double last_nonlinear_residual_ = 0.0;
+    bool last_nonlinear_converged_ = true;
+    bool analysis_convergence_ok_ = true;
     // Update a radial (inner/outer, len ntheta) or theta (theta_min/theta_max, len nr) transmission
     // profile in-place between Schwarz sweeps. edge in {inner,outer,theta_min,theta_max}.
     void setBoundaryProfile(const std::string& edge, const std::vector<double>& prof);
@@ -623,6 +629,11 @@ private:
     // pole-pair polarity flip after the wrap. CV_8S, same dimensions as
     // `image` (cv::Mat, rows × cols, BGR Y-down).
     cv::Mat slide_sign_map;
+
+    // Material image used when the previous transient step's nonlinear μ
+    // distribution was computed.  A warm μ value is reusable only when the
+    // material RGB at the same cell is unchanged after sliding.
+    cv::Mat previous_material_image;
 
     // Phase B.6: per-rectangle-slide cumulative displacement state.
     // dx / dy can be tinyexpr formulas in $step, so we accumulate the

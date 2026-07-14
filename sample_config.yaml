@@ -6,7 +6,9 @@
 
 coordinate_system: polar
 
-# Optional OpenMP limit. Omit or use 0 to use the runtime default.
+# Optional OpenMP limit. Omit or use 0 for automatic selection. Windows uses
+# physical cores by default because SMT commonly slows memory-bound AMG work;
+# an explicit value or OMP_NUM_THREADS still overrides it.
 omp:
   threads: 0
 
