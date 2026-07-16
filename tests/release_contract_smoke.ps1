@@ -91,9 +91,12 @@ try {
         'nonlinear_solver:',
         '  enabled: true',
         '  solver_type: newton-krylov',
-        '  max_iterations: 1',
-        '  tolerance: 1.0e-12',
-        '  verbose: false'
+        '  max_iterations: 2',
+        '  tolerance: 0.0',
+        '  verbose: true',
+        '  anderson:',
+        '    enabled: true',
+        '    depth: 5'
     )
     Set-Content -LiteralPath $nonlinearConfig -Value $nonlinearLines -Encoding UTF8
     & $solver $nonlinearConfig $imagePath 'contract_nonlinear_failure_out'
@@ -103,6 +106,22 @@ try {
     $nonlinearLog = Get-Content -Raw -LiteralPath 'contract_nonlinear_failure_out\log.txt'
     if ($nonlinearLog -notmatch 'DID NOT CONVERGE') {
         throw 'Nonlinear nonconvergence was not recorded in log.txt'
+    }
+    if ($nonlinearLog -notmatch 'Anderson acceleration: enabled \(depth=5, beta=(?:0\.3|3\.0e-01)\)') {
+        throw 'Newton-Krylov did not apply the beta=0.3 default when Anderson beta was omitted'
+    }
+    if ($nonlinearLog -notmatch 'AA (?:accepted|rejected)') {
+        throw 'Safeguarded Newton-Krylov Anderson path was not exercised'
+    }
+
+    # Invalid mixing parameters must fail at configuration load rather than
+    # reaching an unstable nonlinear iteration.
+    $invalidAndersonConfig = Join-Path $package 'contract_invalid_anderson.yaml'
+    $invalidAndersonLines = $nonlinearLines + '    beta: 1.1'
+    Set-Content -LiteralPath $invalidAndersonConfig -Value $invalidAndersonLines -Encoding UTF8
+    & $solver $invalidAndersonConfig $imagePath 'contract_invalid_anderson_out'
+    if ($LASTEXITCODE -eq 0) {
+        throw 'Out-of-range nonlinear_solver.anderson.beta was accepted'
     }
 
     $metreConfig = Join-Path $package 'contract_metres.yaml'

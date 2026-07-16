@@ -25,6 +25,11 @@ investigations remain under `docs/research/`.
   differences. This removes mesh-independent fictitious magnet currents that
   appeared as non-physical high harmonics in transient flux-linkage and EMF
   waveforms.
+- Safeguarded opt-in Newton-Krylov Anderson acceleration with true residual and
+  energy checks, beta backtracking, rollback/restart, and automatic per-solve
+  disable after repeated rejection. Nonconverged runs now restore the best
+  evaluated state, prevent poor states from seeding the next transient step,
+  and annotate flux-linkage rows in `flux_linkage_status.csv`.
 
 See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 

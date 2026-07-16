@@ -97,6 +97,10 @@ nonlinear_solver:
     alpha: 2.0
     eta_min: 1.0e-6
     eta_max: 0.1
+  anderson:
+    enabled: false
+    depth: 5
+    beta: 0.3
   verbose: false
   export_convergence: true
 ```
@@ -114,6 +118,21 @@ by the model, or disable Eisenstat-Walker for a slower comparison run. Do not
 compare fields from two runs unless both report convergence. The assembled
 tangent Jacobian remains an opt-in research path; it did not reduce wall time
 on the IEEJ-D reference case.
+
+The stable baseline is Newton-Krylov with `anderson.enabled: false`. Anderson
+acceleration is an experimental opt-in: each candidate is rebuilt with its own
+field and permeability, then accepted only when the true nonlinear residual
+decreases without increasing magnetic energy. The solver retries with a smaller
+beta, rolls back and restarts the history on rejection, and disables Anderson
+for the current solve after three consecutive rejections. If the iteration
+limit is reached, OpenMagFDM exports the best evaluated state rather than the
+last unchecked update.
+
+Transient warm starts use only states that pass a bounded residual-quality
+gate; a divergent step cannot seed the next one. When flux linkage is enabled,
+`FluxLinkage/flux_linkage_status.csv` records `strict_converged`,
+`state_reusable`, iteration count and residual for each row while the established
+`flux_linkage.csv` schema remains unchanged.
 
 ## Transient motion
 

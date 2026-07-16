@@ -24,7 +24,7 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 ## 特徴
 
 - 画像からメッシュを生成して有限差分（FDM）法で磁界解析を行う
-- **非線形透磁率材料対応**（Newton-Krylov法 + Anderson加速による高速収束）
+- **非線形透磁率材料対応**（Newton-Krylov法 + opt-inのSafeguarded Anderson加速）
 - **永久磁石磁化モデル**（parallel / Halbach / polar anisotropy / custom）
 - **AMGCL native multigrid** と極座標Domain Decomposition精度モード
 - **複数の電磁力評価手法**（束縛電流法・仮想仕事法など）
@@ -400,7 +400,7 @@ materials:
 ```yaml
 nonlinear_solver:
   enabled: true
-  solver_type: newton-krylov  # picard, anderson, newton-krylov
+  solver_type: newton-krylov  # picard または newton-krylov
   max_iterations: 100
   tolerance: 1.0e-3
 
@@ -411,11 +411,11 @@ nonlinear_solver:
     eta_min: 1.0e-6
     eta_max: 0.1
 
-  # Anderson加速（Picard法と併用可能）
+  # Safeguarded Anderson加速（Newton-Krylov用・実験機能）
   anderson:
-    enabled: true
-    depth: 8       # 履歴の深さ
-    beta: 0.3      # 緩和係数
+    enabled: false  # 安定性比較を行う場合だけ明示的に有効化
+    depth: 5        # 履歴の深さ
+    beta: 0.3       # 候補の混合率
 
   # Line search（Newton-Krylov用）
   line_search_adaptive: true
@@ -593,7 +593,7 @@ Flux Phi_Coil_A step 2:
 3. **`coarsening:` block 全体削除** + **`materials.*.coarsen` / `coarsen_ratio` 削除**
 4. **`nonlinear_solver` の Phase 4/5/6 関連 knob 削除** (`use_galerkin_coarsening`,
    `use_matrix_free_jv`, `use_phase6_precond_jfnk`, `precond_*`, `fine_finishing_*`,
-   `strict_convergence`, `relaxation`)
+   `strict_convergence`)
 5. **`eisenstat_walker:` block の追加** (まだ使っていなければ): 2.5× の高速化を得る
 
 ---

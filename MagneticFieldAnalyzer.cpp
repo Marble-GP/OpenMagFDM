@@ -160,7 +160,6 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         // keys to remove from their YAML.
         {
             static const char* kDeprecatedNlKeys[] = {
-                "relaxation",                  // Picard step damping (Picard solver_type unused)
                 "use_galerkin_coarsening",     // Phase 4 Galerkin projection
                 "use_matrix_free_jv",          // Phase 5 matrix-free GMRES on coarse system
                 "use_phase6_precond_jfnk",     // Phase 6 Newton-Picard A(μ_diff) tangent
@@ -185,12 +184,28 @@ MagneticFieldAnalyzer::MagneticFieldAnalyzer(const std::string& config_path,
         // Picard specific settings
         nonlinear_config.relaxation = nl_config["relaxation"].as<double>(0.7);
 
-        // Anderson acceleration settings (shared by Picard and Newton-Krylov)
+        // Anderson acceleration is opt-in for every solver. Full mixing is the
+        // established Picard default; Newton-Krylov uses a conservative default
+        // because its Anderson candidate is applied after a globalized Newton
+        // step. An explicitly supplied beta always wins.
         if (nl_config["anderson"]) {
             auto anderson_cfg = nl_config["anderson"];
+            const double default_beta =
+                (nonlinear_config.solver_type == "newton-krylov") ? 0.3 : 1.0;
             nonlinear_config.anderson.enabled = anderson_cfg["enabled"].as<bool>(false);
             nonlinear_config.anderson.depth = anderson_cfg["depth"].as<int>(5);
-            nonlinear_config.anderson.beta = anderson_cfg["beta"].as<double>(1.0);
+            nonlinear_config.anderson.beta = anderson_cfg["beta"].as<double>(default_beta);
+
+            if (nonlinear_config.anderson.depth < 1) {
+                throw std::runtime_error(
+                    "nonlinear_solver.anderson.depth must be at least 1");
+            }
+            if (!std::isfinite(nonlinear_config.anderson.beta) ||
+                nonlinear_config.anderson.beta < 0.0 ||
+                nonlinear_config.anderson.beta > 1.0) {
+                throw std::runtime_error(
+                    "nonlinear_solver.anderson.beta must be finite and in the range [0, 1]");
+            }
         }
 
         // Newton-Krylov specific settings
@@ -2557,6 +2572,7 @@ double MagneticFieldAnalyzer::interpolateAntialiasedMu(const cv::Vec3b& pixel, d
 void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
     flux_linkage_paths.clear();
     flux_linkage_results.clear();
+    transient_solver_status_results.clear();
 
     if (!config["flux_linkage"]) {
         return;  // No flux linkage paths defined
@@ -2855,6 +2871,38 @@ void MagneticFieldAnalyzer::exportFluxLinkageCSV(const std::string& output_dir) 
 
     file.close();
     std::cout << "Flux linkage results exported to: " << csv_path << std::endl;
+}
+
+void MagneticFieldAnalyzer::exportFluxLinkageStatusCSV(
+    const std::string& output_dir) const {
+    if (flux_linkage_paths.empty() || transient_solver_status_results.empty()) return;
+
+    // Keep flux_linkage.csv's long-standing phase-only schema intact for
+    // existing scripts and the WebUI. Solver quality travels in a row-aligned
+    // sidecar so a diagnostic/non-converged flux point can never look silently
+    // equivalent to a converged one.
+    const std::string flux_dir = output_dir + "/FluxLinkage";
+    createDirectory(flux_dir);
+    const std::string csv_path = flux_dir + "/flux_linkage_status.csv";
+    std::ofstream file(csv_path);
+    if (!file.is_open()) {
+        std::cerr << "Warning: Could not create flux-linkage status CSV: "
+                  << csv_path << std::endl;
+        return;
+    }
+
+    file << "step,nonlinear,strict_converged,state_reusable,iterations,residual\n";
+    for (const auto& status : transient_solver_status_results) {
+        file << status.step << ","
+             << (status.nonlinear ? 1 : 0) << ","
+             << (status.converged ? 1 : 0) << ","
+             << (status.state_reusable ? 1 : 0) << ","
+             << status.iterations << ",";
+        if (status.nonlinear) {
+            file << std::scientific << std::setprecision(10) << status.residual;
+        }
+        file << "\n";
+    }
 }
 
 // ============================================================================
@@ -6751,6 +6799,9 @@ void MagneticFieldAnalyzer::solve() {
         if (nonlinear_config.solver_type == "newton-krylov") {
             solveNonlinearNewtonKrylov();
         } else if (nonlinear_config.solver_type == "anderson") {
+            // Legacy Picard-Anderson selector retained for compatibility.
+            // The nested Anderson block is an accelerator switch only for the
+            // Newton-Krylov path; plain `picard` remains plain Picard.
             solveNonlinearWithAnderson();
         } else {
             // Default: Picard iteration
@@ -12730,9 +12781,10 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
     // step 1 to ~2e+02 at the start of step 2 in the user's log, then
     // having to slowly descend again across the 50-iter cap.
     //
-    // AB snapshots the converged mu_map first; in the per-material loop
-    // below, NL cells that are still NL after the slide reuse their
-    // snapshotted value instead of the peak seed. STATIC (linear)
+    // AB reuses the explicitly snapshotted last quality-accepted mu_map; in the
+    // per-material loop below, NL cells that are still NL after the slide
+    // reuse their snapshotted value instead of the peak seed. A divergent step
+    // never replaces this snapshot. STATIC (linear)
     // materials still get their constant μ written verbatim because
     // their value is exact and cheap. Cells whose material changed due
     // to the slide (rotor magnet now sitting where iron yoke used to
@@ -12741,19 +12793,22 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
     //
     // Cost: one matrix-copy (one mu_map'th of memory) per step. Saves
     // tens of NK iterations in practice.
-    const bool warm_start_mu = (step > 0) && has_nonlinear_materials;
+    const bool warm_start_mu = (step > 0) && has_nonlinear_materials
+        && have_last_accepted_transient_state
+        && last_accepted_mu_map.rows() == mu_map.rows()
+        && last_accepted_mu_map.cols() == mu_map.cols();
     Eigen::MatrixXd mu_map_prev;
     if (warm_start_mu) {
-        mu_map_prev = mu_map;  // snapshot pre-reset
+        mu_map_prev = last_accepted_mu_map;
     }
 
     cv::Mat previous_image_flipped;
     const bool have_previous_material_image = warm_start_mu
-        && !previous_material_image.empty()
-        && previous_material_image.rows == image.rows
-        && previous_material_image.cols == image.cols;
+        && !last_accepted_material_image.empty()
+        && last_accepted_material_image.rows == image.rows
+        && last_accepted_material_image.cols == image.cols;
     if (have_previous_material_image) {
-        cv::flip(previous_material_image, previous_image_flipped, 0);
+        cv::flip(last_accepted_material_image, previous_image_flipped, 0);
     }
 
     auto warmMuIfSameMaterial = [&](int row, int col, const cv::Vec3b& current_pixel,
@@ -13395,32 +13450,45 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
 
             // Update solution history for warm start in next step.
             // Shift history k-1 → k-2 BEFORE overwriting k-1.
-            int n = (coordinate_system == "cartesian") ? (nx * ny) : (nr * ntheta);
-            previous_previous_solution = previous_solution;
-            previous_solution.resize(n);
+            // Failed states remain available for diagnostic export. The warm-
+            // start quality gate also accepts a stable best iterate that is
+            // mildly above strict TOL, while rejecting divergent states.
+            if (last_nonlinear_warm_start_safe_) {
+                last_accepted_mu_map = mu_map;
+                last_accepted_material_image = image.clone();
+                have_last_accepted_transient_state = true;
 
-            if (coordinate_system == "cartesian") {
-                for (int j = 0; j < ny; j++) {
-                    for (int i = 0; i < nx; i++) {
-                        previous_solution[j * nx + i] = Az(j, i);
-                    }
-                }
-            } else {  // polar
-                if (r_orientation == "horizontal") {
-                    // Az(θ, r) → flat[r * ntheta + θ]
-                    for (int i = 0; i < nr; i++) {
-                        for (int j = 0; j < ntheta; j++) {
-                            previous_solution[i * ntheta + j] = Az(j, i);  // Transpose
+                int n = (coordinate_system == "cartesian") ? (nx * ny) : (nr * ntheta);
+                previous_previous_solution = previous_solution;
+                previous_solution.resize(n);
+
+                if (coordinate_system == "cartesian") {
+                    for (int j = 0; j < ny; j++) {
+                        for (int i = 0; i < nx; i++) {
+                            previous_solution[j * nx + i] = Az(j, i);
                         }
                     }
-                } else {  // vertical
-                    // Az(r, θ) → flat[r * ntheta + θ]
-                    for (int i = 0; i < nr; i++) {
-                        for (int j = 0; j < ntheta; j++) {
-                            previous_solution[i * ntheta + j] = Az(i, j);
+                } else {  // polar
+                    if (r_orientation == "horizontal") {
+                        // Az(theta, r) -> flat[r * ntheta + theta]
+                        for (int i = 0; i < nr; i++) {
+                            for (int j = 0; j < ntheta; j++) {
+                                previous_solution[i * ntheta + j] = Az(j, i);
+                            }
+                        }
+                    } else {  // vertical
+                        // Az(r, theta) -> flat[r * ntheta + theta]
+                        for (int i = 0; i < nr; i++) {
+                            for (int j = 0; j < ntheta; j++) {
+                                previous_solution[i * ntheta + j] = Az(i, j);
+                            }
                         }
                     }
                 }
+            } else if (nonlinear_config.verbose && !quiet_solver_) {
+                std::cout << "Warm-start snapshot not updated: nonlinear step "
+                          << step + 1 << " failed the residual quality gate."
+                          << std::endl;
             }
         } else if (use_optimized_solver) {
             // Optimized linear path for transient analysis (when no nonlinear materials)
@@ -14101,6 +14169,17 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
             solve();
         }
 
+        TransientSolverStatus solver_status;
+        solver_status.step = step;
+        solver_status.nonlinear = has_nonlinear_materials && nonlinear_config.enabled;
+        solver_status.iterations = prof_iters;
+        if (solver_status.nonlinear) {
+            solver_status.converged = last_nonlinear_converged_;
+            solver_status.state_reusable = last_nonlinear_warm_start_safe_;
+            solver_status.residual = last_nonlinear_residual_;
+        }
+        transient_solver_status_results.push_back(solver_status);
+
         // <<PROFILING_TIMER_BEGIN>>
         auto prof_t_force = std::chrono::high_resolution_clock::now();
         // <<PROFILING_TIMER_END>>
@@ -14142,7 +14221,10 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         // Chunk workers skip it: their history is chunk-local, so the rows
         // would clobber the shared file — the dispatcher merges all chunks'
         // histories into the final CSV instead.
-        if (!transient_chunk_worker_) exportFluxLinkageCSV(output_dir);
+        if (!transient_chunk_worker_) {
+            exportFluxLinkageCSV(output_dir);
+            exportFluxLinkageStatusCSV(output_dir);
+        }
 
         // <<PROFILING_TIMER_BEGIN>>
         prof_d_flux = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -14349,5 +14431,26 @@ void MagneticFieldAnalyzer::runTransientChunks(const std::string& output_dir) {
             std::cout << "Merged flux linkage CSV (" << K << " chunks, " << T
                       << " steps) written." << std::endl;
         }
+
+        std::vector<TransientSolverStatus> merged_status(T);
+        std::vector<bool> have_status(T, false);
+        auto fold_status = [&](const std::vector<TransientSolverStatus>& source) {
+            for (const auto& status : source) {
+                if (status.step < 0 || status.step >= T) continue;
+                merged_status[status.step] = status;
+                have_status[status.step] = true;
+            }
+        };
+        fold_status(transient_solver_status_results);
+        for (const auto& worker : workers) {
+            fold_status(worker->getTransientSolverStatuses());
+        }
+        transient_solver_status_results.clear();
+        for (int s = 0; s < T; ++s) {
+            if (have_status[s]) {
+                transient_solver_status_results.push_back(merged_status[s]);
+            }
+        }
+        exportFluxLinkageStatusCSV(output_dir);
     }
 }

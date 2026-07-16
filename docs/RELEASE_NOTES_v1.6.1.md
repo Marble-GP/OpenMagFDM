@@ -75,7 +75,15 @@ nonlinear_solver:
   max_iterations: 100
   tolerance: 1.0e-3
   eisenstat_walker: { enabled: true }
+  anderson: { enabled: false, depth: 5, beta: 0.3 }
 ```
+
+Newton-Krylov is the stable baseline. Safeguarded Anderson remains an
+experimental opt-in; candidates must improve the rebuilt nonlinear residual
+without increasing energy, otherwise they are reduced or rolled back. Repeated
+rejection disables acceleration for that solve. At the iteration limit the
+best evaluated state is exported, and transient flux-linkage runs include a
+row-aligned `FluxLinkage/flux_linkage_status.csv` quality sidecar.
 
 ## Upgrade notes
 

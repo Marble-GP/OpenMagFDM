@@ -4349,8 +4349,9 @@ ${SOLVER_HINT_MARKER}
 #   tolerance: 1.0e-3               # accept results only when the reported residual is below this
 #   verbose: false                  # true prints iteration diagnostics for troubleshooting
 #   anderson:
-#     enabled: false                # can reduce iterations for difficult curves
+#     enabled: false                # safest NK baseline; safeguarded AA remains experimental
 #     depth: 5
+#     beta: 0.3                     # NK default when omitted; smaller is more conservative
 #   # Eisenstat-Walker adapts the inner linear-solver tolerance: usually faster,
 #   # while preserving the requested outer tolerance. Disable only for diagnostics.
 #   eisenstat_walker:

@@ -459,27 +459,27 @@
       "validParents": ["eisenstat_walker"]
     },
     "solver_type": {
-      "description": "Nonlinear solver algorithm: 'picard' (simple fixed-point) or 'newton-krylov' (recommended for fast convergence)",
+      "description": "Nonlinear solver algorithm: 'picard' (simple fixed-point) or 'newton-krylov' (recommended baseline).",
       "values": ["picard", "newton-krylov"],
       "example": "solver_type: newton-krylov",
       "validParents": ["nonlinear_solver"]
     },
     "anderson": {
-      "description": "Anderson acceleration settings (works with both picard and newton-krylov solvers)",
+      "description": "Opt-in safeguarded Anderson acceleration for Newton-Krylov (default beta 0.3). Keep it disabled unless comparing convergence against the stable Newton-Krylov baseline. Plain solver_type: picard remains unaccelerated.",
       "children": ["enabled", "depth", "beta"],
       "validParents": ["nonlinear_solver"],
-      "example": "anderson:\n  enabled: true\n  depth: 5\n  beta: 1.0"
+      "example": "anderson:\n  enabled: false\n  depth: 5\n  beta: 0.3"
     },
     "depth": {
-      "description": "Anderson acceleration history depth (typically 3-10, larger = more acceleration but more memory)",
+      "description": "Anderson acceleration history depth (integer >= 1; typically 3-10). Larger history uses more memory and can make extrapolation less robust.",
       "type": "integer",
       "example": "depth: 5",
       "validParents": ["anderson"]
     },
     "beta": {
-      "description": "Anderson: mixing parameter (0.0-1.0, 1.0 = full Anderson). Robin BC: coefficient for ∂Az/∂n term (α·Az + β·∂Az/∂n = γ), set >0 for external reluctance",
+      "description": "Anderson: finite mixing parameter in [0.0, 1.0] (1.0 = full Anderson). Newton-Krylov uses 0.3 when omitted. Robin BC: coefficient for ∂Az/∂n term (α·Az + β·∂Az/∂n = γ), set >0 for external reluctance",
       "type": "number",
-      "example": "beta: 1.0",
+      "example": "beta: 0.3",
       "validParents": ["anderson", "left", "right", "top", "bottom", "inner", "outer", "theta_min", "theta_max"]
     },
     "max_iterations": {
@@ -772,18 +772,13 @@
       "trigger": "nonlinear_solver",
       "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 100\ntolerance: 1.0e-3\nrelaxation: 0.7\nverbose: false\nexport_convergence: true"
     },
-    "nonlinear_picard_anderson": {
-      "name": "Nonlinear Solver - Picard with Anderson Acceleration",
-      "trigger": "nonlinear_solver",
-      "snippet": "enabled: true\nsolver_type: picard\nmax_iterations: 100\ntolerance: 1.0e-3\nrelaxation: 0.7\nanderson:\n  enabled: true\n  depth: 5\n  beta: 1.0\nverbose: false\nexport_convergence: true"
-    },
     "nonlinear_newton_krylov": {
       "name": "Nonlinear Solver - Newton-Krylov",
       "trigger": "nonlinear_solver",
       "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 100\ntolerance: 1.0e-3\ngmres_restart: 30\neisenstat_walker:\n  enabled: true\n  gamma: 0.9\n  alpha: 2.0\n  eta_min: 1.0e-6\n  eta_max: 0.1\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
     },
     "nonlinear_newton_krylov_anderson": {
-      "name": "Nonlinear Solver - Newton-Krylov + Anderson (Recommended)",
+      "name": "Nonlinear Solver - Newton-Krylov + Safeguarded Anderson (Experimental)",
       "trigger": "nonlinear_solver",
       "snippet": "enabled: true\nsolver_type: newton-krylov\nmax_iterations: 100\ntolerance: 1.0e-3\ngmres_restart: 30\neisenstat_walker:\n  enabled: true\n  gamma: 0.9\n  alpha: 2.0\n  eta_min: 1.0e-6\n  eta_max: 0.1\nanderson:\n  enabled: true\n  depth: 5\n  beta: 0.3\nline_search_c: 1.0e-4\nline_search_alpha_init: 1.0\nline_search_alpha_min: 1.0e-4\nline_search_rho: 0.5\nline_search_max_trials: 100\nline_search_adaptive: true\nverbose: false\nexport_convergence: true"
     },

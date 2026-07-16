@@ -21,6 +21,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <limits>
 #include <set>
 #include <string>
 #include <Eigen/Dense>
@@ -34,8 +35,9 @@
  */
 void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     last_nonlinear_iterations_ = 0;
-    last_nonlinear_residual_ = 0.0;
-    last_nonlinear_converged_ = true;
+    last_nonlinear_residual_ = std::numeric_limits<double>::infinity();
+    last_nonlinear_converged_ = false;
+    last_nonlinear_warm_start_safe_ = false;
     // [Phase BJ-8 Path D / v1.5.1] All NK iterations and the initial-guess
     // dispatch run on the full grid via AMGCL+EW. The custom Galerkin
     // coarsening machinery (Phase 6 + Galerkin, Phase 5 matrix-free GMRES,
@@ -52,11 +54,21 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         } else {
             buildAndSolveSystemPolar();
         }
+        last_nonlinear_residual_ = 0.0;
+        last_nonlinear_converged_ = true;
+        last_nonlinear_warm_start_safe_ = true;
         return;
     }
 
     const int MAX_ITER = nonlinear_config.max_iterations;
     const double TOL = nonlinear_config.tolerance;
+    // Warm starts need a quality gate distinct from strict convergence. Some
+    // stable production cases sit at a discretisation residual floor around
+    // 2e-4 with TOL=1e-5; forcing those to cold-start every step is harmful.
+    // Conversely, residual-O(1) states must never propagate. This bounded gate
+    // accepts the former and rejects the latter.
+    const double WARM_START_RESIDUAL_LIMIT =
+        std::min(1e-2, std::max(10.0 * TOL, 1e-3));
     const bool VERBOSE = nonlinear_config.verbose;
     const bool is_polar = (coordinate_system != "cartesian");
 
@@ -70,7 +82,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         std::cout << "Coordinate system: " << coordinate_system << std::endl;
         std::cout << "Max outer iterations: " << MAX_ITER << std::endl;
         std::cout << "Tolerance: " << std::scientific << std::setprecision(1) << TOL << std::endl;
-        if (USE_ANDERSON) {
+        if (USE_ANDERSON && m_AA > 0 && beta_AA > 0.0) {
             std::cout << "Anderson acceleration: enabled (depth=" << m_AA << ", beta=" << beta_AA << ")" << std::endl;
         }
     }
@@ -78,9 +90,25 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     std::vector<double> residual_history;
     double alpha_prev = nonlinear_config.line_search_alpha_init;  // Previous step length for adaptive algorithm
 
+    // Keep the best *evaluated* nonlinear iterate.  A line-search/Anderson
+    // update is applied near the end of each iteration, while its nonlinear
+    // residual is not assembled until the beginning of the next one.  In
+    // particular, the update made by the final allowed iteration has no
+    // corresponding residual.  Exporting that unchecked state used to make
+    // the reported residual, Az and mu_map describe different iterates (and a
+    // bad Anderson extrapolation could therefore escape at max-iteration).
+    // We only checkpoint states after field/mu and the matching residual have
+    // all been evaluated, and restore this checkpoint on a non-converged exit.
+    Eigen::VectorXd best_Az_vec;
+    double best_residual_rel = std::numeric_limits<double>::infinity();
+    int best_iteration = 0;
+
     // Anderson acceleration storage
     std::vector<Eigen::VectorXd> Az_history;      // Az^(k) history
     std::vector<Eigen::VectorXd> g_history;       // g^(k) = Az^(k+1) - Az^(k) history
+    bool anderson_active = USE_ANDERSON && m_AA > 0 && beta_AA > 0.0;
+    int anderson_consecutive_rejections = 0;
+    constexpr int ANDERSON_MAX_CONSECUTIVE_REJECTIONS = 3;
 
     // [v1.6 Stage 2] Field-adaptive coarsening: build the coarse mask from an
     // initial full-grid solution's |B| field (keeps saturated/high-gradient iron +
@@ -174,6 +202,18 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         if (is_polar) calculateMagneticFieldPolar(); else calculateMagneticField();
         calculateHField();
         updateMuDistribution();
+    };
+    // Evaluate the nonlinear residual for the member Az and the current,
+    // matching mu_map.  Callers must update field/mu first.  Keeping this in
+    // one helper makes the max-iteration rollback and the normal convergence
+    // exit report exactly the state that downstream export will consume.
+    auto evaluateCurrentResidual = [&]() {
+        Eigen::SparseMatrix<double> A_final;
+        Eigen::VectorXd b_final;
+        Eigen::VectorXd Az_final;
+        buildMatrixForSolve(A_final, b_final);
+        buildSolveVec(Az_final);
+        return (A_final * Az_final - b_final).norm() / (b_final.norm() + 1e-12);
     };
 
     // [v1.6 DD warm-start] If nonlinear_solver.initial_az_path is set, load that
@@ -275,6 +315,12 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_rel  = residual_norm / (b_vec_norm + 1e-12);
         last_nonlinear_residual_ = residual_rel;
 
+        if (std::isfinite(residual_rel) && residual_rel < best_residual_rel) {
+            best_residual_rel = residual_rel;
+            best_Az_vec = Az_vec;
+            best_iteration = iter + 1;
+        }
+
         residual_history.push_back(residual_rel);
 
         // DEBUG: Print norms for first iteration to diagnose polar vs cartesian scaling
@@ -312,22 +358,6 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             if (VERBOSE) {
                 std::cout << std::endl;
             }
-            // Always print convergence message (important for user feedback).
-            // Only the requested relative-residual tolerance is accepted. The
-            // former polar plateau heuristic accepted residuals up to 10x the
-            // target and could make transient fields differ by several percent.
-            // quiet_solver_ (parallel DD sub-solves) suppresses it: concurrent
-            // prints from many patches would garble the log.
-            last_nonlinear_iterations_ = iter + 1;
-            last_nonlinear_converged_ = true;
-            if (!quiet_solver_) {
-                if (VERBOSE) {
-                    std::cout << "Newton-Krylov solver converged in " << iter + 1 << " iterations (residual: "
-                              << std::scientific << std::setprecision(2) << residual_rel << ")";
-                    std::cout << std::endl;
-                }
-            }
-
             // [Stage 1e] Coarse path keeps only active cells current (active-only
             // scatter + coarse curl). Prolong to the full grid ONCE and recompute
             // full B/H/mu so downstream force/flux/export see a consistent full field.
@@ -336,6 +366,38 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 calculateMagneticFieldPolar();
                 calculateHField();
                 updateMuDistribution();
+            }
+
+            // Re-evaluate after every final-state transformation.  This is a
+            // no-op-equivalent rebuild for the normal full-grid path, and is
+            // essential for the coarse path where prolongation changes the Az
+            // representation consumed by export.
+            const double final_residual_rel = evaluateCurrentResidual();
+            last_nonlinear_iterations_ = iter + 1;
+            last_nonlinear_residual_ = final_residual_rel;
+            last_nonlinear_converged_ = std::isfinite(final_residual_rel)
+                                      && final_residual_rel < TOL;
+            last_nonlinear_warm_start_safe_ = std::isfinite(final_residual_rel)
+                                            && final_residual_rel
+                                               <= WARM_START_RESIDUAL_LIMIT;
+            if (!last_nonlinear_converged_) analysis_convergence_ok_ = false;
+
+            // Always print convergence diagnostics when verbose.  Only the
+            // requested relative-residual tolerance is accepted; the value
+            // printed here is the re-evaluated residual of the exported state.
+            if (!quiet_solver_ && VERBOSE) {
+                if (last_nonlinear_converged_) {
+                    std::cout << "Newton-Krylov solver converged in " << iter + 1
+                              << " iterations (residual: " << std::scientific
+                              << std::setprecision(2) << final_residual_rel << ")"
+                              << std::endl;
+                } else {
+                    std::cerr << "WARNING: final-state residual changed after output "
+                                 "reconstruction (residual="
+                              << std::scientific << std::setprecision(3)
+                              << final_residual_rel << ", target=" << TOL << ")."
+                              << std::defaultfloat << std::endl;
+                }
             }
 
             // [Phase BJ-8 Path D / v1.5.1] Final-output interpolation +
@@ -877,11 +939,16 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                       << " total=" << nkprof_ms(nkp_t0, nkp_t_ls) << "ms" << std::endl;
         }
 
-        // ===== Step 7: Anderson Acceleration =====
-        if (USE_ANDERSON && m_AA > 0) {
-            Eigen::VectorXd g_k = Az_vec - Az_vec_0;  // Actual update
+        // ===== Step 7: Safeguarded Anderson Acceleration =====
+        if (anderson_active) {
+            const Eigen::VectorXd Az_base = Az_vec;    // Armijo-accepted update
+            const Eigen::VectorXd g_k = Az_base - Az_vec_0;
+            bool anderson_attempted = false;
+            bool anderson_accepted = false;
+            bool anderson_restart_history = false;
 
             if (iter >= 1 && g_history.size() > 0) {
+                anderson_attempted = true;
                 int m_k = std::min(m_AA, static_cast<int>(g_history.size()));
 
                 // Build matrix of residual differences: ΔG = [g_{k-m_k} - g_k, ..., g_{k-1} - g_k]
@@ -892,11 +959,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
 
                 // Solve least-squares: min ||DG * θ + g_k||²
-                // Using normal equations: (DG^T * DG) * θ = -DG^T * g_k
-                Eigen::MatrixXd DTD = DG.transpose() * DG;
-                // Add regularization for stability
-                DTD.diagonal().array() += 1e-10;
-                Eigen::VectorXd theta = DTD.ldlt().solve(-DG.transpose() * g_k);
+                // A column-pivoted QR solve avoids squaring the condition number
+                // as the former normal-equations/LDLT implementation did.
+                Eigen::VectorXd theta = Eigen::VectorXd::Zero(m_k);
+                const bool decomposition_input_finite = DG.allFinite() && g_k.allFinite();
+                if (decomposition_input_finite) {
+                    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(DG);
+                    qr.setThreshold(1e-10);
+                    theta = qr.solve(-g_k);
+                }
 
                 // Anderson update: Az_new = Az_new + Σ θ_j * (Az_{k-m_k+j} - Az_k + g_{k-m_k+j} - g_k)
                 //                        = Az_new + Σ θ_j * ((Az_{k-m_k+j} + g_{k-m_k+j}) - (Az_k + g_k))
@@ -909,16 +980,128 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     Az_anderson += theta(j) * (DX_j + DG.col(j));
                 }
 
-                // Apply mixing parameter β
-                Az_vec = beta_AA * Az_anderson + (1.0 - beta_AA) * Az_vec;
+                // Form the full Anderson correction; safeguarded beta mixing is below.
+                Eigen::VectorXd correction = Az_anderson - Az_base;
+                bool proposal_finite = decomposition_input_finite && theta.allFinite() &&
+                                       correction.allFinite();
 
-                // Update member Az from the accelerated vector (coarse: prolong;
-                // full: original row-major write) so the next iteration's field/mu
-                // update sees it.
-                syncMemberAz(Az_vec);
+                // Bound the extrapolation by the norm of the already-globalized
+                // Newton update. Near a fixed point, retain a tiny Az-relative
+                // floor so a roundoff-sized update cannot create an unbounded ratio.
+                const double correction_norm = correction.norm();
+                const double update_norm = g_k.norm();
+                const double current_norm = Az_vec_0.norm();
+                proposal_finite = proposal_finite &&
+                    std::isfinite(correction_norm) && std::isfinite(update_norm) &&
+                    std::isfinite(current_norm);
+                if (proposal_finite) {
+                    const double correction_limit = std::max(
+                        update_norm, 1e-12 * std::max(current_norm, 1.0));
+                    if (correction_norm > correction_limit) {
+                        correction *= correction_limit / correction_norm;
+                    }
+                }
+
+                // Evaluate each state with its own B/H/mu and rebuilt nonlinear
+                // operator. A frozen-Jacobian residual is not a valid safeguard.
+                auto evaluateAndersonState = [&](const Eigen::VectorXd& state,
+                                                 double& residual_rel_out,
+                                                 double& energy_out) -> bool {
+                    if (!state.allFinite()) return false;
+                    syncMemberAz(state);
+                    updateFieldAndMu();
+                    Eigen::SparseMatrix<double> A_eval;
+                    Eigen::VectorXd b_eval;
+                    buildMatrixForSolve(A_eval, b_eval);
+                    const Eigen::VectorXd R_eval = A_eval * state - b_eval;
+                    residual_rel_out = R_eval.norm() / (b_eval.norm() + 1e-12);
+                    energy_out = use_coarse ? 0.0 : computeEnergyObjective();
+                    return R_eval.allFinite() && std::isfinite(residual_rel_out) &&
+                           (use_coarse || std::isfinite(energy_out));
+                };
+
+                double base_residual_rel = 0.0;
+                double base_energy = 0.0;
+                const bool base_finite = evaluateAndersonState(
+                    Az_base, base_residual_rel, base_energy);
+                proposal_finite = proposal_finite && base_finite;
+                if (base_finite && base_residual_rel < best_residual_rel) {
+                    // This post-line-search state has a rebuilt nonlinear
+                    // residual, so it is a valid max-iteration checkpoint.
+                    best_Az_vec = Az_base;
+                    best_residual_rel = base_residual_rel;
+                    best_iteration = iter + 1;
+                }
+
+                // Backtrack the Anderson mixing only; the Armijo base remains
+                // untouched. Accept a candidate only if the true residual strictly
+                // improves and the convex energy does not increase.
+                double beta_trial = std::min(1.0, std::max(0.0, beta_AA));
+                constexpr int ANDERSON_MAX_BETA_TRIALS = 3;
+                constexpr double ANDERSON_BETA_RHO = 0.5;
+                for (int trial = 0;
+                     proposal_finite && trial < ANDERSON_MAX_BETA_TRIALS;
+                     ++trial, beta_trial *= ANDERSON_BETA_RHO) {
+                    const Eigen::VectorXd Az_candidate =
+                        Az_base + beta_trial * correction;
+                    double candidate_residual_rel = 0.0;
+                    double candidate_energy = 0.0;
+                    const bool candidate_finite = evaluateAndersonState(
+                        Az_candidate, candidate_residual_rel, candidate_energy);
+                    const double required_ratio =
+                        1.0 - 1e-4 * std::max(beta_trial, 1e-3);
+                    const double energy_slack =
+                        1e-10 * std::max(std::abs(base_energy), 1.0);
+                    const bool residual_improved = candidate_finite &&
+                        candidate_residual_rel <= base_residual_rel * required_ratio;
+                    const bool energy_not_worse = use_coarse ||
+                        candidate_energy <= base_energy + energy_slack;
+                    if (residual_improved && energy_not_worse) {
+                        Az_vec = Az_candidate;
+                        anderson_accepted = true;
+                        anderson_consecutive_rejections = 0;
+                        if (candidate_residual_rel < best_residual_rel) {
+                            // Unlike the historical unchecked extrapolation,
+                            // this candidate has matching mu and a true residual.
+                            best_Az_vec = Az_candidate;
+                            best_residual_rel = candidate_residual_rel;
+                            best_iteration = iter + 1;
+                        }
+                        if (VERBOSE) {
+                            std::cout << " [AA accepted: beta=" << beta_trial << "]";
+                        }
+                        break;
+                    }
+                }
+
+                if (!anderson_accepted) {
+                    // Roll back both Az and derived material fields to the trusted
+                    // Armijo result, then restart the secant history from here.
+                    Az_vec = Az_base;
+                    syncMemberAz(Az_base);
+                    updateFieldAndMu();
+                    anderson_restart_history = true;
+                    ++anderson_consecutive_rejections;
+                    if (VERBOSE) {
+                        std::cout << " [AA rejected "
+                                  << anderson_consecutive_rejections << "/"
+                                  << ANDERSON_MAX_CONSECUTIVE_REJECTIONS << "]";
+                    }
+                }
+
+                // On acceptance, the last candidate evaluation left member Az and
+                // B/H/mu at Az_vec. On rejection, the rollback above did the same
+                // for Az_base. Do not perform a vector-only sync here: that would
+                // make it easier for future changes to leave derived fields stale.
             }
 
-            // Store history
+            if (anderson_restart_history) {
+                Az_history.clear();
+                g_history.clear();
+            }
+
+            // Store only the underlying Armijo-globalized map pair. After a
+            // rejection, this safe pair seeds a fresh Anderson history.
             Az_history.push_back(Az_vec_0);
             g_history.push_back(g_k);
 
@@ -926,6 +1109,17 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             if (static_cast<int>(Az_history.size()) > m_AA + 1) {
                 Az_history.erase(Az_history.begin());
                 g_history.erase(g_history.begin());
+            }
+
+            if (anderson_attempted && !anderson_accepted &&
+                anderson_consecutive_rejections >=
+                    ANDERSON_MAX_CONSECUTIVE_REJECTIONS) {
+                anderson_active = false;
+                Az_history.clear();
+                g_history.clear();
+                if (VERBOSE) {
+                    std::cout << " [AA disabled for this solve]";
+                }
             }
         }
 
@@ -939,25 +1133,49 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
     }
 
-    last_nonlinear_iterations_ = MAX_ITER;
-    last_nonlinear_converged_ = false;
-    analysis_convergence_ok_ = false;
-    if (!quiet_solver_) {
-        std::cerr << "WARNING: Newton-Krylov did not converge after " << MAX_ITER
-                  << " iterations (residual=" << std::scientific << std::setprecision(3)
-                  << last_nonlinear_residual_ << ", target=" << TOL << ")."
-                  << std::defaultfloat << std::endl;
+    // The final update has not been residual-evaluated.  Restore the best
+    // checkpoint instead of exporting that unchecked state, then rebuild every
+    // derived quantity.  This also makes a rejected/unstable accelerator unable
+    // to contaminate force, energy, flux linkage or the next transient seed.
+    if (best_Az_vec.size() > 0) {
+        syncMemberAz(best_Az_vec);
     }
+    updateFieldAndMu();
 
-    // [Stage 1e] As in the converged branch: promote the coarse solution to the
-    // full grid for downstream force/flux/export. (Az_vec is loop-scoped, so
-    // reconstruct the coarse vector from the active cells of member Az.)
+    // [Stage 1e] Promote the restored coarse state to the full grid for
+    // downstream force/flux/export, and derive full-grid B/H/mu from that exact
+    // exported Az.
     if (use_coarse) {
-        Eigen::VectorXd Az_c; buildSolveVec(Az_c);
+        Eigen::VectorXd Az_c;
+        if (best_Az_vec.size() > 0) Az_c = best_Az_vec;
+        else buildSolveVec(Az_c);
         interpolateToFullGridPolar(Az_c);
         calculateMagneticFieldPolar();
         calculateHField();
         updateMuDistribution();
+    }
+
+    last_nonlinear_iterations_ = MAX_ITER;
+    last_nonlinear_residual_ = evaluateCurrentResidual();
+    last_nonlinear_converged_ = std::isfinite(last_nonlinear_residual_)
+                              && last_nonlinear_residual_ < TOL;
+    last_nonlinear_warm_start_safe_ = std::isfinite(last_nonlinear_residual_)
+                                    && last_nonlinear_residual_
+                                       <= WARM_START_RESIDUAL_LIMIT;
+    if (!last_nonlinear_converged_) analysis_convergence_ok_ = false;
+    if (!quiet_solver_ && !last_nonlinear_converged_) {
+        std::cerr << "WARNING: Newton-Krylov did not converge after " << MAX_ITER
+                  << " iterations; restored best evaluated iterate "
+                  << best_iteration << " (residual=" << std::scientific
+                  << std::setprecision(3) << last_nonlinear_residual_
+                  << ", target=" << TOL << ")."
+                  << std::defaultfloat << std::endl;
+    } else if (!quiet_solver_ && VERBOSE) {
+        std::cout << "Newton-Krylov solver converged on the final evaluated "
+                     "update (residual="
+                  << std::scientific << std::setprecision(3)
+                  << last_nonlinear_residual_ << ")."
+                  << std::defaultfloat << std::endl;
     }
 
     // [Phase BJ-8 Path D / v1.5.1] Hermite-interpolation fallback (coarse →

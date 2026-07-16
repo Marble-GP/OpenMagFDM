@@ -82,12 +82,14 @@ public:
     int  getLastNonlinearIterations() const { return last_nonlinear_iterations_; }
     double getLastNonlinearResidual() const { return last_nonlinear_residual_; }
     bool lastNonlinearConverged() const { return last_nonlinear_converged_; }
+    bool lastNonlinearWarmStartSafe() const { return last_nonlinear_warm_start_safe_; }
     bool analysisConverged() const { return analysis_convergence_ok_; }
     long total_linear_iters_ = 0;
     int  num_linear_solves_  = 0;
     int  last_nonlinear_iterations_ = 0;
     double last_nonlinear_residual_ = 0.0;
     bool last_nonlinear_converged_ = true;
+    bool last_nonlinear_warm_start_safe_ = false;
     bool analysis_convergence_ok_ = true;
     // Update a radial (inner/outer, len ntheta) or theta (theta_min/theta_max, len nr) transmission
     // profile in-place between Schwarz sweeps. edge in {inner,outer,theta_min,theta_max}.
@@ -137,6 +139,17 @@ public:
     }
     const std::map<std::string, std::vector<double>>& getFluxLinkageResults() const {
         return flux_linkage_results;
+    }
+    struct TransientSolverStatus {
+        int step = 0;
+        bool nonlinear = false;
+        bool converged = true;
+        bool state_reusable = true;
+        int iterations = 0;
+        double residual = 0.0;
+    };
+    const std::vector<TransientSolverStatus>& getTransientSolverStatuses() const {
+        return transient_solver_status_results;
     }
     int transient_step_begin_ = 0;    // global step range [begin, end) run by this instance
     int transient_step_end_   = -1;   // -1 = full range (dispatcher may split into chunks)
@@ -441,11 +454,13 @@ private:
         double mu_r;            // Relative permeability (linear or last evaluated)
     };
 
-    // Anderson acceleration configuration (shared by Picard and Newton-Krylov)
+    // Anderson acceleration configuration. It is an opt-in, safeguarded
+    // experimental accelerator for Newton-Krylov and also configures the
+    // legacy `solver_type: anderson` Picard-Anderson path.
     struct AndersonConfig {
         bool enabled;       // Enable Anderson acceleration (default: false)
         int depth;          // History depth (default: 5)
-        double beta;        // Mixing parameter (default: 1.0)
+        double beta;        // Mixing parameter (Picard: 1.0, Newton-Krylov: 0.3)
 
         AndersonConfig() : enabled(false), depth(5), beta(1.0) {}
     };
@@ -457,7 +472,7 @@ private:
         int max_iterations;         // Maximum nonlinear iterations (default: 50)
         double tolerance;           // Convergence tolerance (relative) (default: 5e-4)
         double relaxation;          // Relaxation factor (0.5 ~ 0.8) (default: 0.7) - for Picard
-        AndersonConfig anderson;    // Anderson acceleration settings (for Picard and Newton-Krylov)
+        AndersonConfig anderson;    // Safeguarded NK accelerator; legacy Picard-Anderson settings
         int gmres_restart;          // GMRES restart parameter (default: 30) - for Newton-Krylov
         double line_search_c;       // Line search Armijo parameter (default: 1e-4) - for Newton-Krylov
         double line_search_alpha_init;    // Initial step length (default: 1.0) - for Newton-Krylov
@@ -616,6 +631,7 @@ private:
     // Flux linkage calculation
     std::vector<FluxLinkagePath> flux_linkage_paths;  // Defined paths for flux linkage
     std::map<std::string, std::vector<double>> flux_linkage_results;  // Results per path per step
+    std::vector<TransientSolverStatus> transient_solver_status_results;
 
     // Boundary detection optimization for transient analysis (incremental update)
     cv::Mat cached_boundaries;  // Cached boundary detection result (binary mask)
@@ -634,6 +650,14 @@ private:
     // distribution was computed.  A warm μ value is reusable only when the
     // material RGB at the same cell is unchanged after sliding.
     cv::Mat previous_material_image;
+
+    // Last transient nonlinear state accepted by the warm-start quality gate.
+    // A mildly tolerance-limited but stable best iterate remains useful; a
+    // divergent state is exported only for diagnostics and cannot contaminate
+    // later steps. The image snapshot belongs to the same accepted solve as mu.
+    Eigen::MatrixXd last_accepted_mu_map;
+    cv::Mat last_accepted_material_image;
+    bool have_last_accepted_transient_state = false;
 
     // Phase B.6: per-rectangle-slide cumulative displacement state.
     // dx / dy can be tinyexpr formulas in $step, so we accumulate the
@@ -1183,6 +1207,7 @@ private:
     double calculateFluxLinkage(const FluxLinkagePath& path) const;  // Φ = Az(end) - Az(start)
     void calculateAllFluxLinkages(int step);  // Calculate and store all flux linkages
     void exportFluxLinkageCSV(const std::string& output_dir) const;  // Export to CSV
+    void exportFluxLinkageStatusCSV(const std::string& output_dir) const;
 
     // Adaptive mesh coarsening methods
     cv::Mat detectMaterialBoundaries();  // Detect material boundaries using edge detection

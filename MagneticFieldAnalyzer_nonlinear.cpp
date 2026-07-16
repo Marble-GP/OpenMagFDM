@@ -1356,6 +1356,9 @@ void MagneticFieldAnalyzer::updateMuDistribution() {
  */
 void MagneticFieldAnalyzer::solveNonlinear() {
     last_nonlinear_iterations_ = 0;
+    last_nonlinear_residual_ = std::numeric_limits<double>::infinity();
+    last_nonlinear_converged_ = false;
+    last_nonlinear_warm_start_safe_ = false;
     if (!has_nonlinear_materials) {
         // No nonlinear materials, use standard linear solver
         if (coordinate_system == "cartesian") {
@@ -1363,6 +1366,9 @@ void MagneticFieldAnalyzer::solveNonlinear() {
         } else {
             buildAndSolveSystemPolar();
         }
+        last_nonlinear_residual_ = 0.0;
+        last_nonlinear_converged_ = true;
+        last_nonlinear_warm_start_safe_ = true;
         return;
     }
 
@@ -1376,6 +1382,8 @@ void MagneticFieldAnalyzer::solveNonlinear() {
     const int MAX_ITER = nonlinear_config.max_iterations;
     const double TOL = nonlinear_config.tolerance;
     const double OMEGA = nonlinear_config.relaxation;
+    const double WARM_START_RESIDUAL_LIMIT =
+        std::min(1e-2, std::max(10.0 * TOL, 1e-3));
 
     // Save previous solution for convergence check
     Eigen::VectorXd Az_old;
@@ -1458,6 +1466,10 @@ void MagneticFieldAnalyzer::solveNonlinear() {
 
         residual_history.push_back(Az_residual);
         mu_change_history.push_back(mu_change_rel);
+        last_nonlinear_residual_ = std::max(Az_residual, mu_change_rel);
+        last_nonlinear_warm_start_safe_ = std::isfinite(last_nonlinear_residual_)
+                                        && last_nonlinear_residual_
+                                           <= WARM_START_RESIDUAL_LIMIT;
 
         if (nonlinear_config.verbose) {
             std::cout << "NL iter " << std::setw(3) << iter + 1
@@ -1469,6 +1481,7 @@ void MagneticFieldAnalyzer::solveNonlinear() {
         // Convergence check (both Az and mu must converge)
         if (Az_residual < TOL && mu_change_rel < TOL) {
             last_nonlinear_iterations_ = iter + 1;
+            last_nonlinear_converged_ = true;
             if (nonlinear_config.verbose)
                 std::cout << "Nonlinear solver converged in " << iter + 1 << " iterations" << std::endl;
 
@@ -1490,6 +1503,8 @@ void MagneticFieldAnalyzer::solveNonlinear() {
     }
 
     last_nonlinear_iterations_ = MAX_ITER;
+    last_nonlinear_converged_ = false;
+    analysis_convergence_ok_ = false;
     if (nonlinear_config.verbose) {
         std::cerr << "WARNING: Nonlinear solver did not converge after "
                   << MAX_ITER << " iterations!" << std::endl;
@@ -1507,6 +1522,9 @@ void MagneticFieldAnalyzer::solveNonlinear() {
  */
 void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
     last_nonlinear_iterations_ = 0;
+    last_nonlinear_residual_ = std::numeric_limits<double>::infinity();
+    last_nonlinear_converged_ = false;
+    last_nonlinear_warm_start_safe_ = false;
     if (!has_nonlinear_materials) {
         // No nonlinear materials, use standard linear solver
         if (coordinate_system == "cartesian") {
@@ -1522,6 +1540,9 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
                 buildAndSolveSystemPolar();
             }
         }
+        last_nonlinear_residual_ = 0.0;
+        last_nonlinear_converged_ = true;
+        last_nonlinear_warm_start_safe_ = true;
         return;
     }
 
@@ -1543,6 +1564,8 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
     const int MAX_ITER = nonlinear_config.max_iterations;
     const double TOL = nonlinear_config.tolerance;
     const double OMEGA = nonlinear_config.relaxation;
+    const double WARM_START_RESIDUAL_LIMIT =
+        std::min(1e-2, std::max(10.0 * TOL, 1e-3));
 
     // Anderson acceleration storage
     std::vector<Eigen::VectorXd> mu_history;      // μ^(k)
@@ -1558,6 +1581,7 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
     };
 
     Eigen::VectorXd Az_old = Eigen::Map<Eigen::VectorXd>(Az.data(), Az.size());
+    Eigen::VectorXd last_picard_mu_new;
     std::vector<double> Az_residual_history;
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
@@ -1614,6 +1638,7 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         }
 
         Eigen::VectorXd mu_new = flatten_mu();
+        last_picard_mu_new = mu_new;
         Eigen::VectorXd residual = mu_new - mu_old;
 
         // Anderson acceleration
@@ -1628,8 +1653,11 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
                 F.col(j) = residual_history_AA[idx] - residual;
             }
 
-            // Solve least-squares: F^T F alpha = F^T residual
-            Eigen::VectorXd alpha = (F.transpose() * F).ldlt().solve(F.transpose() * residual);
+            // Use a rank-revealing QR instead of normal equations so nearly
+            // dependent history vectors do not square the condition number.
+            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(F);
+            qr.setThreshold(1e-10);
+            Eigen::VectorXd alpha = qr.solve(residual);
 
             // Anderson update: μ^(k+1) = μ^(k) + residual - Σ alpha_j (r^(k-m_k+j) - residual)
             Eigen::VectorXd mu_anderson = mu_new;
@@ -1638,7 +1666,17 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
                 mu_anderson -= alpha(j) * (mu_history[idx] - mu_old);
             }
 
-            unflatten_mu(mu_anderson);
+            // Honour the configured mixing parameter. A non-finite legacy
+            // Anderson proposal is discarded in favour of the physical Picard
+            // update derived from the current field.
+            Eigen::VectorXd mu_applied =
+                (1.0 - beta_AA) * mu_new + beta_AA * mu_anderson;
+            if (!alpha.allFinite() || !mu_applied.allFinite()) {
+                mu_applied = mu_new;
+                mu_history.clear();
+                residual_history_AA.clear();
+            }
+            unflatten_mu(mu_applied);
         }
 
         // Store history
@@ -1661,6 +1699,10 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         // Avoid division by zero: use relative residual if norm is large, absolute otherwise
         double Az_res = (Az_norm > 1e-12) ? (Az_diff / Az_norm) : Az_diff;
         double mu_res = (mu_old_norm > 1e-12) ? (mu_diff / mu_old_norm) : mu_diff;
+        last_nonlinear_residual_ = std::max(Az_res, mu_res);
+        last_nonlinear_warm_start_safe_ = std::isfinite(last_nonlinear_residual_)
+                                        && last_nonlinear_residual_
+                                           <= WARM_START_RESIDUAL_LIMIT;
 
         Az_residual_history.push_back(Az_res);
 
@@ -1672,7 +1714,13 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         }
 
         if (Az_res < TOL && mu_res < TOL) {
+            // The convergence metrics describe the unaccelerated fixed-point
+            // map. Return that matching physical state, not an unchecked
+            // extrapolation assembled immediately above.
+            unflatten_mu(mu_new);
             last_nonlinear_iterations_ = iter + 1;
+            last_nonlinear_converged_ = true;
+            last_nonlinear_warm_start_safe_ = true;
             if (nonlinear_config.verbose)
                 std::cout << "Anderson-accelerated solver converged in " << iter + 1 << " iterations" << std::endl;
             return;
@@ -1681,7 +1729,15 @@ void MagneticFieldAnalyzer::solveNonlinearWithAnderson() {
         Az_old = Az_new;
     }
 
+    // Do not export the final unchecked extrapolation. The last Picard map was
+    // evaluated from the current Az/H state and is the diagnostic-safe state.
+    if (last_picard_mu_new.size() == mu_map.size()) {
+        unflatten_mu(last_picard_mu_new);
+    }
     last_nonlinear_iterations_ = MAX_ITER;
+    last_nonlinear_converged_ = false;
+    last_nonlinear_warm_start_safe_ = false;
+    analysis_convergence_ok_ = false;
     if (nonlinear_config.verbose)
         std::cerr << "WARNING: Anderson solver did not converge after " << MAX_ITER << " iterations!" << std::endl;
 }
