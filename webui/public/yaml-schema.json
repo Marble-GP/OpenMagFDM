@@ -483,7 +483,7 @@
       "validParents": ["anderson", "left", "right", "top", "bottom", "inner", "outer", "theta_min", "theta_max"]
     },
     "max_iterations": {
-      "description": "Maximum number of nonlinear iterations. Reaching this limit retains diagnostic output but marks the analysis failed with exit code 2.",
+      "description": "Maximum number of nonlinear iterations. Reaching this limit retains diagnostic output and completes with exit code 2 as a nonlinear-convergence warning; the result is not converged, but execution did not fail.",
       "type": "integer",
       "example": "max_iterations: 100",
       "validParents": ["nonlinear_solver"]

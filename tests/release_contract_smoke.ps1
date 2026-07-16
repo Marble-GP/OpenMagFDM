@@ -79,6 +79,13 @@ try {
     if ($staticJson.export.format -ne 'tiff' -or -not $staticJson.export.async) {
         throw 'A partial export block did not inherit TIFF + async defaults'
     }
+    $staticLog = Get-Content -Raw -LiteralPath 'contract_static_out\log.txt'
+    if ($staticLog -notmatch '(?m)^Linear system solve complete\.\r?$') {
+        throw 'The Cartesian linear subproblem did not use the explicit completion message'
+    }
+    if ($staticLog -match '(?m)^(?:Solution complete!|Coarsened solution complete!|Polar coarsened solve complete!)\r?$') {
+        throw 'An ambiguous legacy linear-solve completion message was emitted'
+    }
 
     # A nonlinear iteration-limit result must remain available for diagnostics
     # but must not be reported to automation as a successful analysis.
@@ -106,6 +113,15 @@ try {
     $nonlinearLog = Get-Content -Raw -LiteralPath 'contract_nonlinear_failure_out\log.txt'
     if ($nonlinearLog -notmatch 'DID NOT CONVERGE') {
         throw 'Nonlinear nonconvergence was not recorded in log.txt'
+    }
+    if ($nonlinearLog -notmatch 'Analysis completed with a nonlinear convergence warning') {
+        throw 'Nonlinear nonconvergence was not reported as a completed analysis with a warning'
+    }
+    if ($nonlinearLog -notmatch 'Results were retained for diagnostics and must not be treated as converged') {
+        throw 'Exit code 2 did not explain that diagnostic results were retained but unconverged'
+    }
+    if ($nonlinearLog -match 'Analysis completed successfully!') {
+        throw 'Exit code 2 was also mislabeled as an unqualified successful analysis'
     }
     if ($nonlinearLog -notmatch 'Anderson acceleration: enabled \(depth=5, beta=(?:0\.3|3\.0e-01)\)') {
         throw 'Newton-Krylov did not apply the beta=0.3 default when Anderson beta was omitted'

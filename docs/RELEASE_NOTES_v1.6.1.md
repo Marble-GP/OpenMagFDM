@@ -24,7 +24,9 @@ experience. It is backward compatible with integer pixel-based slide regions.
   longer leaks the previous material's permeability across the boundary.
 - Removed the legacy polar plateau rule that accepted residuals up to 10x the
   requested tolerance. A Newton-Krylov iteration-limit result is retained for
-  diagnostics, clearly marked `NOT CONVERGED`, and returns exit code `2`.
+  diagnostics, clearly marked `NOT CONVERGED`, and returns exit code `2` as a
+  warning-bearing completion. Linear subproblem logs now say `Linear system
+  solve complete.` so they cannot be mistaken for final analysis convergence.
 - Windows automatic OpenMP selection now uses physical cores while preserving
   explicit `omp.threads` and `OMP_NUM_THREADS` overrides. This avoids SMT
   contention in memory-bound AMG kernels.
@@ -93,7 +95,11 @@ row-aligned `FluxLinkage/flux_linkage_status.csv` quality sidecar.
   Galerkin/JFNK keys from new configurations.
 - DD remains optional and polar-only. Treat it as an accuracy mode; keep the
   active electromagnetic band at full resolution.
-- Automation should treat solver exit code `2` as nonlinear nonconvergence.
+- Solver exit codes distinguish outcome quality: `0` means successful and
+  converged, `2` means execution completed and diagnostic exports were retained
+  but the nonlinear tolerance was not met, and other nonzero codes indicate an
+  execution/configuration failure. Automation may archive code-`2` results for
+  troubleshooting, but must not consume them as converged field results.
   Eisenstat-Walker accelerates inner solves but does not loosen the configured
   outer tolerance; compare exported fields only after both runs converge.
 - See `docs/CONFIGURATION.md` for the normative configuration contract.

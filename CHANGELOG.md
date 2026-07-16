@@ -30,6 +30,10 @@ investigations remain under `docs/research/`.
   disable after repeated rejection. Nonconverged runs now restore the best
   evaluated state, prevent poor states from seeding the next transient step,
   and annotate flux-linkage rows in `flux_linkage_status.csv`.
+- Clarified solver completion reporting: linear-system messages identify an
+  inner solve rather than the whole analysis, while exit code `2` explicitly
+  means the analysis completed with retained diagnostic results and a nonlinear
+  convergence warning (not an execution failure or a converged result).
 
 See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 

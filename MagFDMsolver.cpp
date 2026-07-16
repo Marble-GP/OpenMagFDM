@@ -676,7 +676,9 @@ int main(int argc, char* argv[]) {
         if (convergence_ok) {
             std::cout << "Analysis completed successfully!" << std::endl;
         } else {
-            std::cout << "Analysis finished, but the nonlinear solver DID NOT CONVERGE."
+            std::cout << "Analysis completed with a nonlinear convergence warning."
+                      << std::endl;
+            std::cout << "WARNING: The nonlinear solver DID NOT CONVERGE to the requested tolerance."
                       << std::endl;
             std::cout << "Results were retained for diagnostics and must not be treated as converged."
                       << std::endl;

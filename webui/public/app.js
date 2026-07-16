@@ -4345,7 +4345,7 @@ ${SOLVER_HINT_MARKER}
 # nonlinear_solver:
 #   enabled: true                   # enables the nonlinear material response
 #   solver_type: newton-krylov      # picard is slower but can be more forgiving
-#   max_iterations: 100             # reaching this limit marks the run failed (exit code 2)
+#   max_iterations: 100             # reaching this limit completes with a nonlinear convergence warning (exit code 2)
 #   tolerance: 1.0e-3               # accept results only when the reported residual is below this
 #   verbose: false                  # true prints iteration diagnostics for troubleshooting
 #   anderson:
@@ -6224,17 +6224,42 @@ async function runSolver() {
                         // Flush remaining buffer
                         flushOutputBuffer();
 
-                        if (data.success) {
+                        if (data.exitCode === 0 && data.success) {
+                            progressBar.style.width = '100%';
+                            progressPercent.textContent = '100%';
+                            progressText.textContent = 'Completed successfully';
                             showStatus('solverStatus', 'Solver completed successfully', 'success');
                             // Load results and update dashboard
                             await loadResults();
+                        } else if (data.exitCode === 2 && data.completed) {
+                            progressBar.style.width = '100%';
+                            progressPercent.textContent = '100%';
+                            progressBar.style.background = 'linear-gradient(90deg, #ffc107 0%, #ff9800 100%)';
+                            progressText.textContent = 'Completed with nonlinear convergence warnings';
+                            // Exit code 2 still has intentional diagnostic
+                            // output. Make it available exactly like a
+                            // successful run, then leave the warning visible.
+                            await loadResults();
+                            showStatus(
+                                'solverStatus',
+                                'Solver completed with a nonlinear convergence warning. Diagnostic results were loaded; do not treat them as converged.',
+                                'warning'
+                            );
+                        } else if (data.exitCode === null || data.stopped) {
+                            progressBar.style.background = 'linear-gradient(90deg, #ffc107 0%, #ff9800 100%)';
+                            progressText.textContent = 'Stopped by user';
+                            showStatus('solverStatus', 'Solver stopped by user', 'warning');
                         } else {
                             throw new Error(data.message || 'Solver failed');
                         }
                     } else if (data.type === 'error') {
-                        // Don't throw - stderr messages (including WARNINGs) are just logged
-                        // Actual errors are determined by the exit code in 'done' event
-                        // Message is already buffered above
+                        // Stderr lines (including nonlinear WARNINGs) are log
+                        // entries. A startup/spawn failure carries an explicit
+                        // `error` field because no final `done` event is
+                        // guaranteed in that case.
+                        if (data.success === false && data.error) {
+                            throw new Error(data.error);
+                        }
                     }
                 }
             }
@@ -6257,7 +6282,8 @@ async function runSolver() {
         btn.textContent = 'Run Solver';
         stopBtn.style.display = 'none';
 
-        // Hide progress bar after 3 seconds if completed successfully
+        // Hide only an unambiguously successful run. Warning-complete runs
+        // keep the amber progress state visible for review.
         setTimeout(() => {
             if (progressText.textContent === 'Completed successfully') {
                 progressContainer.style.display = 'none';

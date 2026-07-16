@@ -72,8 +72,41 @@ const MAX_IMAGES_PER_USER = 20;
 const runningProcesses = new Map();
 
 // Async job queue (jobId -> job record)
-// job: { jobId, userId, status, progress, log, resultPath, process, created, finished }
+// job: { jobId, userId, status, progress, log, resultPath, exitCode,
+//        completed, converged, warning, message, process, created, finished }
 const jobs = new Map();
+
+// Keep the solver process contract in one place. Exit code 2 means the
+// requested nonlinear tolerance was not reached, but the solver completed
+// the analysis and deliberately retained diagnostic results.
+function classifySolverExit(code) {
+    if (code === 0) {
+        return {
+            status: 'completed', success: true, completed: true,
+            converged: true, warning: false, stopped: false,
+            message: 'Solver completed successfully'
+        };
+    }
+    if (code === 2) {
+        return {
+            status: 'completed', success: true, completed: true,
+            converged: false, warning: true, stopped: false,
+            message: 'Solver completed with a nonlinear convergence warning; retained results are diagnostic and are not converged'
+        };
+    }
+    if (code === null) {
+        return {
+            status: 'cancelled', success: false, completed: false,
+            converged: false, warning: false, stopped: true,
+            message: 'Solver was stopped by user'
+        };
+    }
+    return {
+        status: 'failed', success: false, completed: false,
+        converged: false, warning: false, stopped: false,
+        message: 'Solver failed'
+    };
+}
 
 /**
  * Generate timestamp-based output folder name
@@ -3068,7 +3101,10 @@ app.post('/api/solve', async (req, res) => {
         await fs.access(SOLVER_PATH);
 
         // コマンドの構築
-        const command = `"${SOLVER_PATH}" "${configPath}" "${imagePath}"`;
+        // Use the same user-scoped output layout as the streaming and job
+        // APIs so warning-complete results remain discoverable in the UI.
+        const outputPath = await prepareUserOutputDirectory(userId);
+        const command = `"${SOLVER_PATH}" "${configPath}" "${imagePath}" "${outputPath}"`;
 
         console.log('Executing:', command);
 
@@ -3078,9 +3114,21 @@ app.post('/api/solve', async (req, res) => {
             maxBuffer: 10 * 1024 * 1024 // 10MB
         }, (error, stdout, stderr) => {
             if (error) {
+                const exitCode = Number.isInteger(error.code) ? error.code : null;
+                const outcome = classifySolverExit(exitCode);
+                if (outcome.warning) {
+                    return res.json({
+                        ...outcome,
+                        exitCode,
+                        resultPath: outputPath,
+                        stdout,
+                        stderr
+                    });
+                }
                 console.error('Solver error:', error);
                 return res.status(500).json({
                     success: false,
+                    exitCode,
                     error: error.message,
                     stderr: stderr
                 });
@@ -3091,8 +3139,9 @@ app.post('/api/solve', async (req, res) => {
             // const muFile = outputPath.replace('Az_', 'Mu_');
 
             res.json({
-                success: true,
-                message: 'Solver completed successfully',
+                ...classifySolverExit(0),
+                exitCode: 0,
+                resultPath: outputPath,
                 stdout: stdout,
             });
         });
@@ -3258,10 +3307,10 @@ app.post('/api/solve-stream', async (req, res) => {
 
             // 完了メッセージ
             const finalData = {
-                type: code === 0 ? 'done' : 'error',
-                success: code === 0,
+                type: 'done',
+                ...classifySolverExit(code),
                 exitCode: code,
-                message: code === 0 ? 'Solver completed successfully' : (code === null ? 'Solver was stopped by user' : 'Solver failed')
+                resultPath: (code === 0 || code === 2) ? outputPath : null
             };
 
             res.write(`data: ${JSON.stringify(finalData)}\n\n`);
@@ -4258,6 +4307,11 @@ app.post('/api/jobs', async (req, res) => {
             progress: 0,
             log: [],
             resultPath: null,
+            exitCode: null,
+            completed: false,
+            converged: false,
+            warning: false,
+            message: null,
             process: null,
             created: new Date().toISOString(),
             finished: null
@@ -4296,10 +4350,16 @@ app.post('/api/jobs', async (req, res) => {
             }
         });
         solverProcess.on('close', (code) => {
-            job.status = code === 0 ? 'completed' : 'failed';
+            const outcome = classifySolverExit(code);
+            job.status = outcome.status;
+            job.exitCode = code;
+            job.completed = outcome.completed;
+            job.converged = outcome.converged;
+            job.warning = outcome.warning;
+            job.message = outcome.message;
             job.finished = new Date().toISOString();
             job.process = null;
-            if (code === 0) {
+            if (outcome.completed) {
                 job.resultPath = outputPath;
                 job.progress = 100;
             }
@@ -4334,8 +4394,8 @@ app.get('/api/jobs', (req, res) => {
 
         const userJobs = Array.from(jobs.values())
             .filter(j => j.userId === userIdKey)
-            .map(({ jobId, status, progress, resultPath, created, finished }) =>
-                ({ jobId, status, progress, resultPath, created, finished }))
+            .map(({ jobId, status, progress, resultPath, exitCode, completed, converged, warning, message, created, finished }) =>
+                ({ jobId, status, progress, resultPath, exitCode, completed, converged, warning, message, created, finished }))
             .sort((a, b) => new Date(b.created) - new Date(a.created));
 
         res.json({ success: true, jobs: userJobs });
@@ -4357,6 +4417,11 @@ app.get('/api/jobs/:jobId', (req, res) => {
             status: job.status,
             progress: job.progress,
             resultPath: job.resultPath,
+            exitCode: job.exitCode,
+            completed: job.completed,
+            converged: job.converged,
+            warning: job.warning,
+            message: job.message,
             created: job.created,
             finished: job.finished,
             logTail

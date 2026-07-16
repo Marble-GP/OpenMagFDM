@@ -5397,7 +5397,9 @@ void MagneticFieldAnalyzer::buildAndSolveSystemCoarsened() {
     smoothInactiveCells(coarsen_smooth_iterations);
     interpolateMuToFullGrid();
 
-    std::cout << "Coarsened solution complete!" << std::endl;
+    // This is one linear subproblem.  In a nonlinear analysis the outer
+    // iteration still has to decide whether the full problem has converged.
+    std::cout << "Coarsened linear system solve complete." << std::endl;
 }
 
 void MagneticFieldAnalyzer::exportCoarseningMask(const std::string& output_dir, int step_number) {
@@ -7287,7 +7289,8 @@ void MagneticFieldAnalyzer::buildAndSolveSystem() {
         }
     }
 
-    std::cout << "Solution complete!" << std::endl;
+    // Avoid implying that the complete (possibly nonlinear) analysis ended.
+    std::cout << "Linear system solve complete." << std::endl;
 }
 
 // Export field selection check. Empty list = export all (backward compat).
@@ -11821,7 +11824,8 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolar() {
         }
     }
 
-    std::cout << "Solution complete!" << std::endl;
+    // Avoid implying that the complete (possibly nonlinear) analysis ended.
+    std::cout << "Linear system solve complete." << std::endl;
 
     // Calculate magnetic field
     calculateMagneticFieldPolar();
@@ -12099,7 +12103,9 @@ void MagneticFieldAnalyzer::buildAndSolveSystemPolarCoarsened() {
     smoothInactiveCells(coarsen_smooth_iterations);
     interpolateMuToFullGrid();
 
-    std::cout << "Polar coarsened solve complete!" << std::endl;
+    // This is one linear subproblem.  Nonlinear convergence is reported by
+    // the outer solver and by the final analysis summary.
+    std::cout << "Polar coarsened linear system solve complete." << std::endl;
 
     // Calculate magnetic field
     calculateMagneticFieldPolar();
