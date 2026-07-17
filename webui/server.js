@@ -4883,6 +4883,12 @@ app.get('/api/load-csv-raw', async (req, res) => {
         const filePath = path.join(BASE_DIR, resultPath, file);
         const content = await fs.readFile(filePath, 'utf8');
 
+        // Timeline CSVs may grow while a solve is running. Prevent browser or
+        // intermediary caches from returning an earlier row count.
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.setHeader('Pragma', 'no-cache');
+        res.setHeader('Expires', '0');
+
         // 生のテキストとして返す
         res.type('text/plain').send(content);
     } catch (error) {

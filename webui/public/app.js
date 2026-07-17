@@ -2151,15 +2151,10 @@ function buildDetectYamlFromAssignments() {
         }
     }
 
-    // Phase L: auto-emit flux_linkage entries for every Coil group that
-    // has BOTH a +sign and a -sign chip assigned. The solver's
-    // material_a / material_b mode computes mean(Az over +) − mean(Az
-    // over −) per step, which is exactly the per-phase flux linkage
-    // Φ_X of a synchronous machine. The solver caveat: this mode is
-    // cartesian-only -- for polar coordinates the entries are still
-    // emitted (the user often switches coords later), but the solver
-    // will print a warning and the value stays zero. We surface that
-    // in an inline comment so the user is not surprised.
+    // Auto-emit one flux_linkage entry for every Coil group. A full model
+    // normally has both + and - cross-sections; an antiperiodic one-pole
+    // model may contain only one. The solver evaluates the signed area mean
+    // of whichever side is present.
     const coilByGroup = {};   // { 'A': { pos: '#hex', neg: '#hex' }, ... }
     for (const c of colors) {
         const hex = `#${c.rgb.map(v => v.toString(16).padStart(2, '0')).join('')}`;
@@ -2170,21 +2165,27 @@ function buildDetectYamlFromAssignments() {
         if (a.coilSign === '-') coilByGroup[grp].neg = hex;
         else                    coilByGroup[grp].pos = hex;
     }
-    const groupsWithPair = Object.keys(coilByGroup)
-        .filter(g => coilByGroup[g].pos && coilByGroup[g].neg)
+    const groupsWithCoil = Object.keys(coilByGroup)
+        .filter(g => coilByGroup[g].pos || coilByGroup[g].neg)
         .sort();
-    if (groupsWithPair.length > 0) {
+    if (groupsWithCoil.length > 0) {
         lines.push('');
-        lines.push('# Flux linkage Phi_Coil_X = ⟨Az⟩(+X pixels) - ⟨Az⟩(-X pixels).');
+        lines.push('# Flux linkage: both sides use ⟨Az⟩(+X) - ⟨Az⟩(-X).');
+        lines.push('# A single visible side is valid for an antiperiodic half-period model:');
+        lines.push('# material_a alone gives +⟨Az⟩; material_b alone gives -⟨Az⟩.');
         lines.push('# Cartesian uses uniform per-cell weight; polar uses the r·dr·dθ');
         lines.push('# Jacobian, so the average is area-weighted in either coord system.');
         lines.push('flux_linkage:');
-        for (const g of groupsWithPair) {
-            const posHex = coilByGroup[g].pos.slice(1);
-            const negHex = coilByGroup[g].neg.slice(1);
+        for (const g of groupsWithCoil) {
             lines.push(`  - name: Phi_Coil_${g}`);
-            lines.push(`    material_a: coil_${g}_pos_${posHex}`);
-            lines.push(`    material_b: coil_${g}_neg_${negHex}`);
+            if (coilByGroup[g].pos) {
+                const posHex = coilByGroup[g].pos.slice(1);
+                lines.push(`    material_a: coil_${g}_pos_${posHex}`);
+            }
+            if (coilByGroup[g].neg) {
+                const negHex = coilByGroup[g].neg.slice(1);
+                lines.push(`    material_b: coil_${g}_neg_${negHex}`);
+            }
         }
     }
 
@@ -9891,7 +9892,8 @@ async function renderTorqueTime(containerId) {
 //   step,<Phi_name_1>,<Phi_name_2>,...
 // Each subsequent row is a step index and one Φ value per defined path.
 //
-// One fetch+parse per result path is cached on AppState.fluxLinkageCache.
+// The solver rewrites this CSV after every completed step. Never retain it
+// across dashboard reloads: a result path can keep growing during analysis.
 // Two palette items consume this:
 //   - flux_linkage_time  → Φ(step)
 //   - back_emf_time      → -dΦ/dstep (back-EMF convention, proportional to
@@ -9904,13 +9906,11 @@ async function loadFluxLinkageData() {
     const resultPath = getCurrentResultPath();
     if (!resultPath) return null;
 
-    if (!AppState.fluxLinkageCache) AppState.fluxLinkageCache = {};
-    if (AppState.fluxLinkageCache[resultPath]) return AppState.fluxLinkageCache[resultPath];
-
     try {
         const response = await fetch(
             `/api/load-csv-raw?result=${encodeURIComponent(resultPath)}`
-            + `&file=FluxLinkage/flux_linkage.csv`);
+            + `&file=FluxLinkage/flux_linkage.csv`,
+            { cache: 'no-store' });
         if (!response.ok) return null;
         const text = await response.text();
         if (!text || !text.trim()) return null;
@@ -9936,9 +9936,7 @@ async function loadFluxLinkageData() {
         }
         if (steps.length === 0) return null;
 
-        const data = { headers, phiNames, steps, phiSeries };
-        AppState.fluxLinkageCache[resultPath] = data;
-        return data;
+        return { headers, phiNames, steps, phiSeries };
     } catch (e) {
         console.error('loadFluxLinkageData failed:', e);
         return null;

@@ -221,11 +221,17 @@ knobs remain off by default and are not supported through the WebUI.
 force calculation in both static and transient analyses. Legacy Maxwell-stress
 implementations remain research APIs but are not the default export path.
 
-`flux_linkage` supports a point/path form and a Cartesian material-pair form.
+`flux_linkage` supports a point/path form and an area-averaged material form in
+both Cartesian and polar coordinates. In polar coordinates the average uses the
+physical-area Jacobian (`r * dr * dtheta`). A material entry may define both
+sides or only the coil cross-section present in an antiperiodic half-period
+domain:
 
 ```yaml
 flux_linkage:
   - { name: phase_U, material_a: coil_U_pos, material_b: coil_U_neg }
+  - { name: phase_V_half, material_a: coil_V_pos } # +mean(Az) over this section
+  - { name: phase_W_half, material_b: coil_W_neg } # -mean(Az) over this section
 export:
   format: tiff
   precision: double

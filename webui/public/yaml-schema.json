@@ -247,9 +247,9 @@
       "example": "material_presets:\n  my_steel:\n    mu_r: [[0, 100, 500], [5000, 4500, 3000]]\n  my_bh:\n    B-H: [[0, 100, 500, 2000], [0, 0.3, 1.0, 1.5]]"
     },
     "flux_linkage": {
-      "description": "Flux linkage paths. Each entry is either a point-to-point path (Φ = Az(end) - Az(start)) OR a material pair (Φ = mean(Az over material_a) - mean(Az over material_b)). The material variant is the right shape for thick coil legs; v1.5 cartesian only (polar returns zero).",
+      "description": "Flux linkage definitions. Each entry is either a point-to-point path (Φ = Az(end) - Az(start)) or an area-averaged material definition. With both materials, Φ = mean(Az over material_a) - mean(Az over material_b). For an antiperiodic half-period model, either side may be omitted: material_a alone gives +mean(Az), and material_b alone gives -mean(Az). Cartesian uses uniform cell area; polar uses r-weighted physical area.",
       "type": "array",
-      "example": "flux_linkage:\n  - name: phase_U          # material variant\n    material_a: coil_U_pos\n    material_b: coil_U_neg\n  - name: phase_V_path     # path variant\n    start: [0.01, 0.05]\n    end:   [0.01, 0.15]"
+      "example": "flux_linkage:\n  - name: phase_U          # paired material sections\n    material_a: coil_U_pos\n    material_b: coil_U_neg\n  - name: phase_V_half     # one visible section in a half-period model\n    material_a: coil_V_pos\n  - name: phase_W_half\n    material_b: coil_W_neg\n  - name: phase_path       # point-to-point variant\n    start: [0.01, 0.05]\n    end:   [0.01, 0.15]"
     },
     "name": {
       "description": "Name identifier for flux linkage path",

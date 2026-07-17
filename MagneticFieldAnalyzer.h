@@ -613,10 +613,11 @@ private:
     //     path. Φ = Az(end) - Az(start) with bilinear interpolation at
     //     the two physical coordinates.
     //   - use_material == true (Phase B.3, v1.5): pixel-region variant
-    //     for thick coils. Φ = mean(Az over material A pixels) -
-    //     mean(Az over material B pixels). The material name -> RGB key
-    //     is resolved at parse time so the per-step computation is just
-    //     an image scan.
+    //     for thick coils. Phi = mean(Az over material A pixels) -
+    //     mean(Az over material B pixels). Either side may be omitted for
+    //     antiperiodic half-period models: a missing side contributes zero.
+    //     Material names are resolved at parse time so each step only scans
+    //     the image.
     struct FluxLinkagePath {
         std::string name;           // Path identifier (e.g., "phase_U")
         bool use_material = false;
@@ -625,7 +626,7 @@ private:
         double x_end   = 0.0, y_end   = 0.0;
         // Material variant
         std::string material_a, material_b;
-        int rgb_key_a = -1, rgb_key_b = -1;  // (R<<16)|(G<<8)|B, -1 = unresolved
+        int rgb_key_a = -1, rgb_key_b = -1;  // (R<<16)|(G<<8)|B, -1 = omitted
     };
 
     // Flux linkage calculation

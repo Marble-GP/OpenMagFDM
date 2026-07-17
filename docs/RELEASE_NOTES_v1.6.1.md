@@ -30,6 +30,10 @@ experience. It is backward compatible with integer pixel-based slide regions.
 - Windows automatic OpenMP selection now uses physical cores while preserving
   explicit `omp.threads` and `OMP_NUM_THREADS` overrides. This avoids SMT
   contention in memory-bound AMG kernels.
+- Flux-linkage material definitions accept a single visible coil section for
+  antiperiodic half-period domains: `material_a` alone evaluates `+mean(Az)`
+  and `material_b` alone evaluates `-mean(Az)`. Dashboard flux-linkage and
+  Back-EMF timelines bypass caches so an in-progress CSV grows on every reload.
 - Corrected the polar permanent-magnet source curl. Cartesian magnetisation at
   each theta neighbour is now converted with that neighbour's own polar basis,
   and theta derivatives wrap consistently across periodic and anti-periodic

@@ -34,6 +34,10 @@ investigations remain under `docs/research/`.
   inner solve rather than the whole analysis, while exit code `2` explicitly
   means the analysis completed with retained diagnostic results and a nonlinear
   convergence warning (not an execution failure or a converged result).
+- Flux-linkage material definitions now accept either `material_a` or
+  `material_b` alone for antiperiodic half-period models, and Dashboard
+  flux/Back-EMF timelines reload growing CSV files instead of retaining an
+  earlier point count.
 
 See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 

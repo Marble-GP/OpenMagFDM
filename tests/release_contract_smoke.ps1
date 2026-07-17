@@ -87,6 +87,42 @@ try {
         throw 'An ambiguous legacy linear-solve completion message was emitted'
     }
 
+    # Antiperiodic half-period models may contain only one signed coil
+    # cross-section. material_a alone is +mean(Az); material_b alone is
+    # -mean(Az), while the paired form remains backward compatible.
+    $singleFluxConfig = Join-Path $package 'contract_single_flux.yaml'
+    $singleFluxLines = Get-Content -LiteralPath $staticConfig
+    $singleFluxLines += @(
+        'flux_linkage:',
+        '  - { name: positive_only, material_a: coil }',
+        '  - { name: negative_only, material_b: coil }',
+        'transient:',
+        '  enabled: true',
+        '  enable_sliding: false',
+        '  total_steps: 1'
+    )
+    Set-Content -LiteralPath $singleFluxConfig -Value $singleFluxLines -Encoding UTF8
+    & $solver $singleFluxConfig $imagePath 'contract_single_flux_out'
+    if ($LASTEXITCODE -ne 0) { throw 'Single-sided flux-linkage solve failed' }
+    $singleFluxCsv = @(Import-Csv -LiteralPath 'contract_single_flux_out\FluxLinkage\flux_linkage.csv')
+    if ($singleFluxCsv.Count -ne 1) {
+        throw 'Single-sided flux-linkage CSV did not contain exactly one transient row'
+    }
+    $positiveFlux = [double]$singleFluxCsv[0].positive_only
+    $negativeFlux = [double]$singleFluxCsv[0].negative_only
+    if ([math]::Abs($positiveFlux) -lt 1e-12) {
+        throw 'material_a-only flux linkage was unexpectedly zero'
+    }
+    $signTolerance = [math]::Max(1e-12, [math]::Abs($positiveFlux) * 1e-10)
+    if ([math]::Abs($positiveFlux + $negativeFlux) -gt $signTolerance) {
+        throw 'material_b-only flux linkage was not the negative of material_a-only linkage'
+    }
+    $singleFluxLog = Get-Content -Raw -LiteralPath 'contract_single_flux_out\log.txt'
+    if ($singleFluxLog -notmatch "Flux linkage \[material\] 'positive_only': mean\(Az, coil\)" -or
+        $singleFluxLog -notmatch "Flux linkage \[material\] 'negative_only': -mean\(Az, coil\)") {
+        throw 'Single-sided flux-linkage definitions were not reported with their signed convention'
+    }
+
     # A nonlinear iteration-limit result must remain available for diagnostics
     # but must not be reported to automation as a successful analysis.
     $nonlinearConfig = Join-Path $package 'contract_nonlinear_failure.yaml'

@@ -231,13 +231,15 @@ transient:
 
 Band と rectangle は同一 `slides:` リスト内で混在可能 (それぞれ独立に処理)。
 
-**材料ペア flux linkage (Phase B.3)** — 各 `flux_linkage` エントリで `material_a` / `material_b` (材料名) を指定すると、`mean(Az over material A pixels) - mean(Az over material B pixels)` を計算します。太い導体や多数巻コイルで「点間の Az 差」が物理的に不適切なケース向け。既存の path variant (`start` + `end`) と同じリスト内で混在可。Cartesian 専用。
+**材料断面 flux linkage (Phase B.3)** — 各 `flux_linkage` エントリで `material_a` / `material_b` (材料名) を指定すると、`mean(Az over material A pixels) - mean(Az over material B pixels)` を計算します。太い導体や多数巻コイルで「点間の Az 差」が物理的に不適切なケース向け。反周期の半周期モデルでは片側断面だけでも定義でき、`material_a` のみは `+mean(Az)`、`material_b` のみは `-mean(Az)` となります。Cartesian は等面積、polar は `r·dr·dθ` で物理面積平均します。既存の path variant (`start` + `end`) と同じリスト内で混在可。
 
 ```yaml
 flux_linkage:
   - name: phase_U                    # 新: 材料ペア variant
     material_a: coil_U_pos
     material_b: coil_U_neg
+  - name: phase_V_half               # 反周期半周期: +側断面だけ
+    material_a: coil_V_pos
   - name: phase_V_legacy             # 既存: path variant
     start: [0.0, 0.05]
     end:   [0.1, 0.05]

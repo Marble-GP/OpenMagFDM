@@ -2605,36 +2605,49 @@ void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
         }
         path.name = path_node["name"].as<std::string>();
 
-        // Material variant: prefer material_a / material_b when present.
-        const bool has_material = path_node["material_a"] && path_node["material_b"];
+        // Either material side is sufficient. An antiperiodic one-pole model
+        // may contain only one physical coil cross-section in the domain.
+        const bool has_material_a = static_cast<bool>(path_node["material_a"]);
+        const bool has_material_b = static_cast<bool>(path_node["material_b"]);
+        const bool has_material = has_material_a || has_material_b;
         const bool has_path = path_node["start"] && path_node["end"];
 
         if (has_material) {
             path.use_material = true;
-            path.material_a = path_node["material_a"].as<std::string>();
-            path.material_b = path_node["material_b"].as<std::string>();
-            auto it_a = name_to_rgb_key.find(path.material_a);
-            auto it_b = name_to_rgb_key.find(path.material_b);
-            if (it_a == name_to_rgb_key.end()) {
-                std::cerr << "Warning: flux_linkage '" << path.name
-                          << "' references unknown material_a '" << path.material_a
-                          << "', skipping" << std::endl;
-                continue;
+            if (has_material_a) {
+                path.material_a = path_node["material_a"].as<std::string>();
+                auto it_a = name_to_rgb_key.find(path.material_a);
+                if (it_a == name_to_rgb_key.end()) {
+                    std::cerr << "Warning: flux_linkage '" << path.name
+                              << "' references unknown material_a '" << path.material_a
+                              << "', skipping" << std::endl;
+                    continue;
+                }
+                path.rgb_key_a = it_a->second;
             }
-            if (it_b == name_to_rgb_key.end()) {
-                std::cerr << "Warning: flux_linkage '" << path.name
-                          << "' references unknown material_b '" << path.material_b
-                          << "', skipping" << std::endl;
-                continue;
+            if (has_material_b) {
+                path.material_b = path_node["material_b"].as<std::string>();
+                auto it_b = name_to_rgb_key.find(path.material_b);
+                if (it_b == name_to_rgb_key.end()) {
+                    std::cerr << "Warning: flux_linkage '" << path.name
+                              << "' references unknown material_b '" << path.material_b
+                              << "', skipping" << std::endl;
+                    continue;
+                }
+                path.rgb_key_b = it_b->second;
             }
-            path.rgb_key_a = it_a->second;
-            path.rgb_key_b = it_b->second;
             // Phase M: polar is supported with r-weighted (Jacobian)
             // averaging in calculateFluxLinkage.
-            std::cout << "  Flux linkage [material] '" << path.name
-                      << "': ⟨Az⟩(" << path.material_a
-                      << ") - ⟨Az⟩(" << path.material_b
-                      << ")  [" << coordinate_system
+            std::cout << "  Flux linkage [material] '" << path.name << "': ";
+            if (has_material_a && has_material_b) {
+                std::cout << "mean(Az, " << path.material_a << ") - mean(Az, "
+                          << path.material_b << ")";
+            } else if (has_material_a) {
+                std::cout << "mean(Az, " << path.material_a << ")";
+            } else {
+                std::cout << "-mean(Az, " << path.material_b << ")";
+            }
+            std::cout << "  [" << coordinate_system
                       << (coordinate_system == "polar" ? "; r-weighted" : "; uniform")
                       << "]" << std::endl;
         } else if (has_path) {
@@ -2655,7 +2668,8 @@ void MagneticFieldAnalyzer::parseFluxLinkagePaths() {
                       << path.x_end << ", " << path.y_end << ")" << std::endl;
         } else {
             std::cerr << "Warning: flux_linkage '" << path.name
-                      << "' missing both {start, end} and {material_a, material_b}, skipping"
+                      << "' requires {start, end} or at least one of "
+                         "{material_a, material_b}; skipping"
                       << std::endl;
             continue;
         }
@@ -2714,12 +2728,15 @@ double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) 
         return Az_end - Az_start;
     }
 
-    // Material-pair variant (Phase B.3 / Phase M):
+    // Material-region variant (Phase B.3 / Phase M):
     //   Φ = ⟨Az⟩_A − ⟨Az⟩_B
     // where ⟨·⟩ is the area-weighted mean over the cells whose pixel
     // RGB matches the resolved key. Useful for thick coil legs where a
     // single point sample misses the bulk; the average of Az across
-    // the conductor cross-section is the per-phase flux linkage.
+    // the conductor cross-section is the per-phase flux linkage. Either side
+    // may be omitted: material_a alone returns +mean(Az)_A, while material_b
+    // alone returns -mean(Az)_B. This supports antiperiodic half-period
+    // domains where the opposite coil cross-section is outside the model.
     //
     // In Cartesian the cell area is dx·dy = constant, so the weighted
     // mean reduces to the arithmetic mean.
@@ -2763,10 +2780,11 @@ double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) 
                 // Cells at the rotor axis (r=0) carry zero weight,
                 // which is the geometrically correct contribution
                 // from a degenerate point cell.
-                if (key == path.rgb_key_a) {
+                if (path.rgb_key_a >= 0 && key == path.rgb_key_a) {
                     sum_a += Az(j, i) * r_phys;
                     w_a   += r_phys;
-                } else if (key == path.rgb_key_b) {
+                }
+                if (path.rgb_key_b >= 0 && key == path.rgb_key_b) {
                     sum_b += Az(j, i) * r_phys;
                     w_b   += r_phys;
                 }
@@ -2782,8 +2800,12 @@ double MagneticFieldAnalyzer::calculateFluxLinkage(const FluxLinkagePath& path) 
                 const int key = (static_cast<int>(px[0]) << 16)
                               | (static_cast<int>(px[1]) << 8)
                               |  static_cast<int>(px[2]);
-                if (key == path.rgb_key_a) { sum_a += Az(j, i); w_a += 1.0; }
-                else if (key == path.rgb_key_b) { sum_b += Az(j, i); w_b += 1.0; }
+                if (path.rgb_key_a >= 0 && key == path.rgb_key_a) {
+                    sum_a += Az(j, i); w_a += 1.0;
+                }
+                if (path.rgb_key_b >= 0 && key == path.rgb_key_b) {
+                    sum_b += Az(j, i); w_b += 1.0;
+                }
             }
         }
     }
@@ -2812,8 +2834,8 @@ void MagneticFieldAnalyzer::calculateAllFluxLinkages(int step) {
         std::cout << "Flux linkage [" << path.name << "] step " << step
                   << ": " << std::scientific << std::setprecision(6) << phi << " Wb/m";
         if (phi == 0.0) {
-            std::cout << "  [WARNING: exactly zero -- check that material_a / material_b"
-                         " rgb_key resolved and that some image pixels matched]";
+            std::cout << "  [WARNING: exactly zero -- check that the configured material"
+                         " side(s) matched image pixels, or confirm that zero is expected]";
         }
         std::cout << std::endl;
     }
