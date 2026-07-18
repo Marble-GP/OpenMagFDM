@@ -1,6 +1,7 @@
 #include "MagneticFieldAnalyzer.h"
 #include "PolarMagnetizationCurl.h"
 #include "tinyexpr/tinyexpr.h"
+#include <opencv2/imgproc.hpp>
 #include <iostream>
 #include <fstream>
 #include <iomanip>
