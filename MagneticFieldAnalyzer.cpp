@@ -22,6 +22,13 @@
 #include <omp.h>
 #endif
 
+namespace {
+// OpenCV 5 removed the public cv::DistanceTypes enum while distanceTransform
+// continues to accept its documented integer ABI. Euclidean/L2 has value 2
+// in OpenCV 4 and 5, so keep the meaning named and cross-version here.
+constexpr int kDistanceTypeL2 = 2;
+}
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -3129,7 +3136,7 @@ void MagneticFieldAnalyzer::generateCoarseningMask() {
     cv::Mat boundary_inv;
     cv::bitwise_not(boundaries, boundary_inv);
     cv::Mat dist_map;
-    cv::distanceTransform(boundary_inv, dist_map, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+    cv::distanceTransform(boundary_inv, dist_map, kDistanceTypeL2, cv::DIST_MASK_PRECISE);
 
     // Generate mask based on coordinate system
     if (coordinate_system == "polar") {
@@ -10111,7 +10118,7 @@ void MagneticFieldAnalyzer::calculateForceShellIntegration(int step, int shell_t
             cv::bitwise_not(mat_padded, mat_padded_inv);
 
             cv::Mat dist_padded;
-            cv::distanceTransform(mat_padded_inv, dist_padded, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+            cv::distanceTransform(mat_padded_inv, dist_padded, kDistanceTypeL2, cv::DIST_MASK_PRECISE);
 
             // Extract center region
             dist_map = dist_padded(cv::Rect(pad_left, pad_top, nx, ny)).clone();
@@ -10119,7 +10126,7 @@ void MagneticFieldAnalyzer::calculateForceShellIntegration(int step, int shell_t
             // Standard distance transform
             cv::Mat mat_mask_inv;
             cv::bitwise_not(mat_mask, mat_mask_inv);
-            cv::distanceTransform(mat_mask_inv, dist_map, cv::DIST_L2, cv::DIST_MASK_PRECISE);
+            cv::distanceTransform(mat_mask_inv, dist_map, kDistanceTypeL2, cv::DIST_MASK_PRECISE);
         }
 
         // Find maximum distance within shell (= shell thickness in pixels)
