@@ -647,11 +647,6 @@ private:
     // `image` (cv::Mat, rows × cols, BGR Y-down).
     cv::Mat slide_sign_map;
 
-    // Material image used when the previous transient step's nonlinear μ
-    // distribution was computed.  A warm μ value is reusable only when the
-    // material RGB at the same cell is unchanged after sliding.
-    cv::Mat previous_material_image;
-
     // Last transient nonlinear state accepted by the warm-start quality gate.
     // A mildly tolerance-limited but stable best iterate remains useful; a
     // divergent state is exported only for diagnostics and cannot contaminate

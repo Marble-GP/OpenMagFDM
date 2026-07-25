@@ -3,6 +3,15 @@
 // =====================================================
 
 // ===== Global State =====
+// Field data is retained by byte budget rather than entry count.  The values
+// are decoded 2D JavaScript arrays, so the estimate below charges each array
+// slot as 8 bytes plus a small per-array overhead.  Keep this as a single
+// constant so packaged builds can tune the browser memory budget easily.
+const FIELD_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
+const FIELD_WORKING_MEMORY_BUDGET_BYTES = 384 * 1024 * 1024;
+const FIELD_UNKNOWN_DECODE_RESERVATION_BYTES = 64 * 1024 * 1024;
+const FIELD_CACHE_ARRAY_OVERHEAD_BYTES = 64;
+
 const AppState = {
     currentTab: 'config',
     configData: null,
@@ -15,12 +24,40 @@ const AppState = {
     aceEditor: null,  // Ace Editor instance
     yamlSchema: null,  // YAML schema for autocomplete
     userId: null,  // User identifier (from cookie)
-    animationTimer: null,  // Animation interval timer
+    animationTimer: null,  // Serialized animation timeout
+    animationRunId: 0,     // Invalidates a pending/in-flight animation loop
     isAnimating: false,  // Animation state flag
     analysisConditions: null,  // Analysis conditions from conditions.json
-    dataCache: {},  // Data cache for preloaded steps: { 'resultPath:Az:step': data, ... }
-    dataMeta: {},   // Per-entry metadata: { 'resultPath:Az:step': { format: 'tiff'|'csv', precision: 'double'|'float' } }
-    maxCacheEntries: 500,  // Maximum cache entries to prevent memory leak (500 * ~2MB = ~1GB max)
+    dataCache: {},       // Decoded field arrays, keyed by resultPath:type:step
+    dataMeta: {},        // Per-entry { format, precision }
+    dataCacheSizes: {},  // Per-entry estimated retained bytes
+    dataCacheLru: new Map(), // Oldest key first; touch by delete+set
+    dataCacheBytes: 0,
+    dataCacheBudgetBytes: FIELD_CACHE_BUDGET_BYTES,
+    fieldLoadGeneration: 0,
+    fieldPayloadsInFlight: new Map(), // key -> leased raw decode entry
+    fieldPreloadController: null,
+    fieldDecodeTail: Promise.resolve(), // serializes memory-heavy TIFF/JSON decoding
+    fieldDecodeReservedBytes: 0,
+    fieldPayloadStagingBytes: 0,
+    fieldViewPins: new Map(), // AbortSignal -> { fields: Map<cacheKey, bytes> }
+    fieldViewPinRefs: new WeakMap(), // decoded array -> { bytes, count }
+    fieldViewPinnedBytes: 0,
+    lastFieldMeta: null,
+    resultLoadGeneration: 0,
+    resultLoadController: null,
+    dashboardRenderGeneration: 0,
+    dashboardRenderQueue: Promise.resolve(),
+    dashboardRenderController: null,
+    containerRenderTokens: new Map(),
+    containerRenderControllers: new Map(),
+    filePreviewGeneration: 0,
+    filePreviewController: null,
+    filePreviewResultPath: '',
+    bhRenderGeneration: 0,
+    bhRenderController: null,
+    bhListGeneration: 0,
+    bhListController: null,
     // Polar coordinate transform options
     isPolarCoordinates: false,  // True if current result uses polar coordinates
     polarCartesianTransform: false,  // Apply cartesian transform (arc/donut view)
@@ -102,12 +139,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             console.warn('Failed to restore material library:', e);
             setCookie('magfdm_last_library', '', -1);
         }
-    }
-
-    // Setup step slider event handler
-    const stepSlider = document.getElementById('stepSlider');
-    if (stepSlider) {
-        stepSlider.addEventListener('input', onStepChange);
     }
 });
 
@@ -5466,6 +5497,24 @@ function initCustomSelect() {
     });
 }
 
+function createAbortError(message) {
+    const error = new Error(message);
+    error.name = 'AbortError';
+    return error;
+}
+
+function isResultLoadCurrent(context) {
+    if (!context || context.controller.signal.aborted) return false;
+    return AppState.resultLoadGeneration === context.generation &&
+           AppState.resultLoadController === context.controller;
+}
+
+function assertResultLoadCurrent(context) {
+    if (!isResultLoadCurrent(context)) {
+        throw createAbortError('Result load superseded');
+    }
+}
+
 async function loadSelectedResult() {
     const select = document.getElementById('resultSelect');
     const resultPath = select.value;
@@ -5475,39 +5524,65 @@ async function loadSelectedResult() {
         return;
     }
 
+    if (AppState.resultLoadController) {
+        AppState.resultLoadController.abort();
+    }
+    const controller = new AbortController();
+    const loadContext = {
+        generation: ++AppState.resultLoadGeneration,
+        controller,
+        resultPath,
+    };
+    AppState.resultLoadController = controller;
+
+    const previousResult = AppState.resultsData.currentResult;
+    if (previousResult !== resultPath) {
+        // Stop scheduling old dashboard work immediately. Field caches remain
+        // usable until the new result has passed its validation phase.
+        pauseAnimation();
+    }
+    invalidateDashboardRenders(`result load requested: ${resultPath}`);
+
     try {
-        const response = await fetch(`/api/detect-steps?result=${encodeURIComponent(resultPath)}`);
-        if (!response.ok) throw new Error('Failed to detect steps');
-
-        const data = await response.json();
-        AppState.totalSteps = data.steps || 1;
-        AppState.currentStep = 1;
-
-        // Clear cache when switching to a different result (BEFORE updating currentResult)
-        const previousResult = AppState.resultsData.currentResult;
-        if (previousResult && previousResult !== resultPath) {
-            const cacheSize = Object.keys(AppState.dataCache).length;
-            console.log(`Switching from ${previousResult} to ${resultPath}, clearing ${cacheSize} cached entries`);
-            AppState.dataCache = {};  // Complete cache clear
-            AppState.dataMeta = {};
-        }
-
-        AppState.resultsData.currentResult = resultPath;
-
-        // Load analysis conditions from conditions.json
-        try {
-            const conditionsResponse = await fetch(`/api/load-conditions?result=${encodeURIComponent(resultPath)}`);
-            if (conditionsResponse.ok) {
-                AppState.analysisConditions = await conditionsResponse.json();
-                console.log('Analysis conditions loaded:', AppState.analysisConditions);
-            } else {
+        const defaultConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
+        const stepsPromise = fetch(
+            `/api/detect-steps?result=${encodeURIComponent(resultPath)}`,
+            { signal: controller.signal }
+        ).then(async response => {
+            if (!response.ok) throw new Error('Failed to detect steps');
+            return await response.json();
+        });
+        const conditionsPromise = fetch(
+            `/api/load-conditions?result=${encodeURIComponent(resultPath)}`,
+            { signal: controller.signal }
+        ).then(async response => {
+            if (!response.ok) {
                 console.warn('conditions.json not found, assuming default (cartesian)');
-                AppState.analysisConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
+                return defaultConditions;
             }
-        } catch (error) {
+            return await response.json();
+        }).catch(error => {
+            if (error && error.name === 'AbortError') throw error;
             console.warn('Failed to load conditions.json:', error);
-            AppState.analysisConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
+            return defaultConditions;
+        });
+
+        const [stepsData, analysisConditions] = await Promise.all([stepsPromise, conditionsPromise]);
+        assertResultLoadCurrent(loadContext);
+
+        // Commit result-dependent state atomically only after both requests
+        // have completed and this selection is still the newest request.
+        if (previousResult !== resultPath) {
+            invalidateFieldLoads(`result switch: ${previousResult || '(none)'} -> ${resultPath}`);
+            clearFieldDataCache('result switch');
+            clearCoarseningMaskCache();
         }
+        AppState.totalSteps = stepsData.steps || 1;
+        AppState.currentStep = 1;
+        AppState.resultsData.currentResult = resultPath;
+        AppState.analysisConditions = analysisConditions;
+        loadContext.analysisConditions = analysisConditions;
+        console.log('Analysis conditions loaded:', AppState.analysisConditions);
 
         updateExportFormatBadge();
 
@@ -5532,38 +5607,115 @@ async function loadSelectedResult() {
 
         showStatus('solverStatus', `Loaded result: ${resultPath} (${AppState.totalSteps} steps)`, 'success');
 
-        // Load preview
-        await loadQuickPreviewFromResult(resultPath);
-
-        // Load and display log.txt
-        await loadResultLog(resultPath);
-
-        // Auto-reload dashboard plots when result selection changes
-        await updateAllPlots();
+        await finalizeCommittedResult(loadContext);
     } catch (error) {
-        showStatus('solverStatus', `Error loading result: ${error.message}`, 'error');
+        if (error && error.name === 'AbortError') return;
+        if (isResultLoadCurrent(loadContext)) {
+            const committedResult = AppState.resultsData.currentResult;
+            controller.abort();
+            if (committedResult) {
+                await restoreCommittedResultAfterValidationFailure(
+                    loadContext,
+                    committedResult,
+                    error
+                );
+            } else {
+                showStatus('solverStatus', `Error loading result: ${error.message}`, 'error');
+            }
+        }
+    } finally {
+        if (AppState.resultLoadController === controller) {
+            controller.abort();
+            AppState.resultLoadController = null;
+        }
     }
 }
 
-async function loadResultLog(resultPath) {
+async function finalizeCommittedResult(loadContext) {
+    assertResultLoadCurrent(loadContext);
+    await Promise.all([
+        loadQuickPreviewFromResult(loadContext.resultPath, loadContext),
+        loadResultLog(loadContext.resultPath, loadContext),
+    ]);
+    assertResultLoadCurrent(loadContext);
+
+    // Auto-reload dashboard plots only after preview and log finalization for
+    // this committed result have survived all generation checks.
+    await updateAllPlots();
+    assertResultLoadCurrent(loadContext);
+}
+
+async function restoreCommittedResultAfterValidationFailure(failedContext, committedResult, validationError) {
+    const select = document.getElementById('resultSelect');
+    if (select) select.value = committedResult;
+    updateCustomSelectDisplay(committedResult);
+
+    const controller = new AbortController();
+    const recoveryContext = {
+        generation: ++AppState.resultLoadGeneration,
+        controller,
+        resultPath: committedResult,
+        analysisConditions: AppState.analysisConditions,
+    };
+    AppState.resultLoadController = controller;
+    invalidateDashboardRenders(`restoring committed result: ${committedResult}`);
+
+    const failureMessage = `Error loading result ${failedContext.resultPath}: ${validationError.message}`;
     try {
-        const response = await fetch(`/api/get-log?result=${encodeURIComponent(resultPath)}`);
+        // A failed superseding validation may have interrupted preview, log,
+        // or dashboard finalization for the last committed result. Re-run all
+        // three under a fresh result generation instead of leaving a partial UI.
+        await finalizeCommittedResult(recoveryContext);
+        showStatus(
+            'solverStatus',
+            `${failureMessage}. Restored current result: ${committedResult}`,
+            'error'
+        );
+    } catch (error) {
+        if (!error || error.name !== 'AbortError') {
+            console.error('Failed to restore committed result UI:', error);
+            if (isResultLoadCurrent(recoveryContext)) {
+                showStatus(
+                    'solverStatus',
+                    `${failureMessage}. Failed to restore ${committedResult}: ${error.message}`,
+                    'error'
+                );
+            }
+        }
+    } finally {
+        if (AppState.resultLoadController === controller) {
+            controller.abort();
+            AppState.resultLoadController = null;
+        }
+    }
+}
+
+async function loadResultLog(resultPath, loadContext = null) {
+    try {
+        const response = await fetch(
+            `/api/get-log?result=${encodeURIComponent(resultPath)}`,
+            loadContext ? { signal: loadContext.controller.signal } : undefined
+        );
         if (response.ok) {
             const logContent = await response.text();
+            if (loadContext) assertResultLoadCurrent(loadContext);
             const logOutput = document.getElementById('logOutput');
             const logPanel = document.getElementById('logPanel');
 
-            logOutput.textContent = logContent;
-            logPanel.style.display = 'block';
+            if (logOutput) logOutput.textContent = logContent;
+            if (logPanel) logPanel.style.display = 'block';
         } else {
             // Log file not found, hide panel
+            if (loadContext) assertResultLoadCurrent(loadContext);
             const logPanel = document.getElementById('logPanel');
-            logPanel.style.display = 'none';
+            if (logPanel) logPanel.style.display = 'none';
         }
     } catch (error) {
+        if ((error && error.name === 'AbortError') ||
+            (loadContext && !isResultLoadCurrent(loadContext))) return;
         console.error('Error loading log:', error);
         const logPanel = document.getElementById('logPanel');
-        logPanel.style.display = 'none';
+        if (logPanel) logPanel.style.display = 'none';
     }
 }
 
@@ -5662,7 +5814,14 @@ function interpolateMuHarmonic(Mu, activeMask) {
 
 // Helper: Calculate magnetic fields from Az and Mu (supports both polar and Cartesian coordinates)
 // activeMask: optional 2D boolean array (same size as Az) indicating active cells for coarsening-aware differentiation
-function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = null) {
+function calculateMagneticField(
+    Az,
+    Mu,
+    dx = 0.001,
+    dy = 0.001,
+    activeMask = null,
+    analysisConditions = AppState.analysisConditions
+) {
     const rows = Az.length;
     const cols = Az[0].length;
 
@@ -5670,15 +5829,15 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
     const By = Array(rows).fill(0).map(() => Array(cols).fill(0));
 
     // Determine coordinate system (if analysisConditions is loaded)
-    const coordSystem = AppState.analysisConditions ? AppState.analysisConditions.coordinate_system : 'cartesian';
+    const coordSystem = analysisConditions ? analysisConditions.coordinate_system : 'cartesian';
 
     if (coordSystem === 'polar') {
         // Polar coordinate magnetic field calculation
-        const polar = AppState.analysisConditions.polar;
+        const polar = analysisConditions.polar;
         // r_start=0 is valid for a full-disc polar model; use null checks,
         // not truthiness, or every such run is reported as missing conditions.
         if (!polar || polar.r_start == null || polar.r_end == null || polar.theta_range == null) {
-            console.error('Polar coordinate parameters missing in analysisConditions:', AppState.analysisConditions);
+            console.error('Polar coordinate parameters missing in analysisConditions:', analysisConditions);
             throw new Error('Polar coordinate parameters not found in conditions.json');
         }
         const r_start = polar.r_start;
@@ -5698,11 +5857,11 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
         }
 
         // Calculate dr, dtheta (use from conditions.json if available, otherwise calculate)
-        const dr = AppState.analysisConditions.dr || (r_end - r_start) / (nr - 1);
-        const dtheta = AppState.analysisConditions.dtheta || polar.theta_range / (ntheta - 1);
+        const dr = analysisConditions.dr || (r_end - r_start) / (nr - 1);
+        const dtheta = analysisConditions.dtheta || polar.theta_range / (ntheta - 1);
 
         // Determine theta boundary conditions
-        const bc = AppState.analysisConditions.boundary_conditions || {};
+        const bc = analysisConditions.boundary_conditions || {};
         const thetaMinBC = bc.theta_min || {};
         const thetaMaxBC = bc.theta_max || {};
         const thetaPeriodic = (thetaMinBC.type === 'periodic' && thetaMaxBC.type === 'periodic');
@@ -5867,7 +6026,7 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
         // Cartesian with coarsening: full-grid step=1 stencil.
         // C++ exports interpolated Az at ALL cells (active + inactive via interpolateToFullGrid),
         // so use immediate ±1 neighbors to match non-coarsened behavior at material boundaries.
-        const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
+        const bc = analysisConditions ? analysisConditions.boundary_conditions : null;
         const x_periodic = bc && bc.left && bc.right &&
                           bc.left.type === 'periodic' && bc.right.type === 'periodic';
         const y_periodic = bc && bc.bottom && bc.top &&
@@ -5910,7 +6069,7 @@ function calculateMagneticField(Az, Mu, dx = 0.001, dy = 0.001, activeMask = nul
         // interpolates the scalar values directly — avoids vector-component artifacts.
     } else {
         // Cartesian coordinate magnetic field calculation (standard uniform grid)
-        const bc = AppState.analysisConditions ? AppState.analysisConditions.boundary_conditions : null;
+        const bc = analysisConditions ? analysisConditions.boundary_conditions : null;
         const x_periodic = bc && bc.left && bc.right &&
                           bc.left.type === 'periodic' && bc.right.type === 'periodic';
         const y_periodic = bc && bc.bottom && bc.top &&
@@ -6040,10 +6199,19 @@ function calculateMagnitude(Fx, Fy) {
     return magnitude;
 }
 
-async function loadQuickPreviewFromResult(resultPath) {
+async function loadQuickPreviewFromResult(resultPath, loadContext = null) {
     const step = 1; // Always show first step in preview
+    const previewB = document.getElementById('previewPlot2');
+    const previewH = document.getElementById('previewPlot3');
+    const bContext = loadContext
+        ? createResultPreviewRenderContext(loadContext, previewB)
+        : null;
+    const hContext = loadContext
+        ? createResultPreviewRenderContext(loadContext, previewH)
+        : null;
 
     try {
+        if (loadContext) assertResultLoadCurrent(loadContext);
         // Load Input Image (step_0001.png from InputImg folder)
         const inputImgContainer = document.getElementById('previewPlot1');
         inputImgContainer.innerHTML = `
@@ -6065,10 +6233,11 @@ async function loadQuickPreviewFromResult(resultPath) {
         let azFlat = null, muFlat = null;
         try {
             [azFlat, muFlat] = await Promise.all([
-                loadFieldData('Az', 1, resultPath),
-                loadFieldData('Mu', 1, resultPath),
+                loadFieldData('Az', 1, resultPath, loadContext?.controller.signal || null),
+                loadFieldData('Mu', 1, resultPath, loadContext?.controller.signal || null),
             ]);
         } catch (e) {
+            if ((e && e.name === 'AbortError') || (loadContext && !isResultLoadCurrent(loadContext))) throw e;
             console.warn('Quick preview load failed:', e.message);
         }
 
@@ -6082,27 +6251,63 @@ async function loadQuickPreviewFromResult(resultPath) {
             console.log('Grid spacing: dx =', dx, ', dy =', dy);
 
             // Load coarsening mask for coarsening-aware B/H computation
-            const maskResult = await getCoarseningMaskArray(resultPath, 1).catch(() => null);
+            const maskResult = await getCoarseningMaskArray(
+                resultPath,
+                1,
+                loadContext?.controller.signal || null
+            ).catch(error => {
+                if ((error && error.name === 'AbortError') ||
+                    error?.code === 'FIELD_MEMORY_BUDGET') throw error;
+                return null;
+            });
+            if (loadContext) assertResultLoadCurrent(loadContext);
             const activeMask = maskResult ? maskResult.mask : null;
 
-            const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
+            const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(
+                azFlipped,
+                muFlipped,
+                dx,
+                dy,
+                activeMask,
+                loadContext?.analysisConditions || AppState.analysisConditions
+            );
             console.log('B field calculated, Bx dimensions:', Bx.length, 'x', Bx[0]?.length);
             console.log('B magnitude dimensions:', B.length, 'x', B[0]?.length);
             console.log('H magnitude dimensions:', H.length, 'x', H[0]?.length);
             console.log('B magnitude sample values:', B[0]?.slice(0, 3));
 
             // Plot |B| and |H|
-            plotHeatmap('previewPlot2', B, '|B| [T]', true);
-            plotHeatmap('previewPlot3', H, '|H| [A/m]', true);
+            await Promise.all([
+                plotHeatmap(previewB, B, '|B| [T]', true, false, bContext),
+                plotHeatmap(previewH, H, '|H| [A/m]', true, false, hContext),
+            ]);
         } else {
-            document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
-            document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>';
+            if (loadContext) assertResultLoadCurrent(loadContext);
+            showPlotMessage(
+                previewB,
+                '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>',
+                bContext
+            );
+            showPlotMessage(
+                previewH,
+                '<p style="text-align:center; padding:20px;">Az/Mu data not available</p>',
+                hContext
+            );
         }
 
     } catch (error) {
+        if ((error && error.name === 'AbortError') || (loadContext && !isResultLoadCurrent(loadContext))) return;
         console.error('Preview error:', error);
-        document.getElementById('previewPlot2').innerHTML = '<p style="text-align:center; padding:20px;">Error loading preview</p>';
-        document.getElementById('previewPlot3').innerHTML = '<p style="text-align:center; padding:20px;">Error loading preview</p>';
+        showPlotMessage(
+            previewB,
+            '<p style="text-align:center; padding:20px;">Error loading preview</p>',
+            bContext
+        );
+        showPlotMessage(
+            previewH,
+            '<p style="text-align:center; padding:20px;">Error loading preview</p>',
+            hContext
+        );
     }
 }
 
@@ -6540,7 +6745,7 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
         console.error('addPlotWidget: No result selected');
         const container = document.getElementById(containerId);
         if (container) {
-            container.innerHTML = '<p style="color:red; padding:20px;">Please select a result first</p>';
+            showPlotMessage(container, '<p style="color:red; padding:20px;">Please select a result first</p>');
         }
         return;
     }
@@ -6559,35 +6764,359 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
         if (rect.width < 50 || rect.height < 50) {
             console.warn(`addPlotWidget: Container size too small, retrying...`);
             setTimeout(async () => {
+                const retryContainer = document.getElementById(containerId);
+                if (!retryContainer) return;
+                const step = AppState.currentStep;
+                const renderContext = createDashboardRenderContext(containerId, getCurrentResultPath(), step);
                 try {
-                    console.log(`addPlotWidget: Rendering ${plotType} in ${containerId} for step ${AppState.currentStep}`);
-                    await plotDef.render(containerId, AppState.currentStep);
+                    console.log(`addPlotWidget: Rendering ${plotType} in ${containerId} for step ${step}`);
+                    await plotDef.render(containerId, step, renderContext);
+                    assertRenderContextCurrent(renderContext, retryContainer);
                     console.log(`addPlotWidget: Successfully rendered ${plotType}`);
                 } catch (error) {
+                    if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, retryContainer)) {
+                        discardStaleRender(retryContainer, renderContext);
+                        return;
+                    }
                     console.error(`Error rendering ${plotType}:`, error);
                     console.error('Error stack:', error.stack);
-                    container.innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
+                    showPlotMessage(retryContainer, `<p style="color:red; padding:20px;">Error: ${error.message}</p>`, renderContext);
                 }
             }, 200);
             return;
         }
 
+        const step = AppState.currentStep;
+        const renderContext = createDashboardRenderContext(containerId, getCurrentResultPath(), step);
         try {
-            console.log(`addPlotWidget: Rendering ${plotType} in ${containerId} for step ${AppState.currentStep}`);
-            await plotDef.render(containerId, AppState.currentStep);
+            console.log(`addPlotWidget: Rendering ${plotType} in ${containerId} for step ${step}`);
+            await plotDef.render(containerId, step, renderContext);
+            assertRenderContextCurrent(renderContext, container);
             console.log(`addPlotWidget: Successfully rendered ${plotType}`);
         } catch (error) {
+            if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+                discardStaleRender(container, renderContext);
+                return;
+            }
             console.error(`Error rendering ${plotType}:`, error);
             console.error('Error stack:', error.stack);
-            container.innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
+            showPlotMessage(container, `<p style="color:red; padding:20px;">Error: ${error.message}</p>`, renderContext);
         }
     }, 100);
+}
+
+function removeZoomTracking(plotDiv) {
+    if (!plotDiv || !plotDiv._zoomTrackingHandler) return;
+    if (typeof plotDiv.removeListener === 'function') {
+        plotDiv.removeListener('plotly_relayout', plotDiv._zoomTrackingHandler);
+    }
+    delete plotDiv._zoomTrackingHandler;
+}
+
+function purgePlotlyTree(root) {
+    if (!root || typeof Plotly === 'undefined' || typeof Plotly.purge !== 'function') return;
+
+    const graphDivs = new Set();
+    if (root._fullLayout || root.data || root.classList?.contains('js-plotly-plot')) {
+        graphDivs.add(root);
+    }
+    root.querySelectorAll?.('.js-plotly-plot').forEach(div => graphDivs.add(div));
+    if (root._lineProfileImageDiv) graphDivs.add(root._lineProfileImageDiv);
+    if (root._fluxLinkagePlotDiv) graphDivs.add(root._fluxLinkagePlotDiv);
+
+    for (const graphDiv of graphDivs) {
+        try {
+            removeZoomTracking(graphDiv);
+            if (graphDiv._clickHandler) {
+                graphDiv.removeEventListener('click', graphDiv._clickHandler);
+                delete graphDiv._clickHandler;
+            }
+            Plotly.purge(graphDiv);
+        } catch (error) {
+            console.warn('Failed to purge Plotly graph:', error);
+        }
+    }
+
+    delete root._lineProfileImageDiv;
+    delete root._fluxLinkagePlotDiv;
+}
+
+function preparePlotlyContainer(container, renderContext = null) {
+    if (!container) return;
+    assertRenderContextCurrent(renderContext, container);
+    purgePlotlyTree(container);
+    container.innerHTML = '';
+    // Claim the cleared container for the new render immediately. Otherwise a
+    // superseded Plotly.newPlot() may resolve later, still see its old token,
+    // and purge a newer no-data/error message from the shared container.
+    if (renderContext) {
+        container._plotlyRenderToken = renderContext.token;
+    } else {
+        delete container._plotlyRenderToken;
+    }
+}
+
+function showPlotMessage(container, html, renderContext = null) {
+    if (!container) return;
+    assertRenderContextCurrent(renderContext, container);
+    preparePlotlyContainer(container, renderContext);
+    container.innerHTML = html;
+}
+
+function invalidateDashboardRenders(reason = '') {
+    AppState.dashboardRenderGeneration++;
+    if (AppState.dashboardRenderController) {
+        AppState.dashboardRenderController.abort();
+        AppState.dashboardRenderController = null;
+    }
+    for (const control of AppState.containerRenderControllers.values()) {
+        control.detachParentAbort?.();
+        control.controller.abort();
+    }
+    AppState.containerRenderControllers.clear();
+    if (reason) console.log(`Invalidated dashboard renders (${reason})`);
+}
+
+function createDashboardRenderContext(
+    containerId,
+    resultPath,
+    step,
+    generation = AppState.dashboardRenderGeneration,
+    requestController = null
+) {
+    const container = document.getElementById(containerId);
+    const previousControl = AppState.containerRenderControllers.get(containerId);
+    if (previousControl) {
+        previousControl.detachParentAbort?.();
+        previousControl.controller.abort();
+    }
+
+    const controller = new AbortController();
+    let detachParentAbort = null;
+    if (requestController) {
+        if (requestController.signal.aborted) {
+            controller.abort();
+        } else {
+            const abortFromParent = () => controller.abort();
+            requestController.signal.addEventListener('abort', abortFromParent, { once: true });
+            detachParentAbort = () => requestController.signal.removeEventListener('abort', abortFromParent);
+        }
+    }
+    AppState.containerRenderControllers.set(containerId, { controller, detachParentAbort });
+
+    const token = {};
+    const context = {
+        scope: 'dashboard',
+        generation,
+        resultPath,
+        step,
+        containerId,
+        container,
+        token,
+        controller,
+        requestController,
+        analysisConditions: AppState.analysisConditions,
+        polarView: snapshotPolarView(AppState.analysisConditions),
+    };
+    AppState.containerRenderTokens.set(containerId, token);
+    if (container) container._activeRenderToken = token;
+    return context;
+}
+
+function createFilePreviewRenderContext(previewContext, container) {
+    const token = {};
+    const context = {
+        scope: 'file-preview',
+        generation: previewContext.generation,
+        controller: previewContext.controller,
+        resultPath: previewContext.resultPath,
+        analysisConditions: previewContext.analysisConditions,
+        polarView: snapshotPolarView(previewContext.analysisConditions),
+        containerId: container.id,
+        container,
+        token,
+    };
+    container._activeRenderToken = token;
+    return context;
+}
+
+function createBHRenderContext(container) {
+    if (AppState.bhRenderController) AppState.bhRenderController.abort();
+    const controller = new AbortController();
+    const token = {};
+    const generation = ++AppState.bhRenderGeneration;
+    if (!container.id) container.id = `libBHPlot-${generation}`;
+    const context = {
+        scope: 'bh-library',
+        generation,
+        controller,
+        containerId: container.id,
+        container,
+        token,
+    };
+    AppState.bhRenderController = controller;
+    container._activeRenderToken = token;
+    return context;
+}
+
+function createResultPreviewRenderContext(loadContext, container) {
+    const token = {};
+    const context = {
+        scope: 'result-load',
+        resultLoadContext: loadContext,
+        resultPath: loadContext.resultPath,
+        analysisConditions: loadContext.analysisConditions || AppState.analysisConditions,
+        polarView: snapshotPolarView(loadContext.analysisConditions || AppState.analysisConditions),
+        containerId: container.id,
+        container,
+        token,
+    };
+    container._activeRenderToken = token;
+    return context;
+}
+
+function snapshotPolarView(analysisConditions) {
+    const isPolar = analysisConditions?.coordinate_system === 'polar';
+    const thetaRange = analysisConditions?.polar?.theta_range
+        || analysisConditions?.theta_range
+        || 0;
+    return Object.freeze({
+        isPolar,
+        cartesianTransform: isPolar && AppState.polarCartesianTransform,
+        fullModel: isPolar && AppState.polarFullModel,
+        fullModelMultiplier: isPolar ? calculateFullModelMultiplier(thetaRange) : 1,
+    });
+}
+
+function ensureDashboardRenderContext(containerId, step, renderContext = null) {
+    if (renderContext) return renderContext;
+    return createDashboardRenderContext(
+        containerId,
+        getCurrentResultPath(),
+        step,
+        AppState.dashboardRenderGeneration
+    );
+}
+
+function isRenderContextCurrent(renderContext, container = null) {
+    if (!renderContext) return true;
+    const expectedContainer = renderContext.container;
+    const target = container || expectedContainer;
+    if (!target || target !== expectedContainer || !target.isConnected ||
+        document.getElementById(renderContext.containerId) !== target ||
+        target._activeRenderToken !== renderContext.token) {
+        return false;
+    }
+
+    if (renderContext.scope === 'result-load') {
+        return isResultLoadCurrent(renderContext.resultLoadContext) &&
+               getCurrentResultPath() === renderContext.resultPath;
+    }
+
+    if (renderContext.scope === 'file-preview') {
+        return !renderContext.controller.signal.aborted &&
+               AppState.filePreviewGeneration === renderContext.generation &&
+               AppState.filePreviewController === renderContext.controller &&
+               AppState.filePreviewResultPath === renderContext.resultPath;
+    }
+
+    if (renderContext.scope === 'bh-library') {
+        return !renderContext.controller.signal.aborted &&
+               AppState.bhRenderGeneration === renderContext.generation &&
+               AppState.bhRenderController === renderContext.controller;
+    }
+
+    return renderContext.scope === 'dashboard' &&
+           !renderContext.controller.signal.aborted &&
+           AppState.dashboardRenderGeneration === renderContext.generation &&
+           AppState.containerRenderTokens.get(renderContext.containerId) === renderContext.token &&
+           getCurrentResultPath() === renderContext.resultPath &&
+           AppState.currentStep === renderContext.step;
+}
+
+function assertRenderContextCurrent(renderContext, container = null) {
+    if (!isRenderContextCurrent(renderContext, container)) {
+        throw createAbortError('Plot render superseded');
+    }
+}
+
+function purgeOwnedStaleRender(graphDiv, renderContext) {
+    if (!graphDiv || !renderContext) return;
+    if (graphDiv._plotlyRenderToken === renderContext.token ||
+        graphDiv._activeRenderToken === renderContext.token) {
+        purgePlotlyTree(graphDiv);
+    }
+}
+
+async function newPlotForRender(graphDiv, traces, layout, config, renderContext = null) {
+    assertRenderContextCurrent(renderContext);
+    if (renderContext) graphDiv._plotlyRenderToken = renderContext.token;
+    let plot;
+    try {
+        plot = await Plotly.newPlot(graphDiv, traces, layout, config);
+    } catch (error) {
+        // Widget cleanup can run while Plotly is still constructing a graph.
+        // If that detached graph later rejects, purge it regardless of token
+        // ownership because no newer connected render can own this node.
+        if (!graphDiv.isConnected) purgePlotlyTree(graphDiv);
+        throw error;
+    }
+    if (!graphDiv.isConnected) {
+        // cleanupPlotWidgetElement may already have removed both ownership
+        // tokens before Plotly.newPlot resolves. A detached graph is always
+        // disposable, so do not gate this purge on the old render token.
+        purgePlotlyTree(graphDiv);
+        throw createAbortError('Plot container detached during Plotly commit');
+    }
+    if (!isRenderContextCurrent(renderContext)) {
+        purgeOwnedStaleRender(graphDiv, renderContext);
+        throw createAbortError('Plot render superseded after Plotly commit');
+    }
+    return plot;
+}
+
+function discardStaleRender(container, renderContext) {
+    if (!container || !renderContext) return;
+    if (container._activeRenderToken === renderContext.token) {
+        preparePlotlyContainer(container);
+    }
+}
+
+function cleanupPlotWidgetElement(widgetEl) {
+    if (!widgetEl) return;
+    const content = widgetEl.querySelector('.grid-stack-item-content');
+    const containerId = content?.dataset.containerId;
+    const plotId = widgetEl.dataset.plotId || widgetEl.gridstackNode?.id ||
+                   (containerId ? containerId.replace(/^container-/, '') : null);
+    const container = containerId ? document.getElementById(containerId) : null;
+
+    if (containerId) {
+        AppState.containerRenderTokens.delete(containerId);
+        const control = AppState.containerRenderControllers.get(containerId);
+        if (control) {
+            control.detachParentAbort?.();
+            control.controller.abort();
+            AppState.containerRenderControllers.delete(containerId);
+        }
+    }
+    purgePlotlyTree(container || widgetEl);
+    if (container) {
+        delete container._activeRenderToken;
+        delete container._plotlyRenderToken;
+    }
+    if (containerId) {
+        delete AppState.plotZoomStates[containerId];
+        delete lineProfileState[containerId];
+        delete fluxLinkageState[containerId];
+    }
+    if (plotId) delete AppState.plotConfigs[plotId];
 }
 
 function removePlot(plotId) {
     const items = AppState.gridStack.engine.nodes;
     const item = items.find(n => n.id === plotId);
     if (item && item.el) {
+        cleanupPlotWidgetElement(item.el);
         AppState.gridStack.removeWidget(item.el);
     }
 }
@@ -6806,63 +7335,121 @@ function resetAllPlots() {
 // ===== Toggle Plotly Mode Bar =====
 function togglePlotlyModeBar(show) {
     AppState.showPlotlyModeBar = show;
-
-    // Update all existing plots
-    const containers = document.querySelectorAll('.plot-container[id^="container-"]');
-    containers.forEach(container => {
-        // Check if this is a Plotly plot
-        if (container._fullLayout) {
-            // Update mode bar visibility using Plotly.relayout
-            Plotly.relayout(container, {
-                'modebar.orientation': 'v'  // Trigger relayout
-            }).then(() => {
-                // Force mode bar visibility update
-                const config = { displayModeBar: show };
-                Plotly.react(container, container.data, container.layout, config);
-            }).catch(err => {
-                console.error('Failed to toggle mode bar:', err);
-            });
-        }
-    });
+    // Re-render through the same serialized generation/controller pipeline as
+    // step and result changes. Direct relayout().then(react) can otherwise
+    // recreate Plotly resources after a widget has already been removed.
+    refreshAllPlots();
 }
 
 // ===== Update All Plots =====
-async function updateAllPlots() {
-    if (!AppState.resultsData.currentResult) {
-        console.log('updateAllPlots: No result selected');
+async function runDashboardRenderRequest(request) {
+    if (request.controller.signal.aborted ||
+        request.generation !== AppState.dashboardRenderGeneration ||
+        request.resultPath !== getCurrentResultPath() ||
+        request.step !== AppState.currentStep) {
         return;
     }
 
-    // Get all plot containers from GridStack items
-    const contentElements = document.querySelectorAll('.grid-stack-item-content[data-plot-type]');
-    console.log(`updateAllPlots: Found ${contentElements.length} plots, currentStep=${AppState.currentStep}`);
+    const contentElements = Array.from(
+        document.querySelectorAll('.grid-stack-item-content[data-plot-type]')
+    );
+    console.log(`updateAllPlots: Found ${contentElements.length} plots, currentStep=${request.step}`);
 
     for (const contentElement of contentElements) {
+        if (request.controller.signal.aborted ||
+            request.generation !== AppState.dashboardRenderGeneration ||
+            request.resultPath !== getCurrentResultPath() ||
+            request.step !== AppState.currentStep) break;
+
         const plotType = contentElement.dataset.plotType;
         const containerId = contentElement.dataset.containerId;
         const container = document.getElementById(containerId);
+        const plotDefinition = plotDefinitions[plotType];
 
-        // Skip invalid plot types
-        if (!plotDefinitions[plotType]) {
+        if (!plotDefinition) {
             console.warn(`updateAllPlots: Skipping invalid plot type: ${plotType}`);
             continue;
         }
-
-        if (!container) {
-            console.warn(`updateAllPlots: Container not found: ${containerId}`);
+        if (!container || !container.isConnected ||
+            contentElement.dataset.containerId !== container.id) {
+            console.warn(`updateAllPlots: Container not available: ${containerId}`);
             continue;
         }
 
+        const renderContext = createDashboardRenderContext(
+            containerId,
+            request.resultPath,
+            request.step,
+            request.generation,
+            request.controller
+        );
         try {
-            console.log(`updateAllPlots: Rendering ${plotType} in ${containerId} for step ${AppState.currentStep}`);
-            await plotDefinitions[plotType].render(containerId, AppState.currentStep);
+            console.log(`updateAllPlots: Rendering ${plotType} in ${containerId} for step ${request.step}`);
+            await plotDefinition.render(containerId, request.step, renderContext);
+            if (!isRenderContextCurrent(renderContext, container)) {
+                discardStaleRender(container, renderContext);
+                if (request.controller.signal.aborted ||
+                    request.generation !== AppState.dashboardRenderGeneration ||
+                    request.resultPath !== getCurrentResultPath() ||
+                    request.step !== AppState.currentStep) break;
+                // A removed/re-rendered container is local staleness; it must
+                // not prevent the remaining widgets in this request rendering.
+                continue;
+            }
             console.log(`updateAllPlots: Successfully rendered ${plotType}`);
         } catch (error) {
+            if ((error && error.name === 'AbortError') ||
+                !isRenderContextCurrent(renderContext, container)) {
+                discardStaleRender(container, renderContext);
+                if (request.controller.signal.aborted ||
+                    request.generation !== AppState.dashboardRenderGeneration ||
+                    request.resultPath !== getCurrentResultPath() ||
+                    request.step !== AppState.currentStep) break;
+                continue;
+            }
             console.error(`Error updating ${plotType}:`, error);
             console.error('Error stack:', error.stack);
-            container.innerHTML = `<p style="color:red; padding:20px;">Error: ${error.message}</p>`;
+            showPlotMessage(
+                container,
+                `<p style="color:red; padding:20px;">Error: ${error.message}</p>`,
+                renderContext
+            );
         }
     }
+}
+
+function updateAllPlots() {
+    const resultPath = getCurrentResultPath();
+    if (!resultPath) {
+        console.log('updateAllPlots: No result selected');
+        return Promise.resolve();
+    }
+
+    if (AppState.dashboardRenderController) AppState.dashboardRenderController.abort();
+    for (const control of AppState.containerRenderControllers.values()) {
+        control.detachParentAbort?.();
+        control.controller.abort();
+    }
+    AppState.containerRenderControllers.clear();
+
+    const controller = new AbortController();
+    AppState.dashboardRenderController = controller;
+    const request = {
+        generation: ++AppState.dashboardRenderGeneration,
+        resultPath,
+        step: AppState.currentStep,
+        controller,
+    };
+    const queued = AppState.dashboardRenderQueue
+        .catch(error => console.error('Previous dashboard render failed:', error))
+        .then(() => runDashboardRenderRequest(request))
+        .finally(() => {
+            if (AppState.dashboardRenderController === controller) {
+                AppState.dashboardRenderController = null;
+            }
+        });
+    AppState.dashboardRenderQueue = queued;
+    return queued;
 }
 
 // ===== Animation Controls =====
@@ -6870,27 +7457,49 @@ function playAnimation() {
     if (AppState.isAnimating || AppState.totalSteps <= 1) return;
 
     AppState.isAnimating = true;
+    const runId = ++AppState.animationRunId;
     document.getElementById('playBtn').style.display = 'none';
     document.getElementById('pauseBtn').style.display = 'inline-block';
 
-    const speed = parseInt(document.getElementById('animSpeed').value);
+    const scheduleNext = (delay) => {
+        AppState.animationTimer = setTimeout(async () => {
+            if (!AppState.isAnimating || AppState.animationRunId !== runId) return;
+            const startedAt = performance.now();
 
-    AppState.animationTimer = setInterval(async () => {
-        AppState.currentStep++;
-        if (AppState.currentStep > AppState.totalSteps) {
-            AppState.currentStep = 1; // Loop
-        }
+            AppState.currentStep++;
+            if (AppState.currentStep > AppState.totalSteps) {
+                AppState.currentStep = 1; // Loop
+            }
 
-        document.getElementById('stepSlider').value = AppState.currentStep;
-        document.getElementById('currentStep').textContent = AppState.currentStep;
+            document.getElementById('stepSlider').value = AppState.currentStep;
+            document.getElementById('currentStep').textContent = AppState.currentStep;
 
-        await updateAllPlots();
-    }, speed);
+            try {
+                // Schedule the next frame only after this render completes, so
+                // full-grid calculations and Plotly updates never overlap.
+                await updateAllPlots();
+            } catch (error) {
+                if (!error || error.name !== 'AbortError') {
+                    console.error('Animation render failed:', error);
+                }
+                pauseAnimation();
+            } finally {
+                if (!AppState.isAnimating || AppState.animationRunId !== runId) return;
+                const speed = Math.max(16, parseInt(document.getElementById('animSpeed').value, 10) || 1000);
+                const elapsed = performance.now() - startedAt;
+                scheduleNext(Math.max(0, speed - elapsed));
+            }
+        }, delay);
+    };
+
+    const initialSpeed = Math.max(16, parseInt(document.getElementById('animSpeed').value, 10) || 1000);
+    scheduleNext(initialSpeed);
 }
 
 function pauseAnimation() {
+    AppState.animationRunId++;
     if (AppState.animationTimer) {
-        clearInterval(AppState.animationTimer);
+        clearTimeout(AppState.animationTimer);
         AppState.animationTimer = null;
     }
 
@@ -6899,12 +7508,214 @@ function pauseAnimation() {
     document.getElementById('pauseBtn').style.display = 'none';
 }
 
+function estimateFieldDataBytes(value) {
+    const seen = new Set();
+    const stack = [value];
+    let bytes = 0;
+
+    while (stack.length > 0) {
+        const current = stack.pop();
+        if (current == null || seen.has(current)) continue;
+
+        if (ArrayBuffer.isView(current)) {
+            seen.add(current);
+            bytes += FIELD_CACHE_ARRAY_OVERHEAD_BYTES + current.byteLength;
+            continue;
+        }
+        if (current instanceof ArrayBuffer) {
+            seen.add(current);
+            bytes += FIELD_CACHE_ARRAY_OVERHEAD_BYTES + current.byteLength;
+            continue;
+        }
+        if (!Array.isArray(current)) continue;
+
+        seen.add(current);
+        bytes += FIELD_CACHE_ARRAY_OVERHEAD_BYTES + current.length * 8;
+        for (const item of current) {
+            if (Array.isArray(item) || ArrayBuffer.isView(item) || item instanceof ArrayBuffer) {
+                stack.push(item);
+            }
+        }
+    }
+
+    return Math.max(bytes, FIELD_CACHE_ARRAY_OVERHEAD_BYTES);
+}
+
+function formatFieldCacheBytes(bytes) {
+    if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+    if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    return `${bytes} B`;
+}
+
+function retainPinnedFieldData(data, bytes) {
+    let ref = AppState.fieldViewPinRefs.get(data);
+    if (!ref) {
+        ref = { bytes, count: 0 };
+        AppState.fieldViewPinRefs.set(data, ref);
+        AppState.fieldViewPinnedBytes += bytes;
+    }
+    ref.count++;
+}
+
+function releasePinnedFieldData(data) {
+    const ref = AppState.fieldViewPinRefs.get(data);
+    if (!ref) return;
+    ref.count = Math.max(0, ref.count - 1);
+    if (ref.count !== 0) return;
+    AppState.fieldViewPinnedBytes = Math.max(
+        0,
+        AppState.fieldViewPinnedBytes - ref.bytes
+    );
+    AppState.fieldViewPinRefs.delete(data);
+}
+
+function pinFieldDataForSignal(cacheKey, data, signal) {
+    if (!signal || signal.aborted || data == null) return;
+    let pin = AppState.fieldViewPins.get(signal);
+    if (!pin) {
+        pin = { fields: new Map() };
+        AppState.fieldViewPins.set(signal, pin);
+        signal.addEventListener('abort', () => {
+            const current = AppState.fieldViewPins.get(signal);
+            if (current !== pin) return;
+            for (const field of pin.fields.values()) {
+                releasePinnedFieldData(field.data);
+            }
+            pin.fields.clear();
+            AppState.fieldViewPins.delete(signal);
+        }, { once: true });
+    }
+
+    const existing = pin.fields.get(cacheKey);
+    if (existing?.data === data) return;
+    if (existing) {
+        releasePinnedFieldData(existing.data);
+    }
+    const bytes = estimateFieldDataBytes(data);
+    pin.fields.set(cacheKey, { data, bytes });
+    retainPinnedFieldData(data, bytes);
+}
+
+function evictFieldCacheEntry(cacheKey) {
+    if (!Object.prototype.hasOwnProperty.call(AppState.dataCache, cacheKey)) return;
+    AppState.dataCacheBytes = Math.max(
+        0,
+        AppState.dataCacheBytes - (AppState.dataCacheSizes[cacheKey] || 0)
+    );
+    delete AppState.dataCache[cacheKey];
+    delete AppState.dataMeta[cacheKey];
+    delete AppState.dataCacheSizes[cacheKey];
+    AppState.dataCacheLru.delete(cacheKey);
+}
+
+function getCachedFieldData(cacheKey) {
+    if (!Object.prototype.hasOwnProperty.call(AppState.dataCache, cacheKey)) return undefined;
+    const data = AppState.dataCache[cacheKey];
+    AppState.dataCacheLru.delete(cacheKey);
+    AppState.dataCacheLru.set(cacheKey, true);
+    return data;
+}
+
+function cacheFieldData(cacheKey, data, meta) {
+    const sizeBytes = estimateFieldDataBytes(data);
+    const budgetBytes = AppState.dataCacheBudgetBytes;
+
+    if (Object.prototype.hasOwnProperty.call(AppState.dataCache, cacheKey)) {
+        evictFieldCacheEntry(cacheKey);
+    }
+    if (sizeBytes > budgetBytes) {
+        console.warn(
+            `Field ${cacheKey} is ${formatFieldCacheBytes(sizeBytes)}, larger than the ` +
+            `${formatFieldCacheBytes(budgetBytes)} cache budget; returning it without caching`
+        );
+        return false;
+    }
+
+    while (AppState.dataCacheBytes + sizeBytes > budgetBytes && AppState.dataCacheLru.size > 0) {
+        const oldestKey = AppState.dataCacheLru.keys().next().value;
+        evictFieldCacheEntry(oldestKey);
+    }
+
+    AppState.dataCache[cacheKey] = data;
+    AppState.dataMeta[cacheKey] = meta;
+    AppState.dataCacheSizes[cacheKey] = sizeBytes;
+    AppState.dataCacheLru.set(cacheKey, true);
+    AppState.dataCacheBytes += sizeBytes;
+    return true;
+}
+
+function cacheFieldPairAtomically(entries) {
+    const pending = entries.filter(entry =>
+        !Object.prototype.hasOwnProperty.call(AppState.dataCache, entry.cacheKey)
+    ).map(entry => ({ ...entry, sizeBytes: estimateFieldDataBytes(entry.data) }));
+    const pendingBytes = pending.reduce((sum, entry) => sum + entry.sizeBytes, 0);
+
+    // Preload never evicts existing entries speculatively. Both decoded fields
+    // are committed in one synchronous section only when the pair fits; a
+    // failed/oversized pair therefore needs no rollback and cannot delete a
+    // pre-existing Az or Mu entry.
+    if (pending.some(entry => entry.sizeBytes > AppState.dataCacheBudgetBytes) ||
+        AppState.dataCacheBytes + pendingBytes > AppState.dataCacheBudgetBytes) {
+        return false;
+    }
+
+    for (const entry of pending) {
+        AppState.dataCache[entry.cacheKey] = entry.data;
+        AppState.dataMeta[entry.cacheKey] = entry.meta;
+        AppState.dataCacheSizes[entry.cacheKey] = entry.sizeBytes;
+        AppState.dataCacheLru.set(entry.cacheKey, true);
+        AppState.dataCacheBytes += entry.sizeBytes;
+    }
+    for (const entry of entries) {
+        AppState.dataCacheLru.delete(entry.cacheKey);
+        AppState.dataCacheLru.set(entry.cacheKey, true);
+    }
+    AppState.lastFieldMeta = entries[entries.length - 1]?.meta || AppState.lastFieldMeta;
+    updateExportFormatBadge();
+    return entries.every(entry =>
+        Object.prototype.hasOwnProperty.call(AppState.dataCache, entry.cacheKey)
+    );
+}
+
+function clearFieldDataCache(reason = '') {
+    const previousBytes = AppState.dataCacheBytes;
+    AppState.dataCache = {};
+    AppState.dataMeta = {};
+    AppState.dataCacheSizes = {};
+    AppState.dataCacheLru.clear();
+    AppState.dataCacheBytes = 0;
+    AppState.lastFieldMeta = null;
+    if (previousBytes > 0) {
+        console.log(
+            `Cleared ${formatFieldCacheBytes(previousBytes)} of field cache` +
+            (reason ? ` (${reason})` : '')
+        );
+    }
+}
+
+function invalidateFieldLoads(reason = '') {
+    AppState.fieldLoadGeneration++;
+    // Result changes invalidate dashboard/preload consumers, not the shared
+    // physical payload itself. A File Manager preview may legitimately be
+    // reading a different result at the same time. Shared requests are
+    // cancelled by releaseSharedFieldPayload() only after their last consumer
+    // has left.
+    AppState.fieldPreloadController?.abort();
+    AppState.fieldPreloadController = null;
+    if (reason) console.log(`Invalidated field loads (${reason})`);
+}
+
 async function preloadAllSteps() {
     const currentResult = AppState.resultsData.currentResult;
     if (!currentResult || AppState.totalSteps <= 0) {
         alert('Please select analysis results first');
         return;
     }
+    const preloadGeneration = AppState.fieldLoadGeneration;
+    const preloadResultLoadGeneration = AppState.resultLoadGeneration;
+    AppState.fieldPreloadController?.abort();
+    const preloadController = new AbortController();
+    AppState.fieldPreloadController = preloadController;
 
     const btn = document.getElementById('preloadBtn');
     if (!btn) return;
@@ -6913,94 +7724,202 @@ async function preloadAllSteps() {
     const originalText = btn.textContent;
 
     try {
-        // Check if preload would exceed cache limit (Az + Mu = 2 entries per step)
-        const estimatedCacheEntries = AppState.totalSteps * 2;
-        if (estimatedCacheEntries > AppState.maxCacheEntries) {
-            const proceed = confirm(
-                `Warning: Preloading ${AppState.totalSteps} steps (${estimatedCacheEntries} cache entries) ` +
-                `exceeds the limit of ${AppState.maxCacheEntries}.\n\n` +
-                `This may consume ~${Math.round(estimatedCacheEntries * 2)}MB of memory.\n\n` +
-                `Continue anyway? (Cache will be cleared if limit is reached)`
-            );
-            if (!proceed) {
-                btn.disabled = false;
-                return;
-            }
-        }
-
-        console.log(`Starting preload of ${AppState.totalSteps} steps (estimated ${estimatedCacheEntries} entries)`);
+        console.log(
+            `Starting preload of ${AppState.totalSteps} steps with ` +
+            `${formatFieldCacheBytes(AppState.dataCacheBudgetBytes)} cache budget`
+        );
+        let previousStepBytes = 0;
+        let loadedSteps = 0;
+        let stoppedForBudget = false;
+        let stoppedForError = false;
 
         for (let step = 1; step <= AppState.totalSteps; step++) {
+            if (preloadGeneration !== AppState.fieldLoadGeneration ||
+                preloadResultLoadGeneration !== AppState.resultLoadGeneration ||
+                preloadController.signal.aborted ||
+                getCurrentResultPath() !== currentResult) {
+                const error = new Error('Preload invalidated');
+                error.name = 'AbortError';
+                throw error;
+            }
             btn.textContent = `Loading ${step}/${AppState.totalSteps}`;
+            const azKey = `${currentResult}:Az:${step}`;
+            const muKey = `${currentResult}:Mu:${step}`;
+            const pairAlreadyCached =
+                Object.prototype.hasOwnProperty.call(AppState.dataCache, azKey) &&
+                Object.prototype.hasOwnProperty.call(AppState.dataCache, muKey);
 
-            // Cap before issuing requests so we don't blow past the limit on
-            // the last iteration.
-            const currentCacheSize = Object.keys(AppState.dataCache).length;
-            if (currentCacheSize >= AppState.maxCacheEntries) {
-                console.warn(`Cache limit reached during preload at step ${step}/${AppState.totalSteps}, stopping`);
-                btn.textContent = `Stopped at ${step}/${AppState.totalSteps}`;
-                setTimeout(() => { btn.textContent = originalText; }, 3000);
+            // Field dimensions are stable within a result. Once one step has
+            // been measured, stop before the next step would force LRU
+            // eviction; decoding every step only to evict earlier ones wastes
+            // both I/O and peak memory.
+            if (!pairAlreadyCached && previousStepBytes > 0 &&
+                AppState.dataCacheBytes + previousStepBytes > AppState.dataCacheBudgetBytes) {
+                stoppedForBudget = true;
                 break;
             }
 
-            // Preload Az and Mu via the shared loader so TIFF/CSV are decoded
-            // uniformly (server picks the format, browser does the work for
-            // TIFF). loadFieldData populates cache + dataMeta as a side effect.
+            // Decode missing halves sequentially to limit simultaneous TIFF
+            // decode pressure, then commit Az+Mu as one cache transaction.
+            let azLease = null;
+            let muLease = null;
+            let cachedAzPinController = null;
             try {
-                await Promise.all([
-                    loadFieldData('Az', step, currentResult),
-                    loadFieldData('Mu', step, currentResult),
-                ]);
-            } catch (e) {
-                console.warn(`Preload failed at step ${step}:`, e.message);
-            }
+                const azWasCached = Object.prototype.hasOwnProperty.call(AppState.dataCache, azKey);
+                if (!azWasCached) {
+                    azLease = await loadFieldDataForPreload(
+                        'Az',
+                        step,
+                        currentResult,
+                        preloadController.signal
+                    );
+                }
+                const azEntry = azWasCached
+                    ? { data: AppState.dataCache[azKey], meta: AppState.dataMeta[azKey] }
+                    : azLease.payload;
+                const azPendingBytes = azWasCached ? 0 : estimateFieldDataBytes(azEntry.data);
+                const muWasCached = Object.prototype.hasOwnProperty.call(AppState.dataCache, muKey);
+                if (azWasCached && !muWasCached) {
+                    // The next decode may evict Az from the LRU, but this
+                    // step-local reference remains live until the pair commit.
+                    // Charge it explicitly so eviction cannot hide it from the
+                    // working-memory decision.
+                    cachedAzPinController = new AbortController();
+                    pinFieldDataForSignal(
+                        azKey,
+                        azEntry.data,
+                        cachedAzPinController.signal
+                    );
+                }
+                // Az and Mu share one grid shape, so Az's measured decoded size
+                // is a conservative predictor for a missing Mu field. Reserve
+                // one additional Mu-sized block for its decode workspace. This
+                // prevents preload from retaining Az and only then discovering
+                // that Mu pushes the browser far beyond the cache budget.
+                const projectedMuBytes = muWasCached
+                    ? 0
+                    : (AppState.dataCacheSizes[azKey] || azPendingBytes);
+                const projectedMuPeakBytes = muWasCached
+                    ? 0
+                    : Math.max(
+                        FIELD_UNKNOWN_DECODE_RESERVATION_BYTES,
+                        projectedMuBytes * 3
+                    );
+                const pairWouldExceedCache =
+                    AppState.dataCacheBytes +
+                    azPendingBytes +
+                    projectedMuBytes >
+                    AppState.dataCacheBudgetBytes;
+                const decodeWouldExceedWorkingBudget =
+                    AppState.dataCacheBytes +
+                    AppState.fieldPayloadStagingBytes +
+                    AppState.fieldViewPinnedBytes +
+                    projectedMuPeakBytes >
+                    FIELD_WORKING_MEMORY_BUDGET_BYTES;
+                if (pairWouldExceedCache || decodeWouldExceedWorkingBudget) {
+                    stoppedForBudget = true;
+                    break;
+                }
+                if (!muWasCached) {
+                    muLease = await loadFieldDataForPreload(
+                        'Mu',
+                        step,
+                        currentResult,
+                        preloadController.signal
+                    );
+                }
+                const muEntry = muWasCached
+                    ? { data: AppState.dataCache[muKey], meta: AppState.dataMeta[muKey] }
+                    : muLease.payload;
 
-            // Preload force data if available
-            const forceData = await loadForceData(step);
-            if (forceData) {
-                const cacheKey = `${currentResult}:Force:${step}`;
-                AppState.dataCache[cacheKey] = forceData;
+                const committed = cacheFieldPairAtomically([
+                    { cacheKey: azKey, ...azEntry },
+                    { cacheKey: muKey, ...muEntry },
+                ]);
+                if (!committed) {
+                    stoppedForBudget = true;
+                    break;
+                }
+                azLease?.markCached();
+                muLease?.markCached();
+                previousStepBytes = (AppState.dataCacheSizes[azKey] || 0) +
+                                    (AppState.dataCacheSizes[muKey] || 0);
+                loadedSteps++;
+            } catch (e) {
+                if (e && e.name === 'AbortError') throw e;
+                if (e && e.code === 'FIELD_MEMORY_BUDGET') {
+                    console.warn(`Preload stopped at step ${step}: ${e.message}`);
+                    stoppedForBudget = true;
+                    break;
+                }
+                console.warn(`Preload failed at step ${step}:`, e.message);
+                stoppedForError = true;
+                break;
+            } finally {
+                // Keep decoded payloads leased through the pair commit so a
+                // normal widget requesting the same field reuses them instead
+                // of starting a duplicate fetch/decode in the staging window.
+                muLease?.release();
+                azLease?.release();
+                cachedAzPinController?.abort();
             }
 
             // Small delay to prevent overwhelming the server
             if (step < AppState.totalSteps) {
-                await new Promise(resolve => setTimeout(resolve, 10));
+                await awaitWithAbortSignal(
+                    new Promise(resolve => setTimeout(resolve, 10)),
+                    preloadController.signal,
+                    'Preload invalidated'
+                );
             }
         }
 
-        const cacheSize = Object.keys(AppState.dataCache).length;
-        console.log(`Preload complete: ${AppState.totalSteps} steps cached (${cacheSize} entries)`);
-        btn.textContent = 'Preloaded ✓';
+        const cacheEntries = AppState.dataCacheLru.size;
+        console.log(
+            `Preload complete: ${loadedSteps}/${AppState.totalSteps} steps, ` +
+            `${cacheEntries} fields / ${formatFieldCacheBytes(AppState.dataCacheBytes)}`
+        );
+        btn.textContent = stoppedForBudget
+            ? `Cached ${loadedSteps}/${AppState.totalSteps} (memory limit)`
+            : stoppedForError
+                ? `Stopped ${loadedSteps}/${AppState.totalSteps}`
+                : 'Preloaded ✓';
         setTimeout(() => {
             btn.textContent = originalText;
-        }, 2000);
+        }, (stoppedForBudget || stoppedForError) ? 3000 : 2000);
 
     } catch (error) {
-        console.error('Preload error:', error);
-        alert(`Preload failed: ${error.message}`);
+        if (error && error.name === 'AbortError') {
+            console.log('Preload cancelled because the field-data context changed');
+        } else {
+            console.error('Preload error:', error);
+            alert(`Preload failed: ${error.message}`);
+        }
         btn.textContent = originalText;
     } finally {
+        if (AppState.fieldPreloadController === preloadController) {
+            AppState.fieldPreloadController = null;
+        }
         btn.disabled = false;
     }
-}
-
-async function onStepChange() {
-    AppState.currentStep = parseInt(document.getElementById('stepSlider').value);
-    document.getElementById('currentStep').textContent = AppState.currentStep;
-
-    // Update all plots
-    await updateAllPlots();
 }
 
 function setStep(step) {
     pauseAnimation();
     AppState.currentStep = step;
+    const slider = document.getElementById('stepSlider');
+    if (slider) slider.value = step;
     document.getElementById('currentStep').textContent = step;
-    updateAllPlots();
+    return updateAllPlots();
 }
 
 function clearDashboard() {
     if (AppState.gridStack) {
+        pauseAnimation();
+        invalidateDashboardRenders('dashboard cleared');
+        document.querySelectorAll('#dashboard-grid .grid-stack-item')
+            .forEach(cleanupPlotWidgetElement);
+        AppState.containerRenderTokens.clear();
         AppState.gridStack.removeAll();
     }
 }
@@ -7040,9 +7959,8 @@ function updateExportFormatBadge() {
     let line = `Source intent: ${fmt} (${prec})${asyncFlag}`;
     // If we've already loaded any field, append what the server actually
     // returned (useful when format=both — server picks tiff first).
-    const metaKeys = Object.keys(AppState.dataMeta || {});
-    if (metaKeys.length > 0) {
-        const last = AppState.dataMeta[metaKeys[metaKeys.length - 1]];
+    const last = AppState.lastFieldMeta;
+    if (last) {
         if (last && last.format) {
             line += ` — served: ${last.format} (${last.precision || '?'})`;
         }
@@ -7054,21 +7972,105 @@ function updateExportFormatBadge() {
 // a 2D JS array. NaN bit patterns become null so the existing
 // _fillInactiveScalar() Gauss-Seidel filler treats them as gaps. Y-axis is
 // reversed to match the legacy CSV path (image coords).
-async function decodeTiffArrayBuffer(arrayBuffer) {
+function reserveFieldDecodeWorkspace(bytes, label = 'field decode') {
+    const requested = Math.max(
+        FIELD_UNKNOWN_DECODE_RESERVATION_BYTES,
+        Math.ceil(Number(bytes) || 0)
+    );
+    AppState.fieldDecodeReservedBytes = Math.max(
+        AppState.fieldDecodeReservedBytes,
+        requested
+    );
+
+    // Keep one bounded decode workspace in addition to retained/staged field
+    // arrays. Cache entries are safe to discard because renderers already hold
+    // their own references while drawing.
+    while (
+        AppState.dataCacheLru.size > 0 &&
+        AppState.dataCacheBytes +
+            AppState.fieldPayloadStagingBytes +
+            AppState.fieldViewPinnedBytes +
+            AppState.fieldDecodeReservedBytes >
+            FIELD_WORKING_MEMORY_BUDGET_BYTES
+    ) {
+        const oldestKey = AppState.dataCacheLru.keys().next().value;
+        evictFieldCacheEntry(oldestKey);
+    }
+
+    const estimatedWorkingBytes =
+        AppState.dataCacheBytes +
+        AppState.fieldPayloadStagingBytes +
+        AppState.fieldViewPinnedBytes +
+        AppState.fieldDecodeReservedBytes;
+    if (estimatedWorkingBytes > FIELD_WORKING_MEMORY_BUDGET_BYTES) {
+        const error = new Error(
+            `${label} was stopped before allocating about ` +
+            `${formatFieldCacheBytes(requested)} because active views and ` +
+            `field data would exceed the ` +
+            `${formatFieldCacheBytes(FIELD_WORKING_MEMORY_BUDGET_BYTES)} ` +
+            'browser working-memory budget'
+        );
+        error.name = 'FieldMemoryBudgetError';
+        error.code = 'FIELD_MEMORY_BUDGET';
+        throw error;
+    }
+}
+
+async function runSerializedFieldDecode(task, signal) {
+    const previous = AppState.fieldDecodeTail;
+    const turn = previous.catch(() => {}).then(async () => {
+        if (signal?.aborted) throw createAbortError('Field decode cancelled');
+        AppState.fieldDecodeReservedBytes = 0;
+        reserveFieldDecodeWorkspace(
+            FIELD_UNKNOWN_DECODE_RESERVATION_BYTES,
+            'Field decode'
+        );
+        try {
+            return await task();
+        } finally {
+            AppState.fieldDecodeReservedBytes = 0;
+        }
+    });
+    // Keep the queue usable after either a decode failure or cancellation.
+    AppState.fieldDecodeTail = turn.then(() => undefined, () => undefined);
+    return await awaitWithAbortSignal(turn, signal, 'Field decode cancelled');
+}
+
+async function decodeTiffArrayBuffer(arrayBuffer, signal = null) {
     if (typeof GeoTIFF === 'undefined') {
         throw new Error('GeoTIFF library not loaded (expected at /lib/geotiff.js)');
     }
+    if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
     const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
+    if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
     const image = await tiff.getImage();
-    const rasters = await image.readRasters();
+    if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
     const width = image.getWidth();
     const height = image.getHeight();
-    const raster = rasters[0];
     const bps = image.getBitsPerSample();
+    const bytesPerSample = bps === 64 ? 8 : 4;
+    // Account for the source ArrayBuffer, GeoTIFF/raster workspace and the
+    // final JS row arrays. The multiplier deliberately leaves headroom for
+    // decoder temporaries that are not directly observable from JavaScript.
+    reserveFieldDecodeWorkspace(
+        arrayBuffer.byteLength * 2 +
+            width * height * (bytesPerSample + 24) +
+            height * FIELD_CACHE_ARRAY_OVERHEAD_BYTES,
+        'TIFF field decode'
+    );
+    const rasters = await image.readRasters();
+    if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
+    const raster = rasters[0];
     const precision = bps === 64 ? 'double' : 'float';
 
     const data = new Array(height);
     for (let j = 0; j < height; j++) {
+        if (j > 0 && j % 64 === 0) {
+            // Yield to the browser so a superseding view can deliver its abort
+            // event instead of waiting for the full row conversion.
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
         const row = new Array(width);
         for (let i = 0; i < width; i++) {
             const v = raster[j * width + i];
@@ -7080,161 +8082,436 @@ async function decodeTiffArrayBuffer(arrayBuffer) {
     return { data, precision };
 }
 
+async function fetchDecodedFieldPayload(
+    dataType,
+    step,
+    resultPath,
+    signal,
+    onDecoded = null
+) {
+    return await runSerializedFieldDecode(async () => {
+        const file = `${dataType}/${formatStepFilename(step)}`;
+        const response = await fetch(
+            `/api/load-field?result=${encodeURIComponent(resultPath)}&file=${file}`,
+            { signal }
+        );
+        if (!response.ok) {
+            throw new Error(`Failed to load ${dataType} data (HTTP ${response.status})`);
+        }
+
+        const contentLength = Math.max(
+            0,
+            Number(response.headers.get('Content-Length')) || 0
+        );
+        const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
+        if (contentType.startsWith('image/tiff')) {
+            reserveFieldDecodeWorkspace(
+                Math.max(
+                    FIELD_UNKNOWN_DECODE_RESERVATION_BYTES,
+                    contentLength * 8
+                ),
+                'TIFF response'
+            );
+            const arrayBuffer = await response.arrayBuffer();
+            if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
+            const decoded = await decodeTiffArrayBuffer(arrayBuffer, signal);
+            if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
+            const payload = {
+                data: decoded.data,
+                meta: { format: 'tiff', precision: decoded.precision },
+            };
+            onDecoded?.(payload);
+            return payload;
+        }
+
+        reserveFieldDecodeWorkspace(
+            Math.max(
+                FIELD_UNKNOWN_DECODE_RESERVATION_BYTES,
+                contentLength * 6
+            ),
+            'JSON field response'
+        );
+        const result = await response.json();
+        if (signal?.aborted) throw createAbortError('JSON field decode cancelled');
+        if (!result.success) {
+            throw new Error(`Failed to parse ${dataType} data: ${result.error || 'unknown error'}`);
+        }
+        reserveFieldDecodeWorkspace(
+            contentLength * 2 + estimateFieldDataBytes(result.data) * 2,
+            'JSON field decode'
+        );
+        const payload = {
+            data: result.data,
+            meta: {
+                format: result.format || 'csv',
+                precision: result.precision || 'double',
+            },
+        };
+        onDecoded?.(payload);
+        return payload;
+    }, signal);
+}
+
+function awaitWithAbortSignal(promise, signal, message = 'Request superseded') {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(createAbortError(message));
+    return new Promise((resolve, reject) => {
+        const onAbort = () => reject(createAbortError(message));
+        signal.addEventListener('abort', onAbort, { once: true });
+        promise.then(
+            value => {
+                signal.removeEventListener('abort', onAbort);
+                resolve(value);
+            },
+            error => {
+                signal.removeEventListener('abort', onAbort);
+                reject(error);
+            }
+        );
+    });
+}
+
+function getSharedFieldPayloadEntry(dataType, step, resultPath) {
+    const cacheKey = `${resultPath}:${dataType}:${step}`;
+    const existing = AppState.fieldPayloadsInFlight.get(cacheKey);
+    if (existing) return existing;
+
+    const controller = new AbortController();
+    const entry = {
+        cacheKey,
+        controller,
+        consumers: 0,
+        settled: false,
+        stagingBytes: 0,
+        promise: null,
+    };
+    entry.promise = (async () => {
+        try {
+            const payload = await fetchDecodedFieldPayload(
+                dataType,
+                step,
+                resultPath,
+                controller.signal,
+                decodedPayload => {
+                    if (controller.signal.aborted || entry.consumers === 0) return;
+                    entry.stagingBytes = estimateFieldDataBytes(decodedPayload.data);
+                    AppState.fieldPayloadStagingBytes += entry.stagingBytes;
+                }
+            );
+            if (controller.signal.aborted) {
+                throw createAbortError('Field payload invalidated');
+            }
+            return payload;
+        } finally {
+            entry.settled = true;
+        }
+    })();
+    AppState.fieldPayloadsInFlight.set(cacheKey, entry);
+    // A rejection may happen after every caller has cancelled its await.
+    // Attach a handler here so abort-driven disposal never produces an
+    // unhandled rejection.
+    entry.promise.catch(() => {});
+    return entry;
+}
+
+function releaseSharedFieldPayload(entry) {
+    if (!entry) return;
+    entry.consumers = Math.max(0, entry.consumers - 1);
+    if (entry.consumers !== 0) return;
+
+    if (AppState.fieldPayloadsInFlight.get(entry.cacheKey) === entry) {
+        AppState.fieldPayloadsInFlight.delete(entry.cacheKey);
+    }
+    if (entry.stagingBytes > 0) {
+        AppState.fieldPayloadStagingBytes = Math.max(
+            0,
+            AppState.fieldPayloadStagingBytes - entry.stagingBytes
+        );
+        entry.stagingBytes = 0;
+    }
+    // If the final consumer leaves before fetch/decode settles, no useful
+    // owner remains. Abort the physical request as well as the caller await.
+    if (!entry.settled && !entry.controller.signal.aborted) {
+        entry.controller.abort();
+    }
+}
+
+function markSharedFieldPayloadCached(entry) {
+    if (!entry) return;
+    // Keep staging bytes charged until the final lease is released. Another
+    // consumer (for example File Preview) may still hold the same array after
+    // the cache copy is evicted. Temporary double-accounting is intentional
+    // and safer than hiding that live reference from the working-set budget.
+    entry.cached = true;
+}
+
+async function acquireSharedFieldPayload(
+    dataType,
+    step,
+    resultPath,
+    callerSignal = null
+) {
+    const entry = getSharedFieldPayloadEntry(dataType, step, resultPath);
+    entry.consumers++;
+    try {
+        const payload = await awaitWithAbortSignal(
+            entry.promise,
+            callerSignal,
+            'Field payload consumer superseded'
+        );
+        let released = false;
+        return {
+            payload,
+            markCached() {
+                markSharedFieldPayloadCached(entry);
+            },
+            release() {
+                if (released) return;
+                released = true;
+                releaseSharedFieldPayload(entry);
+            },
+        };
+    } catch (error) {
+        releaseSharedFieldPayload(entry);
+        throw error;
+    }
+}
+
+async function loadFieldDataForPreload(dataType, step, resultPath, callerSignal = null) {
+    const generation = AppState.fieldLoadGeneration;
+    const lease = await acquireSharedFieldPayload(
+        dataType,
+        step,
+        resultPath,
+        callerSignal
+    );
+    try {
+        if (generation !== AppState.fieldLoadGeneration || getCurrentResultPath() !== resultPath) {
+            throw createAbortError('Preload field decode invalidated');
+        }
+        return lease;
+    } catch (error) {
+        lease.release();
+        throw error;
+    }
+}
+
 // Helper function to load field data (CSV or TIFF) with caching.
 // Server returns either application/json (CSV path, decoded server-side) or
 // image/tiff (raw TIFF stream, decoded here via GeoTIFF). The cache key does
 // not include format so a format=both run hits cache regardless of which
 // branch served it last time.
-async function loadFieldData(dataType, step, providedResultPath = null) {
+async function loadFieldData(dataType, step, providedResultPath = null, callerSignal = null) {
     const resultPath = providedResultPath || getCurrentResultPath();
     if (!resultPath) throw new Error('No result selected');
+    if (callerSignal?.aborted) throw createAbortError('Field consumer superseded');
+    const selectedResultAtStart = getCurrentResultPath();
 
     const cacheKey = `${resultPath}:${dataType}:${step}`;
-    if (AppState.dataCache[cacheKey]) {
+    const cached = getCachedFieldData(cacheKey);
+    if (cached !== undefined) {
+        if (callerSignal?.aborted) throw createAbortError('Field consumer superseded');
+        pinFieldDataForSignal(cacheKey, cached, callerSignal);
         console.log(`Cache hit: ${cacheKey}`);
-        return AppState.dataCache[cacheKey];
+        return cached;
     }
 
-    const file = `${dataType}/${formatStepFilename(step)}`;
-    const response = await fetch(`/api/load-field?result=${encodeURIComponent(resultPath)}&file=${file}`);
-    if (!response.ok) throw new Error(`Failed to load ${dataType} data (HTTP ${response.status})`);
+    const generation = AppState.fieldLoadGeneration;
+    // Every actual caller owns a lease. Once all caller signals are aborted,
+    // releaseSharedFieldPayload() aborts the physical fetch/decode instead of
+    // allowing an invisible cache-populating request to run to completion.
+    const lease = await acquireSharedFieldPayload(
+        dataType,
+        step,
+        resultPath,
+        callerSignal
+    );
+    try {
+        const { data, meta } = lease.payload;
+        const selectedResultChanged = getCurrentResultPath() !== selectedResultAtStart;
+        const implicitResultIsStale = !providedResultPath && getCurrentResultPath() !== resultPath;
+        if (callerSignal?.aborted ||
+            generation !== AppState.fieldLoadGeneration ||
+            selectedResultChanged ||
+            implicitResultIsStale) {
+            throw createAbortError('Field load invalidated');
+        }
 
-    const contentType = (response.headers.get('Content-Type') || '').toLowerCase();
-    let data, format, precision;
-    if (contentType.startsWith('image/tiff')) {
-        const ab = await response.arrayBuffer();
-        const decoded = await decodeTiffArrayBuffer(ab);
-        data = decoded.data;
-        format = 'tiff';
-        precision = decoded.precision;
-    } else {
-        const result = await response.json();
-        if (!result.success) throw new Error(`Failed to parse ${dataType} data: ${result.error || 'unknown error'}`);
-        data = result.data;
-        format = result.format || 'csv';
-        precision = result.precision || 'double';
-    }
+        const alreadyCached = getCachedFieldData(cacheKey);
+        if (alreadyCached !== undefined) {
+            pinFieldDataForSignal(cacheKey, alreadyCached, callerSignal);
+            return alreadyCached;
+        }
 
-    const currentCacheSize = Object.keys(AppState.dataCache).length;
-    if (currentCacheSize >= AppState.maxCacheEntries) {
-        console.warn(`Cache full (${currentCacheSize}/${AppState.maxCacheEntries}), clearing cache to prevent memory leak`);
-        AppState.dataCache = {};
-        AppState.dataMeta = {};
-    }
-    AppState.dataCache[cacheKey] = data;
-    AppState.dataMeta[cacheKey] = { format, precision };
-    if (Object.keys(AppState.dataMeta).length === 1) {
+        AppState.lastFieldMeta = meta;
+        if (cacheFieldData(cacheKey, data, meta)) {
+            lease.markCached();
+        }
+        pinFieldDataForSignal(cacheKey, data, callerSignal);
         updateExportFormatBadge();
+        return data;
+    } finally {
+        lease.release();
     }
-    return data;
 }
 
 // Placeholder implementations - these will call actual data loading and plotting
-async function renderAzContour(containerId, step) {
-    const data = await loadFieldData('Az', step);
+async function renderAzContour(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const data = await loadFieldData(
+        'Az', step, renderContext.resultPath, renderContext.controller.signal
+    );
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotContour(containerId, flipped, 'Az [Wb/m]', true);
+    await plotContour(containerId, flipped, 'Az [Wb/m]', true, renderContext);
 }
 
-async function renderAzHeatmap(containerId, step) {
-    const data = await loadFieldData('Az', step);
+async function renderAzHeatmap(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const data = await loadFieldData(
+        'Az', step, renderContext.resultPath, renderContext.controller.signal
+    );
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
     // C++ solver already outputs fully-interpolated Az grid (bilinear at inactive cells).
     // No JS re-interpolation needed — Gauss-Seidel would create visible dots at active cells.
-    plotHeatmap(containerId, flipped, 'Az [Wb/m]', true);
+    await plotHeatmap(containerId, flipped, 'Az [Wb/m]', true, false, renderContext);
 }
 
-async function renderJzDistribution(containerId, step) {
-    const data = await loadFieldData('Jz', step);
+async function renderJzDistribution(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const data = await loadFieldData(
+        'Jz', step, renderContext.resultPath, renderContext.controller.signal
+    );
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, flipped, 'Jz [A/m²]', true);
+    await plotHeatmap(containerId, flipped, 'Jz [A/m²]', true, false, renderContext);
 }
 
-async function renderBMagnitude(containerId, step) {
+async function renderBMagnitude(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const analysisConditions = AppState.analysisConditions;
     // Use grid spacing from analysis conditions
-    const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
-    const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
+    const dx = analysisConditions ? analysisConditions.dx : 0.001;
+    const dy = analysisConditions ? analysisConditions.dy : 0.001;
 
     // Load Az and Mu with caching
-    const azData = await loadFieldData('Az', step);
-    const muData = await loadFieldData('Mu', step);
+    const azData = await loadFieldData(
+        'Az', step, renderContext.resultPath, renderContext.controller.signal
+    );
+    const muData = await loadFieldData(
+        'Mu', step, renderContext.resultPath, renderContext.controller.signal
+    );
 
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
     // Load coarsening mask for coarsening-aware B computation (image coords, matches flipped Az)
-    const resultPath = getCurrentResultPath();
-    const maskResult = await getCoarseningMaskArray(resultPath, step).catch(() => null);
+    const resultPath = renderContext.resultPath;
+    const maskResult = await getCoarseningMaskArray(
+        resultPath,
+        step,
+        renderContext.controller.signal
+    ).catch(error => {
+        if ((error && error.name === 'AbortError') ||
+            error?.code === 'FIELD_MEMORY_BUDGET') throw error;
+        return null;
+    });
     const activeMask = maskResult ? maskResult.mask : null;
 
-    const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
+    const { B } = calculateMagneticField(
+        azFlipped, muFlipped, dx, dy, activeMask, renderContext.analysisConditions
+    );
 
-    plotHeatmap(containerId, B, '|B| [T]', true);
+    await plotHeatmap(containerId, B, '|B| [T]', true, false, renderContext);
 }
 
-async function renderHMagnitude(containerId, step) {
+async function renderHMagnitude(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const analysisConditions = AppState.analysisConditions;
     // Check if nonlinear materials are present and enabled
-    const hasNonlinear = AppState.analysisConditions?.nonlinear_solver?.has_nonlinear_materials;
-    const nlEnabled = AppState.analysisConditions?.nonlinear_solver?.enabled;
+    const hasNonlinear = analysisConditions?.nonlinear_solver?.has_nonlinear_materials;
+    const nlEnabled = analysisConditions?.nonlinear_solver?.enabled;
 
     if (hasNonlinear && nlEnabled) {
         // For nonlinear materials: load H directly from solver output (H.csv)
         try {
-            const hData = await loadFieldData('H', step);
+            const hData = await loadFieldData(
+                'H', step, renderContext.resultPath, renderContext.controller.signal
+            );
             // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
             const hFlipped = flipVertical(hData);
-            plotHeatmap(containerId, hFlipped, '|H| [A/m] (solver)', true);
+            await plotHeatmap(containerId, hFlipped, '|H| [A/m] (solver)', true, false, renderContext);
             return;
         } catch (error) {
+            if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext)) throw error;
             console.warn('H.csv not found, falling back to calculation from Az and Mu:', error);
         }
     }
 
     // For linear materials: calculate H from Az and Mu
-    const dx = AppState.analysisConditions ? AppState.analysisConditions.dx : 0.001;
-    const dy = AppState.analysisConditions ? AppState.analysisConditions.dy : 0.001;
+    const dx = analysisConditions ? analysisConditions.dx : 0.001;
+    const dy = analysisConditions ? analysisConditions.dy : 0.001;
 
     // Load Az and Mu with caching
-    const azData = await loadFieldData('Az', step);
-    const muData = await loadFieldData('Mu', step);
+    const azData = await loadFieldData(
+        'Az', step, renderContext.resultPath, renderContext.controller.signal
+    );
+    const muData = await loadFieldData(
+        'Mu', step, renderContext.resultPath, renderContext.controller.signal
+    );
 
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const azFlipped = flipVertical(azData);
     const muFlipped = flipVertical(muData);
 
     // Load coarsening mask for coarsening-aware H computation
-    const resultPath = getCurrentResultPath();
-    const maskResult = await getCoarseningMaskArray(resultPath, step).catch(() => null);
+    const resultPath = renderContext.resultPath;
+    const maskResult = await getCoarseningMaskArray(
+        resultPath,
+        step,
+        renderContext.controller.signal
+    ).catch(error => {
+        if ((error && error.name === 'AbortError') ||
+            error?.code === 'FIELD_MEMORY_BUDGET') throw error;
+        return null;
+    });
     const activeMask = maskResult ? maskResult.mask : null;
 
-    const { H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
+    const { H } = calculateMagneticField(
+        azFlipped, muFlipped, dx, dy, activeMask, renderContext.analysisConditions
+    );
 
-    plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true);
+    await plotHeatmap(containerId, H, '|H| [A/m] (calculated)', true, false, renderContext);
 }
 
-async function renderMuDistribution(containerId, step) {
-    const data = await loadFieldData('Mu', step);
+async function renderMuDistribution(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const data = await loadFieldData(
+        'Mu', step, renderContext.resultPath, renderContext.controller.signal
+    );
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     let flipped = flipVertical(data);
 
     // C++ solver outputs fully-interpolated Mu grid — no frontend interpolation needed
 
-    plotHeatmap(containerId, flipped, 'μ [H/m]', true, true);
+    await plotHeatmap(containerId, flipped, 'μ [H/m]', true, true, renderContext);
 }
 
-async function renderEnergyDensity(containerId, step) {
-    const data = await loadFieldData('EnergyDensity', step);
+async function renderEnergyDensity(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const data = await loadFieldData(
+        'EnergyDensity', step, renderContext.resultPath, renderContext.controller.signal
+    );
     // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
     const flipped = flipVertical(data);
-    plotHeatmap(containerId, flipped, 'Energy [J/m³]', true);
+    await plotHeatmap(containerId, flipped, 'Energy [J/m³]', true, false, renderContext);
 }
 
 // Helper: Convert black pixels in image to transparent
-async function makeBlackTransparent(url, threshold = 30) {
+async function makeBlackTransparent(url, threshold = 30, signal = null) {
+    const sourceUrl = signal ? await loadImageDataUrl(url, signal) : url;
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = 'Anonymous';
@@ -7275,12 +8552,13 @@ async function makeBlackTransparent(url, threshold = 30) {
             reject(new Error('Failed to load boundary image for transparency conversion'));
         };
 
-        img.src = url;
+        img.src = sourceUrl;
     });
 }
 
 // Helper: Flip an image URL vertically (for image coordinate to analysis coordinate conversion)
-async function flipImageVertical(url) {
+async function flipImageVertical(url, signal = null) {
+    const sourceUrl = signal ? await loadImageDataUrl(url, signal) : url;
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = 'Anonymous';
@@ -7304,12 +8582,13 @@ async function flipImageVertical(url) {
             reject(new Error('Failed to load image for vertical flip'));
         };
 
-        img.src = url;
+        img.src = sourceUrl;
     });
 }
 
 // Helper: Flip an image URL vertically AND make black pixels transparent
-async function flipAndMakeBlackTransparent(url, threshold = 30) {
+async function flipAndMakeBlackTransparent(url, threshold = 30, signal = null) {
+    const sourceUrl = signal ? await loadImageDataUrl(url, signal) : url;
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = 'Anonymous';
@@ -7355,7 +8634,7 @@ async function flipAndMakeBlackTransparent(url, threshold = 30) {
             reject(new Error('Failed to load image for flip and transparency conversion'));
         };
 
-        img.src = url;
+        img.src = sourceUrl;
     });
 }
 
@@ -7365,7 +8644,8 @@ async function flipAndMakeBlackTransparent(url, threshold = 30) {
  * @param {string} url - Image URL
  * @returns {Promise<HTMLCanvasElement>} - Canvas with edge detection result
  */
-async function applySobelEdgeDetection(url) {
+async function applySobelEdgeDetection(url, signal = null) {
+    const sourceUrl = signal ? await loadImageDataUrl(url, signal) : url;
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = 'Anonymous';
@@ -7470,7 +8750,7 @@ async function applySobelEdgeDetection(url) {
             reject(new Error('Failed to load image for edge detection'));
         };
 
-        img.src = url;
+        img.src = sourceUrl;
     });
 }
 
@@ -7850,7 +9130,8 @@ function mergeImages(contourCanvas, boundaryCanvas) {
  * @param {string} url - Image URL
  * @returns {Promise<HTMLCanvasElement>} - Canvas with loaded image
  */
-async function loadImageToCanvas(url) {
+async function loadImageToCanvas(url, signal = null) {
+    const sourceUrl = signal ? await loadImageDataUrl(url, signal) : url;
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = 'Anonymous';
@@ -7868,12 +9149,13 @@ async function loadImageToCanvas(url) {
             reject(new Error(`Failed to load image: ${url}`));
         };
 
-        img.src = url;
+        img.src = sourceUrl;
     });
 }
 
-async function renderAzBoundary(containerId, step) {
-    const resultPath = getCurrentResultPath();
+async function renderAzBoundary(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
     if (!resultPath) throw new Error('No result selected');
 
     const container = document.getElementById(containerId);
@@ -7881,12 +9163,14 @@ async function renderAzBoundary(containerId, step) {
 
     try {
         // Load Az data with caching
-        const azData = await loadFieldData('Az', step);
+        const azData = await loadFieldData(
+            'Az', step, resultPath, renderContext.controller.signal
+        );
 
         // Get input image URL (material image as background for field lines)
         const inputImgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         const coordSys = AppState.analysisConditions?.coordinate_system || 'cartesian';
@@ -7904,7 +9188,7 @@ async function renderAzBoundary(containerId, step) {
             dilateImage(contourCanvas, 1);
 
             // Step 3: Load input image (material image) to canvas
-            const inputCanvas = await loadImageToCanvas(inputImgUrl);
+            const inputCanvas = await loadImageToCanvas(inputImgUrl, renderContext.controller.signal);
 
             // Step 4: Transform both images to cartesian coordinates
             // For contour: preserveColors=false (convert black to transparent)
@@ -7966,13 +9250,13 @@ async function renderAzBoundary(containerId, step) {
             // Restore saved zoom state if exists
             layout = restoreZoomState(containerId, layout);
 
-            await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+            await newPlotForRender(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
             setupZoomTracking(containerId);
 
         } else {
             // Original Plotly contour approach for non-transformed coordinates
             const azFlipped = flipVertical(azData);
-            const transparentInputUrl = await makeBlackTransparent(inputImgUrl);
+            const transparentInputUrl = await makeBlackTransparent(inputImgUrl, 30, renderContext.controller.signal);
 
             const rows = azFlipped.length;
             const cols = azFlipped[0].length;
@@ -8085,12 +9369,16 @@ async function renderAzBoundary(containerId, step) {
             // Restore saved zoom state if exists
             layout = restoreZoomState(containerId, layout);
 
-            await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+            await newPlotForRender(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
             setupZoomTracking(containerId);
         }
     } catch (error) {
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
+        }
         console.error('Field Lines + Material Image render error:', error);
-        container.innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+        showPlotMessage(container, `<p style="padding:20px; color:red;">Error: ${error.message}</p>`, renderContext);
     }
 }
 
@@ -8098,8 +9386,9 @@ async function renderAzBoundary(containerId, step) {
  * Render field lines (Az contours) overlaid on edge-detected boundary image
  * Uses Sobel edge detection on input image for clearer boundary visualization
  */
-async function renderAzEdge(containerId, step) {
-    const resultPath = getCurrentResultPath();
+async function renderAzEdge(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
     if (!resultPath) throw new Error('No result selected');
 
     const container = document.getElementById(containerId);
@@ -8107,18 +9396,20 @@ async function renderAzEdge(containerId, step) {
 
     try {
         // Load Az data with caching
-        const azData = await loadFieldData('Az', step);
+        const azData = await loadFieldData(
+            'Az', step, resultPath, renderContext.controller.signal
+        );
 
         // Get input image URL
         const inputImgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         const coordSys = AppState.analysisConditions?.coordinate_system || 'cartesian';
 
         // Apply Sobel edge detection to input image
-        const edgeCanvas = await applySobelEdgeDetection(inputImgUrl);
+        const edgeCanvas = await applySobelEdgeDetection(inputImgUrl, renderContext.controller.signal);
         const edgeImgUrl = edgeCanvas.toDataURL('image/png');
 
         // Check if polar coordinate transformation is enabled
@@ -8187,7 +9478,7 @@ async function renderAzEdge(containerId, step) {
             };
 
             layout = restoreZoomState(containerId, layout);
-            await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+            await newPlotForRender(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
             setupZoomTracking(containerId);
 
         } else {
@@ -8300,17 +9591,23 @@ async function renderAzEdge(containerId, step) {
             };
 
             layout = restoreZoomState(containerId, layout);
-            await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+            await newPlotForRender(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
             setupZoomTracking(containerId);
         }
     } catch (error) {
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
+        }
         console.error('Field Lines + Edge render error:', error);
-        container.innerHTML = `<p style="padding:20px; color:red;">Error: ${error.message}</p>`;
+        showPlotMessage(container, `<p style="padding:20px; color:red;">Error: ${error.message}</p>`, renderContext);
     }
 }
 
-async function renderMaterialImage(containerId, step) {
-    const resultPath = getCurrentResultPath();
+async function renderMaterialImage(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const analysisConditions = AppState.analysisConditions;
     if (!resultPath) throw new Error('No result selected');
 
     const container = document.getElementById(containerId);
@@ -8318,30 +9615,28 @@ async function renderMaterialImage(containerId, step) {
 
     try {
         // Get step input image (from InputImage folder)
-        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await loadImageDataUrl(
+            `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`,
+            renderContext.controller.signal
+        );
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // Load image to get dimensions
-        const img = new Image();
-        await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = reject;
-            img.src = imgUrl;
-        });
+        const img = await loadImage(imgUrl, renderContext.controller.signal);
 
         const rows = img.height;
         const cols = img.width;
 
         // Generate physical coordinates if available
         let xTitle, yTitle, xMin, xMax, yMin, yMax;
-        if (AppState.analysisConditions) {
-            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+        if (analysisConditions) {
+            const coordSys = analysisConditions.coordinate_system || 'cartesian';
             if (coordSys === 'polar') {
-                const theta_start = AppState.analysisConditions.theta_start || 0;
-                const dr = AppState.analysisConditions.dr || 0.001;
-                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                const theta_start = analysisConditions.theta_start || 0;
+                const dr = analysisConditions.dr || 0.001;
+                const dtheta = analysisConditions.dtheta || 0.001;
                 xTitle = 'r - r_start [mm]';
                 yTitle = 'θ [rad]';
                 xMin = 0;
@@ -8349,8 +9644,8 @@ async function renderMaterialImage(containerId, step) {
                 yMin = theta_start;
                 yMax = theta_start + (rows - 1) * dtheta;
             } else {
-                const dx = AppState.analysisConditions.dx || 0.001;
-                const dy = AppState.analysisConditions.dy || 0.001;
+                const dx = analysisConditions.dx || 0.001;
+                const dy = analysisConditions.dy || 0.001;
                 xTitle = 'X [mm]';
                 yTitle = 'Y [mm]';
                 xMin = 0;
@@ -8402,16 +9697,22 @@ async function renderMaterialImage(containerId, step) {
         // Restore saved zoom state if exists
         layout = restoreZoomState(containerId, layout);
 
-        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        await newPlotForRender(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
         setupZoomTracking(containerId);
     } catch (error) {
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
+        }
         console.error('Material image load error:', error);
-        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading material image</div>';
+        showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">Error loading material image</div>', renderContext);
     }
 }
 
-async function renderStepInputImage(containerId, step) {
-    const resultPath = getCurrentResultPath();
+async function renderStepInputImage(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const analysisConditions = AppState.analysisConditions;
     if (!resultPath) throw new Error('No result selected');
 
     const container = document.getElementById(containerId);
@@ -8419,30 +9720,28 @@ async function renderStepInputImage(containerId, step) {
 
     try {
         // Get step input image
-        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await loadImageDataUrl(
+            `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`,
+            renderContext.controller.signal
+        );
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // Load image to get dimensions
-        const img = new Image();
-        await new Promise((resolve, reject) => {
-            img.onload = resolve;
-            img.onerror = reject;
-            img.src = imgUrl;
-        });
+        const img = await loadImage(imgUrl, renderContext.controller.signal);
 
         const rows = img.height;
         const cols = img.width;
 
         // Generate physical coordinates if available
         let xTitle, yTitle, xMin, xMax, yMin, yMax;
-        if (AppState.analysisConditions) {
-            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+        if (analysisConditions) {
+            const coordSys = analysisConditions.coordinate_system || 'cartesian';
             if (coordSys === 'polar') {
-                const theta_start = AppState.analysisConditions.theta_start || 0;
-                const dr = AppState.analysisConditions.dr || 0.001;
-                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                const theta_start = analysisConditions.theta_start || 0;
+                const dr = analysisConditions.dr || 0.001;
+                const dtheta = analysisConditions.dtheta || 0.001;
                 xTitle = 'r - r_start [mm]';
                 yTitle = 'θ [rad]';
                 xMin = 0;
@@ -8450,8 +9749,8 @@ async function renderStepInputImage(containerId, step) {
                 yMin = theta_start;
                 yMax = theta_start + (rows - 1) * dtheta;
             } else {
-                const dx = AppState.analysisConditions.dx || 0.001;
-                const dy = AppState.analysisConditions.dy || 0.001;
+                const dx = analysisConditions.dx || 0.001;
+                const dy = analysisConditions.dy || 0.001;
                 xTitle = 'X [mm]';
                 yTitle = 'Y [mm]';
                 xMin = 0;
@@ -8503,87 +9802,225 @@ async function renderStepInputImage(containerId, step) {
         // Restore saved zoom state if exists
         layout = restoreZoomState(containerId, layout);
 
-        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        await newPlotForRender(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
         setupZoomTracking(containerId);
     } catch (error) {
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
+        }
         console.error('Step input image load error:', error);
-        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading image</div>';
+        showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">Error loading image</div>', renderContext);
     }
 }
 
-// Shared utility: Fetch coarsening mask PNG and convert to 2D boolean array.
-// Returns { mask: bool[][] (analysis coords, y=0 at bottom), img, pixelData (image coords) }
-// mask is flipped from image coords to match flipVertical()'d Az/Mu data.
-// pixelData remains in image coords for overlay rendering (renderCoarseningMask).
+// Shared utility: fetch a coarsening mask PNG and retain compact Uint8Array
+// rows in analysis coordinates plus one compact image-coordinate overlay mask.
 // Cached per resultPath:step — same mask is reused across Az/B/H renders in a single step
-const _maskCache = { key: '', result: null, promise: null };
+const COARSENING_MASK_CACHE_LIMIT = 4;
+const COARSENING_MASK_CACHE_BUDGET_BYTES = 32 * 1024 * 1024;
+const COARSENING_MASK_WORKING_BUDGET_BYTES = 128 * 1024 * 1024;
+const _maskCache = new Map();
+let _maskCacheBytes = 0;
 
-async function getCoarseningMaskArray(resultPath, step) {
-    const cacheKey = `${resultPath}:${step}`;
-
-    // Return cached result (including null = no coarsening)
-    if (_maskCache.key === cacheKey && _maskCache.promise === null) {
-        return _maskCache.result;
+function estimateCoarseningMaskBytes(result) {
+    if (!result) return FIELD_CACHE_ARRAY_OVERHEAD_BYTES;
+    let bytes = FIELD_CACHE_ARRAY_OVERHEAD_BYTES;
+    if (result.imageMask instanceof Uint8Array) {
+        bytes += FIELD_CACHE_ARRAY_OVERHEAD_BYTES + result.imageMask.byteLength;
     }
-
-    // Deduplicate concurrent requests for the same mask
-    if (_maskCache.key === cacheKey && _maskCache.promise) {
-        return _maskCache.promise;
+    if (Array.isArray(result.mask)) {
+        bytes += FIELD_CACHE_ARRAY_OVERHEAD_BYTES +
+            result.mask.length * FIELD_CACHE_ARRAY_OVERHEAD_BYTES;
+        for (const row of result.mask) {
+            bytes += row instanceof Uint8Array
+                ? row.byteLength
+                : FIELD_CACHE_ARRAY_OVERHEAD_BYTES;
+        }
     }
+    return bytes;
+}
 
-    _maskCache.key = cacheKey;
-    _maskCache.promise = _fetchCoarseningMask(resultPath, step);
+function removeCoarseningMaskEntry(cacheKey, entry) {
+    if (_maskCache.get(cacheKey) !== entry) return false;
+    _maskCache.delete(cacheKey);
+    _maskCacheBytes = Math.max(0, _maskCacheBytes - (entry.sizeBytes || 0));
+    entry.sizeBytes = 0;
+    return true;
+}
 
-    try {
-        const result = await _maskCache.promise;
-        _maskCache.result = result;
-        _maskCache.promise = null;
-        return result;
-    } catch (e) {
-        _maskCache.key = '';
-        _maskCache.promise = null;
-        throw e;
+function touchCoarseningMaskEntry(cacheKey, entry) {
+    if (_maskCache.get(cacheKey) !== entry) return;
+    _maskCache.delete(cacheKey);
+    _maskCache.set(cacheKey, entry);
+}
+
+function trimCoarseningMaskCache() {
+    let settledCount = Array.from(_maskCache.values())
+        .filter(entry => entry.settled).length;
+    if (settledCount <= COARSENING_MASK_CACHE_LIMIT &&
+        _maskCacheBytes <= COARSENING_MASK_CACHE_BUDGET_BYTES) return;
+
+    for (const [cacheKey, entry] of _maskCache) {
+        if (!entry.settled || entry.consumers > 0) continue;
+        removeCoarseningMaskEntry(cacheKey, entry);
+        settledCount--;
+        if (settledCount <= COARSENING_MASK_CACHE_LIMIT &&
+            _maskCacheBytes <= COARSENING_MASK_CACHE_BUDGET_BYTES) break;
     }
 }
 
-async function _fetchCoarseningMask(resultPath, step) {
-    const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}`;
-    const img = await loadImage(maskUrl);
+function clearCoarseningMaskCache() {
+    for (const [cacheKey, entry] of _maskCache) {
+        entry.retain = false;
+        if (entry.settled || entry.consumers === 0) {
+            removeCoarseningMaskEntry(cacheKey, entry);
+            if (!entry.settled) entry.controller.abort();
+        }
+    }
+}
 
-    const canvas = document.createElement('canvas');
-    canvas.width = img.width;
-    canvas.height = img.height;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(img, 0, 0);
-    const pixelData = ctx.getImageData(0, 0, img.width, img.height);
+async function getCoarseningMaskArray(resultPath, step, signal = null) {
+    if (signal?.aborted) throw createAbortError('Coarsening mask load aborted');
+    const cacheKey = `${resultPath}:${step}`;
+    let entry = _maskCache.get(cacheKey);
+
+    // Return cached result (including null = no coarsening).
+    if (entry?.settled) {
+        touchCoarseningMaskEntry(cacheKey, entry);
+        return entry.result;
+    }
+
+    if (!entry) {
+        const controller = new AbortController();
+        entry = {
+            cacheKey,
+            controller,
+            consumers: 0,
+            settled: false,
+            retain: true,
+            result: null,
+            sizeBytes: 0,
+            promise: null,
+        };
+        entry.promise = (async () => {
+            try {
+                const result = await _fetchCoarseningMask(
+                    resultPath,
+                    step,
+                    controller.signal
+                );
+                entry.result = result;
+                entry.settled = true;
+                entry.promise = null;
+                entry.sizeBytes = estimateCoarseningMaskBytes(result);
+                _maskCacheBytes += entry.sizeBytes;
+                touchCoarseningMaskEntry(cacheKey, entry);
+                trimCoarseningMaskCache();
+                return result;
+            } catch (error) {
+                removeCoarseningMaskEntry(cacheKey, entry);
+                throw error;
+            }
+        })();
+        _maskCache.set(cacheKey, entry);
+        entry.promise.catch(() => {});
+    } else {
+        // A new caller arriving after a cache clear makes this active entry
+        // useful again without restarting the same physical image request.
+        entry.retain = true;
+    }
+
+    entry.consumers++;
+    const requestPromise = entry.promise;
+    try {
+        return await awaitWithAbortSignal(
+            requestPromise,
+            signal,
+            'Coarsening mask consumer superseded'
+        );
+    } finally {
+        entry.consumers = Math.max(0, entry.consumers - 1);
+        if (entry.consumers === 0 && !entry.settled) {
+            removeCoarseningMaskEntry(cacheKey, entry);
+            entry.controller.abort();
+        } else if (entry.consumers === 0 && entry.settled && !entry.retain) {
+            removeCoarseningMaskEntry(cacheKey, entry);
+        } else if (entry.consumers === 0 && entry.settled) {
+            trimCoarseningMaskCache();
+        }
+    }
+}
+
+async function _fetchCoarseningMask(resultPath, step, signal = null) {
+    const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}`;
+    const img = await loadImage(maskUrl, signal);
+    if (signal?.aborted) throw createAbortError('Coarsening mask load aborted');
 
     const rows = img.height;
     const cols = img.width;
-    const mask = Array(rows).fill(null).map(() => Array(cols).fill(false));
+    const cellCount = rows * cols;
+    // Peak includes the canvas RGBA backing store, ImageData, compact
+    // image-coordinate mask and compact analysis-coordinate mask.
+    const estimatedWorkingBytes = cellCount * 14 +
+        rows * FIELD_CACHE_ARRAY_OVERHEAD_BYTES;
+    if (estimatedWorkingBytes > COARSENING_MASK_WORKING_BUDGET_BYTES) {
+        const error = new Error(
+            `Coarsening mask ${cols}x${rows} requires about ` +
+            `${formatFieldCacheBytes(estimatedWorkingBytes)}, exceeding the ` +
+            `${formatFieldCacheBytes(COARSENING_MASK_WORKING_BUDGET_BYTES)} ` +
+            'mask working-memory budget'
+        );
+        error.name = 'FieldMemoryBudgetError';
+        error.code = 'FIELD_MEMORY_BUDGET';
+        throw error;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = cols;
+    canvas.height = rows;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const pixelData = ctx.getImageData(0, 0, cols, rows);
+    const imageMask = new Uint8Array(cellCount);
+    const mask = Array.from({ length: rows }, () => new Uint8Array(cols));
     let activeCount = 0;
 
     for (let j = 0; j < rows; j++) {
+        if (j > 0 && j % 64 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        if (signal?.aborted) throw createAbortError('Coarsening mask load aborted');
         for (let i = 0; i < cols; i++) {
             // Active=255, inactive=max 127 (255/skip). Threshold at 200 to avoid
             // grayscale PNG color-space conversion artifacts near 128.
-            const isActive = pixelData.data[(j * cols + i) * 4] > 200;
-            mask[j][i] = isActive;
+            const cellIndex = j * cols + i;
+            const isActive = pixelData.data[cellIndex * 4] > 200;
+            imageMask[cellIndex] = isActive ? 255 : 0;
+            // Store analysis coordinates directly, avoiding a second reverse
+            // pass and the high overhead of JavaScript boolean arrays.
+            mask[rows - 1 - j][i] = isActive ? 1 : 0;
             if (isActive) activeCount++;
         }
     }
 
+    // Release the large RGBA canvas backing store before retaining the compact
+    // masks in the LRU.
+    canvas.width = 0;
+    canvas.height = 0;
+    img.removeAttribute?.('src');
+
     // All cells active means no coarsening
-    if (activeCount === rows * cols) return null;
+    if (activeCount === cellCount) return null;
 
-    // Flip mask to analysis coordinates (y=0 at bottom) to match flipVertical()'d data
-    mask.reverse();
-
-    console.log(`Coarsening mask: ${activeCount}/${rows * cols} active cells`);
-    return { mask, img, pixelData };
+    console.log(`Coarsening mask: ${activeCount}/${cellCount} active cells`);
+    return { mask, imageMask, width: cols, height: rows };
 }
 
-async function renderCoarseningMask(containerId, step) {
-    const resultPath = getCurrentResultPath();
+async function renderCoarseningMask(containerId, step, renderContext = null) {
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const analysisConditions = AppState.analysisConditions;
     if (!resultPath) throw new Error('No result selected');
 
     const container = document.getElementById(containerId);
@@ -8591,19 +10028,29 @@ async function renderCoarseningMask(containerId, step) {
 
     try {
         // Load coarsening mask via shared utility
-        const maskResult = await getCoarseningMaskArray(resultPath, step).catch(() => null);
+        const maskResult = await getCoarseningMaskArray(
+            resultPath,
+            step,
+            renderContext.controller.signal
+        ).catch(error => {
+            if ((error && error.name === 'AbortError') ||
+                error?.code === 'FIELD_MEMORY_BUDGET') throw error;
+            return null;
+        });
         if (!maskResult) throw new Error('Coarsening mask not available');
 
-        const maskImg = maskResult.img;
-        const rows = maskImg.height;
-        const cols = maskImg.width;
+        const rows = maskResult.height;
+        const cols = maskResult.width;
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // Load input image for overlay
         const inputUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-        const inputImg = await loadImage(inputUrl).catch(() => null);
+        const inputImg = await loadImage(inputUrl, renderContext.controller.signal).catch(error => {
+            if (error && error.name === 'AbortError') throw error;
+            return null;
+        });
 
         // Compute product of input image and mask
         let resultImgUrl;
@@ -8617,9 +10064,9 @@ async function renderCoarseningMask(containerId, step) {
             const inputData = ctx.getImageData(0, 0, cols, rows);
 
             const outputData = ctx.createImageData(cols, rows);
-            const maskPixels = maskResult.pixelData.data; // image coords (not flipped)
+            const maskPixels = maskResult.imageMask; // image coords (not flipped)
             for (let pi = 0; pi < inputData.data.length; pi += 4) {
-                if (maskPixels[pi] > 200) { // R channel > 200 = active (255 vs max 127)
+                if (maskPixels[pi / 4] > 200) {
                     outputData.data[pi] = inputData.data[pi];         // R
                     outputData.data[pi + 1] = inputData.data[pi + 1]; // G
                     outputData.data[pi + 2] = inputData.data[pi + 2]; // B
@@ -8635,17 +10082,17 @@ async function renderCoarseningMask(containerId, step) {
             resultImgUrl = canvas.toDataURL('image/png');
         } else {
             const maskUrl = `/api/get-coarsening-mask?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-            resultImgUrl = maskUrl;
+            resultImgUrl = await loadImageDataUrl(maskUrl, renderContext.controller.signal);
         }
 
         // Generate physical coordinates if available
         let xTitle, yTitle, xMin, xMax, yMin, yMax;
-        if (AppState.analysisConditions) {
-            const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+        if (analysisConditions) {
+            const coordSys = analysisConditions.coordinate_system || 'cartesian';
             if (coordSys === 'polar') {
-                const theta_start = AppState.analysisConditions.theta_start || 0;
-                const dr = AppState.analysisConditions.dr || 0.001;
-                const dtheta = AppState.analysisConditions.dtheta || 0.001;
+                const theta_start = analysisConditions.theta_start || 0;
+                const dr = analysisConditions.dr || 0.001;
+                const dtheta = analysisConditions.dtheta || 0.001;
                 xTitle = 'r - r_start [mm]';
                 yTitle = 'θ [rad]';
                 xMin = 0;
@@ -8653,8 +10100,8 @@ async function renderCoarseningMask(containerId, step) {
                 yMin = theta_start;
                 yMax = theta_start + (rows - 1) * dtheta;
             } else {
-                const dx = AppState.analysisConditions.dx || 0.001;
-                const dy = AppState.analysisConditions.dy || 0.001;
+                const dx = analysisConditions.dx || 0.001;
+                const dy = analysisConditions.dy || 0.001;
                 xTitle = 'X [mm]';
                 yTitle = 'Y [mm]';
                 xMin = 0;
@@ -8710,22 +10157,85 @@ async function renderCoarseningMask(containerId, step) {
         // Restore saved zoom state if exists
         layout = restoreZoomState(containerId, layout);
 
-        await Plotly.newPlot(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        await newPlotForRender(container, [], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
         setupZoomTracking(containerId);
     } catch (error) {
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
+        }
         console.error('Coarsening mask load error:', error);
-        container.innerHTML = '<div style="padding: 20px; text-align: center; color: #666;">Coarsening mask not available<br><small>(Adaptive mesh may not be enabled for this result)</small></div>';
+        showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #666;">Coarsening mask not available<br><small>(Adaptive mesh may not be enabled for this result)</small></div>', renderContext);
     }
 }
 
 // Helper function to load an image and return a promise
-function loadImage(url) {
-    return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.crossOrigin = 'Anonymous';
-        img.onload = () => resolve(img);
-        img.onerror = () => reject(new Error('Failed to load image: ' + url));
-        img.src = url;
+async function loadImage(url, signal = null) {
+    if (signal?.aborted) throw createAbortError('Image load aborted');
+    const response = await fetch(url, signal ? { signal } : undefined);
+    if (!response.ok) throw new Error(`Failed to load image (HTTP ${response.status}): ${url}`);
+    const blob = await response.blob();
+    if (signal?.aborted) throw createAbortError('Image load aborted');
+
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+        return await new Promise((resolve, reject) => {
+            const img = new Image();
+            let settled = false;
+            const cleanup = () => {
+                img.onload = null;
+                img.onerror = null;
+                signal?.removeEventListener('abort', onAbort);
+            };
+            const onAbort = () => {
+                if (settled) return;
+                settled = true;
+                img.src = '';
+                cleanup();
+                reject(createAbortError('Image decode aborted'));
+            };
+            img.onload = () => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(img);
+            };
+            img.onerror = () => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(new Error('Failed to decode image: ' + url));
+            };
+            signal?.addEventListener('abort', onAbort, { once: true });
+            img.src = objectUrl;
+        });
+    } finally {
+        URL.revokeObjectURL(objectUrl);
+    }
+}
+
+async function loadImageDataUrl(url, signal = null) {
+    if (signal?.aborted) throw createAbortError('Image load aborted');
+    const response = await fetch(url, signal ? { signal } : undefined);
+    if (!response.ok) throw new Error(`Failed to load image (HTTP ${response.status}): ${url}`);
+    const blob = await response.blob();
+    if (signal?.aborted) throw createAbortError('Image load aborted');
+    return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        const onAbort = () => {
+            reader.abort();
+            reject(createAbortError('Image conversion aborted'));
+        };
+        reader.onload = () => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve(reader.result);
+        };
+        reader.onerror = () => {
+            signal?.removeEventListener('abort', onAbort);
+            reject(reader.error || new Error('Failed to convert image'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        reader.readAsDataURL(blob);
     });
 }
 
@@ -8734,15 +10244,17 @@ function loadImage(url) {
 // State for interactive line profile
 const lineProfileState = {};
 
-async function renderLineProfile(containerId, step) {
+async function renderLineProfile(containerId, step, renderContext = null) {
     const container = document.getElementById(containerId);
     if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
 
-    const resultPath = getCurrentResultPath();
+    const resultPath = renderContext.resultPath;
     if (!resultPath) {
-        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No result selected</div>';
+        showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">No result selected</div>', renderContext);
         return;
     }
+    const analysisConditions = AppState.analysisConditions;
 
     // Initialize state for this container
     if (!lineProfileState[containerId]) {
@@ -8759,32 +10271,45 @@ async function renderLineProfile(containerId, step) {
 
     try {
         // Load Az and Mu data
-        const azData = await loadFieldData('Az', step);
-        const muData = await loadFieldData('Mu', step);
+        const azData = await loadFieldData(
+            'Az', step, resultPath, renderContext.controller.signal
+        );
+        const muData = await loadFieldData(
+            'Mu', step, resultPath, renderContext.controller.signal
+        );
 
         if (!azData || azData.length === 0) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">No data available</div>', renderContext);
             return;
         }
 
-        const dx = AppState.analysisConditions?.dx || 0.001;
-        const dy = AppState.analysisConditions?.dy || 0.001;
+        const dx = analysisConditions?.dx || 0.001;
+        const dy = analysisConditions?.dy || 0.001;
 
         // Flip data for display (analysis y-up to image y-down)
         const azFlipped = flipVertical(azData);
         const muFlipped = flipVertical(muData);
 
         // Load coarsening mask for coarsening-aware B/H computation
-        const resultPath_lp = getCurrentResultPath();
-        const maskResult = await getCoarseningMaskArray(resultPath_lp, step).catch(() => null);
+        const maskResult = await getCoarseningMaskArray(
+            resultPath,
+            step,
+            renderContext.controller.signal
+        ).catch(error => {
+            if ((error && error.name === 'AbortError') ||
+                error?.code === 'FIELD_MEMORY_BUDGET') throw error;
+            return null;
+        });
         const activeMask = maskResult ? maskResult.mask : null;
 
-        const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
+        const { Bx, By, B, Hx, Hy, H } = calculateMagneticField(
+            azFlipped, muFlipped, dx, dy, activeMask, renderContext.analysisConditions
+        );
 
         const rows = azFlipped.length;
         const cols = azFlipped[0].length;
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // Create compact control bar (use panel header for mode toggle)
@@ -8821,7 +10346,10 @@ async function renderLineProfile(containerId, step) {
         container.appendChild(contentArea);
 
         // Get input image URL
-        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await loadImageDataUrl(
+            `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`,
+            renderContext.controller.signal
+        );
 
         // Create X and Y coordinate arrays
         const xCoords = Array.from({ length: cols }, (_, i) => i * dx * 1000); // mm
@@ -8886,7 +10414,7 @@ async function renderLineProfile(containerId, step) {
             dragmode: false  // Default to move/click mode for point selection
         };
 
-        await Plotly.newPlot(imageDiv, traces, imageLayout, { responsive: true, displayModeBar: false });
+        await newPlotForRender(imageDiv, traces, imageLayout, { responsive: true, displayModeBar: false }, renderContext);
 
         // Store reference in main container for panel header toggle
         container._lineProfileImageDiv = imageDiv;
@@ -8942,7 +10470,9 @@ async function renderLineProfile(containerId, step) {
                 state.selectingStart = true;
             }
 
-            renderLineProfile(containerId, AppState.currentStep);
+            void renderLineProfile(containerId, AppState.currentStep).catch(error => {
+                if (!error || error.name !== 'AbortError') console.error('Line profile re-render error:', error);
+            });
         };
         imageDiv.addEventListener('click', imageDiv._clickHandler);
 
@@ -9023,7 +10553,7 @@ async function renderLineProfile(containerId, step) {
                 showlegend: false
             };
 
-            await Plotly.newPlot(profileDiv, profileTraces, profileLayout, { responsive: true, displayModeBar: false });
+            await newPlotForRender(profileDiv, profileTraces, profileLayout, { responsive: true, displayModeBar: false }, renderContext);
         } else {
             // Show instructions
             profileDiv.innerHTML = `
@@ -9038,8 +10568,12 @@ async function renderLineProfile(containerId, step) {
             `;
         }
     } catch (error) {
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
+        }
         console.error('Line profile error:', error);
-        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading data</div>';
+        showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">Error loading data</div>', renderContext);
     }
 }
 
@@ -9047,7 +10581,9 @@ async function renderLineProfile(containerId, step) {
 function setLineProfileField(containerId, field) {
     if (lineProfileState[containerId]) {
         lineProfileState[containerId].displayField = field;
-        renderLineProfile(containerId, AppState.currentStep);
+        void renderLineProfile(containerId, AppState.currentStep).catch(error => {
+            if (!error || error.name !== 'AbortError') console.error('Line profile field update error:', error);
+        });
     }
 }
 
@@ -9056,7 +10592,9 @@ function resetLineProfilePoints(containerId) {
         lineProfileState[containerId].startPoint = null;
         lineProfileState[containerId].endPoint = null;
         lineProfileState[containerId].selectingStart = true;
-        renderLineProfile(containerId, AppState.currentStep);
+        void renderLineProfile(containerId, AppState.currentStep).catch(error => {
+            if (!error || error.name !== 'AbortError') console.error('Line profile reset error:', error);
+        });
     }
 }
 
@@ -9137,15 +10675,17 @@ function extractLineProfileEnhanced(start, end, azData, muData, Bx, By, Hx, Hy, 
 // State for interactive flux linkage
 const fluxLinkageState = {};
 
-async function renderFluxLinkageInteractive(containerId, step) {
+async function renderFluxLinkageInteractive(containerId, step, renderContext = null) {
     const container = document.getElementById(containerId);
     if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
 
-    const resultPath = getCurrentResultPath();
+    const resultPath = renderContext.resultPath;
     if (!resultPath) {
-        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No result selected</div>';
+        showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">No result selected</div>', renderContext);
         return;
     }
+    const analysisConditions = AppState.analysisConditions;
 
     // Initialize state for this container
     if (!fluxLinkageState[containerId]) {
@@ -9162,22 +10702,24 @@ async function renderFluxLinkageInteractive(containerId, step) {
 
     try {
         // Load Az data
-        const azData = await loadFieldData('Az', step);
+        const azData = await loadFieldData(
+            'Az', step, resultPath, renderContext.controller.signal
+        );
 
         if (!azData || azData.length === 0) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">No data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">No data available</div>', renderContext);
             return;
         }
 
-        const dx = AppState.analysisConditions?.dx || 0.001;
-        const dy = AppState.analysisConditions?.dy || 0.001;
+        const dx = analysisConditions?.dx || 0.001;
+        const dy = analysisConditions?.dy || 0.001;
 
         // Flip data for display
         const azFlipped = flipVertical(azData);
         const rows = azFlipped.length;
         const cols = azFlipped[0].length;
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // Create compact control bar (use panel header for mode toggle)
@@ -9195,7 +10737,10 @@ async function renderFluxLinkageInteractive(containerId, step) {
         container.appendChild(plotDiv);
 
         // Get input image URL
-        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
+        const imgUrl = await loadImageDataUrl(
+            `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`,
+            renderContext.controller.signal
+        );
 
         // Create X and Y coordinate arrays
         const xCoords = Array.from({ length: cols }, (_, i) => i * dx * 1000); // mm
@@ -9305,7 +10850,7 @@ async function renderFluxLinkageInteractive(containerId, step) {
             ] : []
         };
 
-        await Plotly.newPlot(plotDiv, traces, layout, { responsive: true, displayModeBar: false });
+        await newPlotForRender(plotDiv, traces, layout, { responsive: true, displayModeBar: false }, renderContext);
 
         // Store reference in main container for panel header toggle
         container._fluxLinkagePlotDiv = plotDiv;
@@ -9363,13 +10908,19 @@ async function renderFluxLinkageInteractive(containerId, step) {
             }
 
             // Re-render to update
-            renderFluxLinkageInteractive(containerId, AppState.currentStep);
+            void renderFluxLinkageInteractive(containerId, AppState.currentStep).catch(error => {
+                if (!error || error.name !== 'AbortError') console.error('Flux linkage re-render error:', error);
+            });
         };
         plotDiv.addEventListener('click', plotDiv._clickHandler);
 
     } catch (error) {
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
+        }
         console.error('Flux linkage interactive error:', error);
-        container.innerHTML = '<div style="padding: 20px; text-align: center; color: red;">Error loading data</div>';
+        showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: red;">Error loading data</div>', renderContext);
     }
 }
 
@@ -9380,17 +10931,22 @@ function resetFluxLinkagePoints(containerId) {
         fluxLinkageState[containerId].endPoint = null;
         fluxLinkageState[containerId].selectingStart = true;
         fluxLinkageState[containerId].fluxValue = null;
-        renderFluxLinkageInteractive(containerId, AppState.currentStep);
+        void renderFluxLinkageInteractive(containerId, AppState.currentStep).catch(error => {
+            if (!error || error.name !== 'AbortError') console.error('Flux linkage reset error:', error);
+        });
     }
 }
 
 // Helper: Load force data for a specific step
-async function loadForceData(step) {
-    const resultPath = getCurrentResultPath();
+async function loadForceData(step, providedResultPath = null, signal = null) {
+    const resultPath = providedResultPath || getCurrentResultPath();
     if (!resultPath) return null;
 
     try {
-        const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/step_${String(step).padStart(4, '0')}.csv`);
+        const response = await fetch(
+            `/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=Forces/step_${String(step).padStart(4, '0')}.csv`,
+            signal ? { signal } : undefined
+        );
 
         if (!response.ok) {
             console.warn(`Forces data not found for step ${step}`);
@@ -9507,36 +11063,40 @@ async function loadForceData(step) {
             system_total_energy: systemTotalEnergy
         };
     } catch (error) {
+        if (error && error.name === 'AbortError') throw error;
         console.error(`Force data load error for step ${step}:`, error);
         return null;
     }
 }
 
-async function renderForceXTime(containerId) {
+async function renderForceXTime(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const totalSteps = AppState.totalSteps;
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
         // Load all steps data
         const allStepsData = [];
         let hasData = false;
 
-        for (let i = 0; i < AppState.totalSteps; i++) {
-            const data = await loadForceData(i + 1);
+        for (let i = 0; i < totalSteps; i++) {
+            const data = await loadForceData(i + 1, resultPath, renderContext.controller.signal);
+            assertRenderContextCurrent(renderContext, container);
             allStepsData.push(data || null);
             if (data) hasData = true;
         }
 
         if (!hasData) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // x-axis values: 1..totalSteps array (1-based)
-        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+        const xSteps = Array.from({ length: totalSteps }, (_, k) => k + 1);
 
         // Get list of material names (from first step)
         const materialNames = new Set();
@@ -9551,8 +11111,8 @@ async function renderForceXTime(containerId) {
 
         // Calculate marker sizes (always return array)
         const getMarkerSizes = (baseSize, highlightSize) => {
-            return Array.from({ length: AppState.totalSteps }, (_, i) => {
-                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            return Array.from({ length: totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === renderContext.step)) ? highlightSize : baseSize;
             });
         };
 
@@ -9566,7 +11126,7 @@ async function renderForceXTime(containerId) {
             const forceData = [];
             let matColor = null;
 
-            for (let i = 0; i < AppState.totalSteps; i++) {
+            for (let i = 0; i < totalSteps; i++) {
                 const stepData = allStepsData[i];
                 if (stepData && stepData.materials) {
                     const mat = stepData.materials.find(m => m.name === matName);
@@ -9616,7 +11176,7 @@ async function renderForceXTime(containerId) {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            xaxis: { title: 'Step', range: [1, totalSteps] },
             yaxis: { title: yaxisTitle, range: yrange },
             showlegend: true,
             legend: legendConfig,
@@ -9631,40 +11191,44 @@ async function renderForceXTime(containerId) {
             layout.yaxis.range = plotConfig.yRange;
         }
 
-        await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        await newPlotForRender(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('Force X time plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('Force X time plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
-async function renderForceYTime(containerId) {
+async function renderForceYTime(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const totalSteps = AppState.totalSteps;
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
         // Load all steps data
         const allStepsData = [];
         let hasData = false;
 
-        for (let i = 0; i < AppState.totalSteps; i++) {
-            const data = await loadForceData(i + 1);
+        for (let i = 0; i < totalSteps; i++) {
+            const data = await loadForceData(i + 1, resultPath, renderContext.controller.signal);
+            assertRenderContextCurrent(renderContext, container);
             allStepsData.push(data || null);
             if (data) hasData = true;
         }
 
         if (!hasData) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
-        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+        const xSteps = Array.from({ length: totalSteps }, (_, k) => k + 1);
 
         const materialNames = new Set();
         allStepsData.forEach(data => {
@@ -9676,8 +11240,8 @@ async function renderForceYTime(containerId) {
         const traces = [];
 
         const getMarkerSizes = (baseSize, highlightSize) => {
-            return Array.from({ length: AppState.totalSteps }, (_, i) => {
-                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            return Array.from({ length: totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === renderContext.step)) ? highlightSize : baseSize;
             });
         };
 
@@ -9690,7 +11254,7 @@ async function renderForceYTime(containerId) {
             const forceData = [];
             let matColor = null;
 
-            for (let i = 0; i < AppState.totalSteps; i++) {
+            for (let i = 0; i < totalSteps; i++) {
                 const stepData = allStepsData[i];
                 if (stepData && stepData.materials) {
                     const mat = stepData.materials.find(m => m.name === matName);
@@ -9737,7 +11301,7 @@ async function renderForceYTime(containerId) {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            xaxis: { title: 'Step', range: [1, totalSteps] },
             yaxis: { title: yaxisTitle, range: yrange },
             showlegend: true,
             legend: legendConfig,
@@ -9752,40 +11316,44 @@ async function renderForceYTime(containerId) {
             layout.yaxis.range = plotConfig.yRange;
         }
 
-        await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        await newPlotForRender(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('Force Y time plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('Force Y time plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
-async function renderTorqueTime(containerId) {
+async function renderTorqueTime(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const totalSteps = AppState.totalSteps;
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
         // Load all steps data
         const allStepsData = [];
         let hasData = false;
 
-        for (let i = 0; i < AppState.totalSteps; i++) {
-            const data = await loadForceData(i + 1);
+        for (let i = 0; i < totalSteps; i++) {
+            const data = await loadForceData(i + 1, resultPath, renderContext.controller.signal);
+            assertRenderContextCurrent(renderContext, container);
             allStepsData.push(data || null);
             if (data) hasData = true;
         }
 
         if (!hasData) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">No Forces data available</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
-        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+        const xSteps = Array.from({ length: totalSteps }, (_, k) => k + 1);
 
         const materialNames = new Set();
         allStepsData.forEach(data => {
@@ -9797,8 +11365,8 @@ async function renderTorqueTime(containerId) {
         const traces = [];
 
         const getMarkerSizes = (baseSize, highlightSize) => {
-            return Array.from({ length: AppState.totalSteps }, (_, i) => {
-                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            return Array.from({ length: totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === renderContext.step)) ? highlightSize : baseSize;
             });
         };
 
@@ -9811,7 +11379,7 @@ async function renderTorqueTime(containerId) {
             const torqueData = [];
             let matColor = null;
 
-            for (let i = 0; i < AppState.totalSteps; i++) {
+            for (let i = 0; i < totalSteps; i++) {
                 const stepData = allStepsData[i];
                 if (stepData && stepData.materials) {
                     const mat = stepData.materials.find(m => m.name === matName);
@@ -9858,7 +11426,7 @@ async function renderTorqueTime(containerId) {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            xaxis: { title: 'Step', range: [1, totalSteps] },
             yaxis: { title: yaxisTitle, range: yrange },
             showlegend: true,
             legend: legendConfig,
@@ -9873,13 +11441,14 @@ async function renderTorqueTime(containerId) {
             layout.yaxis.range = plotConfig.yRange;
         }
 
-        await Plotly.newPlot(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        await newPlotForRender(container, traces, layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('Torque time plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('Torque time plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
@@ -9902,15 +11471,15 @@ async function renderTorqueTime(containerId) {
 //
 // Plotly's built-in legend click hides/shows traces, so the user can
 // inspect one phase at a time without us writing a custom legend.
-async function loadFluxLinkageData() {
-    const resultPath = getCurrentResultPath();
+async function loadFluxLinkageData(providedResultPath = null, signal = null) {
+    const resultPath = providedResultPath || getCurrentResultPath();
     if (!resultPath) return null;
 
     try {
         const response = await fetch(
             `/api/load-csv-raw?result=${encodeURIComponent(resultPath)}`
             + `&file=FluxLinkage/flux_linkage.csv`,
-            { cache: 'no-store' });
+            signal ? { cache: 'no-store', signal } : { cache: 'no-store' });
         if (!response.ok) return null;
         const text = await response.text();
         if (!text || !text.trim()) return null;
@@ -9938,6 +11507,7 @@ async function loadFluxLinkageData() {
 
         return { headers, phiNames, steps, phiSeries };
     } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
         console.error('loadFluxLinkageData failed:', e);
         return null;
     }
@@ -9954,21 +11524,22 @@ function fluxPhaseColor(name) {
     return null;
 }
 
-async function renderFluxLinkageTime(containerId) {
+async function renderFluxLinkageTime(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
-        const data = await loadFluxLinkageData();
+        const data = await loadFluxLinkageData(renderContext.resultPath, renderContext.controller.signal);
+        assertRenderContextCurrent(renderContext, container);
         if (!data || data.steps.length === 0) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">'
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">'
                 + 'No flux_linkage.csv in this result.<br>'
                 + 'Define <code>flux_linkage:</code> in the YAML and rerun the transient analysis.'
-                + '</div>';
+                + '</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // CSV step column is 0-based to match the solver's `step 0:` print;
@@ -9993,7 +11564,7 @@ async function renderFluxLinkageTime(containerId) {
             ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
             : { x: 1.02, y: 1, xanchor: 'left' };
 
-        await Plotly.newPlot(container, traces, {
+        await newPlotForRender(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 60, r: 10, t: 10, b: 35 },
@@ -10002,31 +11573,33 @@ async function renderFluxLinkageTime(containerId) {
             legend: legendConfig,
             showlegend: true,
             hovermode: 'closest'
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('Flux linkage time plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('Flux linkage time plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
-async function renderBackEMFTime(containerId) {
+async function renderBackEMFTime(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
-        const data = await loadFluxLinkageData();
+        const data = await loadFluxLinkageData(renderContext.resultPath, renderContext.controller.signal);
+        assertRenderContextCurrent(renderContext, container);
         if (!data || data.steps.length < 2) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">'
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">'
                 + 'Need at least 2 transient steps to compute dΦ/dstep.<br>'
                 + 'Define <code>flux_linkage:</code> and run a transient analysis (total_steps ≥ 2).'
-                + '</div>';
+                + '</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
         // Forward-difference EMF ∝ -ΔΦ/Δstep, plotted at the midpoint
@@ -10071,7 +11644,7 @@ async function renderBackEMFTime(containerId) {
             ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
             : { x: 1.02, y: 1, xanchor: 'left' };
 
-        await Plotly.newPlot(container, traces, {
+        await newPlotForRender(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 60, r: 10, t: 10, b: 35 },
@@ -10080,40 +11653,44 @@ async function renderBackEMFTime(containerId) {
             legend: legendConfig,
             showlegend: true,
             hovermode: 'closest'
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('Back-EMF time plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('Back-EMF time plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
-async function renderEnergyTime(containerId) {
+async function renderEnergyTime(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const totalSteps = AppState.totalSteps;
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
         // Load all steps data
         const allStepsData = [];
         let hasData = false;
 
-        for (let i = 0; i < AppState.totalSteps; i++) {
-            const data = await loadForceData(i + 1);
+        for (let i = 0; i < totalSteps; i++) {
+            const data = await loadForceData(i + 1, resultPath, renderContext.controller.signal);
+            assertRenderContextCurrent(renderContext, container);
             allStepsData.push(data || null);
             if (data) hasData = true;
         }
 
         if (!hasData) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No Energy data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">No Energy data available</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
-        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+        const xSteps = Array.from({ length: totalSteps }, (_, k) => k + 1);
 
         const materialNames = new Set();
         allStepsData.forEach(data => {
@@ -10125,8 +11702,8 @@ async function renderEnergyTime(containerId) {
         const traces = [];
 
         const getMarkerSizes = (baseSize, highlightSize) => {
-            return Array.from({ length: AppState.totalSteps }, (_, i) => {
-                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            return Array.from({ length: totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === renderContext.step)) ? highlightSize : baseSize;
             });
         };
 
@@ -10140,7 +11717,7 @@ async function renderEnergyTime(containerId) {
             const energyData = [];
             let matColor = null;
 
-            for (let i = 0; i < AppState.totalSteps; i++) {
+            for (let i = 0; i < totalSteps; i++) {
                 const stepData = allStepsData[i];
                 if (stepData && stepData.materials) {
                     const mat = stepData.materials.find(m => m.name === matName);
@@ -10169,7 +11746,7 @@ async function renderEnergyTime(containerId) {
         // Add system total energy as black line
         const systemEnergyData = [];
         let hasSystemEnergy = false;
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 0; i < totalSteps; i++) {
             const stepData = allStepsData[i];
             if (stepData && stepData.system_total_energy !== undefined) {
                 systemEnergyData.push(stepData.system_total_energy * energyMultiplier);
@@ -10196,49 +11773,53 @@ async function renderEnergyTime(containerId) {
             ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
             : { x: 1.02, y: 1, xanchor: 'left' };
 
-        await Plotly.newPlot(container, traces, {
+        await newPlotForRender(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 45, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            xaxis: { title: 'Step', range: [1, totalSteps] },
             yaxis: { title: 'Energy [J/m]' },
             showlegend: true,
             legend: legendConfig,
             dragmode: false
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('Energy time plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('Energy time plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
-async function renderSystemEnergyTime(containerId) {
+async function renderSystemEnergyTime(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const totalSteps = AppState.totalSteps;
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
         // Load all steps data
         const allStepsData = [];
         let hasData = false;
 
-        for (let i = 0; i < AppState.totalSteps; i++) {
-            const data = await loadForceData(i + 1);
+        for (let i = 0; i < totalSteps; i++) {
+            const data = await loadForceData(i + 1, resultPath, renderContext.controller.signal);
+            assertRenderContextCurrent(renderContext, container);
             allStepsData.push(data || null);
             if (data && data.system_total_energy !== undefined) hasData = true;
         }
 
         if (!hasData) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No System Energy data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">No System Energy data available</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
-        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+        const xSteps = Array.from({ length: totalSteps }, (_, k) => k + 1);
 
         // Full model multiplier for polar coordinates (energy is also multiplied for full model)
         const energyMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
@@ -10247,7 +11828,7 @@ async function renderSystemEnergyTime(containerId) {
 
         // Extract system total energy for each step
         const energyData = [];
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 0; i < totalSteps; i++) {
             const stepData = allStepsData[i];
             if (stepData && stepData.system_total_energy !== undefined) {
                 energyData.push(stepData.system_total_energy * energyMultiplier);
@@ -10257,8 +11838,8 @@ async function renderSystemEnergyTime(containerId) {
         }
 
         const getMarkerSizes = (baseSize, highlightSize) => {
-            return Array.from({ length: AppState.totalSteps }, (_, i) => {
-                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            return Array.from({ length: totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === renderContext.step)) ? highlightSize : baseSize;
             });
         };
 
@@ -10272,48 +11853,53 @@ async function renderSystemEnergyTime(containerId) {
             marker: { color: '#1f77b4', size: getMarkerSizes(6, 14) }
         }];
 
-        await Plotly.newPlot(container, traces, {
+        await newPlotForRender(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 55, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            xaxis: { title: 'Step', range: [1, totalSteps] },
             yaxis: { title: 'System Energy [J/m]' },
             showlegend: false,
             dragmode: false
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('System energy time plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('System energy time plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
-async function renderVirtualWork(containerId) {
+async function renderVirtualWork(containerId, step, renderContext = null) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const resultPath = renderContext.resultPath;
+    const totalSteps = AppState.totalSteps;
+    const analysisConditions = AppState.analysisConditions;
     try {
-        const container = document.getElementById(containerId);
-        if (!container) return;
-
         // Load all steps data
         const allStepsData = [];
         let hasData = false;
 
-        for (let i = 0; i < AppState.totalSteps; i++) {
-            const data = await loadForceData(i + 1);
+        for (let i = 0; i < totalSteps; i++) {
+            const data = await loadForceData(i + 1, resultPath, renderContext.controller.signal);
+            assertRenderContextCurrent(renderContext, container);
             allStepsData.push(data || null);
             if (data && data.system_total_energy !== undefined) hasData = true;
         }
 
         if (!hasData) {
-            container.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">No System Energy data available</div>';
+            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">No System Energy data available</div>', renderContext);
             return;
         }
 
-        container.innerHTML = '';
+        preparePlotlyContainer(container, renderContext);
         const size = getContainerSize(container);
 
-        const xSteps = Array.from({ length: AppState.totalSteps }, (_, k) => k + 1);
+        const xSteps = Array.from({ length: totalSteps }, (_, k) => k + 1);
 
         // Full model multiplier for polar coordinates
         const energyMultiplier = (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1)
@@ -10322,7 +11908,7 @@ async function renderVirtualWork(containerId) {
 
         // Extract system total energy for each step
         const energyData = [];
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 0; i < totalSteps; i++) {
             const stepData = allStepsData[i];
             if (stepData && stepData.system_total_energy !== undefined) {
                 energyData.push(stepData.system_total_energy * energyMultiplier);
@@ -10336,17 +11922,17 @@ async function renderVirtualWork(containerId) {
         let yAxisTitle = '+dW/dx [N/m]';
         let isAngular = false;
 
-        if (AppState.analysisConditions) {
-            const transient = AppState.analysisConditions.transient;
+        if (analysisConditions) {
+            const transient = analysisConditions.transient;
             const slidePixelsPerStep = transient?.slide_pixels_per_step || 1;
             const slideDirection = transient?.slide_direction || 'horizontal';
-            const coordSystem = AppState.analysisConditions.coordinate_system || 'cartesian';
+            const coordSystem = analysisConditions.coordinate_system || 'cartesian';
 
             if (coordSystem === 'polar') {
-                const polar = AppState.analysisConditions.polar;
+                const polar = analysisConditions.polar;
                 const rOrientation = polar?.r_orientation || 'horizontal';
-                const dr = AppState.analysisConditions.dr || 0.001;
-                const dtheta = AppState.analysisConditions.dtheta || 0.01;
+                const dr = analysisConditions.dr || 0.001;
+                const dtheta = analysisConditions.dtheta || 0.01;
 
                 // Determine if sliding is in theta direction (angular) or r direction (radial)
                 // r_orientation = 'horizontal': r along x-axis, theta along y-axis
@@ -10369,8 +11955,8 @@ async function renderVirtualWork(containerId) {
                 }
             } else {
                 // Cartesian coordinates
-                const dx = AppState.analysisConditions.dx || 0.001;
-                const dy = AppState.analysisConditions.dy || 0.001;
+                const dx = analysisConditions.dx || 0.001;
+                const dy = analysisConditions.dy || 0.001;
 
                 if (slideDirection === 'horizontal') {
                     displacementPerStep = slidePixelsPerStep * dx;  // [m]
@@ -10385,16 +11971,16 @@ async function renderVirtualWork(containerId) {
         // Calculate virtual work: F = +dW/dx for constant-current systems (Jz specified)
         // Note: For constant-flux systems, F = -dW/dx. OpenMagFDM uses constant current.
         const virtualWorkData = [];
-        for (let i = 0; i < AppState.totalSteps; i++) {
+        for (let i = 0; i < totalSteps; i++) {
             if (i === 0) {
                 // Forward difference for first point
-                if (AppState.totalSteps > 1) {
+                if (totalSteps > 1) {
                     const dW = energyData[1] - energyData[0];
                     virtualWorkData.push(dW / displacementPerStep);
                 } else {
                     virtualWorkData.push(0);
                 }
-            } else if (i === AppState.totalSteps - 1) {
+            } else if (i === totalSteps - 1) {
                 // Backward difference for last point
                 const dW = energyData[i] - energyData[i - 1];
                 virtualWorkData.push(dW / displacementPerStep);
@@ -10406,8 +11992,8 @@ async function renderVirtualWork(containerId) {
         }
 
         const getMarkerSizes = (baseSize, highlightSize) => {
-            return Array.from({ length: AppState.totalSteps }, (_, i) => {
-                return (AppState.isAnimating && (i + 1 === AppState.currentStep)) ? highlightSize : baseSize;
+            return Array.from({ length: totalSteps }, (_, i) => {
+                return (AppState.isAnimating && (i + 1 === renderContext.step)) ? highlightSize : baseSize;
             });
         };
 
@@ -10421,21 +12007,22 @@ async function renderVirtualWork(containerId) {
             marker: { color: '#d62728', size: getMarkerSizes(6, 14) }
         }];
 
-        await Plotly.newPlot(container, traces, {
+        await newPlotForRender(container, traces, {
             width: size.width,
             height: size.height,
             margin: { l: 55, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', range: [1, AppState.totalSteps] },
+            xaxis: { title: 'Step', range: [1, totalSteps] },
             yaxis: { title: yAxisTitle },
             showlegend: false,
             dragmode: false
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
     } catch (error) {
-        console.error('Virtual work plot error:', error);
-        const container = document.getElementById(containerId);
-        if (container) {
-            container.innerHTML = `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`;
+        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
+            discardStaleRender(container, renderContext);
+            return;
         }
+        console.error('Virtual work plot error:', error);
+        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
     }
 }
 
@@ -10454,20 +12041,28 @@ function getContainerSize(container) {
 }
 
 // ===== Plotting Functions =====
-function plotContour(elementId, data, title, usePhysicalAxes = false) {
-    const container = document.getElementById(elementId);
+function resolvePlotContainer(elementOrId) {
+    return typeof elementOrId === 'string'
+        ? document.getElementById(elementOrId)
+        : elementOrId;
+}
+
+async function plotContour(elementOrId, data, title, usePhysicalAxes = false, renderContext = null) {
+    const container = resolvePlotContainer(elementOrId);
+    const elementId = container?.id || String(elementOrId);
+    const analysisConditions = renderContext?.analysisConditions || AppState.analysisConditions;
     if (!container) {
         console.error(`plotContour: Container not found: ${elementId}`);
         return;
     }
 
     if (!data || data.length === 0) {
-        container.innerHTML = '<p>No data available</p>';
+        showPlotMessage(container, '<p>No data available</p>', renderContext);
         return;
     }
 
     // Clear container before plotting
-    container.innerHTML = '';
+    preparePlotlyContainer(container, renderContext);
 
     // Get container size
     const size = getContainerSize(container);
@@ -10491,16 +12086,16 @@ function plotContour(elementId, data, title, usePhysicalAxes = false) {
 
     // Generate physical axes if requested and conditions are available
     let xaxis, yaxis;
-    if (usePhysicalAxes && AppState.analysisConditions) {
+    if (usePhysicalAxes && analysisConditions) {
         const rows = data.length;
         const cols = data[0]?.length || 0;
-        const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+        const coordSys = analysisConditions.coordinate_system || 'cartesian';
 
         if (coordSys === 'polar') {
-            const theta_start = AppState.analysisConditions.theta_start || 0;
-            const dr = AppState.analysisConditions.dr || 0.001;
-            const dtheta = AppState.analysisConditions.dtheta || 0.001;
-            const r_orientation = AppState.analysisConditions.polar?.r_orientation || 'horizontal';
+            const theta_start = analysisConditions.theta_start || 0;
+            const dr = analysisConditions.dr || 0.001;
+            const dtheta = analysisConditions.dtheta || 0.001;
+            const r_orientation = analysisConditions.polar?.r_orientation || 'horizontal';
 
             // Determine nr and ntheta based on r_orientation
             let nr, ntheta;
@@ -10530,8 +12125,8 @@ function plotContour(elementId, data, title, usePhysicalAxes = false) {
                 yaxis = { title: 'r - r_start [mm]' };
             }
         } else {
-            const dx = AppState.analysisConditions.dx || 0.001;
-            const dy = AppState.analysisConditions.dy || 0.001;
+            const dx = analysisConditions.dx || 0.001;
+            const dy = analysisConditions.dy || 0.001;
 
             // Cartesian: both in mm
             const xVals = Array.from({ length: cols }, (_, i) => i * dx * 1000);
@@ -10557,7 +12152,13 @@ function plotContour(elementId, data, title, usePhysicalAxes = false) {
         dragmode: false
     };
 
-    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar });
+    return await newPlotForRender(
+        container,
+        [trace],
+        layout,
+        { responsive: true, displayModeBar: AppState.showPlotlyModeBar },
+        renderContext
+    );
 }
 
 // ===== Plot Zoom State Management =====
@@ -10596,34 +12197,41 @@ function restoreZoomState(containerId, layout) {
  * Setup zoom state tracking for a Plotly container
  * @param {string} containerId - Plot container ID
  */
-function setupZoomTracking(containerId) {
-    const container = document.getElementById(containerId);
+function setupZoomTracking(containerOrId) {
+    const container = resolvePlotContainer(containerOrId);
     if (!container) return;
+    const containerId = container.id;
 
-    container.on('plotly_relayout', (eventData) => {
+    removeZoomTracking(container);
+    const handler = (eventData) => {
         // Save zoom state when user zooms/pans
         if (eventData['xaxis.range[0]'] !== undefined || eventData['xaxis.range'] !== undefined) {
             const layout = container.layout;
             saveZoomState(containerId, layout);
         }
-    });
+    };
+    container._zoomTrackingHandler = handler;
+    container.on('plotly_relayout', handler);
 }
 
 // ===== Plotting Functions =====
-function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmonicMean = false) {
-    const container = document.getElementById(elementId);
+async function plotHeatmap(elementOrId, data, title, usePhysicalAxes = false, useHarmonicMean = false, renderContext = null) {
+    const container = resolvePlotContainer(elementOrId);
+    const elementId = container?.id || String(elementOrId);
+    const analysisConditions = renderContext?.analysisConditions || AppState.analysisConditions;
+    const polarView = renderContext?.polarView || snapshotPolarView(analysisConditions);
     if (!container) {
         console.error(`plotHeatmap: Container not found: ${elementId}`);
         return;
     }
 
     if (!data || data.length === 0) {
-        container.innerHTML = '<p>No data available</p>';
+        showPlotMessage(container, '<p>No data available</p>', renderContext);
         return;
     }
 
     // Clear container before plotting
-    container.innerHTML = '';
+    preparePlotlyContainer(container, renderContext);
 
     // Get container size
     const size = getContainerSize(container);
@@ -10667,29 +12275,30 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
 
     // Generate physical axes if requested and conditions are available
     let xaxis, yaxis;
-    if (usePhysicalAxes && AppState.analysisConditions) {
+    if (usePhysicalAxes && analysisConditions) {
         const rows = data.length;
         const cols = data[0]?.length || 0;
-        const coordSys = AppState.analysisConditions.coordinate_system || 'cartesian';
+        const coordSys = analysisConditions.coordinate_system || 'cartesian';
 
-        if (coordSys === 'polar' && AppState.polarCartesianTransform) {
+        if (coordSys === 'polar' && polarView.cartesianTransform) {
             // Apply polar to cartesian transformation
             const transformedData = transformPolarToCartesian(
                 data,
-                AppState.analysisConditions,
-                AppState.polarFullModel,
-                useHarmonicMean
+                analysisConditions,
+                polarView.fullModel,
+                useHarmonicMean,
+                polarView.fullModelMultiplier
             );
 
             trace.x = transformedData.x;
             trace.y = transformedData.y;
             trace.z = transformedData.z;
 
-            const r_o = AppState.analysisConditions.polar?.r_end || AppState.analysisConditions.r_o || 1;
+            const r_o = analysisConditions.polar?.r_end || analysisConditions.r_o || 1;
             xaxis = {
                 title: 'X [mm]',
                 range: [-r_o * 1000, r_o * 1000],
-                ...(AppState.polarFullModel && { scaleanchor: 'y', scaleratio: 1 })
+                ...(polarView.fullModel && { scaleanchor: 'y', scaleratio: 1 })
             };
             yaxis = {
                 title: 'Y [mm]',
@@ -10697,10 +12306,10 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
             };
         } else if (coordSys === 'polar') {
             // Original polar view (r vs theta)
-            const theta_start = AppState.analysisConditions.theta_start || 0;
-            const dr = AppState.analysisConditions.dr || 0.001;
-            const dtheta = AppState.analysisConditions.dtheta || 0.001;
-            const r_orientation = AppState.analysisConditions.polar?.r_orientation || 'horizontal';
+            const theta_start = analysisConditions.theta_start || 0;
+            const dr = analysisConditions.dr || 0.001;
+            const dtheta = analysisConditions.dtheta || 0.001;
+            const r_orientation = analysisConditions.polar?.r_orientation || 'horizontal';
 
             // Determine nr and ntheta based on r_orientation
             let nr, ntheta;
@@ -10731,8 +12340,8 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
             }
         } else {
             // Cartesian coordinates
-            const dx = AppState.analysisConditions.dx || 0.001;
-            const dy = AppState.analysisConditions.dy || 0.001;
+            const dx = analysisConditions.dx || 0.001;
+            const dy = analysisConditions.dy || 0.001;
 
             // Cartesian: both in mm
             const xVals = Array.from({ length: cols }, (_, i) => i * dx * 1000);
@@ -10749,8 +12358,8 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
     }
 
     // Update title for full model
-    if (AppState.isPolarCoordinates && AppState.polarFullModel && AppState.polarFullModelMultiplier > 1) {
-        graphTitle += ` (Full Model ×${AppState.polarFullModelMultiplier})`;
+    if (polarView.isPolar && polarView.fullModel && polarView.fullModelMultiplier > 1) {
+        graphTitle += ` (Full Model ×${polarView.fullModelMultiplier})`;
     }
 
     let layout = {
@@ -10776,17 +12385,32 @@ function plotHeatmap(elementId, data, title, usePhysicalAxes = false, useHarmoni
         layout = restoreZoomState(elementId, layout);
     }
 
-    Plotly.newPlot(container, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }).then(() => {
-        setupZoomTracking(elementId);
-    });
+    const plot = await newPlotForRender(
+        container,
+        [trace],
+        layout,
+        { responsive: true, displayModeBar: AppState.showPlotlyModeBar },
+        renderContext
+    );
+    setupZoomTracking(container);
+    return plot;
 }
 
-function plotForceGraph(elementId, data, title) {
-    // Parse force data from CSV
-    if (!data || !Array.isArray(data) || data.length < 2) {
-        document.getElementById(elementId).innerHTML = '<p>No force data available</p>';
+async function plotForceGraph(elementOrId, data, title, renderContext = null) {
+    const container = resolvePlotContainer(elementOrId);
+    const elementId = container?.id || String(elementOrId);
+    if (!container) {
+        console.error(`plotForceGraph: Container not found: ${elementId}`);
         return;
     }
+
+    // Parse force data from CSV
+    if (!data || !Array.isArray(data) || data.length < 2) {
+        showPlotMessage(container, '<p>No force data available</p>', renderContext);
+        return;
+    }
+
+    preparePlotlyContainer(container, renderContext);
 
     // Get plot configuration if available
     const plotId = elementId.replace('container-', '');
@@ -10827,9 +12451,15 @@ function plotForceGraph(elementId, data, title) {
         layout = restoreZoomState(elementId, layout);
     }
 
-    Plotly.newPlot(elementId, [trace], layout, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }).then(() => {
-        setupZoomTracking(elementId);
-    });
+    const plot = await newPlotForRender(
+        container,
+        [trace],
+        layout,
+        { responsive: true, displayModeBar: AppState.showPlotlyModeBar },
+        renderContext
+    );
+    setupZoomTracking(container);
+    return plot;
 }
 
 // ===== Utility Functions =====
@@ -11104,6 +12734,7 @@ async function fileManagerDelete(button) {
         if (file.category === 'configs') await refreshConfigList();
         if (file.category === 'images') await refreshImageList();
         if (file.category === 'results') await refreshResultsList();
+        if (file.category === 'results') clearFilePreview({ hide: true });
         fileManagerStatus(`Deleted ${file.name}`, 'success');
     } catch (error) {
         fileManagerStatus(`Delete failed: ${error.message}`, 'error');
@@ -11159,6 +12790,7 @@ async function deleteSelectedUserFiles() {
     if (categories.has('images')) refreshes.push(refreshImageList());
     if (categories.has('results')) refreshes.push(refreshResultsList());
     await Promise.allSettled(refreshes);
+    if (categories.has('results')) clearFilePreview({ hide: true });
     updateUserFileSelectionControls();
 
     if (failures.length > 0) {
@@ -11196,6 +12828,7 @@ async function refreshOutputsList() {
 
         if (result.outputs.length === 0) {
             outputsList.innerHTML = '<p style="color: #666;">No analysis results found.</p>';
+            clearFilePreview({ hide: true });
             return;
         }
 
@@ -11288,6 +12921,7 @@ async function deleteOutput(folderName) {
 
         // Refresh the list
         refreshOutputsList();
+        clearFilePreview({ hide: true });
 
     } catch (error) {
         console.error('Error deleting output:', error);
@@ -11325,6 +12959,27 @@ async function selectOutput(folderName, event) {
     await showOutputPreview(folderName);
 }
 
+function clearFilePreview({
+    hide = false,
+    descriptionHtml = '',
+    plotHtml = '',
+} = {}) {
+    AppState.filePreviewController?.abort();
+    AppState.filePreviewController = null;
+    AppState.filePreviewResultPath = '';
+    AppState.filePreviewGeneration++;
+
+    const descDiv = document.getElementById('previewDescription');
+    if (descDiv) descDiv.innerHTML = descriptionHtml;
+    for (const id of ['filePreviewPlot1', 'filePreviewPlot2']) {
+        const plot = document.getElementById(id);
+        if (plot) showPlotMessage(plot, plotHtml);
+    }
+
+    const previewPanel = document.getElementById('filePreviewPanel');
+    if (previewPanel) previewPanel.style.display = hide ? 'none' : 'block';
+}
+
 /**
  * Show output preview in right panel
  * @param {string} folderName - Folder name
@@ -11340,12 +12995,36 @@ async function showOutputPreview(folderName) {
         return;
     }
 
-    previewPanel.style.display = 'block';
+    clearFilePreview({
+        descriptionHtml: '<em>Loading preview...</em>',
+        plotHtml: '<div style="padding:20px; text-align:center; color:#999;">Loading...</div>',
+    });
+    const controller = new AbortController();
+    const resultPath = `outputs/${AppState.userId}/${folderName}`;
+    const previewContext = {
+        generation: ++AppState.filePreviewGeneration,
+        controller,
+        resultPath,
+    };
+    AppState.filePreviewController = controller;
+    AppState.filePreviewResultPath = resultPath;
+    const assertCurrent = () => {
+        if (controller.signal.aborted ||
+            AppState.filePreviewGeneration !== previewContext.generation ||
+            AppState.filePreviewController !== controller ||
+            AppState.filePreviewResultPath !== resultPath) {
+            throw createAbortError('File preview superseded');
+        }
+    };
 
     try {
         // Fetch description
-        const descResponse = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`);
+        const descResponse = await fetch(
+            `/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`,
+            { signal: controller.signal }
+        );
         const descResult = await descResponse.json();
+        assertCurrent();
 
         if (descResult.success && descResult.description) {
             // Escape HTML and convert newlines to <br>
@@ -11360,27 +13039,40 @@ async function showOutputPreview(folderName) {
         }
 
         // Render preview plots (similar to Run & Preview)
-        const resultPath = `outputs/${AppState.userId}/${folderName}`;
         console.log('Loading preview from:', resultPath);
 
         // Load analysis conditions for this result
+        let previewConditions = { coordinate_system: 'cartesian', dx: 0.001, dy: 0.001 };
         try {
-            const conditionsResponse = await fetch(`/api/get-conditions?result=${encodeURIComponent(resultPath)}`);
+            const conditionsResponse = await fetch(
+                `/api/get-conditions?result=${encodeURIComponent(resultPath)}`,
+                { signal: controller.signal }
+            );
             if (conditionsResponse.ok) {
                 const conditionsText = await conditionsResponse.text();
-                AppState.analysisConditions = JSON.parse(conditionsText);
-                console.log('Loaded analysis conditions:', AppState.analysisConditions);
+                previewConditions = JSON.parse(conditionsText);
+                console.log('Loaded preview analysis conditions:', previewConditions);
             }
         } catch (error) {
+            if (error && error.name === 'AbortError') throw error;
             console.warn('Could not load analysis conditions:', error);
         }
+        assertCurrent();
 
-        await renderFileManagerPreview(resultPath);
+        previewContext.analysisConditions = previewConditions;
+        await renderFileManagerPreview(resultPath, previewConditions, previewContext);
+        assertCurrent();
         console.log('Preview rendered successfully');
 
     } catch (error) {
+        if ((error && error.name === 'AbortError') || controller.signal.aborted) return;
         console.error('Error loading preview:', error);
-        descDiv.innerHTML = `<em style="color: #dc3545;">Error loading description</em>`;
+        if (AppState.filePreviewController === controller) {
+            clearFilePreview({
+                descriptionHtml: '<em style="color:#dc3545;">Error loading preview</em>',
+                plotHtml: '<div style="padding:20px; text-align:center; color:#dc3545;">Preview not available</div>',
+            });
+        }
     }
 }
 
@@ -11388,7 +13080,7 @@ async function showOutputPreview(folderName) {
  * Render preview plots for File Manager
  * @param {string} resultPath - Result path
  */
-async function renderFileManagerPreview(resultPath) {
+async function renderFileManagerPreview(resultPath, analysisConditions, previewContext) {
     console.log('renderFileManagerPreview called:', resultPath);
 
     const plot1 = document.getElementById('filePreviewPlot1');
@@ -11401,12 +13093,25 @@ async function renderFileManagerPreview(resultPath) {
 
     // Load step 1 data for preview
     const step = 1;
+    const assertCurrent = () => {
+        if (previewContext.controller.signal.aborted ||
+            AppState.filePreviewGeneration !== previewContext.generation ||
+            AppState.filePreviewController !== previewContext.controller ||
+            AppState.filePreviewResultPath !== resultPath) {
+            throw createAbortError('File preview superseded');
+        }
+    };
 
     // Plot 1: Input image (use simple HTML img tag)
     try {
-        const imgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
-        console.log('Loading input image from:', imgUrl);
+        const imgUrl = await loadImageDataUrl(
+            `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`,
+            previewContext.controller.signal
+        );
+        assertCurrent();
+        console.log('Loaded file preview input image:', resultPath);
 
+        purgePlotlyTree(plot1);
         plot1.innerHTML = `
             <h4 style="text-align: center; margin-bottom: 10px;">Input Image (Step ${step})</h4>
             <img src="${imgUrl}"
@@ -11415,30 +13120,42 @@ async function renderFileManagerPreview(resultPath) {
         `;
         console.log('Input image HTML set');
     } catch (error) {
+        if (error && error.name === 'AbortError') throw error;
         console.error('Error loading input image:', error);
-        plot1.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">Input image not available</div>';
+        assertCurrent();
+        showPlotMessage(plot1, '<div style="padding: 20px; text-align: center; color: #999;">Input image not available</div>');
     }
 
     // Plot 2: B magnitude (calculated from Az and Mu)
+    let azLease = null;
+    let muLease = null;
     try {
         // Get grid spacing (handle both Cartesian and Polar coordinate systems)
         let dx = 0.001;
         let dy = 0.001;
 
-        if (AppState.analysisConditions) {
-            if (AppState.analysisConditions.coordinate_system === 'polar') {
-                dx = AppState.analysisConditions.dr || 0.001;
-                dy = AppState.analysisConditions.dtheta || 0.001;
+        if (analysisConditions) {
+            if (analysisConditions.coordinate_system === 'polar') {
+                dx = analysisConditions.dr || 0.001;
+                dy = analysisConditions.dtheta || 0.001;
             } else {
-                dx = AppState.analysisConditions.dx || 0.001;
-                dy = AppState.analysisConditions.dy || 0.001;
+                dx = analysisConditions.dx || 0.001;
+                dy = analysisConditions.dy || 0.001;
             }
         }
 
-        console.log('Using dx:', dx, 'dy:', dy, 'coordinate_system:', AppState.analysisConditions?.coordinate_system);
+        console.log('Using dx:', dx, 'dy:', dy, 'coordinate_system:', analysisConditions?.coordinate_system);
 
-        const azData = await loadFieldData('Az', step, resultPath);
-        const muData = await loadFieldData('Mu', step, resultPath);
+        azLease = await acquireSharedFieldPayload(
+            'Az', step, resultPath, previewContext.controller.signal
+        );
+        const { data: azData } = azLease.payload;
+        assertCurrent();
+        muLease = await acquireSharedFieldPayload(
+            'Mu', step, resultPath, previewContext.controller.signal
+        );
+        const { data: muData } = muLease.payload;
+        assertCurrent();
         console.log('Loaded Az and Mu data');
 
         // Flip data from analysis coordinate system (y-up) to image coordinate system (y-down)
@@ -11446,42 +13163,40 @@ async function renderFileManagerPreview(resultPath) {
         const muFlipped = flipVertical(muData);
 
         // Load coarsening mask for coarsening-aware B computation
-        const maskResult = await getCoarseningMaskArray(resultPath, step).catch(() => null);
+        const maskResult = await getCoarseningMaskArray(
+            resultPath,
+            step,
+            previewContext.controller.signal
+        ).catch(error => {
+            if ((error && error.name === 'AbortError') ||
+                error?.code === 'FIELD_MEMORY_BUDGET') throw error;
+            return null;
+        });
+        assertCurrent();
         const activeMask = maskResult ? maskResult.mask : null;
 
-        const { B } = calculateMagneticField(azFlipped, muFlipped, dx, dy, activeMask);
+        const { B } = calculateMagneticField(
+            azFlipped, muFlipped, dx, dy, activeMask, analysisConditions
+        );
         console.log('Calculated B magnitude');
 
+        purgePlotlyTree(plot2);
         plot2.innerHTML = '';
-        await plotHeatmapInDiv(plot2, B, '|B| [T]', true);
+        const graphDiv = document.createElement('div');
+        graphDiv.id = `filePreviewGraph-${previewContext.generation}`;
+        graphDiv.style.cssText = 'width:100%; height:100%;';
+        plot2.appendChild(graphDiv);
+        const renderContext = createFilePreviewRenderContext(previewContext, graphDiv);
+        await plotHeatmap(graphDiv, B, '|B| [T]', true, false, renderContext);
         console.log('B magnitude plot rendered');
     } catch (error) {
+        if ((error && error.name === 'AbortError') || previewContext.controller.signal.aborted) return;
         console.error('Error calculating B magnitude:', error);
-        plot2.innerHTML = '<div style="padding: 20px; text-align: center; color: #999;">B magnitude not available</div>';
-    }
-}
-
-/**
- * Plot heatmap in a specific div
- * @param {HTMLElement} container - Container element
- * @param {Array} data - Data array
- * @param {string} title - Plot title
- * @param {boolean} usePhysicalAxes - Use physical axes
- * @param {boolean} useHarmonicMean - Use harmonic mean for interpolation
- */
-async function plotHeatmapInDiv(container, data, title, usePhysicalAxes, useHarmonicMean) {
-    // Save original ID
-    const originalId = container.id;
-
-    // Use a temporary unique ID for Plotly
-    const tempId = 'temp_' + Math.random().toString(36).substr(2, 9);
-    container.id = tempId;
-
-    try {
-        await plotHeatmap(tempId, data, title, usePhysicalAxes, useHarmonicMean);
+        assertCurrent();
+        showPlotMessage(plot2, '<div style="padding: 20px; text-align: center; color: #999;">B magnitude not available</div>');
     } finally {
-        // Restore original ID
-        container.id = originalId;
+        muLease?.release();
+        azLease?.release();
     }
 }
 
@@ -11561,11 +13276,7 @@ async function bulkDeleteOutputs() {
         // Refresh list
         refreshOutputsList();
 
-        // Hide preview panel
-        const previewPanel = document.getElementById('filePreviewPanel');
-        if (previewPanel) {
-            previewPanel.style.display = 'none';
-        }
+        clearFilePreview({ hide: true });
 
     } catch (error) {
         console.error('Error in bulk delete:', error);
@@ -11597,6 +13308,7 @@ async function renameOutput(folderName) {
         alert('Folder renamed successfully');
         refreshOutputsList();
         refreshResultsList();  // Update Run & Preview tab list
+        clearFilePreview({ hide: true });
 
     } catch (error) {
         console.error('Error renaming:', error);
@@ -11954,7 +13666,6 @@ function toggleCartesianTransform() {
 
     // Refresh all plots including dashboard
     refreshAllPlots();
-    updateAllPlots();
 }
 
 /**
@@ -11972,7 +13683,6 @@ function toggleFullModel() {
 
     // Refresh all plots including dashboard
     refreshAllPlots();
-    updateAllPlots();
 }
 
 /**
@@ -11982,7 +13692,13 @@ function toggleFullModel() {
  * @param {boolean} fullModel - If true, replicate to full 360 degrees
  * @returns {object} - {x: Array, y: Array, z: Array} for Plotly heatmap
  */
-function transformPolarToCartesian(polarData, conditions, fullModel = false, useHarmonicMean = false) {
+function transformPolarToCartesian(
+    polarData,
+    conditions,
+    fullModel = false,
+    useHarmonicMean = false,
+    fullModelMultiplier = 1
+) {
     // Extract polar parameters (check both nested and top-level locations)
     const r_i = conditions.polar?.r_start || conditions.r_i || 0;
     const r_o = conditions.polar?.r_end || conditions.r_o || 1;
@@ -12011,7 +13727,7 @@ function transformPolarToCartesian(polarData, conditions, fullModel = false, use
     }
 
     // Determine number of repetitions
-    const N = fullModel ? AppState.polarFullModelMultiplier : 1;
+    const N = fullModel ? Math.max(1, fullModelMultiplier) : 1;
 
     // Create output grid
     const resolution = Math.max(nr, ntheta) * 2; // Higher resolution for interpolation
@@ -12261,38 +13977,11 @@ function bilinearInterpolateHarmonic(data, theta_idx, r_idx, thetaPeriodic = fal
  * Refresh all plots in the dashboard (for when polar transform settings change)
  */
 function refreshAllPlots() {
-    console.log('refreshAllPlots: Starting plot refresh');
-
-    // Refresh all gridstack items
-    if (AppState.gridStack) {
-        const items = AppState.gridStack.getGridItems();
-        console.log(`refreshAllPlots: Found ${items.length} items`);
-
-        items.forEach(item => {
-            const plotId = item.getAttribute('data-plot-id');
-            const plotType = item.getAttribute('data-plot-type');
-
-            console.log(`refreshAllPlots: Item plotId=${plotId}, plotType=${plotType}`);
-
-            if (plotId && plotType) {
-                // Find the container inside the item (id starts with "container-")
-                const container = item.querySelector('[id^="container-"]');
-                if (container && plotDefinitions[plotType]) {
-                    const containerId = container.id;
-                    console.log(`refreshAllPlots: Re-rendering ${plotType} in ${containerId}`);
-
-                    // Re-render the plot using plotDefinitions
-                    try {
-                        plotDefinitions[plotType].render(containerId, AppState.currentStep);
-                    } catch (error) {
-                        console.error(`refreshAllPlots: Error rendering ${plotType}:`, error);
-                    }
-                } else {
-                    console.warn(`refreshAllPlots: Container or plotDefinition not found for plotType=${plotType}`);
-                }
-            }
-        });
-    }
+    void updateAllPlots().catch(error => {
+        if (!error || error.name !== 'AbortError') {
+            console.error('Dashboard refresh failed:', error);
+        }
+    });
 }
 
 // =====================================================
@@ -12528,22 +14217,44 @@ function evaluateMuFormula(formula, H) {
 async function loadBHMaterialList() {
     const listEl    = document.getElementById('libBHMaterialList');
     const plotEl    = document.getElementById('libBHPlotContainer');
-    listEl.innerHTML = '';
-    plotEl.innerHTML = '';
+    AppState.bhListController?.abort();
+    const listController = new AbortController();
+    const listGeneration = ++AppState.bhListGeneration;
+    const selectedLibrary = AppState.selectedLibrary;
+    AppState.bhListController = listController;
+    const isListCurrent = () =>
+        !listController.signal.aborted &&
+        AppState.bhListGeneration === listGeneration &&
+        AppState.bhListController === listController &&
+        AppState.selectedLibrary === selectedLibrary;
 
-    if (!AppState.selectedLibrary) {
+    AppState.bhRenderController?.abort();
+    AppState.bhRenderController = null;
+    AppState.bhRenderGeneration++;
+    AppState.currentBHMaterial = null;
+    const toolbar = document.getElementById('libBHToolbar');
+    if (toolbar) toolbar.style.display = 'none';
+    listEl.innerHTML = '';
+    preparePlotlyContainer(plotEl);
+
+    if (!selectedLibrary) {
         listEl.innerHTML = `<div style="color:#888; font-size:0.82rem; padding:8px; line-height:1.5;">
             No active library.<br>
             Open a library file,<br>click <em>Use This Library</em>,<br>then return here.</div>`;
+        if (AppState.bhListController === listController) {
+            AppState.bhListController = null;
+        }
         return;
     }
 
     try {
         const response = await fetch(
-            `/api/material-libraries/${encodeURIComponent(AppState.selectedLibrary)}?userId=${AppState.userId}`
+            `/api/material-libraries/${encodeURIComponent(selectedLibrary)}?userId=${AppState.userId}`,
+            { signal: listController.signal }
         );
         if (!response.ok) throw new Error('Failed to load library');
         const content = await response.text();
+        if (!isListCurrent()) return;
 
         const doc = jsyaml.load(content) || {};
         // Combine material_presets and materials sections
@@ -12558,7 +14269,7 @@ async function loadBHMaterialList() {
         // Header showing which library is active
         const hdr = document.createElement('div');
         hdr.style.cssText = 'font-weight:600; font-size:0.8rem; margin-bottom:8px; color:#495057; word-break:break-all;';
-        hdr.textContent   = AppState.selectedLibrary;
+        hdr.textContent   = selectedLibrary;
         listEl.appendChild(hdr);
 
         // Build clickable material list
@@ -12611,8 +14322,9 @@ async function loadBHMaterialList() {
             item.onclick = () => {
                 listEl.querySelectorAll('.lib-file-item[data-matname]').forEach(el => el.classList.remove('active'));
                 item.classList.add('active');
-                if (hasPlot) renderBHCurveForMaterial(name, props);
-                else plotEl.innerHTML = '<div style="color:#888; text-align:center; padding:30px;">No B-H / μr data for this material.</div>';
+                // The renderer owns both plot and no-data states, so it can
+                // abort/purge an older Plotly render and reset the toolbar.
+                requestBHCurveRender(name, props);
             };
 
             listEl.appendChild(item);
@@ -12637,13 +14349,21 @@ async function loadBHMaterialList() {
         }, null) || (names.length > 0 ? { name: names[0], props: presets[names[0]] } : null);
 
         if (autoSelect) {
+            if (!isListCurrent()) return;
             const target = listEl.querySelector(`[data-matname="${CSS.escape(autoSelect.name)}"]`);
             if (target) target.classList.add('active');
-            renderBHCurveForMaterial(autoSelect.name, autoSelect.props);
+            requestBHCurveRender(autoSelect.name, autoSelect.props);
         }
 
     } catch (e) {
-        listEl.innerHTML = `<div style="color:#c62828; font-size:0.82rem; padding:8px;">Error: ${e.message}</div>`;
+        if (e && e.name === 'AbortError') return;
+        if (isListCurrent()) {
+            listEl.innerHTML = `<div style="color:#c62828; font-size:0.82rem; padding:8px;">Error: ${e.message}</div>`;
+        }
+    } finally {
+        if (AppState.bhListController === listController) {
+            AppState.bhListController = null;
+        }
     }
 }
 
@@ -12652,10 +14372,22 @@ async function loadBHMaterialList() {
 //   1. B-H: [[H,...],[B,...]]   — B values are direct; μr derived from B/μ₀H
 //   2. mu_r: [[H,...],[μr,...]] — μr direct; B = μ₀·μr·H
 //   3. mu_r: formula / constant
-function renderBHCurveForMaterial(name, props) {
-    const container = document.getElementById('libBHPlotContainer');
+function requestBHCurveRender(name, props) {
+    void renderBHCurveForMaterial(name, props).catch(error => {
+        if (!error || error.name !== 'AbortError') console.error('B-H render failed:', error);
+    });
+}
+
+async function renderBHCurveForMaterial(name, props) {
+    const host = document.getElementById('libBHPlotContainer');
     const toolbar   = document.getElementById('libBHToolbar');
-    container.innerHTML = '';
+    if (!host) return;
+    preparePlotlyContainer(host);
+    const container = document.createElement('div');
+    container.style.cssText = 'width:100%; height:100%;';
+    host.appendChild(container);
+    const renderContext = createBHRenderContext(container);
+    preparePlotlyContainer(container, renderContext);
 
     AppState.currentBHMaterial = { name, props };
 
@@ -12817,13 +14549,17 @@ function renderBHCurveForMaterial(name, props) {
     }
 
     if (!H_arr || !B_arr) {
-        container.innerHTML = '<div style="color:#888; text-align:center; padding:40px; font-size:0.9rem;">'
-                            + 'No plottable B-H / μr data for this material.</div>';
+        showPlotMessage(
+            container,
+            '<div style="color:#888; text-align:center; padding:40px; font-size:0.9rem;">'
+                + 'No plottable B-H / μr data for this material.</div>',
+            renderContext
+        );
         if (toolbar) toolbar.style.display = 'none';
         return;
     }
 
-    const plotH = Math.max(350, container.offsetHeight || 0);
+    const plotH = Math.max(350, host.offsetHeight || 0);
 
     // Keep checkbox label in sync: "Log |H| axis" for demagnetization, "Log X axis" otherwise
     const logLabelNode = logCb && logCb.nextSibling;
@@ -12887,7 +14623,8 @@ function renderBHCurveForMaterial(name, props) {
               font: { color: '#555', size: 11 } }
         ];
 
-        Plotly.newPlot(container, [{
+        try {
+            await newPlotForRender(container, [{
             x: x_data, y: y_data,
             mode: isDashed ? 'lines' : 'lines+markers',
             name: 'B [T]',
@@ -12916,7 +14653,13 @@ function renderBHCurveForMaterial(name, props) {
             margin:     { t: 45, l: 65, r: 30, b: 55 },
             height:     plotH,
             showlegend: false
-        }, { responsive: true, displayModeBar: false });
+            }, { responsive: true, displayModeBar: false }, renderContext);
+        } catch (error) {
+            if ((error && error.name === 'AbortError') ||
+                !isRenderContextCurrent(renderContext, container)) return;
+            console.error('B-H demagnetization plot failed:', error);
+            showPlotMessage(container, '<div style="color:#c62828; padding:40px; text-align:center;">Failed to render B-H plot</div>', renderContext);
+        }
         return;
     }
 
@@ -12949,7 +14692,8 @@ function renderBHCurveForMaterial(name, props) {
         hovertemplate: 'H=%{x:.4g} A/m<br>μr=%{y:.4g}<extra></extra>'
     };
 
-    Plotly.newPlot(container, [traceB, traceMur], {
+    try {
+        await newPlotForRender(container, [traceB, traceMur], {
         title:  { text: `<b>${name}</b>`, font: { size: 14 } },
         xaxis:  { title: 'H [A/m]', type: xtype, exponentformat: 'power' },
         yaxis:  { title: 'B [T]', exponentformat: 'power',
@@ -12960,15 +14704,22 @@ function renderBHCurveForMaterial(name, props) {
         height:     plotH,
         legend:     { x: 0.02, y: 0.98, bgcolor: 'rgba(255,255,255,0.8)', bordercolor: '#ccc', borderwidth: 1 },
         showlegend: true
-    }, { responsive: true, displayModeBar: false });
+        }, { responsive: true, displayModeBar: false }, renderContext);
+    } catch (error) {
+        if ((error && error.name === 'AbortError') ||
+            !isRenderContextCurrent(renderContext, container)) return;
+        console.error('B-H plot failed:', error);
+        showPlotMessage(container, '<div style="color:#c62828; padding:40px; text-align:center;">Failed to render B-H plot</div>', renderContext);
+        return;
+    }
 
-    if (toolbar) toolbar.style.display = '';
+    if (toolbar && isRenderContextCurrent(renderContext, container)) toolbar.style.display = '';
 }
 
 // Called when the log/linear checkbox changes.
 function onLibBHAxisChange() {
     if (AppState.currentBHMaterial) {
-        renderBHCurveForMaterial(AppState.currentBHMaterial.name, AppState.currentBHMaterial.props);
+        requestBHCurveRender(AppState.currentBHMaterial.name, AppState.currentBHMaterial.props);
     }
 }
 

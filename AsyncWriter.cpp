@@ -1,7 +1,12 @@
 #include "AsyncWriter.h"
 
+#include <stdexcept>
+
 AsyncWriter::AsyncWriter(std::size_t max_depth)
-    : max_depth_(max_depth == 0 ? 1 : max_depth) {
+    : max_depth_(max_depth) {
+    if (max_depth_ == 0 || max_depth_ > kMaxQueueDepth) {
+        throw std::invalid_argument("AsyncWriter queue depth must be in the range [1, 16]");
+    }
     worker_ = std::thread(&AsyncWriter::workerLoop, this);
 }
 

@@ -44,6 +44,11 @@ experience. It is backward compatible with integer pixel-based slide regions.
   periodic and anti-periodic seams, second-order angular convergence, radial
   derivatives and non-periodic endpoint differences. All release-platform
   builds now execute these tests before packaging.
+- Asynchronous field export now permits `async_queue_depth: 1..16`, applies
+  backpressure at that bound, and shares a single immutable matrix snapshot
+  when `format: both` schedules CSV and TIFF output. Reusing an analyzer also
+  starts with empty transient flux/status histories, while output-directory
+  creation no longer launches a command shell for every export step.
 
 ## WebUI
 
@@ -71,6 +76,23 @@ experience. It is backward compatible with integer pixel-based slide regions.
   and iteration count instead. `conditions.json` is written before solver
   initialization, and full-disc `r_start: 0` is valid in the viewer.
 - New user directories receive the bundled `general_materials.yaml` library.
+- Dashboard field data now has a 256 MiB byte-budgeted LRU cache instead of a
+  fixed entry count. Field fetch/decode work is serialized, and retained cache,
+  decoded staging payloads and decode headroom use an estimated 384 MiB
+  field-data working budget. Duplicate requests share one leased load; the
+  physical request is aborted after its final consumer leaves, without a
+  Dashboard result switch cancelling an independent File Manager preview.
+  Coarsening masks use compact byte arrays and a keyed four-entry/32 MiB cache,
+  animation frames are serialized, and removed or redrawn Plotly graphs
+  release their old WebGL/DOM state. Preload stops at the memory budget rather
+  than cycling the cache.
+- The WebUI server centrally tracks solver children, rejects conflicting runs
+  for one user, and terminates active children during client disconnect or
+  server shutdown. Background-job records and captured logs are bounded and
+  expire, so leaving the application open does not retain every historical
+  solve in the Node.js heap. Solver-start preparation slots are reserved before
+  asynchronous file/YAML work, and legacy response permits plus bounded log
+  payloads prevent slow completed clients from accumulating response buffers.
 
 ## Recommended nonlinear settings
 

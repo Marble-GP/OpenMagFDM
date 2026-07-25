@@ -43,6 +43,39 @@ package or in the configured development paths. Use `GET /api/health` and
   available.
 - Input Image and Magnetisation Preview support wheel zoom, middle-drag pan,
   reset and image-pixel rulers.
+- Decoded field data uses a 256 MiB byte-budgeted LRU cache. Memory-heavy field
+  fetch/decode work is serialized and cache, staging payloads and decode
+  headroom share an estimated 384 MiB field-data working budget. In-flight
+  loads are leased per viewer and the physical request is cancelled when its
+  final viewer leaves. Preload stops at the budget instead of retaining every
+  transient step.
+- Coarsening masks use compact byte arrays and retain at most four completed
+  result/step entries within a 32 MiB cache budget. Dashboard and File Manager
+  consumers use independent cancellation, and deleted/redrawn plots release
+  their Plotly state.
+- Solver children are tracked until their `close` event and are stopped on an
+  interrupted stream or server shutdown. The default process limits are two
+  solver processes globally and one active solve per user.
+
+Long-running server retention is bounded by default: at most 200 completed job
+records are kept for 24 hours, with 256 KiB of log text per job. The principal
+deployment overrides are `MAX_SOLVER_PROCESSES`, `MAX_CONCURRENT_JOBS`,
+`MAX_CONCURRENT_JOBS_PER_USER`, `MAX_SOLVER_START_OPERATIONS`,
+`MAX_SOLVER_START_OPERATIONS_PER_USER`, `MAX_JOB_RECORDS`,
+`MAX_JOB_LOG_CHARS`, and `JOB_TTL_MS`. Solver preparation is reserved before
+asynchronous YAML/file work begins. Legacy non-streaming responses retain at
+most `LEGACY_RESPONSE_LOG_CHARS` characters per returned stream and are bounded
+by `MAX_LEGACY_RESPONSES` until the response finishes or closes. Raise process
+limits only after measuring solver peak memory on the target model.
+
+Windows `Cached`/standby memory and the paged/nonpaged kernel pools are managed
+by Windows, not by the WebUI cache. OpenMagFDM deliberately does not call
+working-set or system-cache purge APIs: those counters may remain high while
+their pages are reclaimable, and forced trimming causes avoidable rereads and
+page faults. Diagnose application retention with each process's Private Bytes,
+the number of live `MagFDMsolver` children, and whether those values return
+after the run; the limits and lifecycle cleanup above address those owned
+resources.
 
 The authoritative YAML contract is in `../docs/CONFIGURATION.md`.
 
@@ -58,6 +91,7 @@ The authoritative YAML contract is in `../docs/CONFIGURATION.md`.
 node --check server.js
 node --check public/app.js
 node -e "JSON.parse(require('fs').readFileSync('public/yaml-schema.json','utf8'))"
+node --test tests/process_lifecycle.test.js
 ```
 
 - Prefer browser-side decoding for TIFF; `public/lib/geotiff.js` is the shipped

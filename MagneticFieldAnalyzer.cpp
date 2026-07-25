@@ -34,20 +34,29 @@ constexpr int kDistanceTypeL2 = 2;
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <direct.h>
-#define MKDIR(path) _mkdir(path)
-#else
-#include <sys/stat.h>
-#define MKDIR(path) mkdir(path, 0755)
 #endif
 
-// Cross-platform directory creation (like mkdir -p)
+// Cross-platform directory creation (like mkdir -p), without spawning a
+// shell.  Besides avoiding quoting/injection problems, reporting the path and
+// operating-system error here makes output failures actionable to callers.
 static void createDirectory(const std::string& path) {
-#ifdef _WIN32
-    system(("mkdir \"" + path + "\" 2>nul").c_str());
-#else
-    system(("mkdir -p \"" + path + "\"").c_str());
-#endif
+    if (path.empty()) {
+        throw std::invalid_argument("Cannot create directory: path is empty");
+    }
+
+    const std::filesystem::path directory = std::filesystem::u8path(path);
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "Failed to create directory '" + path + "': " + ec.message());
+    }
+
+    if (!std::filesystem::is_directory(directory, ec)) {
+        const std::string detail = ec ? ec.message() : "path exists but is not a directory";
+        throw std::runtime_error(
+            "Failed to create directory '" + path + "': " + detail);
+    }
 }
 
 #ifdef _WIN32
@@ -425,6 +434,13 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
 
             export_config.async = exp["async"].as<bool>(export_config.async);
             export_config.async_queue_depth = exp["async_queue_depth"].as<int>(4);
+            if (export_config.async_queue_depth < 1 ||
+                export_config.async_queue_depth >
+                    static_cast<int>(AsyncWriter::kMaxQueueDepth)) {
+                throw std::runtime_error(
+                    "export.async_queue_depth must be in the range [1, " +
+                    std::to_string(AsyncWriter::kMaxQueueDepth) + "]");
+            }
 
             if (exp["tiff"]) {
                 std::string comp = exp["tiff"]["compression"].as<std::string>("deflate");
@@ -442,7 +458,7 @@ void MagneticFieldAnalyzer::loadConfig(const std::string& config_path) {
 
         if (export_config.async) {
             async_writer_ = std::make_unique<AsyncWriter>(
-                static_cast<std::size_t>(std::max(1, export_config.async_queue_depth)));
+                static_cast<std::size_t>(export_config.async_queue_depth));
             std::cout << "  Async writer enabled (queue depth = "
                       << export_config.async_queue_depth << ")" << std::endl;
         }
@@ -2047,10 +2063,6 @@ void MagneticFieldAnalyzer::setupMaterialProperties() {
         }
     }
 
-    // Baseline for the next transient step's nonlinear μ warm start.  The
-    // image is retained in source coordinates and flipped alongside the live
-    // image when setupMaterialPropertiesForStep compares material identity.
-    previous_material_image = image.clone();
 }
 
 // ============================================================================
@@ -7436,11 +7448,11 @@ void MagneticFieldAnalyzer::writeMatrixTIFF(const Eigen::MatrixXd& m,
 // to the CSV/TIFF writers based on opts.format.
 //
 // When opts.async is true and async_writer_ is live, the actual file write is
-// posted to a worker thread. The matrix is copied into the lambda by value so
-// the solver can mutate Az/mu_map/... for the next step without racing the
-// pending write. Async path also goes through a .tmp -> rename dance so the
-// WebUI (or anything else watching the output dir) never sees a half-written
-// file.
+// posted to a worker thread. A single immutable snapshot is shared by the CSV
+// and TIFF jobs so format=both does not duplicate a full MatrixXd. The solver
+// can still mutate Az/mu_map/... for the next step without racing pending
+// writes. Async path also goes through a .tmp -> rename dance so the WebUI (or
+// anything else watching the output dir) never sees a half-written file.
 void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
                                         const std::string& base_path,
                                         const ExportConfig& opts) const {
@@ -7450,19 +7462,20 @@ void MagneticFieldAnalyzer::writeMatrix(const Eigen::MatrixXd& m,
                             opts.format == ExportConfig::Format::BOTH);
 
     if (opts.async && async_writer_) {
+        const auto snapshot = std::make_shared<const Eigen::MatrixXd>(m);
         if (want_csv) {
-            async_writer_->enqueue([m, base_path] {
+            async_writer_->enqueue([snapshot, base_path] {
                 const std::string final_path = base_path + ".csv";
                 const std::string tmp_path   = final_path + ".tmp";
-                writeMatrixCSV(m, tmp_path);
+                writeMatrixCSV(*snapshot, tmp_path);
                 std::filesystem::rename(tmp_path, final_path);
             });
         }
         if (want_tiff) {
-            async_writer_->enqueue([m, base_path, opts] {
+            async_writer_->enqueue([snapshot, base_path, opts] {
                 const std::string final_path = base_path + ".tiff";
                 const std::string tmp_path   = final_path + ".tmp";
-                writeMatrixTIFF(m, tmp_path, opts);
+                writeMatrixTIFF(*snapshot, tmp_path, opts);
                 std::filesystem::rename(tmp_path, final_path);
             });
         }
@@ -13058,7 +13071,6 @@ void MagneticFieldAnalyzer::setupMaterialPropertiesForStep(int step) {
         computeMagnetizationGrids(step);
     }
 
-    previous_material_image = image.clone();
 }
 
 double MagneticFieldAnalyzer::evaluateSlideFormula(const std::string& formula, int step) const {
@@ -13382,6 +13394,17 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
     const int step_end   = (transient_step_end_ >= 0)
                              ? std::min(transient_step_end_, transient_config.total_steps)
                              : transient_config.total_steps;
+    const std::size_t expected_steps = static_cast<std::size_t>(
+        std::max(0, step_end - step_begin));
+
+    // A transient run owns one result set. Reusing the same analyzer must not
+    // append a second sweep to the first sweep's flux/status history.
+    for (auto& result : flux_linkage_results) {
+        result.second.clear();
+        result.second.reserve(expected_steps);
+    }
+    transient_solver_status_results.clear();
+    transient_solver_status_results.reserve(expected_steps);
 
     std::cout << "\n=== Starting Transient Analysis ===" << std::endl;
     std::cout << "Total steps: " << transient_config.total_steps;

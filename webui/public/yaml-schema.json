@@ -657,7 +657,7 @@
       "validParents": ["export"]
     },
     "async_queue_depth": {
-      "description": "Maximum number of pending write jobs before the solver thread blocks (backpressure). Bigger = more overlap, more transient memory. Default 4.",
+      "description": "Maximum number of pending write jobs before the solver thread blocks (backpressure). Valid range 1..16. Bigger = more overlap, more transient memory. Default 4.",
       "type": "integer",
       "example": "async_queue_depth: 4",
       "validParents": ["export"]

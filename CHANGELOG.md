@@ -38,6 +38,17 @@ investigations remain under `docs/research/`.
   `material_b` alone for antiperiodic half-period models, and Dashboard
   flux/Back-EMF timelines reload growing CSV files instead of retaining an
   earlier point count.
+- Bounded long-running memory use across the application: decoded Dashboard
+  fields now use a 256 MiB byte-budgeted LRU cache, field decoding is
+  serialized under an estimated 384 MiB field-data working budget, stale
+  consumer leases and plots are released when views change, solver children
+  and start preparations are bounded through shutdown, slow legacy responses
+  retain bounded log payloads, and completed WebUI jobs/logs expire instead of
+  accumulating indefinitely.
+- Reduced transient output memory and Windows process churn by sharing one
+  immutable field snapshot between asynchronous CSV/TIFF writes, validating
+  `export.async_queue_depth` to `1..16`, resetting per-run histories, and
+  creating output directories without spawning command shells.
 
 See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 

@@ -25,6 +25,10 @@
 
 class AsyncWriter {
 public:
+    // Each queued job may own a full field matrix. Keep configuration errors
+    // from turning into an unexpectedly large memory backlog.
+    static constexpr std::size_t kMaxQueueDepth = 16;
+
     explicit AsyncWriter(std::size_t max_depth);
     ~AsyncWriter();
 

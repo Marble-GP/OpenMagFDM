@@ -2,7 +2,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
-const { exec, spawn } = require('child_process');
+const { spawn } = require('child_process');
 const multer = require('multer');
 const yaml = require('js-yaml');
 // NOTE: TIFF decoding is intentionally NOT done on the server. geotiff's CJS
@@ -33,9 +33,12 @@ const BASE_DIR = isPkg ? path.dirname(process.execPath) : path.join(__dirname, '
 
 // アップロードディレクトリの設定
 const UPLOAD_DIR = path.join(BASE_DIR, 'uploads');
-const SOLVER_PATH = isPkg
+const DEFAULT_SOLVER_PATH = isPkg
     ? path.join(BASE_DIR, 'MagFDMsolver.exe')  // pkg版ではexeが同じディレクトリにある
     : path.join(BASE_DIR, 'build', 'MagFDMsolver');
+// Override for release-contract tests and managed deployments. The packaged
+// default remains the solver executable beside the pkg binary.
+const SOLVER_PATH = process.env.SOLVER_PATH || DEFAULT_SOLVER_PATH;
 const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
 const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
 const OUTPUTS_DIR = path.join(BASE_DIR, 'outputs');
@@ -68,13 +71,665 @@ async function initializeDirectories() {
 const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
 const MAX_IMAGES_PER_USER = 20;
 
-// Running solver processes (userId -> process)
+function positiveIntegerFromEnv(name, fallback) {
+    const parsed = Number.parseInt(process.env[name], 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Solves are memory intensive; keep conservative defaults and allow explicit
+// deployment overrides for larger hosts.
+const MAX_SOLVER_PROCESSES = positiveIntegerFromEnv('MAX_SOLVER_PROCESSES', 2);
+const MAX_SOLVER_START_OPERATIONS = positiveIntegerFromEnv(
+    'MAX_SOLVER_START_OPERATIONS',
+    MAX_SOLVER_PROCESSES
+);
+const MAX_SOLVER_START_OPERATIONS_PER_USER = positiveIntegerFromEnv(
+    'MAX_SOLVER_START_OPERATIONS_PER_USER',
+    1
+);
+const MAX_CONCURRENT_JOBS = positiveIntegerFromEnv('MAX_CONCURRENT_JOBS', 2);
+const MAX_CONCURRENT_JOBS_PER_USER = positiveIntegerFromEnv('MAX_CONCURRENT_JOBS_PER_USER', 1);
+const MAX_JOB_RECORDS = positiveIntegerFromEnv('MAX_JOB_RECORDS', 200);
+const MAX_JOB_LOG_LINES = positiveIntegerFromEnv('MAX_JOB_LOG_LINES', 500);
+const MAX_JOB_LOG_CHARS = positiveIntegerFromEnv('MAX_JOB_LOG_CHARS', 256 * 1024);
+const MAX_LOG_LINE_CHARS = positiveIntegerFromEnv('MAX_LOG_LINE_CHARS', 16 * 1024);
+const MAX_PARTIAL_LOG_CHARS = positiveIntegerFromEnv('MAX_PARTIAL_LOG_CHARS', 64 * 1024);
+const JOB_TTL_MS = positiveIntegerFromEnv('JOB_TTL_MS', 24 * 60 * 60 * 1000);
+const CHILD_TERMINATION_GRACE_MS = positiveIntegerFromEnv('CHILD_TERMINATION_GRACE_MS', 5000);
+const CHILD_FORCE_WAIT_MS = positiveIntegerFromEnv('CHILD_FORCE_WAIT_MS', 2000);
+const SHUTDOWN_TIMEOUT_MS = positiveIntegerFromEnv('SHUTDOWN_TIMEOUT_MS', 10000);
+const LEGACY_OUTPUT_LIMIT_CHARS = positiveIntegerFromEnv('LEGACY_OUTPUT_LIMIT_CHARS', 10 * 1024 * 1024);
+const LEGACY_RESPONSE_LOG_CHARS = positiveIntegerFromEnv(
+    'LEGACY_RESPONSE_LOG_CHARS',
+    256 * 1024
+);
+const MAX_LEGACY_RESPONSES = positiveIntegerFromEnv(
+    'MAX_LEGACY_RESPONSES',
+    MAX_SOLVER_PROCESSES
+);
+const LEGACY_RESPONSE_DRAIN_TIMEOUT_MS = positiveIntegerFromEnv(
+    'LEGACY_RESPONSE_DRAIN_TIMEOUT_MS',
+    10000
+);
+const MAX_SSE_BUFFER_BYTES = positiveIntegerFromEnv('MAX_SSE_BUFFER_BYTES', 1024 * 1024);
+const SSE_DRAIN_TIMEOUT_MS = positiveIntegerFromEnv('SSE_DRAIN_TIMEOUT_MS', 10000);
+const SOLVER_VERSION_CACHE_MS = positiveIntegerFromEnv('SOLVER_VERSION_CACHE_MS', 5 * 60 * 1000);
+const SOLVER_VERSION_FAILURE_CACHE_MS = positiveIntegerFromEnv('SOLVER_VERSION_FAILURE_CACHE_MS', 30000);
+const FINAL_SHUTDOWN_FORCE_WAIT_MS = positiveIntegerFromEnv('FINAL_SHUTDOWN_FORCE_WAIT_MS', 500);
+
+function normalizeUserId(userId) {
+    const safe = String(userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+    return safe || 'default';
+}
+
+function resolveUserFilePath(baseDir, fileName, label) {
+    const safeName = path.basename(String(fileName || ''));
+    if (!safeName) throw new Error(`${label} is required`);
+    const resolvedBase = path.resolve(baseDir);
+    const resolvedPath = path.resolve(resolvedBase, safeName);
+    if (path.dirname(resolvedPath) !== resolvedBase) {
+        throw new Error(`Invalid ${label}`);
+    }
+    return resolvedPath;
+}
+
+function truncateLogLine(line, maxChars = MAX_LOG_LINE_CHARS) {
+    const text = String(line);
+    if (text.length <= maxChars) return text;
+    const marker = ' ... [truncated]';
+    if (maxChars <= marker.length) return marker.slice(0, maxChars);
+    return text.slice(0, Math.max(0, maxChars - marker.length)) + marker;
+}
+
+function appendCappedLog(log, line, maxLines = MAX_JOB_LOG_LINES,
+                         maxChars = MAX_LOG_LINE_CHARS,
+                         maxTotalChars = MAX_JOB_LOG_CHARS) {
+    let next = log.concat(truncateLogLine(line, Math.min(maxChars, maxTotalChars)));
+    if (next.length > maxLines) next = next.slice(next.length - maxLines);
+
+    let totalChars = next.reduce((total, entry) => total + entry.length, 0);
+    let firstRetained = 0;
+    while (firstRetained < next.length - 1 && totalChars > maxTotalChars) {
+        totalChars -= next[firstRetained].length;
+        firstRetained++;
+    }
+    return firstRetained > 0 ? next.slice(firstRetained) : next;
+}
+
+function splitCappedLines(partial, chunk, maxPartialChars = MAX_PARTIAL_LOG_CHARS,
+                          maxLineChars = MAX_LOG_LINE_CHARS) {
+    const pieces = (partial + String(chunk)).split(/\r?\n/);
+    let nextPartial = pieces.pop() || '';
+    const lines = pieces.map(line => truncateLogLine(line, maxLineChars));
+    if (nextPartial.length > maxPartialChars) {
+        lines.push(truncateLogLine(
+            `${nextPartial.slice(0, maxPartialChars)} ... [partial line truncated]`,
+            maxLineChars
+        ));
+        nextPartial = '';
+    }
+    return { lines, partial: nextPartial };
+}
+
+function appendBoundedText(current, chunk, maxChars = LEGACY_OUTPUT_LIMIT_CHARS) {
+    const text = String(chunk);
+    const remaining = Math.max(0, maxChars - current.length);
+    return {
+        text: current + text.slice(0, remaining),
+        overflow: text.length > remaining
+    };
+}
+
+function trackCleanup(promise) {
+    const tracked = Promise.resolve(promise);
+    pendingCleanupPromises.add(tracked);
+    tracked.then(
+        () => pendingCleanupPromises.delete(tracked),
+        () => pendingCleanupPromises.delete(tracked)
+    );
+    return tracked;
+}
+
+function unlinkTemporaryFile(filePath) {
+    if (!filePath) return Promise.resolve();
+    return trackCleanup(fs.unlink(filePath).catch(() => {}));
+}
+
+function removeEmptyOutputDirectory(outputPath) {
+    if (!outputPath) return Promise.resolve();
+    const resolvedBase = path.resolve(OUTPUTS_DIR);
+    const resolvedPath = path.resolve(outputPath);
+    const relative = path.relative(resolvedBase, resolvedPath);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+        return Promise.resolve();
+    }
+    return trackCleanup(fs.rmdir(resolvedPath).catch((error) => {
+        if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY') {
+            console.warn(`Failed to remove unused output directory ${resolvedPath}: ${error.message}`);
+        }
+    }));
+}
+
+async function waitForPendingCleanups() {
+    while (pendingCleanupPromises.size > 0) {
+        await Promise.allSettled(Array.from(pendingCleanupPromises));
+    }
+}
+
+function pruneJobRecords(jobMap, now = Date.now(), ttlMs = JOB_TTL_MS,
+                         maxRecords = MAX_JOB_RECORDS) {
+    let removed = 0;
+    for (const [jobId, job] of jobMap) {
+        if (job.process || !job.finished) continue;
+        const finishedAt = Date.parse(job.finished);
+        if (Number.isFinite(finishedAt) && now - finishedAt >= ttlMs) {
+            jobMap.delete(jobId);
+            removed++;
+        }
+    }
+
+    if (jobMap.size > maxRecords) {
+        const removable = Array.from(jobMap.entries())
+            .filter(([, job]) => !job.process && job.finished)
+            .sort((a, b) => Date.parse(a[1].finished) - Date.parse(b[1].finished));
+        for (const [jobId] of removable) {
+            if (jobMap.size <= maxRecords) break;
+            jobMap.delete(jobId);
+            removed++;
+        }
+    }
+    return removed;
+}
+
+// Running interactive solver processes (userId -> { process, purpose }). Jobs
+// are stored separately; userHasActiveSolver() prevents interactive/job overlap,
+// while the job API applies its configured per-user job limit.
 const runningProcesses = new Map();
 
 // Async job queue (jobId -> job record)
 // job: { jobId, userId, status, progress, log, resultPath, exitCode,
 //        completed, converged, warning, message, process, created, finished }
 const jobs = new Map();
+
+// Every MagFDMsolver child, including legacy solves, streams, background jobs,
+// and version probes, is registered here until its close event.
+const trackedSolverProcesses = new Map();
+const terminationPromises = new WeakMap();
+const pendingCleanupPromises = new Set();
+const activeSolverStartOperations = new Set();
+const activeSolverStartOperationsByUser = new Map();
+const activeLegacyResponses = new Set();
+let shuttingDown = false;
+let shutdownPromise = null;
+let httpServer = null;
+let jobCleanupTimer = null;
+let shutdownHandlersInstalled = false;
+let solverVersionCache = null;
+let solverVersionProbe = null;
+
+function isChildRunning(child) {
+    return Boolean(child && child.exitCode === null && child.signalCode === null);
+}
+
+function makeProcessError(message, code, statusCode) {
+    const error = new Error(message);
+    error.code = code;
+    error.statusCode = statusCode;
+    return error;
+}
+
+function assertRequestOpen(req, res) {
+    if (req.aborted || res.destroyed || res.writableEnded) {
+        throw makeProcessError('Client disconnected before solver start', 'CLIENT_DISCONNECTED', 499);
+    }
+}
+
+function beginSolverStartOperation(userId = 'default') {
+    const userIdKey = normalizeUserId(userId);
+    if (shuttingDown) {
+        throw makeProcessError('Server is shutting down', 'SERVER_SHUTTING_DOWN', 503);
+    }
+    if (trackedSolverProcesses.size + activeSolverStartOperations.size >=
+        MAX_SOLVER_PROCESSES ||
+        activeSolverStartOperations.size >= MAX_SOLVER_START_OPERATIONS) {
+        throw makeProcessError(
+            `Solver preparation limit reached (${MAX_SOLVER_START_OPERATIONS})`,
+            'SOLVER_START_LIMIT',
+            429
+        );
+    }
+    const userStarts = activeSolverStartOperationsByUser.get(userIdKey) || 0;
+    if (userStarts >= MAX_SOLVER_START_OPERATIONS_PER_USER) {
+        throw makeProcessError(
+            'A solver request is already being prepared for this user',
+            'USER_SOLVER_START_LIMIT',
+            409
+        );
+    }
+
+    let resolveCompletion;
+    let finished = false;
+    const completion = new Promise(resolve => { resolveCompletion = resolve; });
+    activeSolverStartOperations.add(completion);
+    activeSolverStartOperationsByUser.set(userIdKey, userStarts + 1);
+    return () => {
+        if (finished) return;
+        finished = true;
+        activeSolverStartOperations.delete(completion);
+        const remainingUserStarts =
+            (activeSolverStartOperationsByUser.get(userIdKey) || 1) - 1;
+        if (remainingUserStarts > 0) {
+            activeSolverStartOperationsByUser.set(userIdKey, remainingUserStarts);
+        } else {
+            activeSolverStartOperationsByUser.delete(userIdKey);
+        }
+        resolveCompletion();
+    };
+}
+
+function claimLegacyResponsePermit(res) {
+    if (activeLegacyResponses.size >= MAX_LEGACY_RESPONSES) {
+        throw makeProcessError(
+            `Legacy solver response limit reached (${MAX_LEGACY_RESPONSES})`,
+            'LEGACY_RESPONSE_LIMIT',
+            429
+        );
+    }
+    const permit = {};
+    let released = false;
+    const release = () => {
+        if (released) return;
+        released = true;
+        activeLegacyResponses.delete(permit);
+    };
+    activeLegacyResponses.add(permit);
+    res.once('finish', release);
+    res.once('close', release);
+    return release;
+}
+
+function boundedLegacyResponseText(value) {
+    const text = String(value || '');
+    if (text.length <= LEGACY_RESPONSE_LOG_CHARS) return text;
+    const marker = '[... earlier solver output omitted ...]\n';
+    return marker + text.slice(
+        -(Math.max(0, LEGACY_RESPONSE_LOG_CHARS - marker.length))
+    );
+}
+
+function sendLegacyJson(res, statusCode, payload) {
+    let timer = setTimeout(() => {
+        timer = null;
+        if (!res.destroyed && !res.writableFinished) {
+            console.warn('Legacy solver response did not drain in time; closing client connection');
+            res.destroy();
+        }
+    }, LEGACY_RESPONSE_DRAIN_TIMEOUT_MS);
+    timer.unref?.();
+    const clearDeadline = () => {
+        if (!timer) return;
+        clearTimeout(timer);
+        timer = null;
+    };
+    res.once('finish', clearDeadline);
+    res.once('close', clearDeadline);
+    try {
+        return res.status(statusCode).json(payload);
+    } catch (error) {
+        clearDeadline();
+        if (!res.destroyed) res.destroy(error);
+        return undefined;
+    }
+}
+
+async function waitForSolverStartOperations() {
+    while (activeSolverStartOperations.size > 0) {
+        await Promise.allSettled(Array.from(activeSolverStartOperations));
+    }
+}
+
+function assertSolverCapacity() {
+    if (shuttingDown) {
+        throw makeProcessError('Server is shutting down', 'SERVER_SHUTTING_DOWN', 503);
+    }
+    if (trackedSolverProcesses.size >= MAX_SOLVER_PROCESSES) {
+        throw makeProcessError(
+            `Solver process limit reached (${MAX_SOLVER_PROCESSES})`,
+            'SOLVER_PROCESS_LIMIT',
+            503
+        );
+    }
+}
+
+function registerTrackedSolverProcess(child, metadata = {}) {
+    const record = {
+        purpose: metadata.purpose || 'solver',
+        userId: metadata.userId || null,
+        jobId: metadata.jobId || null,
+        started: new Date().toISOString()
+    };
+    trackedSolverProcesses.set(child, record);
+    child.once('close', () => {
+        trackedSolverProcesses.delete(child);
+        if (record.userId && (record.purpose === 'legacy' || record.purpose === 'stream')) {
+            deleteRunningProcessIfSame(record.userId, child);
+        }
+    });
+    return record;
+}
+
+function spawnTrackedSolver(args, metadata = {}, options = {}) {
+    assertSolverCapacity();
+    const child = spawn(SOLVER_PATH, args, { cwd: BASE_DIR, ...options });
+    registerTrackedSolverProcess(child, metadata);
+    return child;
+}
+
+function claimRunningProcess(userId, child, purpose) {
+    if (runningProcesses.has(userId)) return false;
+    runningProcesses.set(userId, { process: child, purpose });
+    return true;
+}
+
+function deleteRunningProcessIfSame(userId, child) {
+    const current = runningProcesses.get(userId);
+    if (!current || current.process !== child) return false;
+    runningProcesses.delete(userId);
+    return true;
+}
+
+function terminateChildProcess(child, options = {}) {
+    if (!child || !isChildRunning(child)) {
+        return Promise.resolve({ exited: true, forced: false });
+    }
+    const existing = terminationPromises.get(child);
+    if (existing) return existing;
+
+    const graceMs = options.graceMs ?? CHILD_TERMINATION_GRACE_MS;
+    const forceWaitMs = options.forceWaitMs ?? CHILD_FORCE_WAIT_MS;
+    const promise = new Promise((resolve) => {
+        let graceTimer = null;
+        let forceWaitTimer = null;
+        let settled = false;
+        let forced = false;
+
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (graceTimer) clearTimeout(graceTimer);
+            if (forceWaitTimer) clearTimeout(forceWaitTimer);
+            child.removeListener('close', finish);
+            resolve({ exited: !isChildRunning(child), forced });
+        };
+
+        child.once('close', finish);
+        try {
+            child.kill('SIGTERM');
+        } catch (error) {
+            console.warn(`Failed to send SIGTERM to child ${child.pid || 'unknown'}: ${error.message}`);
+        }
+
+        if (settled) return;
+        graceTimer = setTimeout(() => {
+            if (!isChildRunning(child)) return finish();
+            forced = true;
+            try {
+                child.kill('SIGKILL');
+            } catch (error) {
+                console.warn(`Failed to send SIGKILL to child ${child.pid || 'unknown'}: ${error.message}`);
+            }
+            if (settled) return;
+            forceWaitTimer = setTimeout(finish, forceWaitMs);
+        }, graceMs);
+    });
+    terminationPromises.set(child, promise);
+    promise.then(() => terminationPromises.delete(child));
+    return promise;
+}
+
+async function terminateChildWithRetry(child, options = {}, retryOptions = {}) {
+    let result = await terminateChildProcess(child, options);
+    if (!result.exited && isChildRunning(child)) {
+        result = await terminateChildProcess(child, {
+            graceMs: retryOptions.graceMs ?? Math.min(250, CHILD_TERMINATION_GRACE_MS),
+            forceWaitMs: retryOptions.forceWaitMs ?? Math.min(250, CHILD_FORCE_WAIT_MS)
+        });
+    }
+    return result;
+}
+
+function createChildCloseWaiter(child) {
+    let onClose = null;
+    const promise = new Promise((resolve) => {
+        if (!trackedSolverProcesses.has(child)) return resolve();
+        onClose = () => {
+            onClose = null;
+            resolve();
+        };
+        child.once('close', onClose);
+    });
+    return {
+        promise,
+        cancel: () => {
+            if (onClose) child.removeListener('close', onClose);
+            onClose = null;
+        }
+    };
+}
+
+function forceKillChild(child) {
+    if (!isChildRunning(child)) return false;
+    try {
+        return child.kill('SIGKILL');
+    } catch (error) {
+        console.warn(`Failed final SIGKILL for child ${child.pid || 'unknown'}: ${error.message}`);
+        return false;
+    }
+}
+
+function terminateOnPrematureResponseClose(res, child, label) {
+    const onClose = () => {
+        if (res.writableEnded || !isChildRunning(child)) return;
+        console.log(`${label} response disconnected; terminating solver process`);
+        void terminateChildProcess(child);
+    };
+    res.once('close', onClose);
+    if (res.destroyed && !res.writableEnded) onClose();
+    return onClose;
+}
+
+function createSseBackpressureController(res, child, timeoutMs = SSE_DRAIN_TIMEOUT_MS) {
+    let pipesPaused = false;
+    let waitingForDrain = false;
+    let drainTimer = null;
+
+    const resumePipes = () => {
+        if (!pipesPaused) return;
+        pipesPaused = false;
+        // Always drain the pipes, even after the child emits exit. ChildProcess
+        // close (and therefore registry/temp cleanup) waits for stdio to close.
+        if (child.stdout) child.stdout.resume();
+        if (child.stderr) child.stderr.resume();
+    };
+
+    const clearDrainWait = () => {
+        if (!waitingForDrain) {
+            resumePipes();
+            return;
+        }
+        waitingForDrain = false;
+        if (drainTimer) {
+            clearTimeout(drainTimer);
+            drainTimer = null;
+        }
+        res.removeListener('drain', clearDrainWait);
+        resumePipes();
+    };
+
+    const abortSlowResponse = () => {
+        if (!waitingForDrain) return;
+        console.warn('SSE client did not drain in time; terminating its solver process');
+        clearDrainWait();
+        if (!res.destroyed) {
+            try { res.destroy(); } catch { /* connection already gone */ }
+        }
+        void terminateChildProcess(child);
+    };
+
+    const pauseOutput = () => {
+        if (waitingForDrain) return;
+        waitingForDrain = true;
+        if (isChildRunning(child)) {
+            pipesPaused = true;
+            if (child.stdout) child.stdout.pause();
+            if (child.stderr) child.stderr.pause();
+        }
+        res.once('drain', clearDrainWait);
+        drainTimer = setTimeout(abortSlowResponse, timeoutMs);
+    };
+
+    res.once('close', clearDrainWait);
+    res.once('finish', clearDrainWait);
+    // Exit means no more solver output is expected, so resume its streams to
+    // let them close. It does not mean the HTTP response has drained: retain
+    // that independent deadline until drain/finish/close.
+    child.once('exit', resumePipes);
+    child.once('close', resumePipes);
+    return {
+        pause: pauseOutput,
+        dispose: clearDrainWait,
+        isPaused: () => pipesPaused,
+        isWaitingForDrain: () => waitingForDrain
+    };
+}
+
+function activeJobs(userId = null) {
+    return Array.from(jobs.values()).filter(job =>
+        job.process && isChildRunning(job.process) &&
+        (userId === null || job.userId === userId)
+    );
+}
+
+function userHasActiveSolver(userId) {
+    return runningProcesses.has(userId) || activeJobs(userId).length > 0;
+}
+
+function cleanupExpiredJobs(now = Date.now(), maxRecords = MAX_JOB_RECORDS) {
+    return pruneJobRecords(jobs, now, JOB_TTL_MS, maxRecords);
+}
+
+function startJobCleanupTimer() {
+    if (jobCleanupTimer) return;
+    const intervalMs = Math.min(60 * 60 * 1000, Math.max(60 * 1000, Math.floor(JOB_TTL_MS / 4)));
+    jobCleanupTimer = setInterval(() => cleanupExpiredJobs(), intervalMs);
+    if (typeof jobCleanupTimer.unref === 'function') jobCleanupTimer.unref();
+}
+
+function probeSolverVersion(timeoutMs = 3000, signal = null) {
+    if (signal && signal.aborted) return Promise.resolve('unknown');
+    return new Promise((resolve, reject) => {
+        let proc;
+        try {
+            proc = spawnTrackedSolver(['--version'], { purpose: 'version-probe' });
+        } catch (error) {
+            reject(error);
+            return;
+        }
+
+        let output = '';
+        let settled = false;
+        let stopping = false;
+        let timer = null;
+        const append = data => {
+            output = appendBoundedText(output, data.toString(), MAX_PARTIAL_LOG_CHARS).text;
+        };
+        const onClose = () => finish();
+        const onError = () => stopAndFinish();
+        const onAbort = () => stopAndFinish();
+        const finish = (fallback = 'unknown') => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            if (signal) signal.removeEventListener('abort', onAbort);
+            proc.stdout.removeListener('data', append);
+            proc.stderr.removeListener('data', append);
+            proc.stdout.resume();
+            proc.stderr.resume();
+            proc.removeListener('close', onClose);
+            proc.removeListener('error', onError);
+            const match = output.match(/[\d]+\.[\d]+\.[\d]+/);
+            resolve(match ? match[0] : fallback);
+        };
+        const stopAndFinish = () => {
+            if (settled || stopping) return;
+            stopping = true;
+            void terminateChildWithRetry(
+                proc,
+                { graceMs: 250, forceWaitMs: 250 },
+                { graceMs: 250, forceWaitMs: 250 }
+            ).then(() => finish('unknown'));
+        };
+
+        proc.stdout.on('data', append);
+        proc.stderr.on('data', append);
+        proc.once('close', onClose);
+        proc.once('error', onError);
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        timer = setTimeout(stopAndFinish, timeoutMs);
+        if (signal && signal.aborted) stopAndFinish();
+    });
+}
+
+function startSolverVersionProbe() {
+    const controller = new AbortController();
+    const flight = { controller, consumers: new Set(), promise: null };
+    flight.promise = probeSolverVersion(3000, controller.signal).then(
+        (version) => {
+            if (!controller.signal.aborted) {
+                solverVersionCache = {
+                    version,
+                    expiresAt: Date.now() + (version === 'unknown'
+                        ? SOLVER_VERSION_FAILURE_CACHE_MS
+                        : SOLVER_VERSION_CACHE_MS)
+                };
+            }
+            return version;
+        },
+        () => 'unknown'
+    ).finally(() => {
+        if (solverVersionProbe === flight) solverVersionProbe = null;
+    });
+    solverVersionProbe = flight;
+    return flight;
+}
+
+function getSolverVersion(signal = null) {
+    if (solverVersionCache && solverVersionCache.expiresAt > Date.now()) {
+        return Promise.resolve(solverVersionCache.version);
+    }
+
+    const flight = solverVersionProbe || startSolverVersionProbe();
+    const consumer = {};
+    flight.consumers.add(consumer);
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (version) => {
+            if (settled) return;
+            settled = true;
+            if (signal) signal.removeEventListener('abort', onAbort);
+            flight.consumers.delete(consumer);
+            resolve(version);
+        };
+        const onAbort = () => {
+            finish('unknown');
+            if (flight.consumers.size === 0) flight.controller.abort();
+        };
+
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        if (signal && signal.aborted) return onAbort();
+        flight.promise.then(finish, () => finish('unknown'));
+    });
+}
 
 // Keep the solver process contract in one place. Exit code 2 means the
 // requested nonlinear tolerance was not reached, but the solver completed
@@ -110,7 +765,7 @@ function classifySolverExit(code) {
 
 /**
  * Generate timestamp-based output folder name
- * @returns {string} Folder name in format: output_YYYYMMDD_HHMMSS
+ * @returns {string} Base folder name in format: output_YYYYMMDD_HHMMSS
  */
 function generateTimestampFolderName() {
     const now = new Date();
@@ -149,21 +804,30 @@ async function isAnalysisResult(folderPath) {
  * @returns {Promise<string>} Full path to user's output directory for this run
  */
 async function prepareUserOutputDirectory(userId) {
-    const userIdKey = userId || 'default';
+    const userIdKey = normalizeUserId(userId);
     const userOutputBase = path.join(OUTPUTS_DIR, `${userIdKey}`);
 
     // Create user's output base directory if it doesn't exist
     await fs.mkdir(userOutputBase, { recursive: true });
 
-    // Generate timestamped folder for this run
+    // Atomically reserve a timestamped folder for this run. Per-user job
+    // concurrency can be raised by configuration, and two starts in the same
+    // second must never share a solver output directory.
     const timestampFolder = generateTimestampFolderName();
-    const fullOutputPath = path.join(userOutputBase, timestampFolder);
-    // Create the run directory before spawning the solver.  The solver writes
-    // conditions.json as its first artifact, so the WebUI can poll that file
-    // immediately instead of observing a missing result directory race.
-    await fs.mkdir(fullOutputPath, { recursive: true });
-
-    return fullOutputPath;
+    for (let suffix = 0; ; suffix++) {
+        const folderName = suffix === 0
+            ? timestampFolder
+            : `${timestampFolder}_${String(suffix).padStart(3, '0')}`;
+        const fullOutputPath = path.join(userOutputBase, folderName);
+        try {
+            // The solver writes conditions.json as its first artifact, so the
+            // WebUI can poll this directory immediately after submission.
+            await fs.mkdir(fullOutputPath);
+            return fullOutputPath;
+        } catch (error) {
+            if (error.code !== 'EEXIST') throw error;
+        }
+    }
 }
 
 // Multerの設定（ファイルアップロード用）
@@ -325,21 +989,17 @@ const USER_EXPIRY_DAYS = 366;
 
 // Helper: Get user config directory
 function getUserDir(userId) {
-    // Sanitize user ID to prevent directory traversal
-    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
-    return path.join(USER_CONFIGS_DIR, safeUserId);
+    return path.join(USER_CONFIGS_DIR, normalizeUserId(userId));
 }
 
 // Helper: Get user uploads directory
 function getUserUploadsDir(userId) {
-    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
-    return path.join(UPLOAD_DIR, safeUserId);
+    return path.join(UPLOAD_DIR, normalizeUserId(userId));
 }
 
 // Helper: Get user material libraries directory
 function getUserLibsDir(userId) {
-    const safeUserId = userId.replace(/[^a-zA-Z0-9_-]/g, '');
-    return path.join(USER_LIBS_DIR, safeUserId);
+    return path.join(USER_LIBS_DIR, normalizeUserId(userId));
 }
 
 // Helper: Merge material library YAML into analysis config YAML
@@ -519,7 +1179,9 @@ async function cleanupExpiredUsers() {
 }
 
 // Run initialization and cleanup on server start
-initializeDirectories().then(() => cleanupExpiredUsers());
+if (process.env.OPENMAGFDM_SKIP_INIT !== '1') {
+    initializeDirectories().then(() => cleanupExpiredUsers());
+}
 
 // Get list of YAML files for a user
 app.get('/api/config/list', async (req, res) => {
@@ -3077,277 +3739,342 @@ app.delete('/api/config/:filename', async (req, res) => {
 
 // ソルバーの実行（ストリーミングなし）
 app.post('/api/solve', async (req, res) => {
+    let finishStartOperation = () => {};
+    let solverProcess = null;
+    let claimedUserId = null;
+    let outputPath = null;
     try {
+        assertRequestOpen(req, res);
         const { configFile, imageFile, userId } = req.body;
-
-        // パスの構築
-        let configPath;
-        if (configFile) {
-            // User-specific config file
-            const userDir = getUserDir(userId || 'default');
-            configPath = path.join(userDir, configFile);
-        } else {
-            // Default config
-            configPath = CONFIG_PATH;
+        const userIdKey = normalizeUserId(userId);
+        finishStartOperation = beginSolverStartOperation(userIdKey);
+        if (userHasActiveSolver(userIdKey)) {
+            return res.status(409).json({
+                success: false,
+                error: 'A solver process is already running for this user'
+            });
         }
+        claimLegacyResponsePermit(res);
 
-        // Get image path from user upload directory
-        const userUploadDir = getUserUploadsDir(userId || 'default');
-        const imagePath = path.join(userUploadDir, imageFile);
+        const userDir = getUserDir(userIdKey);
+        const configPath = configFile
+            ? resolveUserFilePath(userDir, configFile, 'configFile')
+            : CONFIG_PATH;
+        const userUploadDir = getUserUploadsDir(userIdKey);
+        const imagePath = resolveUserFilePath(userUploadDir, imageFile, 'imageFile');
 
-        // ファイルの存在確認
         await fs.access(configPath);
         await fs.access(imagePath);
         await fs.access(SOLVER_PATH);
+        assertRequestOpen(req, res);
 
-        // コマンドの構築
         // Use the same user-scoped output layout as the streaming and job
         // APIs so warning-complete results remain discoverable in the UI.
-        const outputPath = await prepareUserOutputDirectory(userId);
-        const command = `"${SOLVER_PATH}" "${configPath}" "${imagePath}" "${outputPath}"`;
+        outputPath = await prepareUserOutputDirectory(userIdKey);
+        assertRequestOpen(req, res);
+        console.log('Executing legacy solver without a shell:', SOLVER_PATH);
 
-        console.log('Executing:', command);
+        if (userHasActiveSolver(userIdKey)) {
+            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
+        }
+        assertRequestOpen(req, res);
+        solverProcess = spawnTrackedSolver(
+            [configPath, imagePath, outputPath],
+            { purpose: 'legacy', userId: userIdKey }
+        );
+        if (!claimRunningProcess(userIdKey, solverProcess, 'legacy')) {
+            void terminateChildProcess(solverProcess);
+            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
+        }
+        claimedUserId = userIdKey;
 
-        // ソルバーの実行
-        exec(command, {
-            cwd: BASE_DIR,
-            maxBuffer: 10 * 1024 * 1024 // 10MB
-        }, (error, stdout, stderr) => {
-            if (error) {
-                const exitCode = Number.isInteger(error.code) ? error.code : null;
-                const outcome = classifySolverExit(exitCode);
-                if (outcome.warning) {
-                    return res.json({
-                        ...outcome,
-                        exitCode,
-                        resultPath: outputPath,
-                        stdout,
-                        stderr
-                    });
-                }
-                console.error('Solver error:', error);
-                return res.status(500).json({
+        let stdout = '';
+        let stderr = '';
+        let outputOverflow = false;
+        let finalized = false;
+        let processError = null;
+        terminateOnPrematureResponseClose(res, solverProcess, 'Legacy solve');
+
+        const appendOutput = (target, data) => {
+            const appended = appendBoundedText(target, data.toString());
+            if (appended.overflow && !outputOverflow) {
+                outputOverflow = true;
+                void terminateChildProcess(solverProcess);
+            }
+            return appended.text;
+        };
+
+        solverProcess.stdout.on('data', data => { stdout = appendOutput(stdout, data); });
+        solverProcess.stderr.on('data', data => { stderr = appendOutput(stderr, data); });
+
+        solverProcess.once('error', (error) => {
+            processError = error;
+            console.error('Solver error:', error);
+            if (isChildRunning(solverProcess)) void terminateChildProcess(solverProcess);
+        });
+
+        solverProcess.once('close', (code, signal) => {
+            deleteRunningProcessIfSame(userIdKey, solverProcess);
+            if (finalized || res.destroyed || res.writableEnded) return;
+            finalized = true;
+
+            if (outputOverflow) {
+                return sendLegacyJson(res, 500, {
                     success: false,
-                    exitCode,
-                    error: error.message,
-                    stderr: stderr
+                    exitCode: code,
+                    error: `Solver output exceeded ${LEGACY_OUTPUT_LIMIT_CHARS} characters`,
+                    stderr: boundedLegacyResponseText(stderr)
                 });
             }
 
-            // 出力ファイル名の取得（Muファイルも）
-            // const azFile = outputPath;
-            // const muFile = outputPath.replace('Az_', 'Mu_');
+            if (processError) {
+                return sendLegacyJson(res, 500, {
+                    success: false,
+                    exitCode: code,
+                    error: processError.message,
+                    stderr: boundedLegacyResponseText(stderr)
+                });
+            }
 
-            res.json({
-                ...classifySolverExit(0),
-                exitCode: 0,
+            const outcome = classifySolverExit(code);
+            if (outcome.warning) {
+                return sendLegacyJson(res, 200, {
+                    ...outcome,
+                    exitCode: code,
+                    resultPath: outputPath,
+                    stdout: boundedLegacyResponseText(stdout),
+                    stderr: boundedLegacyResponseText(stderr)
+                });
+            }
+            if (!outcome.success) {
+                const reason = signal ? `signal ${signal}` : `exit code ${code}`;
+                return sendLegacyJson(res, 500, {
+                    success: false,
+                    exitCode: code,
+                    error: `Solver failed with ${reason}`,
+                    stderr: boundedLegacyResponseText(stderr)
+                });
+            }
+
+            sendLegacyJson(res, 200, {
+                ...outcome,
+                exitCode: code,
                 resultPath: outputPath,
-                stdout: stdout,
+                stdout: boundedLegacyResponseText(stdout)
             });
         });
-
     } catch (error) {
-        res.status(500).json({
+        if (solverProcess) {
+            void terminateChildProcess(solverProcess).then(() => {
+                if (claimedUserId) deleteRunningProcessIfSame(claimedUserId, solverProcess);
+            });
+        } else if (outputPath) {
+            void removeEmptyOutputDirectory(outputPath);
+        }
+        if (res.destroyed || res.writableEnded || res.headersSent) return;
+        res.status(error.statusCode || 500).json({
             success: false,
             error: error.message
         });
+    } finally {
+        finishStartOperation();
     }
 });
 
 // ソルバーの実行（プログレス付きSSEストリーミング）
 app.post('/api/solve-stream', async (req, res) => {
+    let finishStartOperation = () => {};
+    let mergedTempPath = null;
+    let solverProcess = null;
+    let claimedUserId = null;
+    let outputPath = null;
     try {
+        assertRequestOpen(req, res);
         const { configFile, imageFile, userId, materialLibraryFile } = req.body;
-
-        // パスの構築
-        let configPath;
-        if (configFile) {
-            // User-specific config file
-            const userDir = getUserDir(userId || 'default');
-            configPath = path.join(userDir, configFile);
-        } else {
-            // Default config
-            configPath = CONFIG_PATH;
+        const userIdKey = normalizeUserId(userId);
+        finishStartOperation = beginSolverStartOperation(userIdKey);
+        if (userHasActiveSolver(userIdKey)) {
+            return res.status(409).json({
+                success: false,
+                error: 'A solver process is already running for this user'
+            });
         }
 
-        // Get image path from user upload directory
-        const userUploadDir = getUserUploadsDir(userId || 'default');
-        const imagePath = path.join(userUploadDir, imageFile);
+        const userDir = getUserDir(userIdKey);
+        const configPath = configFile
+            ? resolveUserFilePath(userDir, configFile, 'configFile')
+            : CONFIG_PATH;
+        const userUploadDir = getUserUploadsDir(userIdKey);
+        const imagePath = resolveUserFilePath(userUploadDir, imageFile, 'imageFile');
 
-        // ファイルの存在確認
         await fs.access(configPath);
         await fs.access(imagePath);
         await fs.access(SOLVER_PATH);
+        assertRequestOpen(req, res);
 
-        // Merge material library if provided
-        const userIdKey = userId || 'default';
         let effectiveConfigPath = configPath;
-        let mergedTempPath = null;
         if (materialLibraryFile) {
-            const libDir  = getUserLibsDir(userIdKey);
-            const libPath = path.join(libDir, path.basename(materialLibraryFile));
-            if (!path.resolve(libPath).startsWith(path.resolve(libDir))) {
-                throw new Error('Invalid library path');
-            }
+            const libDir = getUserLibsDir(userIdKey);
+            const libPath = resolveUserFilePath(libDir, materialLibraryFile, 'materialLibraryFile');
             const configYaml = await fs.readFile(configPath, 'utf8');
-            const libYaml    = await fs.readFile(libPath, 'utf8');
+            const libYaml = await fs.readFile(libPath, 'utf8');
+            assertRequestOpen(req, res);
             const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
-            mergedTempPath   = path.join(getUserDir(userIdKey), `.merged_${Date.now()}.yaml`);
+            mergedTempPath = path.join(userDir, `.merged_${require('crypto').randomUUID()}.yaml`);
             await fs.writeFile(mergedTempPath, mergedYaml);
+            assertRequestOpen(req, res);
             effectiveConfigPath = mergedTempPath;
         }
 
-        // SSEヘッダーの設定
+        outputPath = await prepareUserOutputDirectory(userIdKey);
+        assertRequestOpen(req, res);
+        console.log(`Output directory for user ${userIdKey}: ${outputPath}`);
+        if (userHasActiveSolver(userIdKey)) {
+            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
+        }
+        assertRequestOpen(req, res);
+        solverProcess = spawnTrackedSolver(
+            [effectiveConfigPath, imagePath, outputPath],
+            { purpose: 'stream', userId: userIdKey }
+        );
+        if (!claimRunningProcess(userIdKey, solverProcess, 'stream')) {
+            void terminateChildProcess(solverProcess);
+            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
+        }
+        claimedUserId = userIdKey;
+
+        // Install disconnect cleanup immediately after claiming the child. This
+        // covers errors thrown by header setup/flush as well as later SSE loss.
+        terminateOnPrematureResponseClose(res, solverProcess, 'Streaming solve');
+
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders();
-
         console.log('Executing solver with streaming:', SOLVER_PATH);
-
-        // Prepare user-specific output directory
-        const outputPath = await prepareUserOutputDirectory(userId);
-        console.log(`Output directory for user ${userIdKey}: ${outputPath}`);
-
-        // spawnを使用してリアルタイムで出力を取得（第3引数に出力パスを追加）
-        const solverProcess = spawn(SOLVER_PATH, [effectiveConfigPath, imagePath, outputPath], {
-            cwd: BASE_DIR,
-        });
-
-        // プロセスをマップに登録
-        runningProcesses.set(userIdKey, solverProcess);
         console.log(`Registered solver process for user: ${userIdKey}`);
 
-        let outputBuffer = '';
-        let errorBuffer = '';
-
-        // 標準出力の処理
-        solverProcess.stdout.on('data', (data) => {
-            const text = data.toString();
-            outputBuffer += text;
-
-            // 行ごとに処理
-            const lines = outputBuffer.split('\n');
-            outputBuffer = lines.pop() || ''; // 最後の不完全な行を保持
-
-            for (const line of lines) {
-                if (!line.trim()) continue;
-
-                // プログレス情報を抽出
-                let progressData = { type: 'log', message: line };
-
-                // "--- Step X / Y ---" の形式をパース
-                const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
-                if (stepMatch) {
-                    const current = parseInt(stepMatch[1]);
-                    const total = parseInt(stepMatch[2]);
-                    // percentage reflects COMPLETED steps, not started steps
-                    // Step 1/N -> 0%, Step N/N -> (N-1)/N%, 100% only on complete
-                    progressData = {
-                        type: 'progress',
-                        step: current,
-                        total: total,
-                        percentage: Math.round(((current - 1) / total) * 100),
-                        message: line
-                    };
-                }
-
-                // 他の重要なメッセージ
-                if (line.includes('Solving linear system') ||
-                    line.includes('Using AMGCL') ||
-                    line.includes('Using direct solver')) {
-                    progressData.type = 'status';
-                }
-
-                if (line.includes('completed successfully')) {
-                    progressData.type = 'complete';
-                }
-
-                // SSEフォーマットで送信
-                res.write(`data: ${JSON.stringify(progressData)}\n\n`);
+        let stdoutPartial = '';
+        let stderrPartial = '';
+        let finalized = false;
+        let processError = null;
+        const cleanMergedTemp = () => {
+            if (!mergedTempPath) return;
+            const toDelete = mergedTempPath;
+            mergedTempPath = null;
+            void unlinkTemporaryFile(toDelete);
+        };
+        const backpressure = createSseBackpressureController(res, solverProcess);
+        const sendSse = (data, priority = false) => {
+            if (res.destroyed || res.writableEnded) return false;
+            // Slow/disconnected clients must not make Node's outgoing queue grow
+            // without bound. Preserve progress and the single terminal event;
+            // verbose log/status/error events may be dropped under pressure.
+            if (!priority && res.writableLength >= MAX_SSE_BUFFER_BYTES) return false;
+            try {
+                const writable = res.write(`data: ${JSON.stringify(data)}\n\n`);
+                if (!writable) backpressure.pause();
+                return writable;
+            } catch {
+                return false;
             }
-        });
-
-        // 標準エラー出力の処理
-        solverProcess.stderr.on('data', (data) => {
-            const text = data.toString();
-            errorBuffer += text;
-
-            const lines = text.split('\n');
-            for (const line of lines) {
-                if (!line.trim()) continue;
-
-                const errorData = {
-                    type: 'error',
+        };
+        const sendStdoutLine = (line) => {
+            if (!line.trim()) return;
+            let progressData = { type: 'log', message: line };
+            const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
+            if (stepMatch) {
+                const current = parseInt(stepMatch[1]);
+                const total = parseInt(stepMatch[2]);
+                progressData = {
+                    type: 'progress',
+                    step: current,
+                    total,
+                    percentage: Math.round(((current - 1) / total) * 100),
                     message: line
                 };
-
-                res.write(`data: ${JSON.stringify(errorData)}\n\n`);
             }
-        });
-
-        // プロセス終了時の処理
-        solverProcess.on('close', (code) => {
-            console.log(`Solver process exited with code ${code}`);
-
-            // プロセスをマップから削除
-            runningProcesses.delete(userIdKey);
-            console.log(`Removed solver process for user: ${userIdKey}`);
-
-            // Clean up merged temp config if used
-            if (mergedTempPath) {
-                fs.unlink(mergedTempPath).catch(() => {});
-                mergedTempPath = null;
+            if (line.includes('Solving linear system') ||
+                line.includes('Using AMGCL') ||
+                line.includes('Using direct solver')) {
+                progressData.type = 'status';
             }
-
-            // 最後のバッファを送信
-            if (outputBuffer.trim()) {
-                res.write(`data: ${JSON.stringify({ type: 'log', message: outputBuffer.trim() })}\n\n`);
-            }
-
-            // 完了メッセージ
-            const finalData = {
-                type: 'done',
-                ...classifySolverExit(code),
-                exitCode: code,
-                resultPath: (code === 0 || code === 2) ? outputPath : null
-            };
-
-            res.write(`data: ${JSON.stringify(finalData)}\n\n`);
-            res.end();
-        });
-
-        // エラー時の処理
-        solverProcess.on('error', (error) => {
-            console.error('Solver process error:', error);
-
-            // プロセスをマップから削除
-            runningProcesses.delete(userIdKey);
-
-            const errorData = {
-                type: 'error',
-                success: false,
-                error: error.message
-            };
-            res.write(`data: ${JSON.stringify(errorData)}\n\n`);
-            res.end();
-        });
-
-        // クライアントが接続を切断した場合
-        req.on('close', () => {
-            console.log('Client disconnected, terminating solver process');
-            solverProcess.kill();
-        });
-
-    } catch (error) {
-        console.error('Error starting solver:', error);
-        const errorData = {
-            type: 'error',
-            success: false,
-            error: error.message
+            if (line.includes('completed successfully')) progressData.type = 'complete';
+            sendSse(progressData, progressData.type === 'progress');
         };
-        res.write(`data: ${JSON.stringify(errorData)}\n\n`);
-        res.end();
+
+        solverProcess.stdout.on('data', (data) => {
+            const parsed = splitCappedLines(stdoutPartial, data.toString());
+            stdoutPartial = parsed.partial;
+            for (const line of parsed.lines) sendStdoutLine(line);
+        });
+
+        solverProcess.stderr.on('data', (data) => {
+            const parsed = splitCappedLines(stderrPartial, data.toString());
+            stderrPartial = parsed.partial;
+            for (const line of parsed.lines) {
+                if (line.trim()) sendSse({ type: 'error', message: line });
+            }
+        });
+
+        solverProcess.once('close', (code) => {
+            deleteRunningProcessIfSame(userIdKey, solverProcess);
+            cleanMergedTemp();
+            console.log(`Solver process exited with code ${code}`);
+            if (finalized) return;
+            finalized = true;
+
+            if (stdoutPartial.trim()) sendStdoutLine(truncateLogLine(stdoutPartial.trim()));
+            if (stderrPartial.trim()) {
+                sendSse({ type: 'error', message: truncateLogLine(stderrPartial.trim()) });
+            }
+            const outcome = processError
+                ? { ...classifySolverExit(-1), message: processError.message }
+                : classifySolverExit(code);
+            sendSse({
+                type: 'done',
+                ...outcome,
+                exitCode: code,
+                resultPath: outcome.completed ? outputPath : null
+            }, true);
+            if (!res.destroyed && !res.writableEnded) {
+                try { res.end(); } catch { /* connection already gone */ }
+            }
+        });
+
+        solverProcess.once('error', (error) => {
+            processError = error;
+            console.error('Solver process error:', error);
+            sendSse({ type: 'error', success: false, error: error.message });
+            if (isChildRunning(solverProcess)) void terminateChildProcess(solverProcess);
+        });
+    } catch (error) {
+        if (solverProcess) {
+            void terminateChildProcess(solverProcess).then(() => {
+                if (claimedUserId) deleteRunningProcessIfSame(claimedUserId, solverProcess);
+                if (mergedTempPath) {
+                    const toDelete = mergedTempPath;
+                    mergedTempPath = null;
+                    void unlinkTemporaryFile(toDelete);
+                }
+            });
+        } else if (mergedTempPath) {
+            void unlinkTemporaryFile(mergedTempPath);
+        }
+        if (!solverProcess && outputPath) void removeEmptyOutputDirectory(outputPath);
+        console.error('Error starting solver:', error);
+        if (res.destroyed || res.writableEnded) return;
+        if (!res.headersSent) {
+            return res.status(error.statusCode || 500).json({ success: false, error: error.message });
+        }
+        if (!res.destroyed && !res.writableEnded) {
+            try {
+                res.write(`data: ${JSON.stringify({ type: 'error', success: false, error: error.message })}\n\n`);
+                res.end();
+            } catch { /* connection already gone */ }
+        }
+    } finally {
+        finishStartOperation();
     }
 });
 
@@ -3355,29 +4082,31 @@ app.post('/api/solve-stream', async (req, res) => {
 app.post('/api/stop-solver', async (req, res) => {
     try {
         const { userId } = req.body;
-        const userIdKey = userId || 'default';
+        const userIdKey = normalizeUserId(userId);
+        const entry = runningProcesses.get(userIdKey);
 
-        const solverProcess = runningProcesses.get(userIdKey);
-
-        if (!solverProcess) {
+        if (!entry) {
             return res.status(404).json({
                 success: false,
                 error: 'No running solver process found for this user'
             });
         }
 
+        const solverProcess = entry.process;
+        if (!isChildRunning(solverProcess)) {
+            deleteRunningProcessIfSame(userIdKey, solverProcess);
+            return res.json({ success: true, message: 'Solver process was already stopped' });
+        }
+
         console.log(`Stopping solver process for user: ${userIdKey}`);
-
-        // プロセスを強制終了
-        solverProcess.kill('SIGTERM');
-
-        // プロセスがすぐに終了しない場合のタイムアウト
-        setTimeout(() => {
-            if (!solverProcess.killed) {
-                console.log(`Force killing solver process for user: ${userIdKey}`);
-                solverProcess.kill('SIGKILL');
-            }
-        }, 5000);
+        const termination = await terminateChildProcess(solverProcess);
+        if (!termination.exited) {
+            return res.status(500).json({
+                success: false,
+                error: 'Solver process did not exit after forced termination'
+            });
+        }
+        deleteRunningProcessIfSame(userIdKey, solverProcess);
 
         res.json({
             success: true,
@@ -3641,21 +4370,17 @@ app.get('/api/solver/info', async (req, res) => {
     try {
         // Get version from solver binary
         let version = 'unknown';
+        const probeController = new AbortController();
+        const abortProbe = () => probeController.abort();
+        req.once('aborted', abortProbe);
+        res.once('close', abortProbe);
         try {
-            await new Promise((resolve) => {
-                const proc = spawn(SOLVER_PATH, ['--version']);
-                let output = '';
-                proc.stdout.on('data', d => { output += d.toString(); });
-                proc.stderr.on('data', d => { output += d.toString(); });
-                proc.on('close', () => {
-                    const match = output.match(/[\d]+\.[\d]+\.[\d]+/);
-                    if (match) version = match[0];
-                    resolve();
-                });
-                proc.on('error', resolve);
-                setTimeout(() => { proc.kill(); resolve(); }, 3000);
-            });
+            version = await getSolverVersion(probeController.signal);
         } catch { /* ignore */ }
+        req.removeListener('aborted', abortProbe);
+        res.removeListener('close', abortProbe);
+
+        if (res.destroyed || res.writableEnded) return;
 
         res.json({
             version,
@@ -3675,6 +4400,7 @@ app.get('/api/solver/info', async (req, res) => {
             }
         });
     } catch (error) {
+        if (res.destroyed || res.writableEnded || res.headersSent) return;
         res.status(500).json({ success: false, error: error.message });
     }
 });
@@ -4261,44 +4987,90 @@ app.get('/api/results/:resultFolder/field-at-point', async (req, res) => {
 
 // Submit async solve job (non-blocking, returns jobId immediately)
 app.post('/api/jobs', async (req, res) => {
+    let finishStartOperation = () => {};
+    let mergedTempPath = null;
+    let jobStarted = false;
+    let solverProcess = null;
+    let outputPath = null;
     try {
+        assertRequestOpen(req, res);
         const { configFile, imageFile, userId, materialLibraryFile } = req.body;
-        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const userIdKey = normalizeUserId(userId);
+        finishStartOperation = beginSolverStartOperation(userIdKey);
 
         if (!configFile || !imageFile) {
             return res.status(400).json({ success: false, error: 'configFile and imageFile are required' });
         }
 
+        cleanupExpiredJobs(Date.now(), Math.max(0, MAX_JOB_RECORDS - 1));
+        if (runningProcesses.has(userIdKey)) {
+            throw makeProcessError('An interactive solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
+        }
+        if (activeJobs().length >= MAX_CONCURRENT_JOBS) {
+            throw makeProcessError(`Concurrent job limit reached (${MAX_CONCURRENT_JOBS})`, 'JOB_LIMIT', 429);
+        }
+        if (activeJobs(userIdKey).length >= MAX_CONCURRENT_JOBS_PER_USER) {
+            throw makeProcessError(
+                `Concurrent job limit for this user reached (${MAX_CONCURRENT_JOBS_PER_USER})`,
+                'USER_JOB_LIMIT',
+                409
+            );
+        }
+        if (jobs.size >= MAX_JOB_RECORDS) {
+            throw makeProcessError('Job history capacity is temporarily full', 'JOB_HISTORY_LIMIT', 503);
+        }
+
         // Build paths
         const userDir = getUserDir(userIdKey);
-        const configPath = path.join(userDir, path.basename(configFile));
+        const configPath = resolveUserFilePath(userDir, configFile, 'configFile');
         const userUploadDir = getUserUploadsDir(userIdKey);
-        const imagePath = path.join(userUploadDir, path.basename(imageFile));
+        const imagePath = resolveUserFilePath(userUploadDir, imageFile, 'imageFile');
 
         // Validate files exist
         await fs.access(configPath);
         await fs.access(imagePath);
         await fs.access(SOLVER_PATH);
+        assertRequestOpen(req, res);
 
         // Merge material library if provided
         let effectiveConfigPath = configPath;
-        let mergedTempPath = null;
         if (materialLibraryFile) {
-            const libDir  = getUserLibsDir(userIdKey);
-            const libPath = path.join(libDir, path.basename(materialLibraryFile));
-            if (!path.resolve(libPath).startsWith(path.resolve(libDir))) {
-                throw new Error('Invalid library path');
-            }
+            const libDir = getUserLibsDir(userIdKey);
+            const libPath = resolveUserFilePath(libDir, materialLibraryFile, 'materialLibraryFile');
             const configYaml = await fs.readFile(configPath, 'utf8');
-            const libYaml    = await fs.readFile(libPath, 'utf8');
+            const libYaml = await fs.readFile(libPath, 'utf8');
+            assertRequestOpen(req, res);
             const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
-            mergedTempPath   = path.join(userDir, `.merged_${Date.now()}.yaml`);
+            mergedTempPath = path.join(userDir, `.merged_${require('crypto').randomUUID()}.yaml`);
             await fs.writeFile(mergedTempPath, mergedYaml);
+            assertRequestOpen(req, res);
             effectiveConfigPath = mergedTempPath;
         }
 
         const jobId = require('crypto').randomUUID();
-        const outputPath = await prepareUserOutputDirectory(userIdKey);
+        outputPath = await prepareUserOutputDirectory(userIdKey);
+        assertRequestOpen(req, res);
+
+        // Repeat capacity checks after file I/O so another request cannot claim
+        // this user's slot while the job is being prepared.
+        cleanupExpiredJobs(Date.now(), Math.max(0, MAX_JOB_RECORDS - 1));
+        if (runningProcesses.has(userIdKey)) {
+            throw makeProcessError('An interactive solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
+        }
+        if (activeJobs().length >= MAX_CONCURRENT_JOBS) {
+            throw makeProcessError(`Concurrent job limit reached (${MAX_CONCURRENT_JOBS})`, 'JOB_LIMIT', 429);
+        }
+        if (activeJobs(userIdKey).length >= MAX_CONCURRENT_JOBS_PER_USER) {
+            throw makeProcessError(
+                `Concurrent job limit for this user reached (${MAX_CONCURRENT_JOBS_PER_USER})`,
+                'USER_JOB_LIMIT',
+                409
+            );
+        }
+        if (jobs.size >= MAX_JOB_RECORDS) {
+            throw makeProcessError('Job history capacity is temporarily full', 'JOB_HISTORY_LIMIT', 503);
+        }
+        assertRequestOpen(req, res);
 
         const job = {
             jobId,
@@ -4313,44 +5085,56 @@ app.post('/api/jobs', async (req, res) => {
             warning: false,
             message: null,
             process: null,
+            cancelRequested: false,
             created: new Date().toISOString(),
             finished: null
         };
-        jobs.set(jobId, job);
 
         // Spawn solver in background
-        const solverProcess = spawn(SOLVER_PATH, [effectiveConfigPath, imagePath, outputPath], { cwd: BASE_DIR });
+        solverProcess = spawnTrackedSolver(
+            [effectiveConfigPath, imagePath, outputPath],
+            { purpose: 'job', userId: userIdKey, jobId }
+        );
         job.process = solverProcess;
+        jobs.set(jobId, job);
+        jobStarted = true;
 
-        let outputBuffer = '';
-        solverProcess.stdout.on('data', (data) => {
-            outputBuffer += data.toString();
-            const lines = outputBuffer.split('\n');
-            outputBuffer = lines.pop() || '';
-            for (const line of lines) {
-                if (!line.trim()) continue;
-                job.log.push(line);
-                if (job.log.length > 500) job.log.shift(); // cap log
+        let stdoutPartial = '';
+        let stderrPartial = '';
+        let finalized = false;
+        let processError = null;
 
-                const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
-                if (stepMatch) {
-                    const current = parseInt(stepMatch[1]);
-                    const total = parseInt(stepMatch[2]);
-                    job.progress = Math.round(((current - 1) / total) * 100);
-                }
-                if (line.includes('completed successfully')) {
-                    job.progress = 100;
-                }
+        const appendJobLine = (line) => {
+            if (!line.trim()) return;
+            job.log = appendCappedLog(job.log, line);
+        };
+        const consumeStdoutLine = (line) => {
+            if (!line.trim()) return;
+            appendJobLine(line);
+            const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
+            if (stepMatch) {
+                const current = parseInt(stepMatch[1]);
+                const total = parseInt(stepMatch[2]);
+                job.progress = Math.round(((current - 1) / total) * 100);
             }
-        });
-        solverProcess.stderr.on('data', (data) => {
-            const text = data.toString();
-            for (const line of text.split('\n')) {
-                if (line.trim()) job.log.push(`[err] ${line}`);
-            }
-        });
-        solverProcess.on('close', (code) => {
-            const outcome = classifySolverExit(code);
+            if (line.includes('completed successfully')) job.progress = 100;
+        };
+        const cleanMergedTemp = () => {
+            if (!mergedTempPath) return;
+            const toDelete = mergedTempPath;
+            mergedTempPath = null;
+            void unlinkTemporaryFile(toDelete);
+        };
+        const finalizeJob = (code, error = null) => {
+            if (finalized) return;
+            finalized = true;
+            if (stdoutPartial.trim()) consumeStdoutLine(truncateLogLine(stdoutPartial.trim()));
+            if (stderrPartial.trim()) appendJobLine(`[err] ${truncateLogLine(stderrPartial.trim())}`);
+            if (error) appendJobLine(`[error] ${error.message}`);
+
+            const outcome = error && !job.cancelRequested
+                ? { ...classifySolverExit(-1), message: error.message }
+                : classifySolverExit(job.cancelRequested ? null : code);
             job.status = outcome.status;
             job.exitCode = code;
             job.completed = outcome.completed;
@@ -4358,31 +5142,41 @@ app.post('/api/jobs', async (req, res) => {
             job.warning = outcome.warning;
             job.message = outcome.message;
             job.finished = new Date().toISOString();
-            job.process = null;
+            if (job.process === solverProcess) job.process = null;
             if (outcome.completed) {
                 job.resultPath = outputPath;
                 job.progress = 100;
             }
-            if (mergedTempPath) {
-                fs.unlink(mergedTempPath).catch(() => {});
-                mergedTempPath = null;
-            }
+            cleanMergedTemp();
             console.log(`Job ${jobId} finished with code ${code}`);
+        };
+
+        solverProcess.stdout.on('data', (data) => {
+            const parsed = splitCappedLines(stdoutPartial, data.toString());
+            stdoutPartial = parsed.partial;
+            for (const line of parsed.lines) consumeStdoutLine(line);
         });
-        solverProcess.on('error', (err) => {
-            job.status = 'failed';
-            job.finished = new Date().toISOString();
-            job.process = null;
-            job.log.push(`[error] ${err.message}`);
-            if (mergedTempPath) {
-                fs.unlink(mergedTempPath).catch(() => {});
-                mergedTempPath = null;
+        solverProcess.stderr.on('data', (data) => {
+            const parsed = splitCappedLines(stderrPartial, data.toString());
+            stderrPartial = parsed.partial;
+            for (const line of parsed.lines) {
+                if (line.trim()) appendJobLine(`[err] ${line}`);
             }
         });
+        solverProcess.once('error', (error) => {
+            processError = error;
+            if (isChildRunning(solverProcess)) void terminateChildProcess(solverProcess);
+        });
+        solverProcess.once('close', (code) => finalizeJob(code, processError));
 
         res.json({ success: true, jobId, status: 'running' });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        if (!jobStarted && mergedTempPath) void unlinkTemporaryFile(mergedTempPath);
+        if (!solverProcess && outputPath) void removeEmptyOutputDirectory(outputPath);
+        if (res.destroyed || res.writableEnded || res.headersSent) return;
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    } finally {
+        finishStartOperation();
     }
 });
 
@@ -4390,7 +5184,8 @@ app.post('/api/jobs', async (req, res) => {
 app.get('/api/jobs', (req, res) => {
     try {
         const { userId } = req.query;
-        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const userIdKey = normalizeUserId(userId);
+        cleanupExpiredJobs();
 
         const userJobs = Array.from(jobs.values())
             .filter(j => j.userId === userIdKey)
@@ -4407,6 +5202,7 @@ app.get('/api/jobs', (req, res) => {
 // Get single job status and log tail
 app.get('/api/jobs/:jobId', (req, res) => {
     try {
+        cleanupExpiredJobs();
         const job = jobs.get(req.params.jobId);
         if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 
@@ -4434,24 +5230,26 @@ app.get('/api/jobs/:jobId', (req, res) => {
 // Cancel a running job
 app.delete('/api/jobs/:jobId', async (req, res) => {
     try {
+        cleanupExpiredJobs();
         const job = jobs.get(req.params.jobId);
         if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
 
-        if (job.status !== 'running' || !job.process) {
+        if (!job.process || !isChildRunning(job.process)) {
             return res.json({ success: true, message: `Job already ${job.status}` });
         }
 
-        job.process.kill('SIGTERM');
-        const killTimer = setTimeout(() => {
-            if (job.process) job.process.kill('SIGKILL');
-        }, 5000);
-        job.process.once('close', () => clearTimeout(killTimer));
+        const solverProcess = job.process;
+        job.cancelRequested = true;
+        job.status = 'cancelling';
+        job.message = 'Cancellation requested';
+        void terminateChildProcess(solverProcess).then((termination) => {
+            if (!termination.exited && job.process === solverProcess) {
+                job.log = appendCappedLog(job.log, '[error] Solver did not exit after forced termination');
+                job.message = 'Cancellation requested, but the solver has not exited';
+            }
+        });
 
-        job.status = 'cancelled';
-        job.finished = new Date().toISOString();
-        job.process = null;
-
-        res.json({ success: true, message: 'Job cancelled' });
+        res.status(202).json({ success: true, status: 'cancelling', message: 'Job cancellation requested' });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -4614,31 +5412,6 @@ app.get('/', (req, res) => {
 });
 
 // サーバー起動
-app.listen(PORT, () => {
-    console.log('='.repeat(60));
-    console.log('MagFDM Visualizer Server (Integrated)');
-    console.log('='.repeat(60));
-    console.log(`Server running at: http://localhost:${PORT}`);
-    console.log(`Serving files from: ${PUBLIC_DIR}`);
-    console.log(`CSV data directory: ${BASE_DIR}`);
-    console.log(`Upload directory: ${UPLOAD_DIR}`);
-    console.log(`Solver path: ${SOLVER_PATH}`);
-    console.log(`Config file: ${CONFIG_PATH}`);
-    console.log('='.repeat(60));
-    console.log('Available APIs:');
-    console.log('  GET  /api/config          - Get YAML configuration');
-    console.log('  POST /api/config          - Save YAML configuration');
-    console.log('  POST /api/upload-image    - Upload material image');
-    console.log('  GET  /api/images          - List uploaded images');
-    console.log('  POST /api/solve           - Run FDM solver');
-    console.log('  GET  /api/results         - List result files');
-    console.log('  GET  /api/detect-steps    - Detect number of transient steps');
-    console.log('  GET  /api/load-csv        - Load CSV file for specific step');
-    console.log('='.repeat(60));
-    console.log('Press Ctrl+C to stop the server');
-    console.log('');
-});
-
 // ===== 過渡解析対応API =====
 
 // 解析に使用された画像ファイルを取得
@@ -5033,3 +5806,183 @@ app.get('/api/get-conditions', async (req, res) => {
         res.status(404).send(`Conditions file not found: ${error.message}`);
     }
 });
+
+function logServerStarted() {
+    const address = httpServer && httpServer.address();
+    const port = address && typeof address === 'object' ? address.port : PORT;
+    console.log('='.repeat(60));
+    console.log('MagFDM Visualizer Server (Integrated)');
+    console.log('='.repeat(60));
+    console.log(`Server running at: http://localhost:${port}`);
+    console.log(`Serving files from: ${PUBLIC_DIR}`);
+    console.log(`CSV data directory: ${BASE_DIR}`);
+    console.log(`Upload directory: ${UPLOAD_DIR}`);
+    console.log(`Solver path: ${SOLVER_PATH}`);
+    console.log(`Config file: ${CONFIG_PATH}`);
+    console.log('='.repeat(60));
+    console.log('Available APIs:');
+    console.log('  GET  /api/config          - Get YAML configuration');
+    console.log('  POST /api/config          - Save YAML configuration');
+    console.log('  POST /api/upload-image    - Upload material image');
+    console.log('  GET  /api/images          - List uploaded images');
+    console.log('  POST /api/solve           - Run FDM solver');
+    console.log('  GET  /api/results         - List result files');
+    console.log('  GET  /api/detect-steps    - Detect number of transient steps');
+    console.log('  GET  /api/load-csv        - Load CSV file for specific step');
+    console.log('='.repeat(60));
+    console.log('Press Ctrl+C to stop the server');
+    console.log('');
+}
+
+function installShutdownHandlers() {
+    if (shutdownHandlersInstalled) return;
+    shutdownHandlersInstalled = true;
+    for (const signal of ['SIGINT', 'SIGTERM']) {
+        process.once(signal, () => {
+            void shutdownServer(signal).then(
+                (result) => {
+                    if (!result.clean) {
+                        console.error(
+                            `Shutdown incomplete: ${result.remainingChildren} solver process(es) not closed ` +
+                            `(${result.remainingRunningChildren} still running)`
+                        );
+                    }
+                    process.exit(result.clean ? 0 : 1);
+                },
+                (error) => {
+                    console.error(`Shutdown failed after ${signal}:`, error);
+                    process.exit(1);
+                }
+            );
+        });
+    }
+}
+
+function startServer() {
+    if (httpServer) return httpServer;
+    if (shuttingDown) throw new Error('Server has already started shutting down');
+    startJobCleanupTimer();
+    httpServer = app.listen(PORT, logServerStarted);
+    installShutdownHandlers();
+    return httpServer;
+}
+
+function shutdownServer(reason = 'shutdown') {
+    if (shutdownPromise) return shutdownPromise;
+    shuttingDown = true;
+    if (jobCleanupTimer) {
+        clearInterval(jobCleanupTimer);
+        jobCleanupTimer = null;
+    }
+
+    const serverToClose = httpServer;
+    const children = Array.from(trackedSolverProcesses.keys());
+    console.log(`Shutting down (${reason}); terminating ${children.length} solver process(es)`);
+
+    let serverCloseCompleted = false;
+    const serverClosed = new Promise((resolve) => {
+        if (!serverToClose || !serverToClose.listening) {
+            serverCloseCompleted = true;
+            return resolve();
+        }
+        serverToClose.close(() => {
+            serverCloseCompleted = true;
+            resolve();
+        });
+    });
+    const closeWaiters = children.map(createChildCloseWaiter);
+    const childrenClosed = Promise.all(closeWaiters.map(waiter => waiter.promise));
+    const childrenStopped = Promise.allSettled(children.map(child => terminateChildWithRetry(child)));
+
+    shutdownPromise = (async () => {
+        let timeout = null;
+        let timedOut = false;
+        const deadline = new Promise((resolve) => {
+            timeout = setTimeout(() => {
+                timedOut = true;
+                resolve();
+            }, SHUTDOWN_TIMEOUT_MS);
+        });
+
+        const orderlyShutdown = Promise.all([serverClosed, childrenStopped, childrenClosed])
+            .then(() => waitForSolverStartOperations())
+            .then(() => waitForPendingCleanups());
+        await Promise.race([orderlyShutdown, deadline]);
+        if (timeout) clearTimeout(timeout);
+        if (timedOut) {
+            if (serverToClose && typeof serverToClose.closeAllConnections === 'function') {
+                serverToClose.closeAllConnections();
+            }
+            for (const child of children) forceKillChild(child);
+            let finalWaitTimer = null;
+            await Promise.race([
+                Promise.all([serverClosed, childrenClosed])
+                    .then(() => waitForSolverStartOperations())
+                    .then(() => waitForPendingCleanups()),
+                new Promise(resolve => {
+                    finalWaitTimer = setTimeout(resolve, FINAL_SHUTDOWN_FORCE_WAIT_MS);
+                })
+            ]);
+            if (finalWaitTimer) clearTimeout(finalWaitTimer);
+        }
+        for (const waiter of closeWaiters) waiter.cancel();
+        if (httpServer === serverToClose) httpServer = null;
+
+        const remainingChildren = trackedSolverProcesses.size;
+        const remainingRunningChildren = Array.from(trackedSolverProcesses.keys())
+            .filter(isChildRunning).length;
+        const remainingLegacyResponses = activeLegacyResponses.size;
+        const clean = remainingChildren === 0 &&
+            remainingRunningChildren === 0 &&
+            activeSolverStartOperations.size === 0 &&
+            remainingLegacyResponses === 0 &&
+            pendingCleanupPromises.size === 0 &&
+            serverCloseCompleted;
+        return {
+            clean,
+            timedOut,
+            requestedChildren: children.length,
+            remainingChildren,
+            remainingRunningChildren,
+            remainingStartOperations: activeSolverStartOperations.size,
+            remainingLegacyResponses
+        };
+    })();
+    return shutdownPromise;
+}
+
+if (process.env.OPENMAGFDM_NO_LISTEN !== '1') startServer();
+
+module.exports = {
+    app,
+    startServer,
+    shutdownServer,
+    _test: {
+        activeJobs,
+        appendCappedLog,
+        activeLegacyResponses,
+        activeSolverStartOperations,
+        activeSolverStartOperationsByUser,
+        beginSolverStartOperation,
+        boundedLegacyResponseText,
+        claimLegacyResponsePermit,
+        claimRunningProcess,
+        cleanupExpiredJobs,
+        createSseBackpressureController,
+        deleteRunningProcessIfSame,
+        getSolverVersion,
+        isChildRunning,
+        jobs,
+        normalizeUserId,
+        prepareUserOutputDirectory,
+        pruneJobRecords,
+        registerTrackedSolverProcess,
+        removeEmptyOutputDirectory,
+        runningProcesses,
+        splitCappedLines,
+        terminateChildProcess,
+        terminateOnPrematureResponseClose,
+        trackedSolverProcesses,
+        userHasActiveSolver
+    }
+};

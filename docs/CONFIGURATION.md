@@ -243,7 +243,9 @@ export:
 TIFF/float64/async is the default. `format: csv` is retained for compatibility;
 `format: both` writes both. `transient.export_fields` may restrict output to
 `Az`, `Mu`, `H`, `Jz`, `InputImg`, `BoundaryImg`, `Forces`, and
-`EnergyDensity`.
+`EnergyDensity`. `async_queue_depth` must be in `1..16`; a larger queue can
+overlap more disk I/O but retains more full-field snapshots, so the default is
+recommended unless storage profiling shows that writes are the bottleneck.
 
 ## Removed/deprecated configuration
 
