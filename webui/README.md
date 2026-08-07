@@ -1,4 +1,4 @@
-# OpenMagFDM WebUI v1.6.1
+# OpenMagFDM WebUI v1.6.2
 
 The WebUI is the browser-based editor, preprocessor, solver launcher and result
 viewer for OpenMagFDM. It runs on Node.js/Express and is also distributed as a
@@ -31,6 +31,12 @@ package or in the configured development paths. Use `GET /api/health` and
   bulk deletion across file categories.
 - Export/import selected user content as a standard ZIP backup from File
   Manager; the YAML editor remains focused on editing configuration content.
+
+## v1.6.2 behaviours
+
+- Fixed the Input Image preview feedback loop: ruler canvases and the zoom
+  stage now stay inside a bounded viewport instead of expanding the image
+  plot area on every layout pass.
 
 ## v1.6.1 behaviours
 

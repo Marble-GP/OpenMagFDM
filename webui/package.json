@@ -1,6 +1,6 @@
 {
   "name": "magfdm-visualizer",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "Web UI for MagFDMsolver visualization",
   "main": "server.js",
   "bin": "server.js",

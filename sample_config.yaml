@@ -1,4 +1,4 @@
-# OpenMagFDM v1.6.1 sample configuration
+# OpenMagFDM v1.6.2 sample configuration
 #
 # This file is intentionally conservative: it runs as a static, linear polar
 # analysis after the RGB values are adjusted to match the input image. For the
@@ -68,7 +68,7 @@ materials:
     jz: -$J_peak*cos(2*pi*$step/$N_step)
 
 # Enable this block when a material uses a B-H curve/formula. Eisenstat-Walker
-# is the v1.6.1 recommendation for nonlinear runs.
+# is the v1.6.2 recommendation for nonlinear runs.
 nonlinear_solver:
   enabled: false
   solver_type: newton-krylov

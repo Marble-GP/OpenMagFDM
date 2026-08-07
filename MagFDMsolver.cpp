@@ -23,7 +23,7 @@ using json = nlohmann::json;
 
 namespace {
 #ifndef OPENMAGFDM_VERSION_STRING
-#define OPENMAGFDM_VERSION_STRING "1.6.1"
+#define OPENMAGFDM_VERSION_STRING "1.6.2"
 #endif
 constexpr const char* OPENMAGFDM_VERSION = OPENMAGFDM_VERSION_STRING;
 }

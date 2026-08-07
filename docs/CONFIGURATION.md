@@ -1,6 +1,6 @@
-# OpenMagFDM v1.6.1 configuration reference
+# OpenMagFDM v1.6.2 configuration reference
 
-This document is the normative reference for analysis YAML in v1.6.1. The
+This document is the normative reference for analysis YAML in v1.6.2. The
 WebUI autocomplete file `webui/public/yaml-schema.json` must describe the same
 contract. Historical research knobs may remain parseable for reproducibility,
 but only the keys documented here are supported for production use.
@@ -83,7 +83,7 @@ for the pattern-specific parameters.
 
 ## Nonlinear solver
 
-Recommended v1.6.1 settings:
+Recommended v1.6.2 settings:
 
 ```yaml
 nonlinear_solver:

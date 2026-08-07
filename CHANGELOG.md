@@ -3,6 +3,18 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/research/`.
 
+## 1.6.2 — 2026-08-07
+
+- Fixed an infinite-growth feedback loop in the Run & Preview Input Image
+  viewer. The ruler grid and zoom stage now have bounded tracks and reset
+  min-content sizing, so loading a large image no longer expands its preview
+  area indefinitely.
+- Kept image zoom, pan, pixel rulers and bounded image fitting intact.
+- Synchronized solver, WebUI package, CMake, vcpkg and release-contract
+  version metadata to 1.6.2.
+
+See `docs/RELEASE_NOTES_v1.6.2.md` for the release details.
+
 ## 1.6.1 — release candidate
 
 - Fixed the v1.6.0 default banded-DD OpenMP performance regression.

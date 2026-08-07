@@ -227,6 +227,45 @@
             margin-top: 15px;
         }
 
+        /* The input-image ruler wrapper must be a bounded viewport.  Without
+           an explicit min-content reset, the percentage-sized zoom stage can
+           feed the image's intrinsic dimensions back into the grid track,
+           making the preview grow on every layout pass. */
+        #inputImageRulerWrap {
+            width: 100%;
+            max-width: 100%;
+            min-width: 0;
+            min-height: 0;
+            grid-template-columns: 26px minmax(0, 1fr) !important;
+            grid-template-rows: 20px minmax(120px, 400px) !important;
+            overflow: hidden;
+        }
+        #inputImageRulerWrap > * {
+            min-width: 0;
+            min-height: 0;
+        }
+        #inputImageZoomContainer {
+            width: 100%;
+            min-width: 0;
+            min-height: 120px;
+            height: clamp(120px, 45vh, 400px);
+            max-height: 400px;
+        }
+        #inputImageZoomStage {
+            min-width: 0;
+            min-height: 0;
+            overflow: hidden;
+        }
+        #inputImageZoomStage > #uploadedImage {
+            display: block;
+            width: auto;
+            height: auto;
+            max-width: 100%;
+            max-height: 100%;
+            min-width: 0;
+            min-height: 0;
+        }
+
         .result-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));

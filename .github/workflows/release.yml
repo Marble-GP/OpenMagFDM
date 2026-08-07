@@ -417,14 +417,14 @@ jobs:
 
     - name: Create NSIS installer script
       env:
-        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.6.1")
+        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.6.2")
         # for tag-triggered runs and the branch name for manual dispatch.
-        # We extract the numeric "1.6.1" form, with a hardcoded fallback so
+        # We extract the numeric "1.6.2" form, with a hardcoded fallback so
         # a workflow_dispatch from a feature branch still produces a
         # reasonable installer label.
         TAG_NAME: ${{ github.ref_name }}
       run: |
-        $version = "1.6.1"
+        $version = "1.6.2"
         if ($env:TAG_NAME -match '^v?(\d+\.\d+\.\d+)') {
             $version = $matches[1]
         }

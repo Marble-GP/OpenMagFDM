@@ -14,7 +14,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $package 'general_materials.yaml')))
 }
 
 $version = (& $solver --version | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $version -ne 'OpenMagFDM 1.6.1') {
+if ($LASTEXITCODE -ne 0 -or $version -ne 'OpenMagFDM 1.6.2') {
     throw "Unexpected --version result: '$version'"
 }
 
@@ -181,7 +181,7 @@ try {
     & $solver $metreConfig $imagePath 'contract_metres_out'
     if ($LASTEXITCODE -ne 0) { throw 'Metre metadata run failed' }
     $metreJson = Get-Content -Raw -LiteralPath 'contract_metres_out\conditions.json' | ConvertFrom-Json
-    if ($metreJson.openmagfdm_version -ne '1.6.1' -or
+    if ($metreJson.openmagfdm_version -ne '1.6.2' -or
         $metreJson.transient.slide_region_units -ne 'm' -or
         [math]::Abs([double]$metreJson.transient.slide_region_start - 0.05) -gt 1e-12) {
         throw 'Decimal slide bounds were not preserved as metres in conditions.json'
@@ -200,4 +200,4 @@ try {
     Pop-Location
 }
 
-Write-Host 'OpenMagFDM v1.6.1 release-contract smoke tests passed.'
+Write-Host 'OpenMagFDM v1.6.2 release-contract smoke tests passed.'
