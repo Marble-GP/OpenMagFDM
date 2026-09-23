@@ -49,6 +49,17 @@ Compare candidates sequentially with `--trial-preconditioner secant-amg`,
 `tangent-amg`, then `tangent-ilut`, each in a new output directory. No broad
 parameter search is intended. The default solver remains secant.
 
+Before committing to long sweeps, `run_tangent_screen.py` runs a sequential
+one-step cold-start diagnostic with the same executable: secant, then A/B/C.
+Pass `--exe <tangent-build-exe> --repo . --config <12-step-yaml> --image <png>
+--output <new-directory> --threads 12`. It preserves max iterations/tolerance
+and physical settings, changing only the number of steps and Jacobian option.
+Each child has a 600-second diagnostic time limit and an 8-GiB memory guard.
+Terminated or unconverged runs are not speed comparisons. `--resume` reuses
+completed diagnostics with matching hashes; incomplete directories are retained.
+The summary records inner iterations, tangent acceptance and secant fallback
+counts. This screening does not replace the paired 12-step adoption protocol.
+
 ## Full-revolution waveform gate
 
 Only eligible, strictly converged candidates advance to 248 steps. Configure

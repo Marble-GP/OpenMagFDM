@@ -44,11 +44,12 @@ def identity(exe, repo):
                 dll_sha256={p.name: sha256(p) for p in exe.parent.glob("*.dll")})
 
 
-def run(exe, config, image, out, env):
+def run(exe, config, image, out, env, *, timeout_seconds=None, memory_limit_bytes=None):
     out.mkdir()
     start = time.perf_counter()
     rss_peak = private_peak = 0
     samples = []
+    termination_reason = None
     with (out / "process.log").open("w", encoding="utf-8") as log:
         p = subprocess.Popen([str(exe), str(config), str(image), str(out / "results")],
                              cwd=out, stdout=log, stderr=subprocess.STDOUT, env=env)
@@ -61,8 +62,16 @@ def run(exe, config, image, out, env):
                                    getattr(mem, "peak_pagefile", 0))
                 samples.append([time.perf_counter() - start, mem.rss,
                                 getattr(mem, "private", 0)])
+                if memory_limit_bytes and max(mem.rss, getattr(mem, "private", 0)) > memory_limit_bytes:
+                    termination_reason = "memory_limit"
             except psutil.NoSuchProcess:
                 pass
+            if timeout_seconds and time.perf_counter() - start > timeout_seconds:
+                termination_reason = termination_reason or "diagnostic_time_limit"
+            if termination_reason:
+                # Only the solver child created by this run, never unrelated processes.
+                p.kill()
+                break
             time.sleep(0.05)
         code = p.wait()
     elapsed = time.perf_counter() - start
@@ -80,7 +89,8 @@ def run(exe, config, image, out, env):
     status_ok = all(s.get("strict_converged") == "1" for s in status)
     if isinstance(expected, int) and expected > 0:
         status_ok &= len(status) == expected and [int(s["step"]) for s in status] == list(range(expected))
-    result = dict(exit_code=code, converged=(code == 0 and status_ok), wall_seconds=elapsed,
+    result = dict(exit_code=code, converged=(code == 0 and status_ok and termination_reason is None),
+                  termination_reason=termination_reason, wall_seconds=elapsed,
                   peak_rss_bytes=rss_peak, peak_private_bytes=private_peak,
                   memory_method="50ms sampling; Windows also queries OS peak counters",
                   step_status=status, nk_profiles=profiles,
