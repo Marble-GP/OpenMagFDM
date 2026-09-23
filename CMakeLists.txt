@@ -13,6 +13,7 @@ add_library(omfdm_core STATIC
     MagneticFieldAnalyzer_nonlinear.cpp
     MagneticFieldAnalyzer_nonlinear_newton.cpp
     MagneticFieldAnalyzer_stencil.cpp
+    MagneticFieldAnalyzer_tangent.cpp
     MagneticFieldAnalyzer_dd.cpp
     MagneticFieldAnalyzer.h
     AsyncWriter.cpp
@@ -102,6 +103,10 @@ add_executable(dd_bench dd_bench.cpp)
 target_link_libraries(dd_bench PRIVATE omfdm_core)
 
 if(BUILD_TESTING)
+    add_executable(chunk_threads_test tests/chunk_threads_test.cpp)
+    target_link_libraries(chunk_threads_test PRIVATE omfdm_core)
+    add_test(NAME chunk_threads COMMAND chunk_threads_test
+        ${CMAKE_CURRENT_BINARY_DIR}/chunk_threads_fixture)
     add_executable(solver_numerics_test tests/solver_numerics_test.cpp)
     target_link_libraries(solver_numerics_test PRIVATE omfdm_core)
     add_test(NAME solver_numerics COMMAND solver_numerics_test

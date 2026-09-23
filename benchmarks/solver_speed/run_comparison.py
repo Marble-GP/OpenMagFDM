@@ -17,6 +17,7 @@ import subprocess
 import time
 
 import psutil
+import yaml
 
 
 def sha256(path):
@@ -28,7 +29,8 @@ def sha256(path):
 
 
 def git(repo, *args):
-    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+    return subprocess.check_output(["git", "-C", str(repo), *args],
+                                   encoding="utf-8", errors="replace").strip()
 
 
 def identity(exe, repo):
@@ -72,7 +74,13 @@ def run(exe, config, image, out, env):
     log_text = (out / "process.log").read_text(encoding="utf-8", errors="replace")
     profiles = [dict(re.findall(r"(\w+)=([^\s]+)", line))
                 for line in log_text.splitlines() if line.startswith("[NKPROF]")]
-    result = dict(exit_code=code, converged=(code == 0), wall_seconds=elapsed,
+    cfg = yaml.safe_load(config.read_text(encoding="utf-8-sig"))
+    transient = cfg.get("transient", {})
+    expected = transient.get("total_steps") if transient.get("enabled") else None
+    status_ok = all(s.get("strict_converged") == "1" for s in status)
+    if isinstance(expected, int) and expected > 0:
+        status_ok &= len(status) == expected and [int(s["step"]) for s in status] == list(range(expected))
+    result = dict(exit_code=code, converged=(code == 0 and status_ok), wall_seconds=elapsed,
                   peak_rss_bytes=rss_peak, peak_private_bytes=private_peak,
                   memory_method="50ms sampling; Windows also queries OS peak counters",
                   step_status=status, nk_profiles=profiles,
@@ -89,13 +97,23 @@ def main():
     ap.add_argument("--threads", type=int, default=12,
                     help="OMP_NUM_THREADS; YAML omp.threads MUST agree or be absent")
     ap.add_argument("--trial-preconditioner", choices=("secant-amg", "tangent-amg", "tangent-ilut"))
+    ap.add_argument("--trial-config", type=Path,
+                    help="Only for algorithm comparisons; same physical model with jacobian: tangent")
+    ap.add_argument("--resume", action="store_true", help="Reuse completed runs after verifying input/binary hashes")
+    ap.add_argument("--stop-after-runs", type=int, help="Pause only BETWEEN completed runs (for build/test work)")
     args = ap.parse_args()
     if args.repeats < 1 or args.threads < 1:
         ap.error("repeats and threads must be positive")
     out = args.output.resolve()
-    out.mkdir(parents=True, exist_ok=False)
+    out.mkdir(parents=True, exist_ok=args.resume)
     paths = {k: getattr(args, k).resolve() for k in
              ("baseline", "trial", "baseline_repo", "trial_repo", "config", "image")}
+    trial_config = args.trial_config.resolve() if args.trial_config else paths["config"]
+    for config in (paths["config"], trial_config):
+        cfg = yaml.safe_load(config.read_text(encoding="utf-8-sig"))
+        configured_threads = cfg.get("omp", {}).get("threads", args.threads)
+        if configured_threads != args.threads:
+            ap.error(f"{config}: YAML omp.threads does not match --threads")
     env = os.environ.copy()
     # Do not accidentally inherit historical PoC switches into a benchmark.
     for k in list(env):
@@ -107,21 +125,53 @@ def main():
                 logical_cores=psutil.cpu_count(), threads=args.threads,
                 config_sha256=sha256(paths["config"]), image_sha256=sha256(paths["image"]),
                 config_text=paths["config"].read_text(encoding="utf-8-sig"),
+                trial_config_sha256=sha256(trial_config),
+                trial_config_text=trial_config.read_text(encoding="utf-8-sig"),
                 image_path=str(paths["image"]), repeats=args.repeats,
                 trial_preconditioner=args.trial_preconditioner,
                 baseline=identity(paths["baseline"], paths["baseline_repo"]),
                 trial=identity(paths["trial"], paths["trial_repo"]))
-    (out / "manifest.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    manifest_path = out / "manifest.json"
+    if args.resume:
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for key in ("config_sha256", "image_sha256", "threads", "repeats", "trial_preconditioner"):
+            if previous[key] != meta[key]:
+                raise ValueError(f"Cannot resume: {key} changed")
+        if previous.get("trial_config_sha256", previous["config_sha256"]) != meta["trial_config_sha256"]:
+            raise ValueError("Cannot resume: trial config changed")
+        for name in ("baseline", "trial"):
+            for key in ("executable_sha256", "dll_sha256"):
+                if previous[name][key] != meta[name][key]:
+                    raise ValueError(f"Cannot resume: {name} {key} changed")
+        # Preserve the ORIGINAL source identity associated with these unchanged
+        # binaries, even if development has since advanced in another build dir.
+    else:
+        manifest_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     results = {"baseline": [], "trial": []}
+    new_runs = 0
     for i in range(args.repeats):
         for name in ("baseline", "trial"):
             run_env = env.copy()
             if name == "trial" and args.trial_preconditioner:
                 run_env["OMFDM_TANGENT_PRECONDITIONER"] = args.trial_preconditioner
-            r = run(paths[name], paths["config"], paths["image"], out / f"{i+1}_{name}", run_env)
+            config = trial_config if name == "trial" else paths["config"]
+            run_dir = out / f"{i+1}_{name}"
+            retries = [run_dir] + sorted(out.glob(f"{i+1}_{name}_retry*"))
+            completed = [p / "measurement.json" for p in retries if (p / "measurement.json").exists()]
+            if args.resume and completed:
+                r = json.loads(completed[-1].read_text(encoding="utf-8"))
+            else:
+                if args.resume and run_dir.exists():
+                    # Preserve incomplete logs for diagnosis; never overwrite.
+                    run_dir = out / f"{i+1}_{name}_retry{len(retries)}"
+                r = run(paths[name], config, paths["image"], run_dir, run_env)
+                new_runs += 1
             results[name].append(r)
             print(f"{i+1} {name}: {r['wall_seconds']:.3f}s, exit={r['exit_code']}, "
                   f"peak RSS={r['peak_rss_bytes']/2**30:.3f}GiB", flush=True)
+            if args.stop_after_runs and new_runs >= args.stop_after_runs:
+                print("Paused between runs; --resume verifies hashes before continuing.", flush=True)
+                return
     all_converged = all(r["converged"] for group in results.values() for r in group)
     medians = {name: statistics.median(r["wall_seconds"] for r in group)
                for name, group in results.items()}

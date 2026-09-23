@@ -4,6 +4,9 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <algorithm>
+#include <limits>
+#include <sstream>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -27,6 +30,9 @@ struct SolverNumericsTest {
         a.nx = horizontal ? radial : theta; a.ny = horizontal ? theta : radial;
         a.dx = 0.0013; a.dy = 0.0021; a.dr = 0.0027; a.dtheta = 0.23;
         a.r_start = 0.009;
+        a.r_end = a.r_start + (radial - 1) * a.dr;
+        a.config["polar_domain"]["r_start"] = a.r_start;
+        a.config["polar_domain"]["r_end"] = a.r_end;
         a.r_coords.resize(radial);
         for (int i = 0; i < radial; ++i) a.r_coords[i] = a.r_start + i * a.dr;
         a.mu_map.resize(a.ny, a.nx);
@@ -100,6 +106,250 @@ struct SolverNumericsTest {
         std::cout << "stencil cases=" << cases << " updates=" << cases*3
                   << " max_normalized_residual_error=" << worst << '\n';
     }
+    static void nonlinearFixture(MagneticFieldAnalyzer& a, bool polar, bool horizontal) {
+        grid(a, polar, horizontal);
+        a.image = cv::Mat(a.ny, a.nx, CV_8UC3);
+        a.material_mu.clear(); a.material_bh_tables.clear(); a.rgb_to_material.clear();
+        MagneticFieldAnalyzer::MuValue m;
+        m.type = MagneticFieldAnalyzer::MuType::TABLE;
+        m.H_table = {0, 10, 100, 400, 1600, 6400, 25600};
+        const double B[] = {0, 0.1, 0.55, 1.1, 1.55, 1.8, 2.0};
+        m.mu_table.push_back(8000);
+        for (size_t k = 1; k < m.H_table.size(); ++k)
+            m.mu_table.push_back(B[k] / (4e-7*M_PI*m.H_table[k]));
+        a.precomputeMuTableCache(m);
+        a.material_mu["iron"] = m;
+        a.material_mu["air"] = MagneticFieldAnalyzer::MuValue();
+        a.rgb_to_material[0xffffff].name = "iron";
+        a.rgb_to_material[0x808080].name = "air";
+        a.generateBHTable("iron", m);
+        for (int row = 0; row < a.ny; ++row) for (int col = 0; col < a.nx; ++col) {
+            const bool iron = (row + 3*col) % 5 != 0;
+            a.image.at<cv::Vec3b>(a.ny-1-row, col) = iron ? cv::Vec3b(255,255,255) : cv::Vec3b(128,128,128);
+            a.mu_map(row,col) = 4e-7*M_PI * (iron ? 8000 : 1);
+            a.jz_map(row,col) = 1e4*std::sin(row + col);
+            a.Jz_mag_map(row,col) = 3e4*std::cos(0.31*row + col);
+        }
+    }
+    static Eigen::VectorXd residual(MagneticFieldAnalyzer& a, const Eigen::VectorXd& x, bool polar) {
+        a.Az.resize(a.ny, a.nx);
+        if (polar) {
+            for (int i = 0; i < a.nr; ++i) for (int j = 0; j < a.ntheta; ++j) {
+                if (a.r_orientation == "horizontal") a.Az(j,i) = x[i*a.ntheta+j];
+                else a.Az(i,j) = x[i*a.ntheta+j];
+            }
+            a.calculateMagneticFieldPolar();
+        } else {
+            for (int j = 0; j < a.ny; ++j) for (int i = 0; i < a.nx; ++i) a.Az(j,i) = x[j*a.nx+i];
+            a.calculateMagneticField();
+        }
+        a.calculateHField(); a.updateMuDistribution();
+        Eigen::SparseMatrix<double> A;
+        Eigen::VectorXd b;
+        if (polar) a.buildMatrixPolarReference(A,b); else a.buildMatrixReference(A,b);
+        return A*x-b;
+    }
+    static void derivativeTests(MagneticFieldAnalyzer& a) {
+        double worst = 0;
+        int directions = 0;
+        for (bool polar : {false, true}) for (bool horizontal : {false, true}) {
+            nonlinearFixture(a, polar, horizontal);
+            for (int boundary = 0; boundary < 4; ++boundary) {
+                a.bc_left = bc(boundary == 2 ? "robin" : "dirichlet");
+                a.bc_right = bc("dirichlet");
+                a.bc_bottom = a.bc_top = bc(boundary == 0 ? "periodic" : "dirichlet");
+                a.bc_inner = bc(boundary == 2 ? "robin" : boundary == 3 ? "neumann" : "dirichlet", a.ntheta);
+                a.bc_outer = bc("dirichlet", a.ntheta);
+                a.bc_theta_min = a.bc_theta_max = bc(boundary < 2 ? "periodic" : "robin", a.nr);
+                if (boundary == 1) a.bc_theta_min.value = a.bc_theta_max.value = -1;
+                for (double amplitude : {0.0002, 0.003, 0.015}) {
+                    const int n = a.nx*a.ny;
+                    Eigen::VectorXd x(n);
+                    for (int k = 0; k < n; ++k) x[k] = amplitude * (std::sin(0.3*k) + 0.41*std::cos(0.77*k));
+                    const auto R = residual(a,x,polar);
+                    MagneticFieldAnalyzer::RowMatrix A,J;
+                    Eigen::VectorXd b;
+                    a.buildRowSystem(A,b,polar);
+                    a.buildConsistentTangent(J,x);
+                    Eigen::SparseMatrix<double> jc = J;
+                    Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
+                    lu.compute(jc);
+                    require(lu.info() == Eigen::Success, "small tangent factorization failed");
+                    const Eigen::VectorXd update = lu.solve(-R);
+                    for (int which = 0; which < 4; ++which) {
+                        Eigen::VectorXd v = Eigen::VectorXd::Zero(n);
+                        if (which == 0) for (int k = 0; k < n; ++k) v[k] = std::cos(0.43*k);
+                        if (which == 1) v[polar ? a.ntheta*3 : a.nx*3] = 1; // seam/boundary
+                        if (which == 2) v[n/2+3] = 1; // material interface / saturation
+                        if (which == 3) v = update; // actual Newton update direction
+                        const Eigen::VectorXd jv = J*v;
+                        double best = 1e100;
+                        for (double epsilon : {1e-4,1e-5,1e-6,1e-7,1e-8}) {
+                            const double h = epsilon*std::max(x.norm(),1e-4)/std::max(v.norm(),1e-30);
+                            const Eigen::VectorXd rp = residual(a,x+h*v,polar);
+                            const Eigen::VectorXd rm = residual(a,x-h*v,polar);
+                            const double error = ((rp-rm)/(2*h)-jv).norm()/std::max(jv.norm(),1e-30);
+                            best = std::min(best,error);
+                        }
+                        if (!(std::isfinite(best) && best < 1e-5))
+                            std::cerr << "Jv failure polar=" << polar << " horizontal=" << horizontal
+                                      << " bc=" << boundary << " amplitude=" << amplitude
+                                      << " direction=" << which << " error=" << best << '\n';
+                        require(std::isfinite(best) && best < 1e-5, "tangent Jv mismatch");
+                        worst = std::max(worst,best); ++directions;
+                    }
+                    residual(a,x,polar);
+                    // Structural reuse after a new iterate changes every mu.
+                    a.buildConsistentTangent(J,x);
+                }
+            }
+        }
+        std::cout << "tangent directions=" << directions << " max_best_relative_Jv_error=" << worst << '\n';
+    }
+    static void materialDerivativeTests(MagneticFieldAnalyzer& a) {
+        nonlinearFixture(a, false, true);
+        auto m = a.material_mu.at("iron");
+        double worst = 0;
+        for (double H : {1e-7, 0.17, 4.1, 37.0, 210.0, 917.0, 3091.0, 13013.0, 27111.0, 3e6}) {
+            const double h = 1e-5 * std::max(H, 1e-5);
+            const double fd = (a.evaluateMu(m,H+h)-a.evaluateMu(m,H-h))/(2*h);
+            const double d = a.evaluateMuValueDerivative(m,H);
+            const double err = std::abs(fd-d)/std::max({std::abs(d),std::abs(fd),1e-6});
+            // Very low H involves cancellation in B(H)/H; evaluate its limiting
+            // derivative away from the special H<=1e-12 branch separately.
+            if (H > 1e-5) { require(err < 1e-5, "PCHIP value derivative mismatch"); worst = std::max(worst,err); }
+        }
+        // Branch-consistent one-sided derivatives at original-table endpoints.
+        for (double H : {m.H_table[1], m.H_table[3], m.H_table.back()}) {
+            const double h = 1e-7 * H;
+            const double fd = (a.evaluateMu(m,H+h)-a.evaluateMu(m,H))/h;
+            const double d = a.evaluateMuValueDerivative(m,H);
+            require(std::abs(fd-d) < 1e-4*std::max(std::abs(d),1e-6), "one-sided mu derivative mismatch");
+        }
+        m.has_dmu_extrapolation = true; m.dmu_r_extrap_const = 123;
+        require(a.evaluateMuValueDerivative(m,1e6) == 0, "constant extrapolation must have zero value derivative");
+        auto clamp = a.parseMuValue(YAML::Load("[[1,2,3], [0.2,0.2,0.2]]"));
+        a.precomputeMuTableCache(clamp);
+        require(a.evaluateMuValueDerivative(clamp,1.7) == 0, "clamped table derivative must be zero");
+        auto formula = a.parseMuValue(YAML::Load("'1 + 4000/(1 + $H/100)'"));
+        for (double H : {0.0,3.7,271.0,13903.0}) {
+            const double exact = -40/std::pow(1+H/100,2);
+            require(std::abs(a.evaluateMuValueDerivative(formula,H)/exact-1) < 1e-6,
+                    "numerical formula derivative mismatch");
+        }
+        const auto& table = a.material_bh_tables.at("iron");
+        for (size_t k : {size_t(3),size_t(111),table.B_values.size()-1}) {
+            const double B = table.B_values[k];
+            const double h = 1e-8*std::max(B,1e-4);
+            const double fd = (a.interpolateH_from_B(table,B+h)-a.interpolateH_from_B(table,B))/h;
+            const double d = a.inverseBHDerivative(table,B);
+            require(std::abs(fd/d-1) < 1e-5, "one-sided inverse-table derivative mismatch");
+        }
+        std::cout << "material derivatives max_relative_error=" << worst << '\n';
+    }
+    static void energyDiagnostic(MagneticFieldAnalyzer& a) {
+        nonlinearFixture(a,false,true);
+        a.material_bh_tables.clear();
+        a.material_mu["iron"] = MagneticFieldAnalyzer::MuValue();
+        a.mu_map.setConstant(4e-7*M_PI);
+        a.jz_map.setZero(); a.Jz_mag_map.setZero();
+        a.bc_left = a.bc_right = a.bc_top = a.bc_bottom = bc("dirichlet");
+        a.bc_left.value = a.bc_right.value = a.bc_top.value = a.bc_bottom.value = 0;
+        Eigen::VectorXd x(a.nx*a.ny), v = Eigen::VectorXd::Zero(a.nx*a.ny);
+        for (int k = 0; k < x.size(); ++k) x[k] = 0.003*std::sin(0.31*k);
+        v[a.nx*4+3] = 1;
+        const auto R = residual(a,x,false);
+        const double h = 1e-7;
+        residual(a,x+h*v,false); const double wp = a.computeEnergyObjective();
+        residual(a,x-h*v,false); const double wm = a.computeEnergyObjective();
+        const double derivative = (wp-wm)/(2*h), residual_derivative = -a.dx*a.dy*R.dot(v);
+        std::cout << "energy diagnostic FD=" << derivative << " scaled_negative_R_dot_v="
+                  << residual_derivative << " (not assumed equal)\n";
+        require(std::isfinite(derivative) && std::isfinite(residual_derivative), "energy diagnostic nonfinite");
+    }
+    static void environment(const char* name, const char* value) {
+#ifdef _WIN32
+        _putenv_s(name,value);
+#else
+        if (*value) setenv(name,value,1); else unsetenv(name);
+#endif
+    }
+    struct Capture {
+        std::ostringstream stream;
+        std::streambuf* original = std::cout.rdbuf(stream.rdbuf());
+        ~Capture() { std::cout.rdbuf(original); }
+    };
+    static void accelerationTests(MagneticFieldAnalyzer& a) {
+        int accepted = 0, rejected = 0;
+        for (double amplitude : {0.001,0.01,0.04}) {
+            Eigen::MatrixXd reference_Az, reference_mu;
+            double reference_residual = 0;
+            for (int assembled = 0; assembled < 2; ++assembled) {
+                nonlinearFixture(a,true,true);
+                a.bc_inner = a.bc_outer = bc("dirichlet");
+                a.bc_inner.value = a.bc_outer.value = 0;
+                a.bc_theta_min = a.bc_theta_max = bc("periodic");
+                a.has_nonlinear_materials = true;
+                a.nonlinear_config.max_iterations = 12;
+                a.nonlinear_config.tolerance = 1e-8;
+                a.nonlinear_config.verbose = true;
+                a.nonlinear_config.anderson.enabled = true;
+                a.nonlinear_config.anderson.depth = 3;
+                a.nonlinear_config.anderson.beta = 1;
+                a.nonlinear_config.jacobian_tangent = false;
+                a.dd_warm_start_ = true;
+                Eigen::VectorXd x(a.nr*a.ntheta);
+                for (int k = 0; k < x.size(); ++k) x[k] = amplitude*std::sin(0.4*k);
+                residual(a,x,true);
+                environment("OMFDM_ASSEMBLED_RESIDUAL", assembled ? "1" : "");
+                std::string log;
+                { Capture capture; a.solveNonlinearNewtonKrylov(); log = capture.stream.str(); }
+                environment("OMFDM_ASSEMBLED_RESIDUAL", "");
+                require(a.Az.allFinite() && a.mu_map.allFinite(), "AA exported nonfinite state");
+                for (int i = 0; i < a.nr; ++i) for (int j = 0; j < a.ntheta; ++j) x[i*a.ntheta+j] = a.Az(j,i);
+                const auto R = residual(a,x,true);
+                Eigen::SparseMatrix<double> matrix;
+                Eigen::VectorXd b;
+                a.buildMatrixPolarReference(matrix,b);
+                const double checked = R.norm()/(b.norm()+1e-12);
+                require(std::abs(checked-a.last_nonlinear_residual_) < 1e-10*std::max(1.0,checked),
+                        "AA/max-iteration rollback residual does not describe exported state");
+                if (!assembled) {
+                    reference_Az = a.Az; reference_mu = a.mu_map; reference_residual = checked;
+                    accepted += log.find("[AA accepted:") != std::string::npos;
+                    rejected += log.find("[AA rejected ") != std::string::npos;
+                } else {
+                    require((reference_Az-a.Az).norm() < 1e-9*std::max(1.0,a.Az.norm()), "AA direct/assembled state differs");
+                    require((reference_mu-a.mu_map).norm() < 1e-9*std::max(1.0,a.mu_map.norm()), "AA direct/assembled mu differs");
+                    require(std::abs(reference_residual-checked) < 1e-9*std::max(1.0,checked), "AA direct/assembled residual differs");
+                }
+            }
+        }
+        require(accepted > 0 && rejected > 0, "AA fixtures must exercise both acceptance and rejection");
+        std::cout << "AA acceptance cases=" << accepted << " rejection/rollback cases=" << rejected << '\n';
+        a.nonlinear_config.verbose = false;
+    }
+    static void innerSolverTests(MagneticFieldAnalyzer& a) {
+        MagneticFieldAnalyzer::RowMatrix A(40,40), J(40,40);
+        std::vector<Eigen::Triplet<double>> entries;
+        for (int k = 0; k < 40; ++k) {
+            entries.emplace_back(k,k,3.0);
+            if (k > 0) entries.emplace_back(k,k-1,-1.0);
+            if (k < 39) entries.emplace_back(k,k+1,-1.0);
+        }
+        A.setFromTriplets(entries.begin(),entries.end()); J = A;
+        for (int k = 0; k < 39; ++k) J.coeffRef(k,k+1) += 0.31;
+        Eigen::VectorXd b = Eigen::VectorXd::Ones(40), direction;
+        for (const char* candidate : {"secant-amg", "tangent-amg", "tangent-ilut"}) {
+            environment("OMFDM_TANGENT_PRECONDITIONER",candidate);
+            require(a.solveTangentSystem(J,A,b,1e-6,direction), "FGMRES candidate did not solve small system");
+            require((J*direction-b).norm()/b.norm() <= 1e-6, "FGMRES returned invalid direction");
+        }
+        b[3] = std::numeric_limits<double>::quiet_NaN();
+        require(!a.solveTangentSystem(J,A,b,1e-6,direction), "nonfinite inner RHS accepted");
+        environment("OMFDM_TANGENT_PRECONDITIONER","");
+        std::cout << "FGMRES A/B/C and nonfinite rejection passed\n";
+    }
 };
 
 int main(int argc, char** argv) {
@@ -118,6 +368,11 @@ int main(int argc, char** argv) {
             throw std::runtime_error("fixture image write failed");
         MagneticFieldAnalyzer a(yaml.string(), png.string());
         SolverNumericsTest::run(a);
+        SolverNumericsTest::derivativeTests(a);
+        SolverNumericsTest::materialDerivativeTests(a);
+        SolverNumericsTest::energyDiagnostic(a);
+        SolverNumericsTest::accelerationTests(a);
+        SolverNumericsTest::innerSolverTests(a);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n'; return 1;

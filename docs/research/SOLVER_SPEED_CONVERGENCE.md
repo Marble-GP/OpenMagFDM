@@ -27,7 +27,8 @@ changes, new AMR/DD, merge, tag, or release are authorized by this experiment.
 
 Keep detached baseline and experimental source/build directories separate.
 Build both with the same compiler, dependencies and Release flags. The benchmark
-runner is `benchmarks/solver_speed/run_comparison.py` (Python + psutil). Supply
+runner is `benchmarks/solver_speed/run_comparison.py` (install the pinned
+`benchmarks/solver_speed/requirements.txt` in a dedicated Python environment). Supply
 absolute paths with `--baseline`, `--trial`, `--baseline-repo`, `--trial-repo`,
 `--config`, `--image`, `--output` (new directory), `--threads 12 --repeats 3`.
 YAML `omp.threads` must match `--threads`; it overrides the environment.
@@ -74,4 +75,71 @@ adoption protocol yet; unmeasured items are not passes.
 - The common static core is now compiled once and linked into solver, DD bench
   and numerical tests. SparseLU/legacy APIs convert explicitly; full-grid NK
   retains row-major CRS allocation and feeds the AMGCL Eigen adapter directly.
-- Full-sweep timing/quality, tangent, Linux and macOS gates remain outstanding.
+- Phase 2 now differentiates the **actual shared residual** using local sparse
+  forward differentiation. Boundary elimination and profile RHS derivatives
+  are included. PCHIP value derivatives and the piecewise-linear inverse B-H
+  derivative match their respective evaluation paths. Arbitrary `mu_r` formula
+  derivatives use a five-point scalar numerical derivative (not symbolic AD);
+  material values, interpolation and extrapolation are unchanged.
+- `jacobian: tangent` selects FGMRES(20), at most 100 inner iterations, EW
+  tolerance, with one fresh preconditioner per outer iteration. Candidates:
+  `OMFDM_TANGENT_PRECONDITIONER=secant-amg` (A, default), `tangent-amg` (B,
+  SPAI(0)), `tangent-ilut` (C, p=2, tau=1e-2). These are benchmark environment
+  switches, not new general YAML settings. Nonfinite, unmet-tolerance and
+  iteration-limit directions are rejected; one checked secant fallback is
+  attempted, then the existing safe state is retained if that also fails.
+- Removed the old approximate tangent assembly and the historical
+  `OMFDM_PROBE_WNEWTON` drive that rebuilt AMG inside Krylov applications.
+  Setting that obsolete switch now reports an explicit error. Historical
+  implementations and measurements remain available in Git; no claim is made
+  that their energy merit was an exact potential of the residual.
+- Windows/MSVC and Linux/GCC Release CTest: **3/3 passed** on 2026-09-23.
+  Windows release-contract smoke passed. The Linux build used native Linux
+  TIFF explicitly because this WSL environment otherwise found Windows conda's
+  `tiff.lib`; this was an environment/link selection issue. macOS is untested.
+- Tangent regression: **192 directions**, best finite-difference step selected
+  from 1e-4 through 1e-8, maximum relative Jv error **2.48439e-7** on Windows.
+  Cartesian/polar, both polar storage orientations, periodic/antiperiodic,
+  Dirichlet/Robin/radial Neumann profiles, saturation, material interfaces and
+  an actual Newton update are covered. Scalar material derivative maximum
+  relative error: **2.76283e-10**; table knots, clamp and extrapolation have
+  separate branch/one-sided checks. These are small-case correctness tests,
+  not evidence of large-case convergence or speed.
+- The discrete-energy diagnostic gives dW/dt = -907.017 versus the putative
+  scaled residual product -5595.68 on its fixture. They are **not identical**;
+  energy remains an optional merit function, not an asserted exact gradient.
+- AA regressions exercise acceptance in three cases and rejection/rollback
+  in three cases, direct versus assembled residuals, repeated solves and the
+  outer iteration limit. FGMRES A/B/C small solves and nonfinite-RHS rejection
+  pass. Chunk regression observes two actual OpenMP threads in each of two
+  chunks for a four-thread allocation and checks restoration of parent state.
+- Waveform comparison tooling rejects unfinished/nonfinite/misaligned inputs,
+  compares periodic centered-difference EMF, and does not shift or rescale
+  waveforms. Its synthetic regression passes; no 248-point physical waveform
+  has yet passed the adoption gate.
+
+## Measurements to date (not an adoption decision)
+
+The phase-1 binary is retained separately in `build_solver_speed`, associated
+with `63e8c68`; phase-2 source/binaries use `build_solver_tangent`. Do not rebuild
+the phase-1 directory during the alternating comparison. The manifest pins its
+executable and DLL hashes even when the working source has advanced.
+
+| Run | Commit | Strictly converged steps | Wall time | Peak working set | Peak private commit |
+|---|---|---:|---:|---:|---:|
+| Baseline 1, 12 threads | `25859a7` | 12/12 | 1213.776 s | 1,077,956,608 B | 1,073,070,080 B |
+
+Raw evidence is in the sibling directory
+`bench_results/solver_speed_20260923_phase1/1_baseline/measurement.json` with the
+manifest, process logs, step statuses and sampled memory history. Baseline outer
+iterations are 108, 100, 107, 103, 115, 101, 98, 112, 105, 100, 99, 106; final
+residuals are all below 1e-3. One partial trial was interrupted between sessions
+and is retained for diagnosis, excluded from timing comparisons. Use `--resume`
+to verify hashes and retain completed measurements, and `--stop-after-runs 1`
+to pause only after the next full run. Source identity in the original manifest
+is preserved on resume.
+
+Still pending: three paired timings and medians, 4-thread/cold/35H300 checks,
+large-case tangent A/B/C cost and memory, long-sweep retention, actual sliding
+tangent cache checks, full-waveform gates, and macOS build/numerical regression.
+The numerical gates above do not waive any of these acceptance requirements.

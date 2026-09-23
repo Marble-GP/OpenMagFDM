@@ -2,6 +2,7 @@
 #include "PolarGridAccess.h"
 #include "MagneticFieldAnalyzer_stencil.inl"
 #include <stdexcept>
+#include <algorithm>
 
 void MagneticFieldAnalyzer::buildRowSystem(RowMatrix& A, Eigen::VectorXd& rhs, bool polar) {
     const int n = polar ? nr * ntheta : nx * ny;

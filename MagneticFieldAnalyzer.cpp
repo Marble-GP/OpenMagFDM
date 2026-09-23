@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <thread>
+#include <exception>
 #include <limits>
 #include <tiffio.h>
 #ifdef _OPENMP
@@ -13876,16 +13877,14 @@ void MagneticFieldAnalyzer::runTransientChunks(const std::string& output_dir) {
               << T << " steps ===" << std::endl;
 
 #ifdef _OPENMP
-    // Each chunk thread spawns its own OpenMP team inside AMGCL; divide the
-    // team size so K chunks don't oversubscribe the machine. (OpenMP 2.0 API
-    // only — omp_set_num_threads exists everywhere including MSVC.)
-    {
-        const int total = omp_get_max_threads();
-        const int per   = std::max(1, total / K);
-        omp_set_num_threads(per);
-        std::cout << "  OpenMP: " << per << " thread(s) per chunk ("
-                  << total << " total)" << std::endl;
-    }
+    const int total_threads = omp_get_max_threads();
+    const int chunk_threads = std::max(1, total_threads / K);
+    struct RestoreOpenMP {
+        int threads, dynamic;
+        ~RestoreOpenMP() { omp_set_num_threads(threads); omp_set_dynamic(dynamic); }
+    } restore_openmp{total_threads, omp_get_dynamic()};
+    std::cout << "  OpenMP: " << chunk_threads << " requested thread(s) per chunk ("
+              << total_threads << " total)" << std::endl;
 #endif
 
     // Contiguous step ranges [s_k, s_{k+1}).
@@ -13906,22 +13905,50 @@ void MagneticFieldAnalyzer::runTransientChunks(const std::string& output_dir) {
 
     std::vector<std::thread> threads;
     threads.reserve(workers.size());
-    std::vector<std::string> worker_errors(workers.size());
+    // Join even if a thread launch or the parent chunk throws.
+    struct JoinChunks {
+        std::vector<std::thread>& threads;
+        ~JoinChunks() { for (auto& t : threads) if (t.joinable()) t.join(); }
+    };
+    std::vector<std::exception_ptr> worker_errors(workers.size());
+    std::vector<int> observed_teams(K, 1);
+    auto configure_team = [&](int chunk) {
+#ifdef _OPENMP
+        // Constructors load YAML and may reset the team size. Apply the share
+        // AFTER construction, on each actual execution thread (including 0).
+        omp_set_dynamic(0);
+        omp_set_num_threads(chunk_threads);
+        #pragma omp parallel
+        {
+            #pragma omp single
+            observed_teams[chunk] = omp_get_num_threads();
+        }
+#endif
+    };
+    // Declared last so joins finish before worker error/team storage dies.
+    JoinChunks join_chunks{threads};
     for (size_t i = 0; i < workers.size(); ++i) {
         threads.emplace_back([&, i]() {
             try {
+                configure_team(static_cast<int>(i + 1));
                 workers[i]->performTransientAnalysis(output_dir);
-            } catch (const std::exception& e) {
-                worker_errors[i] = e.what();
+            } catch (...) {
+                worker_errors[i] = std::current_exception();
             }
         });
     }
-    performTransientAnalysis(output_dir);   // chunk 0 on this instance
+    std::exception_ptr parent_error;
+    try {
+        configure_team(0);
+        performTransientAnalysis(output_dir);   // chunk 0 on this instance
+    } catch (...) { parent_error = std::current_exception(); }
     for (auto& t : threads) t.join();
+    last_chunk_openmp_teams_ = observed_teams;
+    for (int k = 0; k < K; ++k)
+        std::cout << "[CHUNK] index=" << k << " observed_openmp_team=" << observed_teams[k] << std::endl;
+    if (parent_error) std::rethrow_exception(parent_error);
     for (size_t i = 0; i < worker_errors.size(); ++i) {
-        if (!worker_errors[i].empty())
-            throw std::runtime_error("transient chunk " + std::to_string(i + 1) +
-                                     " failed: " + worker_errors[i]);
+        if (worker_errors[i]) std::rethrow_exception(worker_errors[i]);
         if (!workers[i]->analysisConverged()) analysis_convergence_ok_ = false;
     }
 

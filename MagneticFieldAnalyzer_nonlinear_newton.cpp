@@ -25,7 +25,7 @@
 #include <set>
 #include <string>
 #include <Eigen/Dense>
-#include <amgcl/solver/bicgstab.hpp>   // tangent-Jacobian inner solver (nonsymmetric)
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -70,6 +70,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     const double WARM_START_RESIDUAL_LIMIT =
         std::min(1e-2, std::max(10.0 * TOL, 1e-3));
     const bool VERBOSE = nonlinear_config.verbose;
+    if (std::getenv("OMFDM_PROBE_WNEWTON"))
+        throw std::invalid_argument("Legacy WNEWTON drive removed: use jacobian: tangent and the Jv regression tests");
     const bool is_polar = (coordinate_system != "cartesian");
 
     // Anderson acceleration settings (shared config)
@@ -78,7 +80,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     const double beta_AA = nonlinear_config.anderson.beta;
 
     if (VERBOSE) {
-        std::cout << "\n=== Newton-Krylov Solver (Jacobian-free + AMGCL) ===" << std::endl;
+        std::cout << "\n=== Newton-Krylov Solver ("
+                  << (nonlinear_config.jacobian_tangent ? "residual tangent + FGMRES" : "secant approximation + AMGCL")
+                  << ") ===" << std::endl;
         std::cout << "Coordinate system: " << coordinate_system << std::endl;
         std::cout << "Max outer iterations: " << MAX_ITER << std::endl;
         std::cout << "Tolerance: " << std::scientific << std::setprecision(1) << TOL << std::endl;
@@ -287,14 +291,16 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // env NK_PROF=1). Measures where the 1.3-1.5 s/iter actually goes.
     const bool NK_PROF = omfdm::profilingEnabled();
     auto nkprof_now = []() { return std::chrono::steady_clock::now(); };
-    auto nkprof_ms  = [](std::chrono::high_resolution_clock::time_point a,
-                         std::chrono::high_resolution_clock::time_point b) {
+    auto nkprof_ms  = [](std::chrono::steady_clock::time_point a,
+                         std::chrono::steady_clock::time_point b) {
         return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
     };
 
-    RowMatrix A_matrix; // retain CRS allocation across outer iterations
+    RowMatrix A_matrix, tangent_matrix; // retain CRS allocation across outer iterations
+    int iterations_done = 0;
     Eigen::VectorXd b_vec, trial_residual, trial_rhs;
     for (int iter = 0; iter < MAX_ITER; iter++) {
+        iterations_done = iter + 1;
         omfdm::IterationProfile profile(iter + 1, linear_profile_);
         auto nkp_t0 = nkprof_now();
         // ===== Step 1: Calculate B and H fields, update μ =====
@@ -481,23 +487,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // (idx = i_r*ntheta+j_theta) but J_matrix is n_active x n_active. The
             // correction is numerically ~negligible anyway (Phase BL: ~3e-19% of
             // ||J v||), so J_coarse = A_coarse.
-            // Consistent tangent (jacobian: tangent): add the per-cell
-            // rank-one (nu_d - nu)(g g^T) curvature of the discrete energy
-            // Hessian — the Stage G gate measured this to be what unlocks
-            // alpha = 1 under the energy merit (25 true-tolerance iterations).
-            // Supersedes the r-weighted diagonal correction below.
-            if (nonlinear_config.jacobian_tangent && !use_coarse && is_polar) {
-                Eigen::SparseMatrix<double> tangent = J_matrix;
-                addTangentCorrection(tangent);
-                J_matrix = tangent;
-            } else
-            // Energy-LS mode keeps J symmetric POSITIVE DEFINITE so CG from
-            // x0=0 yields a guaranteed energy-descent direction: the raw
-            // diagonal correction goes NEGATIVE where dμ/dH > 0 (the rising-
-            // μ_r branch that early iterates sweep through), making J
-            // indefinite — measured to produce energy-ASCENT directions. In
-            // energy mode the correction is therefore CLAMPED to >= 0 (keeps
-            // the saturated-region stiffening, drops the indefinite part).
+            // Preserve the default secant correction as the bounded fallback.
+            // The opt-in exact residual tangent is assembled separately below.
+            // Preserve the historical nonnegative correction in energy mode.
+            // It is a heuristic, not a proof of definiteness or energy descent;
+            // the energy directional derivative is checked by finite difference.
             if (!use_coarse && is_polar && !rgb_to_material.empty() && !material_mu.empty()) {
                 cv::Mat image_to_use;
                 cv::flip(image, image_to_use, 0);  // Match setupMaterialProperties()
@@ -560,7 +554,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     double correction_factor = -r * dmu_dH / (mu_current * mu_current + 1e-20);
                     correction_factor *= (dr_local * dr_local);
                     if (nonlinear_config.line_search_energy && correction_factor < 0.0)
-                        correction_factor = 0.0;  // keep J SPD in energy-LS mode
+                        correction_factor = 0.0;  // historical energy-mode heuristic
                     // J_matrix.coeffRef writes to a unique diagonal entry per
                     // idx — no race even though we are inside a parallel for.
                     J_matrix.coeffRef(idx, idx) += correction_factor;
@@ -623,44 +617,30 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                               << std::setprecision(2) << inner_tol << "]";
                 }
             }
-            if (nonlinear_config.jacobian_tangent && !use_coarse && is_polar) {
-                // Tangent path: J is NONSYMMETRIC (raw mu chain rule), so solve
-                // with BiCGStab preconditioned by AMG built on the SPD secant A
-                // — the assembled twin of the Stage G matrix-free gate
-                // (FD-Jv GMRES preconditioned by A), which converged in 25
-                // true-tolerance iterations.
-                typedef amgcl::backend::builtin<double> TBackend;
-                typedef amgcl::amg<TBackend, amgcl::coarsening::smoothed_aggregation,
-                                   amgcl::relaxation::spai0> TPrecond;
-                auto toCrs = [](const RowMatrix& M,
-                                std::vector<ptrdiff_t>& ptr, std::vector<ptrdiff_t>& col,
-                                std::vector<double>& val) {
-                    Eigen::SparseMatrix<double, Eigen::RowMajor> Mr = M;
-                    Mr.makeCompressed();
-                    const ptrdiff_t rows = Mr.rows();
-                    ptr.assign(Mr.outerIndexPtr(), Mr.outerIndexPtr() + rows + 1);
-                    col.assign(Mr.innerIndexPtr(), Mr.innerIndexPtr() + Mr.nonZeros());
-                    val.assign(Mr.valuePtr(), Mr.valuePtr() + Mr.nonZeros());
-                    return rows;
-                };
-                std::vector<ptrdiff_t> ap, ac, jp, jc;
-                std::vector<double> av, jv;
-                ptrdiff_t n_rows = toCrs(A_matrix, ap, ac, av);
-                toCrs(J_matrix, jp, jc, jv);
-                auto A_crs = std::tie(n_rows, ap, ac, av);
-                TPrecond P(A_crs);
-                TBackend::matrix J_b(std::tie(n_rows, jp, jc, jv));
-                amgcl::solver::bicgstab<TBackend>::params sprm;
-                sprm.tol = (inner_tol > 0.0) ? std::min(inner_tol, 1e-2) : 1e-2;
-                sprm.maxiter = 100;
-                amgcl::solver::bicgstab<TBackend> S(n_rows, sprm);
-                std::vector<double> rhs_v(residual_coarse.size());
-                for (int q = 0; q < residual_coarse.size(); ++q) rhs_v[q] = -residual_coarse[q];
-                std::vector<double> x_v(residual_coarse.size(), 0.0);
-                auto [t_it, t_err] = S(J_b, P, rhs_v, x_v);
-                if (VERBOSE) std::cout << " [tangent BiCGStab " << t_it << " its, res="
-                                       << std::scientific << std::setprecision(1) << t_err << "]";
-                delta_A = Eigen::Map<Eigen::VectorXd>(x_v.data(), (Eigen::Index)x_v.size());
+            if (nonlinear_config.jacobian_tangent && !use_coarse) {
+                bool tangent_ok = false;
+                try {
+                    buildConsistentTangent(tangent_matrix, Az_vec);
+                    nkp_t_jc = nkprof_now();
+                    tangent_ok = solveTangentSystem(tangent_matrix, A_matrix,
+                                                    -residual_coarse, inner_tol, delta_A);
+                } catch (const std::runtime_error& e) {
+                    if (VERBOSE) std::cout << " [tangent rejected: " << e.what() << "]";
+                }
+                if (!tangent_ok) {
+                    if (VERBOSE) std::cout << " [one secant fallback]";
+                    delta_A = solveLinearSystem(J_matrix, -residual_coarse, Eigen::VectorXd(), inner_tol);
+                    const double tol = inner_tol > 0 ? inner_tol : SOLVER_TOLERANCE;
+                    const double error = (J_matrix * delta_A + residual_coarse).norm()
+                                       / std::max(residual_coarse.norm(), 1e-30);
+                    if (!delta_A.allFinite() || !std::isfinite(error) || error > tol) {
+                        // Never feed a failed direction into an alpha-min step.
+                        profile.outcome = "linear_failure";
+                        profile.jacobian_ms = nkprof_ms(nkp_t_conv, nkp_t_jc);
+                        profile.linear_ms = nkprof_ms(nkp_t_jc, nkprof_now());
+                        break; // common best-evaluated-state restoration below
+                    }
+                }
             } else {
                 delta_A = solveLinearSystem(J_matrix, -residual_coarse,
                                             Eigen::VectorXd(), inner_tol);
@@ -669,137 +649,6 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         auto nkp_t_solve = nkprof_now();
         profile.jacobian_ms = nkprof_ms(nkp_t_conv, nkp_t_jc);
         profile.linear_ms = nkprof_ms(nkp_t_jc, nkp_t_solve);
-
-        // ===== [Stage G gate] OMFDM_PROBE_WNEWTON: true-Newton x energy merit =====
-        // Decides GO/NO-GO for building the consistent tangent (CTSM) WITHOUT
-        // building it: the true Newton direction δ_N = J_true^{-1}(-R) is
-        // computed MATRIX-FREE (central-FD Jv oracle + right-preconditioned
-        // GMRES, precond = the assembled secant A via AMGCL), then evaluated
-        // under the energy merit W. Phase BL measured the true direction under
-        // the ||R|| merit only (Finding 3: full step diverges warm); the CONVEX
-        // energy view says W-Armijo is the correct acceptance — this is the one
-        // untested combination.
-        //   OMFDM_PROBE_WNEWTON=1: at iters in OMFDM_PROBE_WNEWTON_ITERS
-        //     (default "5,10,20") print an alpha/W/||R|| scan along δ_N.
-        //   OMFDM_PROBE_WNEWTON=2: DRIVE mode — replace the step direction with
-        //     δ_N every iteration (matrix-free CTSM); the configured line search
-        //     (use line_search_objective: energy) handles acceptance. The
-        //     resulting iteration count IS the gate: <=~20 iters => building the
-        //     assembled CTSM is worth it.
-        {
-            static const char* wn_env = std::getenv("OMFDM_PROBE_WNEWTON");
-            const int wn_mode = wn_env ? std::atoi(wn_env) : 0;
-            bool wn_probe_this_iter = false;
-            if (wn_mode == 1) {
-                static std::set<int> wn_iters = [] {
-                    std::set<int> s;
-                    const char* e = std::getenv("OMFDM_PROBE_WNEWTON_ITERS");
-                    std::string str = e ? e : "5,10,20";
-                    size_t i = 0;
-                    while (i < str.size()) {
-                        s.insert(std::atoi(str.c_str() + i));
-                        size_t n = str.find(',', i);
-                        if (n == std::string::npos) break;
-                        i = n + 1;
-                    }
-                    return s;
-                }();
-                wn_probe_this_iter = wn_iters.count(iter + 1) > 0;
-            }
-            if (!use_coarse && (wn_mode == 2 || wn_probe_this_iter)) {
-                // ~21 preconditioner solves per NK iteration — silence the
-                // per-call AMGCL banners for the duration of the probe.
-                const bool wn_prev_quiet = quiet_solver_;
-                quiet_solver_ = true;
-                // Residual oracle at arbitrary x (mutates member fields; the
-                // caller below restores them to the current iterate).
-                auto evalResidualVec = [&](const Eigen::VectorXd& x) -> Eigen::VectorXd {
-                    syncMemberAz(x);
-                    updateFieldAndMu();
-                    Eigen::VectorXd R_t, b_t;
-                    residualForSolve(x, R_t, b_t);
-                    return R_t;
-                };
-                const double eps_rel = [] {
-                    const char* e = std::getenv("OMFDM_PROBE_EPS");
-                    return e ? std::atof(e) : 1e-6;
-                }();
-                const double xnorm = Az_vec.norm();
-                auto applyJ = [&](const Eigen::VectorXd& v) -> Eigen::VectorXd {
-                    const double vn = v.norm();
-                    if (vn < 1e-30) return Eigen::VectorXd::Zero(v.size());
-                    const double h = eps_rel * std::max(xnorm, 1.0) / vn;
-                    Eigen::VectorXd Rp = evalResidualVec(Az_vec + h * v);
-                    Eigen::VectorXd Rm = evalResidualVec(Az_vec - h * v);
-                    return (Rp - Rm) / (2.0 * h);
-                };
-                // Right-preconditioned GMRES(m): solve J M^{-1} y = -R, δ_N = M^{-1} y,
-                // M = assembled secant A (AMGCL, loose tol).
-                const int m_kry = 20;
-                auto applyM = [&](const Eigen::VectorXd& v) -> Eigen::VectorXd {
-                    return solveLinearSystem(A_matrix, v, Eigen::VectorXd(), 1e-2);
-                };
-                const Eigen::VectorXd rhs = -residual_coarse;
-                const double bnorm = rhs.norm() + 1e-30;
-                std::vector<Eigen::VectorXd> V;
-                V.reserve(m_kry + 1);
-                Eigen::MatrixXd Hh = Eigen::MatrixXd::Zero(m_kry + 1, m_kry);
-                V.push_back(rhs / bnorm);
-                int kdim = 0;
-                for (int k = 0; k < m_kry; ++k) {
-                    Eigen::VectorXd w = applyJ(applyM(V[k]));
-                    for (int i2 = 0; i2 <= k; ++i2) {
-                        Hh(i2, k) = w.dot(V[i2]);
-                        w -= Hh(i2, k) * V[i2];
-                    }
-                    Hh(k + 1, k) = w.norm();
-                    kdim = k + 1;
-                    if (Hh(k + 1, k) < 1e-12 * bnorm) break;
-                    V.push_back(w / Hh(k + 1, k));
-                }
-                Eigen::VectorXd e1 = Eigen::VectorXd::Zero(kdim + 1);
-                e1(0) = bnorm;
-                const Eigen::VectorXd y =
-                    Hh.topLeftCorner(kdim + 1, kdim).householderQr().solve(e1);
-                Eigen::VectorXd yv = Eigen::VectorXd::Zero(V[0].size());
-                for (int k = 0; k < kdim; ++k) yv += y(k) * V[k];
-                Eigen::VectorXd delta_N = applyM(yv);
-                const double gmres_rel =
-                    (Hh.topLeftCorner(kdim + 1, kdim) * y - e1).norm() / bnorm;
-
-                if (wn_probe_this_iter) {
-                    // alpha scan along δ_N under BOTH merits.
-                    const double W0p = [&] {
-                        syncMemberAz(Az_vec); updateFieldAndMu();
-                        return computeEnergyObjective();
-                    }();
-                    std::cout << "\n[WNEWTON probe iter " << iter + 1
-                              << "] ||R||=" << residual_norm
-                              << " gmres_rel=" << gmres_rel
-                              << " ||dN||/||dP||=" << delta_N.norm() / (delta_A.norm() + 1e-30)
-                              << " cos(dN,dP)=" << delta_N.dot(delta_A) /
-                                     (delta_N.norm() * delta_A.norm() + 1e-30) << std::endl;
-                    for (double a : {1.0, 0.65, 0.42, 0.27, 0.18, 0.12, 0.08}) {
-                        Eigen::VectorXd xt = Az_vec + a * delta_N;
-                        const double Rn = evalResidualVec(xt).norm();
-                        const double Wt = computeEnergyObjective();  // fields already at xt
-                        std::cout << "  alpha=" << a
-                                  << "  dW=" << std::scientific << Wt - W0p
-                                  << "  ||R||/||R0||=" << Rn / (residual_norm + 1e-30)
-                                  << std::endl;
-                    }
-                }
-                if (wn_mode == 2) {
-                    delta_A = delta_N;   // drive the solver along the true direction
-                    if (VERBOSE) std::cout << " [WN drive: gmres_rel=" << std::scientific
-                                           << std::setprecision(1) << gmres_rel << "]";
-                }
-                // Restore member fields to the CURRENT iterate for the line search.
-                syncMemberAz(Az_vec);
-                updateFieldAndMu();
-                quiet_solver_ = wn_prev_quiet;
-            }
-        }
 
         // ===== Step 6: Backtracking line search =====
         // Find step length α that ensures sufficient decrease in residual
@@ -851,11 +700,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double residual_0 = (dc_R_fine_norm >= 0.0) ? dc_R_fine_norm : residual_norm;
         Eigen::VectorXd Az_vec_0 = Az_vec;
 
-        // Energy-objective line search: Armijo on the CONVEX functional W(Az)
-        // (∇W = R) instead of on ||R||. ||R|| is not monotone along descent
-        // paths of a non-quadratic convex function, so the residual Armijo
-        // rejects legitimate long steps and pins α at ~0.1 (the linear-rate
-        // crawl). Requires the member fields to currently match Az_vec_0
+        // Experimental energy merit, not assumed to have discrete gradient R.
+        // Use the energy finite difference below for its directional derivative.
+        // Requires the member fields to currently match Az_vec_0
         // (guaranteed: Step 1 ran updateFieldAndMu for this iterate).
         const bool LS_ENERGY = nonlinear_config.line_search_energy && !use_coarse;
         double W0 = 0.0, g0 = 0.0;
@@ -1166,7 +1013,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         updateMuDistribution();
     }
 
-    last_nonlinear_iterations_ = MAX_ITER;
+    last_nonlinear_iterations_ = iterations_done;
     last_nonlinear_residual_ = evaluateCurrentResidual();
     last_nonlinear_converged_ = std::isfinite(last_nonlinear_residual_)
                               && last_nonlinear_residual_ < TOL;
@@ -1175,7 +1022,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                                        <= WARM_START_RESIDUAL_LIMIT;
     if (!last_nonlinear_converged_) analysis_convergence_ok_ = false;
     if (!quiet_solver_ && !last_nonlinear_converged_) {
-        std::cerr << "WARNING: Newton-Krylov did not converge after " << MAX_ITER
+        std::cerr << "WARNING: Newton-Krylov did not converge after " << iterations_done
                   << " iterations; restored best evaluated iterate "
                   << best_iteration << " (residual=" << std::scientific
                   << std::setprecision(3) << last_nonlinear_residual_

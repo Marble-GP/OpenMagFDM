@@ -81,6 +81,7 @@ public:
     // solves since construction (proxy for spectral conditioning; read deltas around solve()).
     long getTotalLinearIters() const { return total_linear_iters_; }
     int  getNumLinearSolves()  const { return num_linear_solves_; }
+    const std::vector<int>& getLastChunkOpenMPTeams() const { return last_chunk_openmp_teams_; }
     // Number of outer nonlinear iterations used by the most recent solve.
     // The transient logger uses this for a concise per-step summary when
     // nonlinear_solver.verbose is false.
@@ -358,7 +359,7 @@ public:
     enum class MuType {
         STATIC,   // Constant mu_r value (linear material)
         FORMULA,  // Mathematical expression with $H variable (|H| in A/m)
-        TABLE     // Table [H_values, mu_r_values] with linear interpolation
+        TABLE     // Table [H_values, mu_r_values]; PCHIP interpolation of B(H)
     };
 
     struct MuValue {
@@ -412,12 +413,6 @@ public:
     // Fill MuValue::B_table_cache / pchip_slopes_cache once at material load
     // (evaluateMu's TABLE branch reads them per cell; see MuValue comment).
     static void precomputeMuTableCache(MuValue& mu_val);
-    // Consistent-tangent correction (jacobian: tangent): adds the per-cell
-    // rank-one (nu_d - nu)(g g^T) terms of the discrete energy Hessian to J.
-    void addTangentCorrection(Eigen::SparseMatrix<double>& J);
-    // Differential reluctivity dH/dB from the B-H table (segment slope;
-    // -> 1/mu0 beyond the table end).
-    double dHdB_FromTable(const BHTable& table, double B_magnitude) const;
 
     /**
      * @brief Evaluate derivative dμ_r/dH at given |H| magnitude
@@ -429,9 +424,17 @@ public:
 
 private:
     omfdm::LinearSolveCounters linear_profile_;
+    std::vector<int> last_chunk_openmp_teams_;
     using RowMatrix = Eigen::SparseMatrix<double, Eigen::RowMajor>;
     RowMatrix stencil_pattern_;
     std::string stencil_pattern_key_;
+    std::string tangent_pattern_key_;
+    double evaluateMuValueDerivative(const MuValue& material, double H);
+    double inverseBHDerivative(const BHTable& table, double B) const;
+    void buildConsistentTangent(RowMatrix& J, const Eigen::VectorXd& state);
+    bool solveTangentSystem(const RowMatrix& J, const RowMatrix& secant,
+                            const Eigen::VectorXd& rhs, double tolerance,
+                            Eigen::VectorXd& direction);
     template<class Scalar, class MuAccessor>
     omfdm::StencilRow<Scalar> cartesianRow(int k, const MuAccessor& mu) const;
     template<class Scalar, class MuAccessor>
