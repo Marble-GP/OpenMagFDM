@@ -57,5 +57,21 @@ exact discrete gradient relationship.
 ## Status
 
 Implementation/verification in progress. No optimization has passed the full
-adoption protocol yet. Measurements and outstanding platform/quality gates
-will be recorded here; unmeasured items are not passes.
+adoption protocol yet; unmeasured items are not passes.
+
+- Profiling commit `b93cdaf`: Windows Release build, polar curl and release-contract
+  smoke passed. The deliberately limited 8-iteration IEEJ-D diagnostic exits 2
+  and records the split timing correctly; it is not a convergence benchmark.
+- Shared row/CRS implementation: 108 boundary/orientation/grid cases with three
+  coefficient/source refreshes each (324 comparisons) against frozen `25859a7`
+  triplet assemblers. Maximum normalized direct-residual error 1.84761e-17.
+  Includes additive Neumann pin, axis Dirichlet, Robin, boundary profiles,
+  periodic/antiperiodic seams and same-DOF/different-grid cache invalidation.
+  Windows Release CTest 2/2 and release-contract smoke passed.
+- `OMFDM_ASSEMBLED_RESIDUAL=1` is a diagnostic-only reference switch; ordinary
+  line search and AA always recompute B/H/mu, then apply the shared row operator
+  without assembling a trial matrix. The existing coarsened path is unchanged.
+- The common static core is now compiled once and linked into solver, DD bench
+  and numerical tests. SparseLU/legacy APIs convert explicitly; full-grid NK
+  retains row-major CRS allocation and feeds the AMGCL Eigen adapter directly.
+- Full-sweep timing/quality, tangent, Linux and macOS gates remain outstanding.

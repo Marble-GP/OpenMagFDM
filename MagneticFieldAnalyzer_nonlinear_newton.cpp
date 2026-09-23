@@ -190,10 +190,22 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             for (int j=0;j<ny;j++) for(int i=0;i<nx;i++) v(j*nx+i)=Az(j,i);
         }
     };
-    auto buildMatrixForSolve = [&](Eigen::SparseMatrix<double>& A, Eigen::VectorXd& b) {
-        if (use_coarse) buildMatrixPolarCoarsened(A, b);
-        else if (is_polar) buildMatrixPolar(A, b);
-        else buildMatrix(A, b);
+    auto buildMatrixForSolve = [&](RowMatrix& A, Eigen::VectorXd& b) {
+        if (use_coarse) {
+            Eigen::SparseMatrix<double> coarse;
+            buildMatrixPolarCoarsened(coarse, b);
+            A = coarse;
+        } else buildRowSystem(A, b, is_polar);
+    };
+    // Candidate fields/materials must be updated by the caller first.
+    // The assembled path is kept as a diagnostic comparison, not production.
+    const bool assembled_residual = std::getenv("OMFDM_ASSEMBLED_RESIDUAL") != nullptr;
+    auto residualForSolve = [&](const Eigen::VectorXd& x, Eigen::VectorXd& R, Eigen::VectorXd& b) {
+        if (use_coarse || assembled_residual) {
+            RowMatrix A;
+            buildMatrixForSolve(A, b);
+            R = A * x - b;
+        } else evaluateDiscreteResidual(x, R, b, is_polar);
     };
     // [Stage 1e] Field + mu update. Coarse: B/H/mu at active cells from the COARSE
     // curl (consistent with the coarse operator + O(n_active)); full: original path.
@@ -208,12 +220,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // one helper makes the max-iteration rollback and the normal convergence
     // exit report exactly the state that downstream export will consume.
     auto evaluateCurrentResidual = [&]() {
-        Eigen::SparseMatrix<double> A_final;
-        Eigen::VectorXd b_final;
-        Eigen::VectorXd Az_final;
-        buildMatrixForSolve(A_final, b_final);
+        Eigen::VectorXd R_final, b_final, Az_final;
         buildSolveVec(Az_final);
-        return (A_final * Az_final - b_final).norm() / (b_final.norm() + 1e-12);
+        residualForSolve(Az_final, R_final, b_final);
+        return R_final.norm() / (b_final.norm() + 1e-12);
     };
 
     // [v1.6 DD warm-start] If nonlinear_solver.initial_az_path is set, load that
@@ -282,6 +292,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
     };
 
+    RowMatrix A_matrix; // retain CRS allocation across outer iterations
+    Eigen::VectorXd b_vec, trial_residual, trial_rhs;
     for (int iter = 0; iter < MAX_ITER; iter++) {
         omfdm::IterationProfile profile(iter + 1, linear_profile_);
         auto nkp_t0 = nkprof_now();
@@ -295,8 +307,6 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // buildSolveVec -> restrict the (interpolated) full member Az to the
         // active cells. Full path: original buildMatrixPolar/buildMatrix + the
         // row-major Az_vec (buildSolveVec is equivalent there).
-        Eigen::SparseMatrix<double> A_matrix;
-        Eigen::VectorXd b_vec;
         buildMatrixForSolve(A_matrix, b_vec);
         auto nkp_t_build = nkprof_now();
         profile.build_ms = nkprof_ms(nkp_t_mu, nkp_t_build);
@@ -455,7 +465,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // the custom Galerkin coarsening that the deleted branches used.
         {
             // Standard direct solve with explicit Jacobian (J = A + diagonal correction)
-            Eigen::SparseMatrix<double> J_matrix = A_matrix;
+            RowMatrix J_matrix = A_matrix;
 
             // Build r-weighted diagonal Jacobian correction for polar + nonlinear.
             //
@@ -477,7 +487,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             // alpha = 1 under the energy merit (25 true-tolerance iterations).
             // Supersedes the r-weighted diagonal correction below.
             if (nonlinear_config.jacobian_tangent && !use_coarse && is_polar) {
-                addTangentCorrection(J_matrix);
+                Eigen::SparseMatrix<double> tangent = J_matrix;
+                addTangentCorrection(tangent);
+                J_matrix = tangent;
             } else
             // Energy-LS mode keeps J symmetric POSITIVE DEFINITE so CG from
             // x0=0 yields a guaranteed energy-descent direction: the raw
@@ -620,7 +632,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 typedef amgcl::backend::builtin<double> TBackend;
                 typedef amgcl::amg<TBackend, amgcl::coarsening::smoothed_aggregation,
                                    amgcl::relaxation::spai0> TPrecond;
-                auto toCrs = [](const Eigen::SparseMatrix<double>& M,
+                auto toCrs = [](const RowMatrix& M,
                                 std::vector<ptrdiff_t>& ptr, std::vector<ptrdiff_t>& col,
                                 std::vector<double>& val) {
                     Eigen::SparseMatrix<double, Eigen::RowMajor> Mr = M;
@@ -704,10 +716,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 auto evalResidualVec = [&](const Eigen::VectorXd& x) -> Eigen::VectorXd {
                     syncMemberAz(x);
                     updateFieldAndMu();
-                    Eigen::SparseMatrix<double> A_t;
-                    Eigen::VectorXd b_t;
-                    buildMatrixForSolve(A_t, b_t);
-                    return A_t * x - b_t;
+                    Eigen::VectorXd R_t, b_t;
+                    residualForSolve(x, R_t, b_t);
+                    return R_t;
                 };
                 const double eps_rel = [] {
                     const char* e = std::getenv("OMFDM_PROBE_EPS");
@@ -898,10 +909,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             } else {
                 double residual_trial_norm;
                 {
-                    Eigen::SparseMatrix<double> A_trial;
-                    Eigen::VectorXd b_trial;
-                    buildMatrixForSolve(A_trial, b_trial);
-                    residual_trial_norm = (A_trial * Az_trial - b_trial).norm();
+                    residualForSolve(Az_trial, trial_residual, trial_rhs);
+                    residual_trial_norm = trial_residual.norm();
                 }
                 // Check Armijo condition: ||R(A + α·δA)|| <= ||R(A)||·(1 - c·α)
                 accept = residual_trial_norm <= residual_0 * (1.0 - c * alpha) ||
@@ -1012,13 +1021,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     if (!state.allFinite()) return false;
                     syncMemberAz(state);
                     updateFieldAndMu();
-                    Eigen::SparseMatrix<double> A_eval;
-                    Eigen::VectorXd b_eval;
-                    buildMatrixForSolve(A_eval, b_eval);
-                    const Eigen::VectorXd R_eval = A_eval * state - b_eval;
-                    residual_rel_out = R_eval.norm() / (b_eval.norm() + 1e-12);
+                    residualForSolve(state, trial_residual, trial_rhs);
+                    residual_rel_out = trial_residual.norm() / (trial_rhs.norm() + 1e-12);
                     energy_out = use_coarse ? 0.0 : computeEnergyObjective();
-                    return R_eval.allFinite() && std::isfinite(residual_rel_out) &&
+                    return trial_residual.allFinite() && std::isfinite(residual_rel_out) &&
                            (use_coarse || std::isfinite(energy_out));
                 };
 

@@ -23,6 +23,7 @@
 
 #include "AsyncWriter.h"
 #include "SolverDiagnostics.h"
+#include "DiscreteStencil.h"
 
 // AMGCL headers for advanced iterative solvers
 // The `builtin` backend supports OpenMP-parallel SpMV / vector operations
@@ -428,6 +429,27 @@ public:
 
 private:
     omfdm::LinearSolveCounters linear_profile_;
+    using RowMatrix = Eigen::SparseMatrix<double, Eigen::RowMajor>;
+    RowMatrix stencil_pattern_;
+    std::string stencil_pattern_key_;
+    template<class Scalar, class MuAccessor>
+    omfdm::StencilRow<Scalar> cartesianRow(int k, const MuAccessor& mu) const;
+    template<class Scalar, class MuAccessor>
+    omfdm::StencilRow<Scalar> polarRow(int k, const MuAccessor& mu) const;
+    void buildRowSystem(RowMatrix& A, Eigen::VectorXd& rhs, bool polar);
+    void evaluateDiscreteResidual(const Eigen::VectorXd& state,
+                                  Eigen::VectorXd& residual, Eigen::VectorXd& rhs,
+                                  bool polar) const;
+    Eigen::VectorXd solveLinearSystem(const RowMatrix& A, const Eigen::VectorXd& rhs,
+                                      const Eigen::VectorXd& initial_guess = Eigen::VectorXd(),
+                                      double tolerance = -1.0);
+    template<class Matrix>
+    Eigen::VectorXd solveLinearSystemImpl(const Matrix& A, const Eigen::VectorXd& rhs,
+                                          const Eigen::VectorXd& initial_guess, double tolerance);
+    // Definitions of the old triplet operators exist only in the test binary.
+    friend struct SolverNumericsTest;
+    void buildMatrixReference(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);
+    void buildMatrixPolarReference(Eigen::SparseMatrix<double>& A, Eigen::VectorXd& rhs);
     // Dynamic current density representation
     enum class JzType {
         STATIC,   // Constant value

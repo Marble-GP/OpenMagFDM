@@ -7,11 +7,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
 
-add_executable(MagFDMsolver
-    MagFDMsolver.cpp
+add_executable(MagFDMsolver MagFDMsolver.cpp)
+add_library(omfdm_core STATIC
     MagneticFieldAnalyzer.cpp
     MagneticFieldAnalyzer_nonlinear.cpp
     MagneticFieldAnalyzer_nonlinear_newton.cpp
+    MagneticFieldAnalyzer_stencil.cpp
     MagneticFieldAnalyzer_dd.cpp
     MagneticFieldAnalyzer.h
     AsyncWriter.cpp
@@ -45,7 +46,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 # on Windows vs 30% on Linux.
 # Requires CPU with AVX2 (Intel Haswell 2013+, AMD Excavator 2015+, Zen 2017+).
 if(MSVC)
-    target_compile_options(MagFDMsolver PRIVATE
+    target_compile_options(omfdm_core PUBLIC
         $<$<CONFIG:Release>:/O2;/arch:AVX2;/fp:fast>
         $<$<CONFIG:RelWithDebInfo>:/O2;/arch:AVX2;/fp:fast>
     )
@@ -86,41 +87,25 @@ message(STATUS "yaml-cpp version: ${yaml-cpp_VERSION}")
 
 # ライブラリのリンク
 # yaml-cpp::yaml-cpp はモダンCMakeターゲットで、インクルードパスも自動設定される
-target_link_libraries(MagFDMsolver
+target_link_libraries(omfdm_core PUBLIC
     Eigen3::Eigen
     ${OpenCV_LIBS}
     yaml-cpp::yaml-cpp
     ${TIFF_LIBRARIES}
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
-target_include_directories(MagFDMsolver PRIVATE ${TIFF_INCLUDE_DIRS})
+target_include_directories(omfdm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${TIFF_INCLUDE_DIRS})
+target_link_libraries(MagFDMsolver PRIVATE omfdm_core)
 
 # v1.6 domain-decomposition wall-time benchmark (reuses the analyzer as patch solvers)
-add_executable(dd_bench
-    dd_bench.cpp
-    MagneticFieldAnalyzer.cpp
-    MagneticFieldAnalyzer_nonlinear.cpp
-    MagneticFieldAnalyzer_nonlinear_newton.cpp
-    MagneticFieldAnalyzer_dd.cpp
-    AsyncWriter.cpp
-    tinyexpr/tinyexpr.cpp
-)
-if(MSVC)
-    target_compile_options(dd_bench PRIVATE
-        $<$<CONFIG:Release>:/O2;/arch:AVX2;/fp:fast>
-        $<$<CONFIG:RelWithDebInfo>:/O2;/arch:AVX2;/fp:fast>
-    )
-endif()
-target_link_libraries(dd_bench
-    Eigen3::Eigen
-    ${OpenCV_LIBS}
-    yaml-cpp::yaml-cpp
-    ${TIFF_LIBRARIES}
-    $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
-)
-target_include_directories(dd_bench PRIVATE ${TIFF_INCLUDE_DIRS})
+add_executable(dd_bench dd_bench.cpp)
+target_link_libraries(dd_bench PRIVATE omfdm_core)
 
 if(BUILD_TESTING)
+    add_executable(solver_numerics_test tests/solver_numerics_test.cpp)
+    target_link_libraries(solver_numerics_test PRIVATE omfdm_core)
+    add_test(NAME solver_numerics COMMAND solver_numerics_test
+        ${CMAKE_CURRENT_BINARY_DIR}/solver_numerics_fixture)
     add_executable(polar_magnetization_curl_test
         tests/polar_magnetization_curl_test.cpp
         PolarMagnetizationCurl.h
