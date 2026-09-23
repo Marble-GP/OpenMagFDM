@@ -7202,6 +7202,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
 
         // Convert Eigen sparse matrix to CRS arrays with ptrdiff_t indices
         // (builtin backend uses ptrdiff_t, Eigen defaults to int — must copy).
+        const auto conversion_start = omfdm::ProfileClock::now();
         Eigen::SparseMatrix<double, Eigen::RowMajor> A_rm = A;
         A_rm.makeCompressed();
         ptrdiff_t rows = A_rm.rows();
@@ -7228,8 +7229,16 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         params.solver.tol     = tol_effective;  // Phase BC: per-call override
         params.solver.maxiter = SOLVER_MAX_ITERATIONS;
 
+        const auto setup_start = omfdm::ProfileClock::now();
         AMGSolver amg(A_crs, params);
+        const auto solve_start = omfdm::ProfileClock::now();
         auto [iters, error] = amg(rhs_vec, x_vec);
+        const auto solve_end = omfdm::ProfileClock::now();
+        linear_profile_.conversion_ms += omfdm::milliseconds(conversion_start, setup_start);
+        linear_profile_.setup_ms += omfdm::milliseconds(setup_start, solve_start);
+        linear_profile_.solve_ms += omfdm::milliseconds(solve_start, solve_end);
+        linear_profile_.iterations += iters;
+        ++linear_profile_.solves;
         total_linear_iters_ += (long)iters; num_linear_solves_++;   // DD conditioning instrumentation
 
         if (solver_verbose)
@@ -7262,6 +7271,7 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
         if (solver_verbose)
             std::cout << "  [Solver] SparseLU (n=" << n << " <= " << AMGCL_THRESHOLD << ")" << std::endl;
 
+        const auto setup_start = omfdm::ProfileClock::now();
         if (!nl_solver_pattern_valid_ || n != nl_solver_last_n_) {
             nl_solver_.analyzePattern(A);
             nl_solver_pattern_valid_ = true;
@@ -7278,7 +7288,11 @@ Eigen::VectorXd MagneticFieldAnalyzer::solveLinearSystem(
                 throw std::runtime_error("SparseLU factorization failed");
         }
 
+        const auto solve_start = omfdm::ProfileClock::now();
         Eigen::VectorXd x = nl_solver_.solve(rhs);
+        linear_profile_.setup_ms += omfdm::milliseconds(setup_start, solve_start);
+        linear_profile_.solve_ms += omfdm::milliseconds(solve_start, omfdm::ProfileClock::now());
+        ++linear_profile_.solves;
         if (nl_solver_.info() != Eigen::Success)
             throw std::runtime_error("SparseLU solve failed");
 

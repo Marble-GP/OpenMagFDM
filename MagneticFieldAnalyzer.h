@@ -22,6 +22,7 @@
 #include <tinyexpr.h>
 
 #include "AsyncWriter.h"
+#include "SolverDiagnostics.h"
 
 // AMGCL headers for advanced iterative solvers
 // The `builtin` backend supports OpenMP-parallel SpMV / vector operations
@@ -60,6 +61,9 @@ public:
      * @brief Solve the FDM equation system
      */
     void solve();
+    // Complete queued exports, including the static-analysis path, before
+    // reporting success or recording end-to-end timings. Propagates I/O errors.
+    void drainOutput() { if (async_writer_) async_writer_->drain(); }
 
     // ---- v1.6 domain-decomposition accessors (used by the dd_bench orchestrator) ----
     // Persistent patch instances re-solved per Schwarz sweep: read/write Az, update the
@@ -423,6 +427,7 @@ public:
     double evaluateMuDerivative(const MuValue& mu_val, double H_magnitude);
 
 private:
+    omfdm::LinearSolveCounters linear_profile_;
     // Dynamic current density representation
     enum class JzType {
         STATIC,   // Constant value

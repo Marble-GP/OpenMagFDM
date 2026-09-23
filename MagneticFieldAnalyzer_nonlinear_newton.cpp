@@ -275,18 +275,20 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
     // [NKPROF] temporary per-iteration phase timing (diagnostic; enabled with
     // env NK_PROF=1). Measures where the 1.3-1.5 s/iter actually goes.
-    const bool NK_PROF = (std::getenv("NK_PROF") != nullptr);
-    auto nkprof_now = []() { return std::chrono::high_resolution_clock::now(); };
+    const bool NK_PROF = omfdm::profilingEnabled();
+    auto nkprof_now = []() { return std::chrono::steady_clock::now(); };
     auto nkprof_ms  = [](std::chrono::high_resolution_clock::time_point a,
                          std::chrono::high_resolution_clock::time_point b) {
         return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count() / 1000.0;
     };
 
     for (int iter = 0; iter < MAX_ITER; iter++) {
+        omfdm::IterationProfile profile(iter + 1, linear_profile_);
         auto nkp_t0 = nkprof_now();
         // ===== Step 1: Calculate B and H fields, update μ =====
         updateFieldAndMu();
         auto nkp_t_mu = nkprof_now();
+        profile.mu_ms = nkprof_ms(nkp_t0, nkp_t_mu);
 
         // ===== Step 2: Build residual and system matrix with current μ =====
         // Coarse-native: buildMatrixForSolve -> FVM coarse operator (n_active),
@@ -297,6 +299,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         Eigen::VectorXd b_vec;
         buildMatrixForSolve(A_matrix, b_vec);
         auto nkp_t_build = nkprof_now();
+        profile.build_ms = nkprof_ms(nkp_t_mu, nkp_t_build);
 
         Eigen::VectorXd Az_vec;
         buildSolveVec(Az_vec);
@@ -314,6 +317,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         double b_vec_norm    = b_vec_coarse_norm;
         double residual_rel  = residual_norm / (b_vec_norm + 1e-12);
         last_nonlinear_residual_ = residual_rel;
+        profile.residual = residual_rel;
+        profile.residual_ms = nkprof_ms(nkp_t_build, nkprof_now());
 
         if (std::isfinite(residual_rel) && residual_rel < best_residual_rel) {
             best_residual_rel = residual_rel;
@@ -355,6 +360,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
 
         if (converged) {
+            profile.outcome = "converged";
             if (VERBOSE) {
                 std::cout << std::endl;
             }
@@ -649,6 +655,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             }
         }
         auto nkp_t_solve = nkprof_now();
+        profile.jacobian_ms = nkprof_ms(nkp_t_conv, nkp_t_jc);
+        profile.linear_ms = nkprof_ms(nkp_t_jc, nkp_t_solve);
 
         // ===== [Stage G gate] OMFDM_PROBE_WNEWTON: true-Newton x energy merit =====
         // Decides GO/NO-GO for building the consistent tangent (CTSM) WITHOUT
@@ -926,21 +934,13 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // Update previous step length for next iteration's adaptive algorithm
         alpha_prev = alpha;
 
-        if (NK_PROF) {
-            auto nkp_t_ls = nkprof_now();
-            std::cout << "\n[NKPROF] iter " << iter + 1
-                      << ": mu=" << nkprof_ms(nkp_t0, nkp_t_mu) << "ms"
-                      << " build=" << nkprof_ms(nkp_t_mu, nkp_t_build) << "ms"
-                      << " resid+conv=" << nkprof_ms(nkp_t_build, nkp_t_conv) << "ms"
-                      << " jcorr=" << nkprof_ms(nkp_t_conv, nkp_t_jc) << "ms"
-                      << " amgcl=" << nkprof_ms(nkp_t_jc, nkp_t_solve) << "ms"
-                      << " ls=" << nkprof_ms(nkp_t_solve, nkp_t_ls) << "ms"
-                      << " (trials=" << nkp_ls_trials << ")"
-                      << " total=" << nkprof_ms(nkp_t0, nkp_t_ls) << "ms" << std::endl;
-        }
+        const auto nkp_t_ls = nkprof_now();
+        profile.line_search_ms = nkprof_ms(nkp_t_solve, nkp_t_ls);
+        profile.ls_trials = nkp_ls_trials;
 
         // ===== Step 7: Safeguarded Anderson Acceleration =====
         if (anderson_active) {
+            profile.aa = "history";
             const Eigen::VectorXd Az_base = Az_vec;    // Armijo-accepted update
             const Eigen::VectorXd g_k = Az_base - Az_vec_0;
             bool anderson_attempted = false;
@@ -949,6 +949,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
             if (iter >= 1 && g_history.size() > 0) {
                 anderson_attempted = true;
+                profile.aa = "rejected";
                 int m_k = std::min(m_AA, static_cast<int>(g_history.size()));
 
                 // Build matrix of residual differences: ΔG = [g_{k-m_k} - g_k, ..., g_{k-1} - g_k]
@@ -1007,6 +1008,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 auto evaluateAndersonState = [&](const Eigen::VectorXd& state,
                                                  double& residual_rel_out,
                                                  double& energy_out) -> bool {
+                    ++profile.aa_evaluations;
                     if (!state.allFinite()) return false;
                     syncMemberAz(state);
                     updateFieldAndMu();
@@ -1059,6 +1061,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     if (residual_improved && energy_not_worse) {
                         Az_vec = Az_candidate;
                         anderson_accepted = true;
+                        profile.aa = "accepted";
                         anderson_consecutive_rejections = 0;
                         if (candidate_residual_rel < best_residual_rel) {
                             // Unlike the historical unchecked extrapolation,
@@ -1122,6 +1125,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
             }
         }
+
+        profile.anderson_ms = nkprof_ms(nkp_t_ls, nkprof_now());
 
         // ===== Step 8: Report iteration statistics =====
         double delta_norm = delta_A.norm();

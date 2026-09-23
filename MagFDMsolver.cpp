@@ -571,6 +571,7 @@ void exportConditionsJSON(const std::string& output_path,
 }
 
 int main(int argc, char* argv[]) {
+    const auto process_start = omfdm::ProfileClock::now();
 #ifdef _WIN32
     // Set console output to UTF-8 for proper encoding in Web UI
     SetConsoleOutputCP(CP_UTF8);
@@ -671,6 +672,12 @@ int main(int argc, char* argv[]) {
             analyzer.exportActiveOnlyResults(base_folder, 0);
         }
 
+        analyzer.drainOutput();
+        if (omfdm::profilingEnabled()) {
+            std::cout << "[RUNPROF] initialization_solve_export_drain_ms="
+                      << omfdm::milliseconds(process_start, omfdm::ProfileClock::now())
+                      << std::endl;
+        }
         const bool convergence_ok = analyzer.analysisConverged();
         std::cout << "\n========================================" << std::endl;
         if (convergence_ok) {
