@@ -54,9 +54,13 @@ def run(exe, config, image, out, env, *, timeout_seconds=None, memory_limit_byte
         p = subprocess.Popen([str(exe), str(config), str(image), str(out / "results")],
                              cwd=out, stdout=log, stderr=subprocess.STDOUT, env=env)
         proc = psutil.Process(p.pid)
+        solver_cpu_seconds = 0.0
+        system_start = psutil.cpu_times()
         while p.poll() is None:
             try:
                 mem = proc.memory_info()
+                cpu = proc.cpu_times()
+                solver_cpu_seconds = cpu.user + cpu.system
                 rss_peak = max(rss_peak, mem.rss, getattr(mem, "peak_wset", 0))
                 private_peak = max(private_peak, getattr(mem, "private", 0),
                                    getattr(mem, "peak_pagefile", 0))
@@ -75,6 +79,9 @@ def run(exe, config, image, out, env, *, timeout_seconds=None, memory_limit_byte
             time.sleep(0.05)
         code = p.wait()
     elapsed = time.perf_counter() - start
+    system_end = psutil.cpu_times()
+    system_busy = sum(max(0, getattr(system_end, k) - getattr(system_start, k))
+                      for k in ("user", "system"))
     statuses = list((out / "results").glob("**/*status*.csv"))
     status = []
     for path in statuses:
@@ -95,6 +102,10 @@ def run(exe, config, image, out, env, *, timeout_seconds=None, memory_limit_byte
                   memory_method="50ms sampling; Windows also queries OS peak counters",
                   step_status=status, nk_profiles=profiles,
                   memory_samples_seconds_rss_private=samples)
+    result["system_busy_cpu_seconds"] = system_busy
+    result["sampled_solver_cpu_seconds"] = solver_cpu_seconds
+    result["estimated_other_cpu_seconds"] = max(0, system_busy - solver_cpu_seconds)
+    result["estimated_other_busy_cores"] = max(0, system_busy - solver_cpu_seconds) / elapsed
     (out / "measurement.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 
@@ -107,6 +118,9 @@ def main():
     ap.add_argument("--threads", type=int, default=12,
                     help="OMP_NUM_THREADS; YAML omp.threads MUST agree or be absent")
     ap.add_argument("--trial-preconditioner", choices=("secant-amg", "tangent-amg", "tangent-ilut"))
+    ap.add_argument("--baseline-preconditioner", choices=("secant-amg", "tangent-amg", "tangent-ilut"))
+    ap.add_argument("--baseline-optimizations", type=int, choices=range(16), default=0)
+    ap.add_argument("--trial-optimizations", type=int, choices=range(16), default=0)
     ap.add_argument("--trial-config", type=Path,
                     help="Only for algorithm comparisons; same physical model with jacobian: tangent")
     ap.add_argument("--resume", action="store_true", help="Reuse completed runs after verifying input/binary hashes")
@@ -139,6 +153,9 @@ def main():
                 trial_config_text=trial_config.read_text(encoding="utf-8-sig"),
                 image_path=str(paths["image"]), repeats=args.repeats,
                 trial_preconditioner=args.trial_preconditioner,
+                baseline_preconditioner=args.baseline_preconditioner,
+                baseline_optimizations=args.baseline_optimizations,
+                trial_optimizations=args.trial_optimizations,
                 baseline=identity(paths["baseline"], paths["baseline_repo"]),
                 trial=identity(paths["trial"], paths["trial_repo"]))
     manifest_path = out / "manifest.json"
@@ -149,6 +166,9 @@ def main():
                 raise ValueError(f"Cannot resume: {key} changed")
         if previous.get("trial_config_sha256", previous["config_sha256"]) != meta["trial_config_sha256"]:
             raise ValueError("Cannot resume: trial config changed")
+        for key, default in (("baseline_preconditioner", None), ("baseline_optimizations", 0), ("trial_optimizations", 0)):
+            if previous.get(key, default) != meta[key]:
+                raise ValueError(f"Cannot resume: {key} changed")
         for name in ("baseline", "trial"):
             for key in ("executable_sha256", "dll_sha256"):
                 if previous[name][key] != meta[name][key]:
@@ -162,8 +182,10 @@ def main():
     for i in range(args.repeats):
         for name in ("baseline", "trial"):
             run_env = env.copy()
-            if name == "trial" and args.trial_preconditioner:
-                run_env["OMFDM_TANGENT_PRECONDITIONER"] = args.trial_preconditioner
+            preconditioner = getattr(args, name + "_preconditioner")
+            if preconditioner:
+                run_env["OMFDM_TANGENT_PRECONDITIONER"] = preconditioner
+            run_env["OMFDM_TANGENT_OPTIMIZATIONS"] = str(getattr(args, name + "_optimizations"))
             config = trial_config if name == "trial" else paths["config"]
             run_dir = out / f"{i+1}_{name}"
             retries = [run_dir] + sorted(out.glob(f"{i+1}_{name}_retry*"))

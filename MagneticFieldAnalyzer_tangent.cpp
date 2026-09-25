@@ -13,6 +13,7 @@
 #include <sstream>
 
 void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::VectorXd& state) {
+    const auto prepare_start = omfdm::ProfileClock::now();
     using D = omfdm::SparseDifferential;
     const bool polar = coordinate_system == "polar";
     const bool horizontal = r_orientation == "horizontal";
@@ -47,6 +48,8 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
         dmu_dB[k] = mu0 * evaluateMuValueDerivative(material->second, H_map(row, col)) * dH;
     }
     if (!dmu_dB.allFinite()) throw std::runtime_error("nonfinite material derivative in tangent");
+    const auto rows_start = omfdm::ProfileClock::now();
+    linear_profile_.material_prepare_ms += omfdm::milliseconds(prepare_start, rows_start);
     const bool theta_periodic = bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic";
     const bool anti = theta_periodic && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
     const bool xp = bc_left.type == "periodic" && bc_right.type == "periodic";
@@ -120,6 +123,7 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
             J.valuePtr()[offset+q] = r.derivative[q];
         }
     }
+    linear_profile_.tangent_rows_ms += omfdm::milliseconds(rows_start, omfdm::ProfileClock::now());
 }
 
 bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatrix& secant,
@@ -148,11 +152,15 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
     Solver::params params;
     params.M = 20; params.maxiter = 100; params.tol = tol;
     Solver solver(rhs.size(), params);
+    const auto preconditioner_start = omfdm::ProfileClock::now();
+    linear_profile_.workspace_ms += omfdm::milliseconds(setup_start, preconditioner_start);
+    ++linear_profile_.workspace_allocations;
     size_t iterations = 0;
     double reported = std::numeric_limits<double>::infinity();
     auto apply = [&](const auto& P) {
         const auto solve_start = omfdm::ProfileClock::now();
         linear_profile_.setup_ms += omfdm::milliseconds(setup_start, solve_start);
+        linear_profile_.preconditioner_ms += omfdm::milliseconds(preconditioner_start, solve_start);
         // P.apply is one AMG cycle / ILUT application, not an inner CG solve.
         // The same numerical P is used throughout this outer iteration.
         std::tie(iterations, reported) = solver(*operator_matrix, P, b, x);

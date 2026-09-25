@@ -16,6 +16,10 @@ inline bool profilingEnabled() {
 struct LinearSolveCounters {
     double conversion_ms = 0, setup_ms = 0, solve_ms = 0;
     long long iterations = 0, solves = 0;
+    double material_prepare_ms = 0, tangent_rows_ms = 0, fallback_build_ms = 0;
+    double workspace_ms = 0, preconditioner_ms = 0;
+    long long workspace_allocations = 0, workspace_reuses = 0, fallbacks = 0;
+    long long field_reuses = 0, field_invalidations = 0, field_updates = 0;
 };
 
 // Declared before iteration workspaces so even early convergence and cleanup
@@ -48,6 +52,17 @@ struct IterationProfile {
           << " krylov_ms=" << counters.solve_ms - before.solve_ms
           << " inner_iters=" << counters.iterations - before.iterations
           << " linear_solves=" << counters.solves - before.solves
+          << " material_prepare_ms=" << counters.material_prepare_ms - before.material_prepare_ms
+          << " tangent_rows_ms=" << counters.tangent_rows_ms - before.tangent_rows_ms
+          << " fallback_build_ms=" << counters.fallback_build_ms - before.fallback_build_ms
+          << " workspace_ms=" << counters.workspace_ms - before.workspace_ms
+          << " preconditioner_ms=" << counters.preconditioner_ms - before.preconditioner_ms
+          << " workspace_allocations=" << counters.workspace_allocations - before.workspace_allocations
+          << " workspace_reuses=" << counters.workspace_reuses - before.workspace_reuses
+          << " fallbacks=" << counters.fallbacks - before.fallbacks
+          << " field_reuses=" << counters.field_reuses - before.field_reuses
+          << " field_invalidations=" << counters.field_invalidations - before.field_invalidations
+          << " field_updates=" << counters.field_updates - before.field_updates
           << " ls_ms=" << line_search_ms << " ls_trials=" << ls_trials
           << " aa_ms=" << anderson_ms << " aa_evaluations=" << aa_evaluations
           << " aa=" << aa << " residual=" << residual << " outcome=" << outcome
