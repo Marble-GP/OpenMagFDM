@@ -400,6 +400,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
 
         if (converged) {
+            tangent_krylov.clear();
             // The final convergence/export gate always checks freshly evaluated
             // fields even when the preceding outer residual reused a state.
             if (reuse_fields) updateFieldAndMu();
@@ -1038,6 +1039,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // checkpoint instead of exporting that unchecked state, then rebuild every
     // derived quantity.  This also makes a rejected/unstable accelerator unable
     // to contaminate force, energy, flux linkage or the next transient seed.
+    tangent_krylov.clear();
     if (best_Az_vec.size() > 0) {
         syncMemberAz(best_Az_vec);
     }

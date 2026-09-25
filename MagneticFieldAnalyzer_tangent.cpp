@@ -54,7 +54,8 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
         workspace->scaled_b1.setZero(n);
         workspace->scaled_b2.setZero(n);
     } else dmu_dB.setZero(n);
-    #pragma omp parallel for schedule(static)
+    int nonfinite_derivatives = 0;
+    #pragma omp parallel for schedule(static) reduction(+:nonfinite_derivatives)
     for (int k = 0; k < n; ++k) {
         const int i = polar ? k / ntheta : k % nx;
         const int j = polar ? k % ntheta : k / nx;
@@ -84,13 +85,14 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
         const double dH = table && table->is_valid
             ? inverseBHDerivative(*table, B) : (mu > 1e-20 ? 1.0 / mu : 0.0);
         const double derivative = mu0 * evaluateMuValueDerivative(*material, H_map(row, col)) * dH;
+        if (!std::isfinite(derivative)) ++nonfinite_derivatives;
         if (workspace) {
             const double scale = B > 0 ? derivative / B : 0.0;
             workspace->scaled_b1[k] = scale * b1;
             workspace->scaled_b2[k] = scale * b2;
         } else dmu_dB[k] = derivative;
     }
-    if (workspace ? (!workspace->scaled_b1.allFinite() || !workspace->scaled_b2.allFinite()) : !dmu_dB.allFinite())
+    if (nonfinite_derivatives || (workspace ? (!workspace->scaled_b1.allFinite() || !workspace->scaled_b2.allFinite()) : !dmu_dB.allFinite()))
         throw std::runtime_error("nonfinite material derivative in tangent");
     const auto rows_start = omfdm::ProfileClock::now();
     linear_profile_.material_prepare_ms += omfdm::milliseconds(prepare_start, rows_start);
@@ -238,8 +240,7 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
     total_linear_iters_ += static_cast<long>(iterations); ++num_linear_solves_;
     direction = Eigen::Map<Eigen::VectorXd>(x.data(), static_cast<Eigen::Index>(x.size()));
     const double true_error = (J * direction - rhs).norm() / std::max(rhs.norm(), 1e-30);
-    const bool accepted = direction.allFinite() && std::isfinite(reported) && std::isfinite(true_error)
-                       && iterations < 100 && reported <= tol && true_error <= tol;
+    const bool accepted = omfdm::tangentDirectionAccepted(iterations, reported, true_error, tol, direction.allFinite());
     if (nonlinear_config.verbose || omfdm::profilingEnabled()) {
         std::ostringstream s;
         s << "\n[TANGENT] candidate=" << candidate << " iterations=" << iterations

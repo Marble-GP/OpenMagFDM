@@ -3,8 +3,15 @@
 #include <amgcl/solver/fgmres.hpp>
 #include <memory>
 #include <vector>
+#include <algorithm>
+#include <cmath>
 
 namespace omfdm {
+inline bool tangentDirectionAccepted(size_t iterations, double reported, double actual,
+                                      double tolerance, bool finite_direction) {
+    return finite_direction && std::isfinite(reported) && std::isfinite(actual)
+        && iterations < 100 && reported <= tolerance && actual <= tolerance;
+}
 // Only storage is reused. AMGCL overwrites the active Arnoldi basis/Hessenberg
 // on every call; x is reset explicitly, including after zero-RHS calls.
 // Never contains an operator view or numerical preconditioner.

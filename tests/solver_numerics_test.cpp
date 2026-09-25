@@ -1,6 +1,7 @@
 #include "MagneticFieldAnalyzer.h"
 #include "PolarGridAccess.h"
 #include "TangentKrylovWorkspace.h"
+#include "SolverExperiments.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -263,6 +264,19 @@ struct SolverNumericsTest {
                 residual(a,x,true);
                 a.buildRowSystem(A,b,true);
                 a.buildConsistentTangent(cached,x);
+                // A slide starts a new solve-local material workspace.
+                MagneticFieldAnalyzer::TangentMaterialWorkspace workspace;
+                MagneticFieldAnalyzer::RowMatrix prepared;
+                a.buildConsistentTangent(prepared,x,&workspace);
+                require((prepared-cached).norm() <= 1e-13*std::max(1.0,cached.norm()),
+                        "material references stale after sliding");
+                residual(a,1.03*x,true);
+                a.buildConsistentTangent(prepared,1.03*x,&workspace);
+                MagneticFieldAnalyzer::RowMatrix changed;
+                a.buildConsistentTangent(changed,1.03*x);
+                require((prepared-changed).norm() <= 1e-13*std::max(1.0,changed.norm()),
+                        "cached chain coefficients stale at a new iterate");
+                residual(a,x,true);
                 if (!step) storage = cached.valuePtr();
                 else require(storage == cached.valuePtr(), "slide rebuilt the fixed tangent graph");
                 MagneticFieldAnalyzer::RowMatrix fresh;
@@ -407,6 +421,78 @@ struct SolverNumericsTest {
         std::cout << "AA acceptance cases=" << accepted << " rejection/rollback cases=" << rejected << '\n';
         a.nonlinear_config.verbose = false;
     }
+    static void optimizationTests(MagneticFieldAnalyzer& a) {
+        long long field_hits = 0, krylov_hits = 0;
+        int cases = 0, ls_failures = 0;
+        environment("OMFDM_TANGENT_PRECONDITIONER","tangent-amg");
+        for (int scenario = 0; scenario < 8; ++scenario) {
+            Eigen::MatrixXd saved_Az, saved_mu;
+            double saved_residual = 0;
+            int saved_iterations = 0;
+            const bool table_valid = scenario != 5;
+            for (unsigned mask : {0u,1u,2u,4u,6u,7u,8u,15u}) {
+                const bool polar = scenario != 7;
+                nonlinearFixture(a,polar,scenario % 2 == 0);
+                a.bc_inner = a.bc_outer = a.bc_left = a.bc_right = a.bc_top = a.bc_bottom = bc("dirichlet");
+                a.bc_inner.value = a.bc_outer.value = a.bc_left.value = a.bc_right.value = a.bc_top.value = a.bc_bottom.value = 0;
+                a.bc_theta_min = a.bc_theta_max = bc("periodic");
+                a.bc_theta_min.value = a.bc_theta_max.value = scenario == 1 ? -1 : 1;
+                if (!table_valid) a.material_bh_tables.clear();
+                a.has_nonlinear_materials = true;
+                a.analysis_convergence_ok_ = true;
+                a.nonlinear_config = MagneticFieldAnalyzer::NonlinearSolverConfig();
+                a.nonlinear_config.max_iterations = scenario == 6 ? 1 : 12;
+                a.nonlinear_config.tolerance = 1e-8;
+                a.nonlinear_config.verbose = true;
+                a.nonlinear_config.jacobian_tangent = true;
+                a.nonlinear_config.line_search_energy = scenario < 3;
+                a.nonlinear_config.anderson.enabled = scenario == 2 || scenario == 3;
+                a.nonlinear_config.anderson.depth = 3;
+                if (scenario == 4) {
+                    a.nonlinear_config.line_search_adaptive = false;
+                    a.nonlinear_config.line_search_alpha_init = 1e6;
+                    a.nonlinear_config.line_search_max_trials = 1;
+                }
+                a.dd_warm_start_ = true;
+                Eigen::VectorXd x(a.nx*a.ny);
+                for (int k = 0; k < x.size(); ++k) x[k] = 0.003*std::sin(0.4*k);
+                residual(a,x,polar);
+                a.linear_profile_ = {};
+                const auto flag = std::to_string(mask);
+                environment("OMFDM_TANGENT_OPTIMIZATIONS",flag.c_str());
+                std::string log;
+                { Capture capture; a.solveNonlinearNewtonKrylov(); log = capture.stream.str(); }
+                require(a.Az.allFinite() && a.mu_map.allFinite(), "optimization exported nonfinite state");
+                if (!mask) {
+                    saved_Az = a.Az; saved_mu = a.mu_map;
+                    saved_residual = a.last_nonlinear_residual_;
+                    saved_iterations = a.last_nonlinear_iterations_;
+                } else {
+                    require((saved_Az-a.Az).norm() <= 1e-10*std::max(1.0,saved_Az.norm()), "optimization changed final Az");
+                    require((saved_mu-a.mu_map).norm() <= 1e-10*std::max(1.0,saved_mu.norm()), "optimization changed final mu");
+                    require(std::abs(saved_residual-a.last_nonlinear_residual_) <= 1e-9*std::max(1.0,saved_residual), "optimization changed true residual");
+                    require(saved_iterations == a.last_nonlinear_iterations_, "optimization changed outer iterations");
+                }
+                if (!table_valid || !(mask & 8))
+                    require(a.linear_profile_.field_reuses == 0, "ineligible field evaluation was skipped");
+                field_hits += a.linear_profile_.field_reuses;
+                krylov_hits += a.linear_profile_.workspace_reuses;
+                ls_failures += log.find("[LS failed,") != std::string::npos;
+                ++cases;
+            }
+        }
+        require(field_hits > 0 && krylov_hits > 0, "reuse optimizations were not exercised");
+        require(ls_failures > 0, "line-search exhaustion was not exercised");
+        environment("OMFDM_TANGENT_OPTIMIZATIONS","16");
+        bool threw = false;
+        try { omfdm::SolverExperiments::fromEnvironment(); } catch (const std::invalid_argument&) { threw = true; }
+        require(threw, "invalid optimization mask accepted");
+        environment("OMFDM_TANGENT_OPTIMIZATIONS","");
+        environment("OMFDM_TANGENT_PRECONDITIONER","");
+        a.nonlinear_config.verbose = false;
+        std::cout << "optimization comparisons=" << cases << " field_reuses=" << field_hits
+                  << " krylov_reuses=" << krylov_hits << " ls_exhaustions=" << ls_failures << '\n';
+    }
     static void innerSolverTests(MagneticFieldAnalyzer& a) {
         MagneticFieldAnalyzer::RowMatrix A(40,40), J(40,40);
         std::vector<Eigen::Triplet<double>> entries;
@@ -463,6 +549,14 @@ struct SolverNumericsTest {
                 "failed FGMRES retained storage");
         b.setOnes();
         require(a.solveTangentSystem(J,A,b,1e-6,direction,&work), "FGMRES did not recover after invalid RHS");
+        MagneticFieldAnalyzer::RowMatrix singular = J;
+        std::fill(singular.valuePtr(), singular.valuePtr()+singular.nonZeros(), 0.0);
+        require(!a.solveTangentSystem(singular,A,b,1e-6,direction,&work) && !work.solver,
+                "AMG setup exception retained workspace");
+        require(a.solveTangentSystem(J,A,b,1e-6,direction,&work), "FGMRES did not recover after setup failure");
+        require(!omfdm::tangentDirectionAccepted(100,1e-9,1e-9,1e-6,true), "iteration-cap direction accepted");
+        require(!omfdm::tangentDirectionAccepted(3,1e-9,1e-2,1e-6,true), "false reported convergence accepted");
+        require(!omfdm::tangentDirectionAccepted(3,1e-9,1e-9,1e-6,false), "nonfinite direction accepted");
         require(work.prepare(41,1e-4) && work.x.size() == 41, "FGMRES size change not rebuilt");
         work.clear();
         require(!work.solver && work.b.capacity() == 0 && work.x.capacity() == 0, "workspace not released");
@@ -493,6 +587,7 @@ int main(int argc, char** argv) {
         SolverNumericsTest::energyDiagnostic(a);
         SolverNumericsTest::accelerationTests(a);
         SolverNumericsTest::innerSolverTests(a);
+        SolverNumericsTest::optimizationTests(a);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n'; return 1;
