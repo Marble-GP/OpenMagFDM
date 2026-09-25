@@ -123,6 +123,44 @@ error 1.84761e-17; 192 tangent directions, max best FD-Jv error 2.48439e-7;
 comparisons exercised 40 field reuses, 168 Krylov reuses and 8 LS-exhaustion
 cases, with matching final Az/mu/residual and outer iteration counts.
 
-Pending: cold and sweep timings, paired medians, secondary cases, waveform and
-long-run memory gates. macOS is not available locally and remains unverified;
-no remote CI is dispatched by this local-only experiment.
+macOS is not available locally and remains unverified; no remote CI is
+dispatched by this local-only experiment.
+
+## Cold-start ablation results
+
+Evidence: `../bench_results/workspace_cold_20260926/` (manifest at `c1fc3eb`,
+solver implementation `ca1027a`). All six runs strictly converged in 19 outer
+iterations with final residual 8.6947404067e-4. For every trial, the recorded
+per-iteration residual, inner iteration count, LS trials and outcome match the
+immutable baseline **at log precision**. This is not a full-field/waveform gate.
+
+| Case | Wall seconds | Peak private MiB | FGMRES allocations / reuses | Estimated other busy cores |
+|---|---:|---:|---:|---:|
+| Immutable baseline | 42.658 | 1778.1 | 18 / 0 (old implementation) | 4.85 |
+| Instrumented, mask 0 | 42.490 | 1778.8 | 18 / 0 | 4.31 |
+| Priority 1, mask 1 | 46.887 | 1818.5 | 18 / 0 | 5.49 |
+| Priority 2, mask 2 | 47.974 | 1696.8 | 18 / 0 | 5.90 |
+| Priority 3, mask 4 | 43.083 | 1777.5 | 3 / 15 | 4.30 |
+| Priorities 2+3, mask 6 | 45.019 | 1696.2 | 3 / 15 | 5.62 |
+
+All cases used two secant fallbacks. Priority 2 reduced fallback construction
+from 425 ms (mask 0, eager) to 49 ms (mask 2, only two failures), and lowered
+private peak by about 82 MiB. Priority 3 eliminated 15/18 workspace allocations;
+three allocations remain because storage is deliberately released at each
+failed tangent direction. Combining 2+3 preserves this memory reduction.
+
+Priority 1 reduced material preparation from 464 to 406 ms but AD-row time
+increased from 8071 to 10040 ms; its retained compact arrays cost about 40 MiB
+at the measured peak. This is **not** a demonstrated overall improvement.
+Other phases also slowed during that run, so separate implementation costs
+from scheduling/load variation before deciding whether to retain it.
+
+Non-solver activity was significant and variable: sampled processes included
+Docker, another Python process and Task Manager. None was stopped. These are
+diagnostic runs: **no wall-time speedup or adoption is established**. The next
+bounded screen is 12 steps for immutable baseline, masks 1, 6 and 7, in that
+order. Priority 4's large-case evaluation follows selection from that screen.
+
+Still pending: sweep timings, repeated controlled medians with secant controls,
+priority 4 large-case comparison, secondary cases, periodic waveform and
+long-run memory gates. No optimization has passed the adoption protocol.
