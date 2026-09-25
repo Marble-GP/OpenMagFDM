@@ -473,9 +473,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         // remains. AMGCL's internal smoothed_aggregation multigrid replaces
         // the custom Galerkin coarsening that the deleted branches used.
         {
+            RowMatrix J_matrix;
+            auto buildSecantDirectionMatrix = [&]() {
             const auto fallback_build_start = omfdm::ProfileClock::now();
             // Standard direct solve with explicit Jacobian (J = A + diagonal correction)
-            RowMatrix J_matrix = A_matrix;
+            J_matrix = A_matrix;
 
             // Build r-weighted diagonal Jacobian correction for polar + nonlinear.
             //
@@ -564,8 +566,11 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                     J_matrix.coeffRef(idx, idx) += correction_factor;
                 }
             }
+            linear_profile_.fallback_build_ms += omfdm::milliseconds(fallback_build_start, nkprof_now());
+            };
+            const bool lazy_fallback = experiments.lazyFallback() && nonlinear_config.jacobian_tangent && !use_coarse;
+            if (!lazy_fallback) buildSecantDirectionMatrix();
             nkp_t_jc = nkprof_now();
-            linear_profile_.fallback_build_ms += omfdm::milliseconds(fallback_build_start, nkp_t_jc);
 
             // Adaptive: SparseLU below the AMGCL threshold, AMGCL above.
             // For full-grid problems (n ~ 250k) this routes through the
@@ -635,6 +640,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 }
                 if (!tangent_ok) {
                     ++linear_profile_.fallbacks;
+                    if (lazy_fallback) buildSecantDirectionMatrix();
                     if (VERBOSE) std::cout << " [one secant fallback]";
                     delta_A = solveLinearSystem(J_matrix, -residual_coarse, Eigen::VectorXd(), inner_tol);
                     const double tol = inner_tol > 0 ? inner_tol : SOLVER_TOLERANCE;
