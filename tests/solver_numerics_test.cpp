@@ -208,6 +208,74 @@ struct SolverNumericsTest {
         }
         std::cout << "tangent directions=" << directions << " max_best_relative_Jv_error=" << worst << '\n';
     }
+    static void slidingTangentTests(MagneticFieldAnalyzer& a) {
+        double worst = 0;
+        int checks = 0;
+        for (bool horizontal : {false, true}) for (bool axis : {false, true})
+        for (bool anti : {false, true}) {
+            nonlinearFixture(a, true, horizontal);
+            if (axis) {
+                a.r_start = 0;
+                a.r_end = (a.nr-1)*a.dr;
+                for (int i = 0; i < a.nr; ++i) a.r_coords[i] = i*a.dr;
+            }
+            a.bc_inner = a.bc_outer = bc("dirichlet");
+            a.bc_inner.value = a.bc_outer.value = 0;
+            a.bc_theta_min = a.bc_theta_max = bc("periodic");
+            a.bc_theta_min.value = a.bc_theta_max.value = anti ? -1 : 1;
+            MagneticFieldAnalyzer::SlideRegion slide;
+            slide.direction = horizontal ? "vertical" : "horizontal";
+            slide.region_start = 0; slide.region_end = a.nr/2;
+            slide.pixels_per_step = 3;
+            slide.wrap_mode = anti ? "antiperiodic" : "periodic";
+            a.transient_config.slides = {slide};
+            a.slide_sign_map.release();
+            a.rect_slide_states.clear(); a.slide_step_counter = 0;
+            const int n = a.nr*a.ntheta;
+            Eigen::VectorXd x(n), v(n), b;
+            for (int k = 0; k < n; ++k) {
+                x[k] = 0.002*(std::sin(0.3*k)+0.41*std::cos(0.77*k));
+                v[k] = std::cos(0.43*k);
+            }
+            MagneticFieldAnalyzer::RowMatrix A, cached;
+            const double* storage = nullptr;
+            for (int step = 0; step < 4; ++step) {
+                if (step) {
+                    const auto before = a.image.clone();
+                    a.slideImageRegion();
+                    require(cv::norm(before, a.image, cv::NORM_INF) > 0,
+                            "sliding fixture did not move the material interface");
+                }
+                // Seed static/nonlinear cells according to the moved image;
+                // residual() then refreshes B/H/mu from the candidate state.
+                for (int row = 0; row < a.ny; ++row) for (int col = 0; col < a.nx; ++col) {
+                    const auto pixel = a.image.at<cv::Vec3b>(a.ny-1-row,col);
+                    a.mu_map(row,col) = 4e-7*M_PI*(pixel[0] == 255 ? 8000 : 1);
+                }
+                residual(a,x,true);
+                a.buildRowSystem(A,b,true);
+                a.buildConsistentTangent(cached,x);
+                if (!step) storage = cached.valuePtr();
+                else require(storage == cached.valuePtr(), "slide rebuilt the fixed tangent graph");
+                MagneticFieldAnalyzer::RowMatrix fresh;
+                a.buildConsistentTangent(fresh,x);
+                require((fresh-cached).norm() <= 1e-13*std::max(1.0,fresh.norm()),
+                        "sliding tangent retained stale coefficients");
+                const Eigen::VectorXd jv = cached*v;
+                double best = 1e100;
+                for (double epsilon : {1e-4,1e-5,1e-6,1e-7,1e-8}) {
+                    const double h = epsilon*x.norm()/v.norm();
+                    const auto rp = residual(a,x+h*v,true);
+                    const auto rm = residual(a,x-h*v,true);
+                    best = std::min(best, ((rp-rm)/(2*h)-jv).norm()/std::max(jv.norm(),1e-30));
+                }
+                require(std::isfinite(best) && best < 1e-5, "axis/sliding tangent Jv mismatch");
+                worst = std::max(worst,best); ++checks;
+            }
+        }
+        a.transient_config.slides.clear(); a.slide_sign_map.release();
+        std::cout << "axis/sliding tangent checks=" << checks << " max_relative_Jv_error=" << worst << '\n';
+    }
     static void materialDerivativeTests(MagneticFieldAnalyzer& a) {
         nonlinearFixture(a, false, true);
         auto m = a.material_mu.at("iron");
@@ -391,6 +459,7 @@ int main(int argc, char** argv) {
         MagneticFieldAnalyzer a(yaml.string(), png.string());
         SolverNumericsTest::run(a);
         SolverNumericsTest::derivativeTests(a);
+        SolverNumericsTest::slidingTangentTests(a);
         SolverNumericsTest::materialDerivativeTests(a);
         SolverNumericsTest::energyDiagnostic(a);
         SolverNumericsTest::accelerationTests(a);

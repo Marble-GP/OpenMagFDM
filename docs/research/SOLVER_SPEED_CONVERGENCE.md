@@ -214,7 +214,53 @@ energy-merit B against a fresh default-secant cold start. C's expensive ILUT
 Krylov work is not plausibly fixed by removing a matrix copy, so C is not rerun
 in this follow-up. These are diagnostics, not an automatic production change.
 
+### Follow-up results (2026-09-25, `abe9ca9`)
+
+| Group / path | Wall seconds | Outer iterations | True residual | Peak private bytes | Within 2x same-group secant peak |
+|---|---:|---:|---:|---:|---|
+| Borrowed-CRS control secant | 61.542 | 108 | 9.59006e-4 | 937,865,216 | yes |
+| Borrowed-CRS A, residual merit | 148.571 | 75 | 5.40273e-4 | 1,592,508,416 | yes |
+| Borrowed-CRS B, residual merit | 140.264 | 80 | 9.05506e-4 | 1,885,573,120 | no (slightly over) |
+| Energy-group control secant | 70.088 | 108 | 9.59006e-4 | 937,627,648 | yes |
+| Borrowed-CRS B, energy merit | 46.064 | 19 | 8.69474e-4 | 1,864,040,448 | yes |
+
+Raw evidence: `../bench_results/tangent_nocopy_20260925/` and
+`../bench_results/tangent_energy_20260925/`, including executable/input hashes.
+A/B residual-merit outer counts, total tangent inner counts (2125/978), accepted
+directions (72/77), fallback counts (2/2) and final residuals agree with the
+original copied-operator runs. Private peaks fell by approximately 288 MB and
+290 MB. The storage correction has evidence of numerical equivalence and lower
+memory, but **not of a measured speedup** in these runs.
+
+External CPU activity was observed during the follow-up (a short process-CPU
+sample showed Docker/Python/WSL and other applications active). No unrelated
+process was stopped. Baseline timings also changed between groups/dates.
+All wall times here are feasibility diagnostics, not controlled adoption data.
+
+B + energy accepts 16 of 18 tangent attempts, falls back to secant twice and
+uses 379 tangent inner iterations. Its cold-start reduction versus its control
+is 34.277%, with a true converged final state. This is a promising candidate for
+the 12-step experiment, not evidence of warm-sweep speed, waveform quality or
+an exact energy/residual gradient relationship. It remains opt-in.
+
+Added 32 tangent regressions combining actual material-image slides, both polar
+storage orientations, periodic/antiperiodic seams and r=0 with Dirichlet axis.
+The cached tangent retains its allocation, matches a fresh assembly after each
+slide and matches finite-difference Jv: maximum relative error 3.55914e-11 on
+Windows. The sliding fixture seeds static/nonlinear mu for the moved image and
+then refreshes B/H/mu; it is not a substitute for the end-to-end warm sweep.
+Windows and Linux CTest pass 3/3; Windows release-contract passed for the
+borrowed-CRS implementation. macOS remains untested.
+
+`benchmarks/solver_speed/ieej_12step_tangent_energy.yaml` differs from the primary
+secant input only in `jacobian: tangent` and `line_search_objective: energy`.
+Use candidate B (`--trial-preconditioner tangent-amg`) and the same current
+executable for both paths. First run one complete baseline/trial pair with
+`--repeats 3 --stop-after-runs 2`; pause to check strict convergence before
+resuming the remaining pairs. External-load observations prevent treating a
+single pair as the final performance gate.
+
 Still pending: three paired timings and medians, 4-thread/cold/35H300 checks,
-large-case tangent warm-sweep cost and memory, long-sweep retention, actual sliding
-tangent cache checks, full-waveform gates, and macOS build/numerical regression.
+large-case tangent warm-sweep cost and memory, long-sweep retention,
+full-waveform gates, and macOS build/numerical regression.
 The numerical gates above do not waive any of these acceptance requirements.
