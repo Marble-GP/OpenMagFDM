@@ -57,6 +57,9 @@ exact discrete gradient relationship.
 
 ## Status
 
+The follow-up workspace branch and its preserved tangent baseline are documented
+in [TANGENT_WORKSPACE_OPTIMIZATION.md](TANGENT_WORKSPACE_OPTIMIZATION.md).
+
 Implementation/verification in progress. No optimization has passed the full
 adoption protocol yet; unmeasured items are not passes.
 
