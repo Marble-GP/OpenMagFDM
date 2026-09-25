@@ -156,6 +156,19 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     const auto experiments = omfdm::SolverExperiments::fromEnvironment();
     TangentMaterialWorkspace tangent_materials;
     omfdm::TangentKrylovWorkspace tangent_krylov;
+    bool reuse_fields = experiments.acceptedFields() && !use_coarse;
+    for (const auto& entry : material_mu) {
+        if (entry.second.type == MuType::STATIC) continue;
+        const auto table = material_bh_tables.find(entry.first);
+        if (table == material_bh_tables.end() || !table->second.is_valid) reuse_fields = false;
+    }
+    // No-table H=B/mu depends on the previous mu: repeated evaluation is NOT
+    // generally idempotent. Never skip that material evaluation path.
+    bool accepted_fields_current = false;
+    auto invalidateAcceptedFields = [&]() {
+        if (accepted_fields_current) ++linear_profile_.field_invalidations;
+        accepted_fields_current = false;
+    };
     const bool horiz = (r_orientation == "horizontal");
 
     // working solve-vector <-> member Az (full). Coarse: restrict/prolong via the
@@ -164,6 +177,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // conversion in the loop (equivalent to the previous inline code for the
     // full-grid path).
     auto syncMemberAz = [&](const Eigen::VectorXd& v) {
+        invalidateAcceptedFields();
         if (use_coarse) {
             // [Stage 1e] Active-only scatter: write the coarse values into member Az
             // at the active cells. The coarse curl (updateCoarseFieldAndMu) and
@@ -219,6 +233,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // [Stage 1e] Field + mu update. Coarse: B/H/mu at active cells from the COARSE
     // curl (consistent with the coarse operator + O(n_active)); full: original path.
     auto updateFieldAndMu = [&]() {
+        invalidateAcceptedFields();
+        ++linear_profile_.field_updates;
         if (use_coarse) { updateCoarseFieldAndMu(); return; }
         if (is_polar) calculateMagneticFieldPolar(); else calculateMagneticField();
         calculateHField();
@@ -309,7 +325,10 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         omfdm::IterationProfile profile(iter + 1, linear_profile_);
         auto nkp_t0 = nkprof_now();
         // ===== Step 1: Calculate B and H fields, update μ =====
-        updateFieldAndMu();
+        if (reuse_fields && accepted_fields_current) {
+            ++linear_profile_.field_reuses;
+            accepted_fields_current = false;
+        } else updateFieldAndMu();
         auto nkp_t_mu = nkprof_now();
         profile.mu_ms = nkprof_ms(nkp_t0, nkp_t_mu);
 
@@ -381,6 +400,9 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
 
         if (converged) {
+            // The final convergence/export gate always checks freshly evaluated
+            // fields even when the preceding outer residual reused a state.
+            if (reuse_fields) updateFieldAndMu();
             profile.outcome = "converged";
             if (VERBOSE) {
                 std::cout << std::endl;
@@ -787,6 +809,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                 // Accept step. Member Az already holds this trial's (full) field
                 // from syncMemberAz above, so no extra write is needed.
                 Az_vec = Az_trial;
+                accepted_fields_current = reuse_fields;
                 if (VERBOSE && ls > 0) {
                     std::cout << " [LS: α=" << alpha << ", " << ls+1 << " trials]";
                 }
@@ -815,6 +838,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
 
         // ===== Step 7: Safeguarded Anderson Acceleration =====
         if (anderson_active) {
+            invalidateAcceptedFields();
             profile.aa = "history";
             const Eigen::VectorXd Az_base = Az_vec;    // Armijo-accepted update
             const Eigen::VectorXd g_k = Az_base - Az_vec_0;
