@@ -59,6 +59,10 @@ Terminated or unconverged runs are not speed comparisons. `--resume` reuses
 completed diagnostics with matching hashes; incomplete directories are retained.
 The summary records inner iterations, tangent acceptance and secant fallback
 counts. This screening does not replace the paired 12-step adoption protocol.
+Use `--candidates tangent-amg --trial-objective energy` for the bounded extra
+energy-merit comparison. The secant control retains the source YAML's settings;
+only the tangent candidate's merit changes. Manifest/resume checks include the
+candidate list and merit. The default list remains A/B/C with residual merit.
 
 ## Full-revolution waveform gate
 

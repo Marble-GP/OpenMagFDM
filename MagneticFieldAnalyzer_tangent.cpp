@@ -3,6 +3,7 @@
 #include "SparseDifferential.h"
 #include "MagneticFieldAnalyzer_stencil.inl"
 #include <amgcl/adapter/eigen.hpp>
+#include <amgcl/adapter/zero_copy.hpp>
 #include <amgcl/solver/fgmres.hpp>
 #include <amgcl/relaxation/as_preconditioner.hpp>
 #include <amgcl/relaxation/ilut.hpp>
@@ -135,7 +136,12 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
     if (!rhs.allFinite() || !Eigen::Map<const Eigen::VectorXd>(J.valuePtr(), J.nonZeros()).allFinite())
         return false;
     const auto conversion_start = omfdm::ProfileClock::now();
-    Backend::matrix operator_matrix(J);
+    // Read-only borrowed CRS for Krylov products. J remains compressed and
+    // alive for this whole solve; preconditioner construction still owns its
+    // fresh numerical hierarchy. Do not widen/copy all indices and values just
+    // to apply J (about 275 MiB on the primary grid).
+    const auto operator_matrix = amgcl::adapter::zero_copy_direct(
+        J.rows(), J.cols(), J.outerIndexPtr(), J.innerIndexPtr(), J.valuePtr());
     std::vector<double> b(rhs.data(), rhs.data() + rhs.size()), x(rhs.size(), 0.0);
     const auto setup_start = omfdm::ProfileClock::now();
     linear_profile_.conversion_ms += omfdm::milliseconds(conversion_start, setup_start);
@@ -149,7 +155,7 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
         linear_profile_.setup_ms += omfdm::milliseconds(setup_start, solve_start);
         // P.apply is one AMG cycle / ILUT application, not an inner CG solve.
         // The same numerical P is used throughout this outer iteration.
-        std::tie(iterations, reported) = solver(operator_matrix, P, b, x);
+        std::tie(iterations, reported) = solver(*operator_matrix, P, b, x);
         linear_profile_.solve_ms += omfdm::milliseconds(solve_start, omfdm::ProfileClock::now());
     };
     try {

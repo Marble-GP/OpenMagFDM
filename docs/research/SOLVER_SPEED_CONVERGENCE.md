@@ -128,6 +128,24 @@ executable and DLL hashes even when the working source has advanced.
 | Run | Commit | Strictly converged steps | Wall time | Peak working set | Peak private commit |
 |---|---|---:|---:|---:|---:|
 | Baseline 1, 12 threads | `25859a7` | 12/12 | 1213.776 s | 1,077,956,608 B | 1,073,070,080 B |
+| Phase-1 trial 1, 12 threads | `63e8c68` | 12/12 | 710.117 s | 1,045,348,352 B | 1,041,260,544 B |
+
+First-pair review: 41.495% wall-time reduction (1.709x speed), 3.025% lower peak
+working set. Outer iterations increased from 1254 to 1263, so the main benefit
+is cheaper iterations, not faster nonlinear convergence. Approximate profile
+totals: assembly 141.4 -> 18.2 s, line search 473.6 -> 135.5 s. Timer scopes
+differ slightly between revisions. Trial linear work is 441.1 s, including
+248.9 s AMG setup and 148.4 s Krylov work. Reusing stale AMG is not justified.
+
+Partial 12-point flux normalized RMS differences (A/B/C) are 0.010206%,
+0.001623%, 0.001860%. Identical centered differences on the interior ten points
+give EMF differences 0.026698%, 0.032182%, 0.033498%. No wrapping or harmonic
+gate was applied to this partial revolution. These are not full-waveform passes.
+Time-sampled private-memory medians in the later run quarters are approximately
+554 MiB baseline and 743 MiB trial: workspace retention increased even though
+the peak decreased. Trial quarters 2-4 remain roughly level, not a long-run
+leak certification. Only one pair has finished and runs were separated in time;
+medians/reproducibility remain pending.
 
 Raw evidence is in the sibling directory
 `bench_results/solver_speed_20260923_phase1/1_baseline/measurement.json` with the
@@ -139,7 +157,64 @@ to verify hashes and retain completed measurements, and `--stop-after-runs 1`
 to pause only after the next full run. Source identity in the original manifest
 is preserved on resume.
 
+## Large-grid tangent screening
+
+The next bounded experiment is `run_tangent_screen.py`: one cold-start step on
+the same 1,339,200-DOF model, optimized secant then candidates A/B/C, sequentially.
+Each uses the same phase-2 executable, max=300, tolerance=1e-3, chunks=1 and
+12 threads. A 600-second diagnostic guard and 8-GiB hard guard bound each child
+process. This is a feasibility diagnostic, not the 12-step adoption benchmark;
+termination is recorded explicitly and cannot count as convergence or speedup.
+No general solver defaults, material laws or preconditioner parameters change.
+
+### Completed cold-start screen (2026-09-23)
+
+Source `1e7fea6` (runner committed as `b1ba180`); raw results are in
+`../bench_results/tangent_screen_20260923/diagnostic_summary.json`.
+
+| Path | Wall seconds | Outer iterations | True final residual | Tangent accepted / attempted | Secant fallbacks | Peak private bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| Optimized secant | 56.697 | 108 | 9.59006e-4 | n/a | 0 | 938,811,392 |
+| A: secant AMG | 124.057 | 75 | 5.40273e-4 | 72 / 74 | 2 | 1,880,981,504 |
+| B: tangent AMG | 115.988 | 80 | 9.05506e-4 | 77 / 79 | 2 | 2,175,987,712 |
+| C: tangent ILUT | 600.116 (guard) | 29 completed updates | no final state | 23 / 29 | 6 | 2,496,786,432 |
+
+A and B converge but are over twice as slow as secant on this cold start. B
+reduces tangent Krylov iterations to 978 versus A's 2125, but that is insufficient
+to pay for tangent assembly/setup. C was interrupted while the 30th outer
+iteration was running; it did not hit the outer limit and has no final
+convergence result. All three exceed the conservative twice-secant private
+peak criterion (A only slightly). None qualifies for speed adoption from this
+screen. This does not establish their 12-step warm-sweep performance.
+
+The small-step ratchet is already documented in Phase BL sections 4.5-4.6.
+That historical ray-minimizing search was NEGATIVE. It is not reintroduced.
+The next finite comparison is the already-planned energy merit with B, using
+the newly verified residual tangent and one preconditioner construction per
+outer iteration. Energy is only a merit function: final true residual remains
+the convergence gate, not energy decrease.
+
+### Storage correction and bounded follow-up (2026-09-25)
+
+Inspection found that FGMRES owned an unnecessary second copy of the entire
+tangent operator with widened indices. Replace that Krylov-only copy with the
+bundled AMGCL `zero_copy_direct` adapter borrowing the compressed Eigen CRS.
+The const tangent stays alive/unmodified until FGMRES returns; the fresh AMG or
+ILUT preconditioner continues to own its numerical storage. No hierarchy reuse,
+material or solver-tolerance change is involved. Regression checks compare
+copied/borrowed products, coefficient refresh, ownership and input immutability.
+
+Preserved the original Windows executable/dependencies under
+`build_solver_tangent_original_1e7fea6/Release` before rebuilding. The original
+manifest hashes still identify that binary; do not resume the old manifest
+against the newly rebuilt executable at its previous path.
+
+Follow-up is bounded to residual-merit A/B to measure the storage change, then
+energy-merit B against a fresh default-secant cold start. C's expensive ILUT
+Krylov work is not plausibly fixed by removing a matrix copy, so C is not rerun
+in this follow-up. These are diagnostics, not an automatic production change.
+
 Still pending: three paired timings and medians, 4-thread/cold/35H300 checks,
-large-case tangent A/B/C cost and memory, long-sweep retention, actual sliding
+large-case tangent warm-sweep cost and memory, long-sweep retention, actual sliding
 tangent cache checks, full-waveform gates, and macOS build/numerical regression.
 The numerical gates above do not waive any of these acceptance requirements.

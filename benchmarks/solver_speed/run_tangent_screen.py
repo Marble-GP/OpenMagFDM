@@ -24,6 +24,10 @@ def main():
     ap.add_argument("--threads", type=int, default=12)
     ap.add_argument("--timeout-seconds", type=float, default=600)
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--candidates", nargs="+", choices=("secant-amg", "tangent-amg", "tangent-ilut"),
+                    default=["secant-amg", "tangent-amg", "tangent-ilut"])
+    ap.add_argument("--trial-objective", choices=("residual", "energy"), default="residual",
+                    help="Tangent-only merit comparison; secant always retains the input settings")
     a = ap.parse_args()
     if a.threads < 1 or a.timeout_seconds <= 0:
         ap.error("positive threads and timeout required")
@@ -40,6 +44,7 @@ def main():
                     config_text=source.read_text(encoding="utf-8-sig"),
                     image_sha256=sha256(image), image_path=str(image), threads=a.threads,
                     timeout_seconds=a.timeout_seconds, hard_memory_limit_bytes=8*2**30,
+                    candidates=a.candidates, trial_objective=a.trial_objective,
                     purpose="one-step cold-start diagnostic; no adoption decision")
     manifest_path = out / "manifest.json"
     if a.resume:
@@ -50,6 +55,10 @@ def main():
         for key in ("executable_sha256", "dll_sha256"):
             if previous["source"][key] != manifest["source"][key]:
                 raise ValueError(f"Cannot resume: {key} changed")
+        if previous.get("candidates", ["secant-amg", "tangent-amg", "tangent-ilut"]) != a.candidates:
+            raise ValueError("Cannot resume: candidate list changed")
+        if previous.get("trial_objective", "residual") != a.trial_objective:
+            raise ValueError("Cannot resume: trial objective changed")
     else:
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     env = os.environ.copy()
@@ -58,10 +67,12 @@ def main():
             del env[key]
     env.update(NK_PROF="1", OMP_NUM_THREADS=str(a.threads))
     summaries = {}
-    for name in ("secant", "secant-amg", "tangent-amg", "tangent-ilut"):
+    for name in ("secant", *dict.fromkeys(a.candidates)):
         config = copy.deepcopy(cfg)
         config["transient"]["total_steps"] = 1
         config["nonlinear_solver"]["jacobian"] = "secant" if name == "secant" else "tangent"
+        if name != "secant":
+            config["nonlinear_solver"]["line_search_objective"] = a.trial_objective
         config_path = out / f"{name}.yaml"
         config_text = yaml.safe_dump(config, sort_keys=False)
         if config_path.exists():

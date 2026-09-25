@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <limits>
 #include <sstream>
+#include <amgcl/adapter/eigen.hpp>
+#include <amgcl/adapter/zero_copy.hpp>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -339,11 +341,31 @@ struct SolverNumericsTest {
         }
         A.setFromTriplets(entries.begin(),entries.end()); J = A;
         for (int k = 0; k < 39; ++k) J.coeffRef(k,k+1) += 0.31;
+        J.makeCompressed();
+        // Borrowed operator must neither copy nor own the analyzer's CRS.
+        // Compare copied and borrowed products, including a numeric refresh.
+        {
+            const auto view = amgcl::adapter::zero_copy_direct(J.rows(), J.cols(),
+                J.outerIndexPtr(), J.innerIndexPtr(), J.valuePtr());
+            require(!view->own_data && view->ptr == J.outerIndexPtr() &&
+                    view->col == J.innerIndexPtr() && view->val == J.valuePtr(),
+                    "Krylov operator is not a borrowed CRS view");
+            for (int refresh = 0; refresh < 2; ++refresh) {
+                if (refresh) J.valuePtr()[0] += 0.125;
+                amgcl::backend::crs<double> copied(J);
+                std::vector<double> x(40, 1.0), borrowed(40), reference(40);
+                amgcl::backend::spmv(1.0, *view, x, 0.0, borrowed);
+                amgcl::backend::spmv(1.0, copied, x, 0.0, reference);
+                require(borrowed == reference, "borrowed/copied Krylov product differs");
+            }
+        }
+        const MagneticFieldAnalyzer::RowMatrix saved_J = J;
         Eigen::VectorXd b = Eigen::VectorXd::Ones(40), direction;
         for (const char* candidate : {"secant-amg", "tangent-amg", "tangent-ilut"}) {
             environment("OMFDM_TANGENT_PRECONDITIONER",candidate);
             require(a.solveTangentSystem(J,A,b,1e-6,direction), "FGMRES candidate did not solve small system");
             require((J*direction-b).norm()/b.norm() <= 1e-6, "FGMRES returned invalid direction");
+            require((J-saved_J).norm() == 0, "FGMRES mutated borrowed tangent matrix");
         }
         b[3] = std::numeric_limits<double>::quiet_NaN();
         require(!a.solveTangentSystem(J,A,b,1e-6,direction), "nonfinite inner RHS accepted");
