@@ -173,6 +173,13 @@ struct SolverNumericsTest {
                     Eigen::VectorXd b;
                     a.buildRowSystem(A,b,polar);
                     a.buildConsistentTangent(J,x);
+                    MagneticFieldAnalyzer::TangentMaterialWorkspace workspace;
+                    MagneticFieldAnalyzer::RowMatrix cached;
+                    for (int repeat = 0; repeat < 2; ++repeat) {
+                        a.buildConsistentTangent(cached,x,&workspace);
+                        require((cached-J).norm() <= 1e-13*std::max(1.0,J.norm()),
+                                "material workspace changed tangent");
+                    }
                     Eigen::SparseMatrix<double> jc = J;
                     Eigen::SparseLU<Eigen::SparseMatrix<double>> lu;
                     lu.compute(jc);

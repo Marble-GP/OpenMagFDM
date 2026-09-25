@@ -431,7 +431,16 @@ private:
     std::string tangent_pattern_key_;
     double evaluateMuValueDerivative(const MuValue& material, double H);
     double inverseBHDerivative(const BHTable& table, double B) const;
-    void buildConsistentTangent(RowMatrix& J, const Eigen::VectorXd& state);
+    // Lifetime: one NK solve only. Material images/maps are immutable within
+    // that solve; a slide starts a new workspace, even on the same grid.
+    struct TangentMaterialWorkspace {
+        std::string pattern_key;
+        std::vector<const MuValue*> materials;
+        std::vector<const BHTable*> tables;
+        Eigen::VectorXd scaled_b1, scaled_b2;
+    };
+    void buildConsistentTangent(RowMatrix& J, const Eigen::VectorXd& state,
+                                TangentMaterialWorkspace* workspace = nullptr);
     bool solveTangentSystem(const RowMatrix& J, const RowMatrix& secant,
                             const Eigen::VectorXd& rhs, double tolerance,
                             Eigen::VectorXd& direction);

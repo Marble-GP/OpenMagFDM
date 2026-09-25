@@ -13,6 +13,7 @@
  */
 
 #include "MagneticFieldAnalyzer.h"
+#include "SolverExperiments.h"
 #include <iostream>
 #include <algorithm>
 #include <iomanip>
@@ -151,6 +152,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // (matrix assembly + solve + Newton/line-search vectors) is coarse.
     const bool use_coarse = is_polar && coarsening_enabled
                             && n_active_cells > 0 && n_active_cells < nr * ntheta;
+    const auto experiments = omfdm::SolverExperiments::fromEnvironment();
+    TangentMaterialWorkspace tangent_materials;
     const bool horiz = (r_orientation == "horizontal");
 
     // working solve-vector <-> member Az (full). Coarse: restrict/prolong via the
@@ -622,7 +625,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
             if (nonlinear_config.jacobian_tangent && !use_coarse) {
                 bool tangent_ok = false;
                 try {
-                    buildConsistentTangent(tangent_matrix, Az_vec);
+                    buildConsistentTangent(tangent_matrix, Az_vec,
+                        experiments.materialCache() ? &tangent_materials : nullptr);
                     nkp_t_jc = nkprof_now();
                     tangent_ok = solveTangentSystem(tangent_matrix, A_matrix,
                                                     -residual_coarse, inner_tol, delta_A);

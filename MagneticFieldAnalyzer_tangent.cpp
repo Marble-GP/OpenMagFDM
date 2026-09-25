@@ -12,7 +12,8 @@
 #include <limits>
 #include <sstream>
 
-void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::VectorXd& state) {
+void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::VectorXd& state,
+                                                  TangentMaterialWorkspace* workspace) {
     const auto prepare_start = omfdm::ProfileClock::now();
     using D = omfdm::SparseDifferential;
     const bool polar = coordinate_system == "polar";
@@ -23,31 +24,73 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
     // Matching B/H/mu must already have been evaluated by the NK caller.
     // Only the scalar chain derivative is stored; no dense AD tape or fixed
     // multi-million-triplet reservation survives an iteration.
-    Eigen::VectorXd dmu_dB = Eigen::VectorXd::Zero(n);
+    Eigen::VectorXd dmu_dB;
     cv::Mat material_image;
-    cv::flip(image, material_image, 0);
+    const bool resolve = workspace && (workspace->materials.size() != static_cast<size_t>(n)
+                                       || workspace->pattern_key != stencil_pattern_key_);
+    if (!workspace || resolve) cv::flip(image, material_image, 0);
+    if (resolve) {
+        workspace->materials.assign(n, nullptr);
+        workspace->tables.assign(n, nullptr);
+        workspace->pattern_key = stencil_pattern_key_;
+        #pragma omp parallel for schedule(static)
+        for (int k = 0; k < n; ++k) {
+            const int i = polar ? k / ntheta : k % nx;
+            const int j = polar ? k % ntheta : k / nx;
+            const int row = polar && !horizontal ? i : j;
+            const int col = polar && !horizontal ? j : i;
+            const auto pixel = material_image.at<cv::Vec3b>(row, col);
+            const auto found = rgb_to_material.find((pixel[0] << 16) | (pixel[1] << 8) | pixel[2]);
+            if (found == rgb_to_material.end()) continue;
+            const auto material = material_mu.find(found->second.name);
+            if (material == material_mu.end() || material->second.type == MuType::STATIC) continue;
+            workspace->materials[k] = &material->second;
+            const auto table = material_bh_tables.find(found->second.name);
+            if (table != material_bh_tables.end()) workspace->tables[k] = &table->second;
+        }
+    }
+    if (workspace) {
+        workspace->scaled_b1.setZero(n);
+        workspace->scaled_b2.setZero(n);
+    } else dmu_dB.setZero(n);
     #pragma omp parallel for schedule(static)
     for (int k = 0; k < n; ++k) {
         const int i = polar ? k / ntheta : k % nx;
         const int j = polar ? k % ntheta : k / nx;
         const int row = polar && !horizontal ? i : j;
         const int col = polar && !horizontal ? j : i;
-        const auto pixel = material_image.at<cv::Vec3b>(row, col);
-        const int rgb = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
-        const auto found = rgb_to_material.find(rgb);
-        if (found == rgb_to_material.end()) continue;
-        const auto material = material_mu.find(found->second.name);
-        if (material == material_mu.end() || material->second.type == MuType::STATIC) continue;
-        const auto table = material_bh_tables.find(found->second.name);
+        const MuValue* material = nullptr;
+        const BHTable* table = nullptr;
+        if (workspace) {
+            material = workspace->materials[k];
+            table = workspace->tables[k];
+        } else {
+            const auto pixel = material_image.at<cv::Vec3b>(row, col);
+            const int rgb = (pixel[0] << 16) | (pixel[1] << 8) | pixel[2];
+            const auto found = rgb_to_material.find(rgb);
+            if (found == rgb_to_material.end()) continue;
+            const auto m = material_mu.find(found->second.name);
+            if (m == material_mu.end() || m->second.type == MuType::STATIC) continue;
+            material = &m->second;
+            const auto t = material_bh_tables.find(found->second.name);
+            if (t != material_bh_tables.end()) table = &t->second;
+        }
+        if (!material) continue;
         const double b1 = polar ? Br(row, col) : Bx(row, col);
         const double b2 = polar ? Btheta(row, col) : By(row, col);
         const double B = std::sqrt(b1*b1 + b2*b2);
         const double mu = mu_map(row, col);
-        const double dH = table != material_bh_tables.end() && table->second.is_valid
-            ? inverseBHDerivative(table->second, B) : (mu > 1e-20 ? 1.0 / mu : 0.0);
-        dmu_dB[k] = mu0 * evaluateMuValueDerivative(material->second, H_map(row, col)) * dH;
+        const double dH = table && table->is_valid
+            ? inverseBHDerivative(*table, B) : (mu > 1e-20 ? 1.0 / mu : 0.0);
+        const double derivative = mu0 * evaluateMuValueDerivative(*material, H_map(row, col)) * dH;
+        if (workspace) {
+            const double scale = B > 0 ? derivative / B : 0.0;
+            workspace->scaled_b1[k] = scale * b1;
+            workspace->scaled_b2[k] = scale * b2;
+        } else dmu_dB[k] = derivative;
     }
-    if (!dmu_dB.allFinite()) throw std::runtime_error("nonfinite material derivative in tangent");
+    if (workspace ? (!workspace->scaled_b1.allFinite() || !workspace->scaled_b2.allFinite()) : !dmu_dB.allFinite())
+        throw std::runtime_error("nonfinite material derivative in tangent");
     const auto rows_start = omfdm::ProfileClock::now();
     linear_profile_.material_prepare_ms += omfdm::milliseconds(prepare_start, rows_start);
     const bool theta_periodic = bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic";
@@ -59,10 +102,16 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
         const int row = polar && !horizontal ? i : j;
         const int col = polar && !horizontal ? j : i;
         D m(mu_map(row, col));
-        const double b1 = polar ? Br(row, col) : Bx(row, col);
-        const double b2 = polar ? Btheta(row, col) : By(row, col);
-        const double B = std::sqrt(b1*b1 + b2*b2);
-        const double scale = B > 0 ? dmu_dB[k] / B : 0.0;
+        double g1, g2;
+        if (workspace) {
+            g1 = workspace->scaled_b1[k]; g2 = workspace->scaled_b2[k];
+        } else {
+            const double b1 = polar ? Br(row, col) : Bx(row, col);
+            const double b2 = polar ? Btheta(row, col) : By(row, col);
+            const double B = std::sqrt(b1*b1 + b2*b2);
+            const double scale = B > 0 ? dmu_dB[k] / B : 0.0;
+            g1 = scale*b1; g2 = scale*b2;
+        }
         // Keep zero derivatives structurally: saturation, B=0, a sliding
         // material interface or a clamp must not change the cached graph.
         if (polar) {
@@ -75,21 +124,21 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
             } else if (j == 0) { prev = 0; next = 1; dt = dtheta; }
             else if (j == ntheta-1) { prev = j-1; next = j; dt = dtheta; }
             const double safe_r = std::max(r_coords[i], 0.5*dr);
-            m.add(i*ntheta+next, scale*b1*sn/(safe_r*dt));
-            m.add(i*ntheta+prev, -scale*b1*sp/(safe_r*dt));
+            m.add(i*ntheta+next, g1*sn/(safe_r*dt));
+            m.add(i*ntheta+prev, -g1*sp/(safe_r*dt));
             const int lo = std::max(0, i-1), hi = std::min(nr-1, i+1);
             const double rd = (i == 0 || i == nr-1) ? dr : 2*dr;
-            m.add(hi*ntheta+j, -scale*b2/rd);
-            m.add(lo*ntheta+j, scale*b2/rd);
+            m.add(hi*ntheta+j, -g2/rd);
+            m.add(lo*ntheta+j, g2/rd);
         } else {
             int lo = std::max(0, j-1), hi = std::min(ny-1, j+1);
             double yd = (j == 0 || j == ny-1) && !yp ? dy : 2*dy;
             if (yp) { lo = (j-1+ny)%ny; hi = (j+1)%ny; }
-            m.add(hi*nx+i, scale*b1/yd); m.add(lo*nx+i, -scale*b1/yd);
+            m.add(hi*nx+i, g1/yd); m.add(lo*nx+i, -g1/yd);
             lo = std::max(0, i-1); hi = std::min(nx-1, i+1);
             double xd = (i == 0 || i == nx-1) && !xp ? dx : 2*dx;
             if (xp) { lo = (i-1+nx)%nx; hi = (i+1)%nx; }
-            m.add(j*nx+hi, -scale*b2/xd); m.add(j*nx+lo, scale*b2/xd);
+            m.add(j*nx+hi, -g2/xd); m.add(j*nx+lo, g2/xd);
         }
         return m;
     };
