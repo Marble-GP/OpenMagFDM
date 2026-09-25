@@ -1,5 +1,6 @@
 #include "MagneticFieldAnalyzer.h"
 #include "PolarGridAccess.h"
+#include "TangentKrylovWorkspace.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -444,6 +445,27 @@ struct SolverNumericsTest {
         }
         b[3] = std::numeric_limits<double>::quiet_NaN();
         require(!a.solveTangentSystem(J,A,b,1e-6,direction), "nonfinite inner RHS accepted");
+        environment("OMFDM_TANGENT_PRECONDITIONER","tangent-amg");
+        omfdm::TangentKrylovWorkspace work;
+        for (int repeat = 0; repeat < 6; ++repeat) {
+            b = repeat == 1 ? Eigen::VectorXd::Zero(40).eval() : Eigen::VectorXd::Constant(40,1.0+repeat).eval();
+            J.coeffRef(0,0) += 0.1;
+            const double tol = repeat % 2 ? 1e-8 : 1e-4;
+            Eigen::VectorXd fresh;
+            const auto allocations = a.linear_profile_.workspace_allocations;
+            require(a.solveTangentSystem(J,A,b,tol,direction,&work), "reused FGMRES failed");
+            require(a.linear_profile_.workspace_allocations == allocations + (repeat == 0), "workspace not reused");
+            require(a.solveTangentSystem(J,A,b,tol,fresh), "fresh FGMRES failed");
+            require((direction-fresh).norm() < 1e-13*std::max(1.0,fresh.norm()), "FGMRES storage leaked history");
+        }
+        b[3] = std::numeric_limits<double>::quiet_NaN();
+        require(!a.solveTangentSystem(J,A,b,1e-6,direction,&work) && !work.solver && work.x.capacity() == 0,
+                "failed FGMRES retained storage");
+        b.setOnes();
+        require(a.solveTangentSystem(J,A,b,1e-6,direction,&work), "FGMRES did not recover after invalid RHS");
+        require(work.prepare(41,1e-4) && work.x.size() == 41, "FGMRES size change not rebuilt");
+        work.clear();
+        require(!work.solver && work.b.capacity() == 0 && work.x.capacity() == 0, "workspace not released");
         environment("OMFDM_TANGENT_PRECONDITIONER","");
         std::cout << "FGMRES A/B/C and nonfinite rejection passed\n";
     }

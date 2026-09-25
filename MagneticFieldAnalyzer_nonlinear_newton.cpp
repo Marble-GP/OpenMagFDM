@@ -14,6 +14,7 @@
 
 #include "MagneticFieldAnalyzer.h"
 #include "SolverExperiments.h"
+#include "TangentKrylovWorkspace.h"
 #include <iostream>
 #include <algorithm>
 #include <iomanip>
@@ -154,6 +155,7 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                             && n_active_cells > 0 && n_active_cells < nr * ntheta;
     const auto experiments = omfdm::SolverExperiments::fromEnvironment();
     TangentMaterialWorkspace tangent_materials;
+    omfdm::TangentKrylovWorkspace tangent_krylov;
     const bool horiz = (r_orientation == "horizontal");
 
     // working solve-vector <-> member Az (full). Coarse: restrict/prolong via the
@@ -634,11 +636,15 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
                         experiments.materialCache() ? &tangent_materials : nullptr);
                     nkp_t_jc = nkprof_now();
                     tangent_ok = solveTangentSystem(tangent_matrix, A_matrix,
-                                                    -residual_coarse, inner_tol, delta_A);
+                        -residual_coarse, inner_tol, delta_A,
+                        experiments.krylovWorkspace() ? &tangent_krylov : nullptr);
                 } catch (const std::runtime_error& e) {
                     if (VERBOSE) std::cout << " [tangent rejected: " << e.what() << "]";
                 }
                 if (!tangent_ok) {
+                    // Also covers tangent assembly exceptions before inner solve.
+                    // Do not overlap retained Krylov storage with secant AMG.
+                    tangent_krylov.clear();
                     ++linear_profile_.fallbacks;
                     if (lazy_fallback) buildSecantDirectionMatrix();
                     if (VERBOSE) std::cout << " [one secant fallback]";

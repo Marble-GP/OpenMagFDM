@@ -1,6 +1,7 @@
 #include "MagneticFieldAnalyzer.h"
 #include "PolarGridAccess.h"
 #include "SparseDifferential.h"
+#include "TangentKrylovWorkspace.h"
 #include "MagneticFieldAnalyzer_stencil.inl"
 #include <amgcl/adapter/eigen.hpp>
 #include <amgcl/adapter/zero_copy.hpp>
@@ -176,18 +177,20 @@ void MagneticFieldAnalyzer::buildConsistentTangent(RowMatrix& J, const Eigen::Ve
 }
 
 bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatrix& secant,
-    const Eigen::VectorXd& rhs, double tolerance, Eigen::VectorXd& direction) {
+    const Eigen::VectorXd& rhs, double tolerance, Eigen::VectorXd& direction,
+    omfdm::TangentKrylovWorkspace* workspace) {
     using Backend = amgcl::backend::builtin<double>;
     using AMG = amgcl::amg<Backend, amgcl::coarsening::smoothed_aggregation, amgcl::relaxation::spai0>;
     using ILUT = amgcl::relaxation::as_preconditioner<Backend, amgcl::relaxation::ilut>;
-    using Solver = amgcl::solver::fgmres<Backend>;
     const char* env = std::getenv("OMFDM_TANGENT_PRECONDITIONER");
     const std::string candidate = env ? env : "secant-amg";
     if (candidate != "secant-amg" && candidate != "tangent-amg" && candidate != "tangent-ilut")
         throw std::invalid_argument("OMFDM_TANGENT_PRECONDITIONER must be secant-amg, tangent-amg or tangent-ilut");
     const double tol = tolerance > 0 ? tolerance : SOLVER_TOLERANCE;
-    if (!rhs.allFinite() || !Eigen::Map<const Eigen::VectorXd>(J.valuePtr(), J.nonZeros()).allFinite())
+    if (!rhs.allFinite() || !Eigen::Map<const Eigen::VectorXd>(J.valuePtr(), J.nonZeros()).allFinite()) {
+        if (workspace) workspace->clear();
         return false;
+    }
     const auto conversion_start = omfdm::ProfileClock::now();
     // Read-only borrowed CRS for Krylov products. J remains compressed and
     // alive for this whole solve; preconditioner construction still owns its
@@ -195,15 +198,19 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
     // to apply J (about 275 MiB on the primary grid).
     const auto operator_matrix = amgcl::adapter::zero_copy_direct(
         J.rows(), J.cols(), J.outerIndexPtr(), J.innerIndexPtr(), J.valuePtr());
-    std::vector<double> b(rhs.data(), rhs.data() + rhs.size()), x(rhs.size(), 0.0);
     const auto setup_start = omfdm::ProfileClock::now();
     linear_profile_.conversion_ms += omfdm::milliseconds(conversion_start, setup_start);
-    Solver::params params;
-    params.M = 20; params.maxiter = 100; params.tol = tol;
-    Solver solver(rhs.size(), params);
+    omfdm::TangentKrylovWorkspace local;
+    auto& work = workspace ? *workspace : local;
+    const bool allocated = work.prepare(rhs.size(), tol);
+    std::copy(rhs.data(), rhs.data() + rhs.size(), work.b.begin());
+    auto& solver = *work.solver;
+    auto& b = work.b;
+    auto& x = work.x;
     const auto preconditioner_start = omfdm::ProfileClock::now();
     linear_profile_.workspace_ms += omfdm::milliseconds(setup_start, preconditioner_start);
-    ++linear_profile_.workspace_allocations;
+    if (allocated) ++linear_profile_.workspace_allocations;
+    else ++linear_profile_.workspace_reuses;
     size_t iterations = 0;
     double reported = std::numeric_limits<double>::infinity();
     auto apply = [&](const auto& P) {
@@ -224,6 +231,7 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
         }
     } catch (const std::runtime_error& e) {
         if (nonlinear_config.verbose) std::cout << " [tangent setup/solve rejected: " << e.what() << "]";
+        work.clear();
         return false;
     }
     linear_profile_.iterations += iterations; ++linear_profile_.solves;
@@ -231,7 +239,7 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
     direction = Eigen::Map<Eigen::VectorXd>(x.data(), static_cast<Eigen::Index>(x.size()));
     const double true_error = (J * direction - rhs).norm() / std::max(rhs.norm(), 1e-30);
     const bool accepted = direction.allFinite() && std::isfinite(reported) && std::isfinite(true_error)
-                       && iterations < params.maxiter && reported <= tol && true_error <= tol;
+                       && iterations < 100 && reported <= tol && true_error <= tol;
     if (nonlinear_config.verbose || omfdm::profilingEnabled()) {
         std::ostringstream s;
         s << "\n[TANGENT] candidate=" << candidate << " iterations=" << iterations
@@ -239,5 +247,6 @@ bool MagneticFieldAnalyzer::solveTangentSystem(const RowMatrix& J, const RowMatr
           << " accepted=" << accepted << '\n';
         std::cout << s.str();
     }
+    if (!accepted) work.clear();
     return accepted;
 }

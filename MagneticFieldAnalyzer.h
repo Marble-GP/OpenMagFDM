@@ -42,6 +42,7 @@
 
 #define SOLVER_TOLERANCE (1e-6)
 #define SOLVER_MAX_ITERATIONS (5000)
+namespace omfdm { struct TangentKrylovWorkspace; }
 
 /**
  * @brief 2D Magnetic Field Analyzer using Finite Difference Method
@@ -443,7 +444,8 @@ private:
                                 TangentMaterialWorkspace* workspace = nullptr);
     bool solveTangentSystem(const RowMatrix& J, const RowMatrix& secant,
                             const Eigen::VectorXd& rhs, double tolerance,
-                            Eigen::VectorXd& direction);
+                            Eigen::VectorXd& direction,
+                            omfdm::TangentKrylovWorkspace* workspace = nullptr);
     template<class Scalar, class MuAccessor>
     omfdm::StencilRow<Scalar> cartesianRow(int k, const MuAccessor& mu) const;
     template<class Scalar, class MuAccessor>
