@@ -158,9 +158,70 @@ from scheduling/load variation before deciding whether to retain it.
 Non-solver activity was significant and variable: sampled processes included
 Docker, another Python process and Task Manager. None was stopped. These are
 diagnostic runs: **no wall-time speedup or adoption is established**. The next
-bounded screen is 12 steps for immutable baseline, masks 1, 6 and 7, in that
-order. Priority 4's large-case evaluation follows selection from that screen.
+bounded screen at that checkpoint was 12 steps for immutable baseline, masks
+1, 6 and 7, in that order. Its results and the subsequent retest follow below.
 
-Still pending: sweep timings, repeated controlled medians with secant controls,
-priority 4 large-case comparison, secondary cases, periodic waveform and
-long-run memory gates. No optimization has passed the adoption protocol.
+## September 26 sweep and October 8–9 idle retest
+
+The first 12-step screen (`../bench_results/workspace_sweep_20260926/`)
+measured baseline / mask 1 / mask 6 / mask 7 at 563.739 / 660.341 / 649.574 /
+639.169 seconds. All cases converged in 353 outer iterations, with identical
+Az and mu TIFF hashes. Estimated other busy cores increased from 2.82 to
+3.86 / 4.19 / 4.87, so this was diagnostic, not an adoption comparison.
+
+The user then made the Windows machine idle. Evidence is preserved in
+`../bench_results/workspace_idle_retest_20261008_01/`: original and resume
+manifests, archived runner sources, per-run measurements/logs, and final
+`summary.json`. No unrelated processes were stopped and the Balanced power
+plan was unchanged. Conditions: IEEJ-D, 12 steps, 12 threads, chunk 1,
+tolerance 1e-3, maximum 300 outer iterations, tangent-AMG and energy merit.
+Wall time includes process initialization and output completion.
+
+| Case | Cycle 1 seconds | Cycle 2 seconds | Cycle 3 seconds | Median seconds | Median peak private MiB |
+|---|---:|---:|---:|---:|---:|
+| Original tangent (`6e6f644`) | 532.838 | 551.928 | 557.293 | 551.928 | 1844.188 |
+| Instrumented, mask 0 | 549.683 | 563.602 | 565.751 | 563.602 | 1845.957 |
+| Priorities 2+3, mask 6 | 543.188 | 536.334 | 497.645 | 536.334 | 1761.988 |
+
+Orders were original/off/opt23, off/opt23/original, opt23/original/off.
+The user interrupted the first cycle-3 opt23 attempt after 121.440 seconds
+and 3 completed steps. That attempt remains unchanged and is excluded.
+Cycle 3 uses `3_opt23_retry1`, followed by the remaining two runs. Resumption
+could introduce thermal/frequency effects; these were not measured.
+
+All nine accepted runs converged: 108/108 steps, 353 outer iterations per run.
+Per-iteration residuals, inner counts, line-search trials/outcomes and step
+status match at log precision. All 12 Az and 12 mu TIFFs of each run have
+identical SHA256 hashes to their corresponding first-baseline files.
+This short-sweep equivalence is not a full-revolution EMF quality pass.
+
+Mask 6 reduces median wall time by **4.84% versus mask 0**, or **2.83% versus
+the original tangent**, and median private peak by **83.97 MiB versus mask 0**.
+Paired reductions versus mask 0 are 1.18%, 4.84%, and 12.04%; the last includes
+the interruption/resumption. Do not advertise a stable 12% improvement.
+Estimated other busy cores ranged from 0.57 to 1.06. The instrumented OFF
+median is itself 2.12% slower than original; its cause is not isolated.
+
+Work counters support the intended mechanism: every OFF run allocates FGMRES
+storage 341 times; mask 6 allocates 27 times and reuses it 314 times. All runs
+use 16 secant fallbacks. Fallback construction drops from 8.04–8.22 to
+0.328–0.344 seconds; workspace allocation/reset drops from 8.58–8.73 to
+1.046–1.084 seconds. AMG numerical hierarchies are still rebuilt each iteration.
+
+Executable SHA256 identities (the binaries were preserved, not rebuilt):
+
+- Original: `c83fd924d7e8cb7eef114f6f1b4740037f73388c4ab8d8afe72ea5349b4b03ec`
+- Trial, core checkpoint `ca1027a`: `034c389d315326835aefc2f578fd656043177e5ba906964bf1fcd7221b9ce6a0`
+
+Decision: retain priorities 2+3 as the research candidate; keep priority 1
+off. Next compare masks **6 and 14**, isolating priority 4 (accepted B/H/mu
+reuse), with the same trial executable and inputs in three paired cycles.
+Priority 4 already exists in commit `f5dbb90`; this is its large-case evaluation,
+not a change to material laws or acceptance criteria. Require actual field
+reuse, identical numerical histories/fields, and measure allocation/memory
+and total time. Stop for review on failed convergence or equivalence.
+
+Still pending: priority 4 large-case results, same-session secant controls,
+4-thread/35H300 checks, full periodic waveform and long-run memory gates.
+Neither the >=15% secant speed gate nor the full adoption protocol is passed.
+No defaults, public YAML, release settings, tags or main-branch changes.
