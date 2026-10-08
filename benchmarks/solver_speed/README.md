@@ -64,6 +64,33 @@ energy-merit comparison. The secant control retains the source YAML's settings;
 only the tangent candidate's merit changes. Manifest/resume checks include the
 candidate list and merit. The default list remains A/B/C with residual merit.
 
+## Priority-4 paired screen
+
+`run_field_reuse_pairs.py` uses the completed idle retest's manifest to pin
+the trial executable, DLLs, configuration and image. It compares masks 6
+(priorities 2+3) and 14 (2+3+4), with priority 1 off, in AB/BA/AB order.
+No rebuild, solver/default changes or simultaneous children are involved.
+
+```text
+python benchmarks/solver_speed/run_field_reuse_pairs.py --prior-manifest ../bench_results/workspace_idle_retest_20261008_01/manifest.json --output ../bench_results/workspace_field_reuse_20261009_01 --prepare-only
+python benchmarks/solver_speed/run_field_reuse_pairs.py --prior-manifest ../bench_results/workspace_idle_retest_20261008_01/manifest.json --output ../bench_results/workspace_field_reuse_20261009_01 --resume
+python -m unittest discover -s benchmarks/solver_speed -p test_field_reuse_pairs.py
+```
+
+The first command validates/records without starting computation. Progress is
+printed at each step or once per minute and saved in `progress.json`. Each run
+has a 7200-second and 8-GiB guard; these kill only the runner's solver child.
+The final summary excludes unconverged or inequivalent results. Each candidate
+must actually reuse fields; iteration/status histories and all 12 Az/mu TIFF
+hashes must match the first reference. A difference stops further launches for
+review (it is not silently treated as a speed improvement).
+
+Resume pins the harness, engine and power-plan GUID too. Completed results are
+reverified; incomplete directories are preserved and require manual review,
+not automatic retries. Do not modify the experiment while it is running.
+Raw process logs and measurement JSON retain profiling, memory samples and
+estimated non-solver CPU load. Peak private memory is not OS pool usage.
+
 ## Full-revolution waveform gate
 
 Only eligible, strictly converged candidates advance to 248 steps. Configure

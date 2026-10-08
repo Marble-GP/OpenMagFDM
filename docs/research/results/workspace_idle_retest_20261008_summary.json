@@ -1,0 +1,148 @@
+{
+  "complete": true,
+  "completed_runs": 9,
+  "selected_attempts": 9,
+  "runs": [
+    {
+      "converged": true,
+      "wall_seconds": 532.837965000188,
+      "peak_rss_bytes": 1938321408,
+      "peak_private_bytes": 1935294464,
+      "estimated_other_busy_cores": 0.9009833317850788,
+      "termination_reason": null,
+      "cycle": 1,
+      "case": "original",
+      "result_directory": "1_original",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 1.4424830655812055
+    },
+    {
+      "converged": true,
+      "wall_seconds": 549.6833826000802,
+      "peak_rss_bytes": 1938919424,
+      "peak_private_bytes": 1936044032,
+      "estimated_other_busy_cores": 1.0008318286752915,
+      "termination_reason": null,
+      "cycle": 1,
+      "case": "off",
+      "result_directory": "1_off",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 0.5362584149721085
+    },
+    {
+      "converged": true,
+      "wall_seconds": 543.1876936000772,
+      "peak_rss_bytes": 1850372096,
+      "peak_private_bytes": 1846919168,
+      "estimated_other_busy_cores": 0.8091701177602162,
+      "termination_reason": null,
+      "cycle": 1,
+      "case": "opt23",
+      "result_directory": "1_opt23",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 0.4738310781056538
+    },
+    {
+      "converged": true,
+      "wall_seconds": 563.6024815000128,
+      "peak_rss_bytes": 1939169280,
+      "peak_private_bytes": 1935626240,
+      "estimated_other_busy_cores": 0.7921418724336418,
+      "termination_reason": null,
+      "cycle": 2,
+      "case": "off",
+      "result_directory": "2_off",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 0.5778420500076215
+    },
+    {
+      "converged": true,
+      "wall_seconds": 536.3338035000488,
+      "peak_rss_bytes": 1850793984,
+      "peak_private_bytes": 1847578624,
+      "estimated_other_busy_cores": 0.5884278558251074,
+      "termination_reason": null,
+      "cycle": 2,
+      "case": "opt23",
+      "result_directory": "2_opt23",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 0.8591293749416942
+    },
+    {
+      "converged": true,
+      "wall_seconds": 551.9279495999217,
+      "peak_rss_bytes": 1935994880,
+      "peak_private_bytes": 1932779520,
+      "estimated_other_busy_cores": 0.5745201891476107,
+      "termination_reason": null,
+      "cycle": 2,
+      "case": "original",
+      "result_directory": "2_original",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 0.5675611080061321
+    },
+    {
+      "converged": true,
+      "wall_seconds": 497.644955500029,
+      "peak_rss_bytes": 1853476864,
+      "peak_private_bytes": 1850101760,
+      "estimated_other_busy_cores": 1.055502761940976,
+      "termination_reason": null,
+      "cycle": 3,
+      "case": "opt23",
+      "result_directory": "3_opt23_retry1",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 1.9316975397195828
+    },
+    {
+      "converged": true,
+      "wall_seconds": 557.2926525999792,
+      "peak_rss_bytes": 1936740352,
+      "peak_private_bytes": 1933770752,
+      "estimated_other_busy_cores": 0.7453164384384363,
+      "termination_reason": null,
+      "cycle": 3,
+      "case": "original",
+      "result_directory": "3_original",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 0.5934709697494779
+    },
+    {
+      "converged": true,
+      "wall_seconds": 565.7513250000775,
+      "peak_rss_bytes": 1935339520,
+      "peak_private_bytes": 1932800000,
+      "estimated_other_busy_cores": 0.720087796530766,
+      "termination_reason": null,
+      "cycle": 3,
+      "case": "off",
+      "result_directory": "3_off",
+      "history_matches_first_baseline": true,
+      "outer_iterations": 353,
+      "pre_run_busy_cores": 0.5414984591962643
+    }
+  ],
+  "excluded_attempts": [
+    {
+      "path": "3_opt23",
+      "reason": "interrupted or nonconverged; retained unchanged"
+    }
+  ],
+  "median_wall_seconds": {
+    "original": 551.9279495999217,
+    "off": 563.6024815000128,
+    "opt23": 536.3338035000488
+  },
+  "numerical_history_gate_passed": true,
+  "speed_reduction_opt23_vs_off": 0.048382821039732016,
+  "speed_reduction_opt23_vs_original": 0.028253952551554384,
+  "note": "Interrupted/nonconverged/history-mismatched attempts excluded from medians. Round 3 resumed after a user interruption; review load and thermal/order effects. No automatic adoption."
+}

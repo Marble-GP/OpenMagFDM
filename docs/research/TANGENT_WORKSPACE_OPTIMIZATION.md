@@ -177,6 +177,9 @@ plan was unchanged. Conditions: IEEJ-D, 12 steps, 12 threads, chunk 1,
 tolerance 1e-3, maximum 300 outer iterations, tangent-AMG and energy merit.
 Wall time includes process initialization and output completion.
 
+The compact final aggregate is also versioned in
+[`results/workspace_idle_retest_20261008_summary.json`](results/workspace_idle_retest_20261008_summary.json).
+
 | Case | Cycle 1 seconds | Cycle 2 seconds | Cycle 3 seconds | Median seconds | Median peak private MiB |
 |---|---:|---:|---:|---:|---:|
 | Original tangent (`6e6f644`) | 532.838 | 551.928 | 557.293 | 551.928 | 1844.188 |
