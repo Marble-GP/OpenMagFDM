@@ -93,6 +93,27 @@ estimated non-solver CPU load. Peak private memory is not OS pool usage.
 
 ## Full-revolution waveform gate
 
+`run_selection_sweep.py` automates the selected mask-6 tangent candidate versus
+optimized secant (mask 0), three 12-step pairs in AB/BA/AB order. Priority 4 is
+rejected and always OFF. It pins the preserved executable/DLLs/image using the
+idle-retest manifest; generated configurations, harness hashes and power-plan
+GUID are saved for strict resume validation.
+
+```text
+python benchmarks/solver_speed/run_selection_sweep.py --prior-manifest ../bench_results/workspace_idle_retest_20261008_01/manifest.json --output ../bench_results/selected_secant_20261009_01 --run-waveforms --prepare-only
+python benchmarks/solver_speed/run_selection_sweep.py --prior-manifest ../bench_results/workspace_idle_retest_20261008_01/manifest.json --output ../bench_results/selected_secant_20261009_01 --run-waveforms --resume
+python -m unittest discover -s benchmarks/solver_speed -p test_selection_sweep.py
+```
+
+The waveform stage only starts after all timing runs converge with repeatable
+within-method histories, >=15% median reduction, shortening in every pair,
+and paired peak-memory limits. It runs 248 steps for each method sequentially
+and calls the existing comparator below. Expect hours for the full stage;
+`progress.json` and launcher output identify the method and current step.
+Timeouts are bounded at 600 seconds per configured step, memory at 8 GiB.
+Failed/incomplete attempts stop for review and are preserved, never overwritten.
+No performance claims are made from unfinished or unconverged runs.
+
 Only eligible, strictly converged candidates advance to 248 steps. Configure
 both runs for the same complete revolution before using this command:
 

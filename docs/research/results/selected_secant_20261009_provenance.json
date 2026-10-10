@@ -1,0 +1,89 @@
+{
+  "evidence_directory": "../bench_results/selected_secant_20261009_01",
+  "experiment_timestamp": "2026-10-09T09:37:59+0900",
+  "binary_core_checkpoint": "ca1027a; preserved executable",
+  "protocol": {
+    "binary_sha256": "034c389d315326835aefc2f578fd656043177e5ba906964bf1fcd7221b9ce6a0",
+    "dll_sha256": {
+      "jpeg62.dll": "efe3d322093e6cb1c9fec55038df326e8377dd4998a9cb08b2bf4b959e68bdf4",
+      "liblzma.dll": "31544da72a5481922aca4f3c48654559c4243153864669e53ec1f40efce0e98e",
+      "libpng16.dll": "80cd3c320380a75498c20ea62037e9e988abc0d7cde8cd502e6ec7cb50a8b0e0",
+      "libsharpyuv.dll": "2d11d1ecc3bc0a5c1f0bbf9f1b7ca817425ad67313a72898a575d09f3cbd91c9",
+      "libwebp.dll": "538a320e83f819159c61b1f7845151ac1d937bdf75ee65c7ed6c4c996457c506",
+      "libwebpdecoder.dll": "06f8db9b6aab1fdd12e6b8f476f41c5dc26aba2a69aabf63c537ed9b824a9695",
+      "libwebpdemux.dll": "5f473c084654b5e9126bb4ec0243fe83fbbb2ac4a8a059358f93a52558d0b099",
+      "libwebpmux.dll": "0ff043037b0ef61bcf5d4eb142a9f4e46a8cc3ff24d42e609ba1c493fb2449f1",
+      "opencv_core4.dll": "e8c1b123611002c8761ec01f759e77e75813c49f283e15554bad96c918f7b656",
+      "opencv_imgcodecs4.dll": "5d8379bf11002d6777df6f04c186eec43bfd2271a23c345e9c57741d144086fb",
+      "opencv_imgproc4.dll": "48192d2b85c312e5074752dc95a9f7087d0b04e8f49000bd5b0c156b54a5787c",
+      "tiff.dll": "21792472d65dbfb4953554dd293881e02110fea015d0272c8d626d5afce8673b",
+      "yaml-cpp.dll": "0a2b1b0ef955bfef528e6db8387fb58816fba4327a6bc838efb61eb33c65f94b",
+      "zlib1.dll": "5f2b1e2010c47b57bbf7ccbf5df397a7d2fd374cf75ec546c8453267b0eff6a0"
+    },
+    "image_sha256": "d5c1d8c34038ff710e30d25274958f26260d043534acbc3625f8ce2096daa011",
+    "prior_manifest_sha256": "31f0ca8847f3fd95addb6ada2b519cbaeb8e85f955eeec802e100a5703f62ae6",
+    "scripts": {
+      "run_selection_sweep.py": "393ff090bcfcb942b2e387520a9c268d80ed0319091d53a9fd56ff5bf474b65a",
+      "run_comparison.py": "d5f31438b09cc8e5bf07485b764aa67598585cf322d05d9f525a318c14c3c321",
+      "run_field_reuse_pairs.py": "82425c0d8e65b4b8fc3c455cfba5f28bb9d0790076f2def5c417757b3de37752",
+      "compare_waveforms.py": "57e49917f846d27afff005b87936b46ce37b55804b14f5d7a820014fb66bac73"
+    },
+    "configs": {
+      "secant_12.yaml": "coordinate_system: polar\npolar_domain:\n  r_start: 0.0050633\n  r_end: 0.1\n  r_orientation: horizontal\n  theta_range: 2*pi\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0\n  outer:\n    type: dirichlet\n    value: 0\n  theta_min:\n    type: periodic\n    value: 1\n  theta_max:\n    type: periodic\n    value: 1\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 12\n  parallel_chunks: 1\n  slide_direction: vertical\n  slide_region_start: 0\n  slide_region_end: 212\n  slide_pixels_per_step: 12\nmaterial_presets:\n  pure_iron_model:\n    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))\n  NdFeB_N40:\n    mu_r: 1.05\n    magnetization:\n      Br: 1.27\n      pattern: parallel\n      angle: 0\nmaterials:\n  material_92989e:\n    rgb:\n    - 146\n    - 152\n    - 158\n    preset: pure_iron_model\n  material_f7f7f7:\n    rgb:\n    - 247\n    - 247\n    - 247\n    mu_r: 1\n    jz: 0\n  material_d072a7:\n    rgb:\n    - 208\n    - 114\n    - 167\n    preset: NdFeB_N40\n    magnetization:\n      pattern: parallel_array\n      p: 4\n      angle: 0\n      cx: 0\n      cy: 0\n      direction: outward\n      orientation_offset: -45\n  material_000000:\n    rgb:\n    - 0\n    - 0\n    - 0\n    mu_r: 1\n    jz: 0\n  coil_C_neg_253f70:\n    rgb:\n    - 37\n    - 63\n    - 112\n    mu_r: 1\n    jz: 0\n  coil_C_pos_3a6ccf:\n    rgb:\n    - 58\n    - 108\n    - 207\n    mu_r: 1\n    jz: 0\n  coil_B_pos_3ad052:\n    rgb:\n    - 58\n    - 208\n    - 82\n    mu_r: 1\n    jz: 0\n  coil_B_neg_257030:\n    rgb:\n    - 37\n    - 112\n    - 48\n    mu_r: 1\n    jz: 0\n  coil_A_pos_d0533a:\n    rgb:\n    - 208\n    - 83\n    - 58\n    mu_r: 1\n    jz: 0\n  coil_A_neg_703025:\n    rgb:\n    - 112\n    - 48\n    - 37\n    mu_r: 1\n    jz: 0\nflux_linkage:\n- name: Phi_Coil_A\n  material_a: coil_A_pos_d0533a\n  material_b: coil_A_neg_703025\n- name: Phi_Coil_B\n  material_a: coil_B_pos_3ad052\n  material_b: coil_B_neg_257030\n- name: Phi_Coil_C\n  material_a: coil_C_pos_3a6ccf\n  material_b: coil_C_neg_253f70\nnonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  verbose: true\n  tolerance: 0.001\n  max_iterations: 300\n  anderson:\n    enabled: false\n  eisenstat_walker:\n    enabled: true\n    gamma: 0.9\n    alpha: 2.0\n    eta_min: 1.0e-06\n    eta_max: 0.1\nexport:\n  format: tiff\n  precision: double\n",
+      "candidate_12.yaml": "coordinate_system: polar\npolar_domain:\n  r_start: 0.0050633\n  r_end: 0.1\n  r_orientation: horizontal\n  theta_range: 2*pi\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0\n  outer:\n    type: dirichlet\n    value: 0\n  theta_min:\n    type: periodic\n    value: 1\n  theta_max:\n    type: periodic\n    value: 1\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 12\n  parallel_chunks: 1\n  slide_direction: vertical\n  slide_region_start: 0\n  slide_region_end: 212\n  slide_pixels_per_step: 12\nmaterial_presets:\n  pure_iron_model:\n    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))\n  NdFeB_N40:\n    mu_r: 1.05\n    magnetization:\n      Br: 1.27\n      pattern: parallel\n      angle: 0\nmaterials:\n  material_92989e:\n    rgb:\n    - 146\n    - 152\n    - 158\n    preset: pure_iron_model\n  material_f7f7f7:\n    rgb:\n    - 247\n    - 247\n    - 247\n    mu_r: 1\n    jz: 0\n  material_d072a7:\n    rgb:\n    - 208\n    - 114\n    - 167\n    preset: NdFeB_N40\n    magnetization:\n      pattern: parallel_array\n      p: 4\n      angle: 0\n      cx: 0\n      cy: 0\n      direction: outward\n      orientation_offset: -45\n  material_000000:\n    rgb:\n    - 0\n    - 0\n    - 0\n    mu_r: 1\n    jz: 0\n  coil_C_neg_253f70:\n    rgb:\n    - 37\n    - 63\n    - 112\n    mu_r: 1\n    jz: 0\n  coil_C_pos_3a6ccf:\n    rgb:\n    - 58\n    - 108\n    - 207\n    mu_r: 1\n    jz: 0\n  coil_B_pos_3ad052:\n    rgb:\n    - 58\n    - 208\n    - 82\n    mu_r: 1\n    jz: 0\n  coil_B_neg_257030:\n    rgb:\n    - 37\n    - 112\n    - 48\n    mu_r: 1\n    jz: 0\n  coil_A_pos_d0533a:\n    rgb:\n    - 208\n    - 83\n    - 58\n    mu_r: 1\n    jz: 0\n  coil_A_neg_703025:\n    rgb:\n    - 112\n    - 48\n    - 37\n    mu_r: 1\n    jz: 0\nflux_linkage:\n- name: Phi_Coil_A\n  material_a: coil_A_pos_d0533a\n  material_b: coil_A_neg_703025\n- name: Phi_Coil_B\n  material_a: coil_B_pos_3ad052\n  material_b: coil_B_neg_257030\n- name: Phi_Coil_C\n  material_a: coil_C_pos_3a6ccf\n  material_b: coil_C_neg_253f70\nnonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  jacobian: tangent\n  line_search_objective: energy\n  verbose: true\n  tolerance: 0.001\n  max_iterations: 300\n  anderson:\n    enabled: false\n  eisenstat_walker:\n    enabled: true\n    gamma: 0.9\n    alpha: 2.0\n    eta_min: 1.0e-06\n    eta_max: 0.1\nexport:\n  format: tiff\n  precision: double\n",
+      "secant_248.yaml": "coordinate_system: polar\npolar_domain:\n  r_start: 0.0050633\n  r_end: 0.1\n  r_orientation: horizontal\n  theta_range: 2*pi\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0\n  outer:\n    type: dirichlet\n    value: 0\n  theta_min:\n    type: periodic\n    value: 1\n  theta_max:\n    type: periodic\n    value: 1\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 248\n  parallel_chunks: 1\n  slide_direction: vertical\n  slide_region_start: 0\n  slide_region_end: 212\n  slide_pixels_per_step: 12\nmaterial_presets:\n  pure_iron_model:\n    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))\n  NdFeB_N40:\n    mu_r: 1.05\n    magnetization:\n      Br: 1.27\n      pattern: parallel\n      angle: 0\nmaterials:\n  material_92989e:\n    rgb:\n    - 146\n    - 152\n    - 158\n    preset: pure_iron_model\n  material_f7f7f7:\n    rgb:\n    - 247\n    - 247\n    - 247\n    mu_r: 1\n    jz: 0\n  material_d072a7:\n    rgb:\n    - 208\n    - 114\n    - 167\n    preset: NdFeB_N40\n    magnetization:\n      pattern: parallel_array\n      p: 4\n      angle: 0\n      cx: 0\n      cy: 0\n      direction: outward\n      orientation_offset: -45\n  material_000000:\n    rgb:\n    - 0\n    - 0\n    - 0\n    mu_r: 1\n    jz: 0\n  coil_C_neg_253f70:\n    rgb:\n    - 37\n    - 63\n    - 112\n    mu_r: 1\n    jz: 0\n  coil_C_pos_3a6ccf:\n    rgb:\n    - 58\n    - 108\n    - 207\n    mu_r: 1\n    jz: 0\n  coil_B_pos_3ad052:\n    rgb:\n    - 58\n    - 208\n    - 82\n    mu_r: 1\n    jz: 0\n  coil_B_neg_257030:\n    rgb:\n    - 37\n    - 112\n    - 48\n    mu_r: 1\n    jz: 0\n  coil_A_pos_d0533a:\n    rgb:\n    - 208\n    - 83\n    - 58\n    mu_r: 1\n    jz: 0\n  coil_A_neg_703025:\n    rgb:\n    - 112\n    - 48\n    - 37\n    mu_r: 1\n    jz: 0\nflux_linkage:\n- name: Phi_Coil_A\n  material_a: coil_A_pos_d0533a\n  material_b: coil_A_neg_703025\n- name: Phi_Coil_B\n  material_a: coil_B_pos_3ad052\n  material_b: coil_B_neg_257030\n- name: Phi_Coil_C\n  material_a: coil_C_pos_3a6ccf\n  material_b: coil_C_neg_253f70\nnonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  verbose: true\n  tolerance: 0.001\n  max_iterations: 300\n  anderson:\n    enabled: false\n  eisenstat_walker:\n    enabled: true\n    gamma: 0.9\n    alpha: 2.0\n    eta_min: 1.0e-06\n    eta_max: 0.1\nexport:\n  format: tiff\n  precision: double\n",
+      "candidate_248.yaml": "coordinate_system: polar\npolar_domain:\n  r_start: 0.0050633\n  r_end: 0.1\n  r_orientation: horizontal\n  theta_range: 2*pi\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0\n  outer:\n    type: dirichlet\n    value: 0\n  theta_min:\n    type: periodic\n    value: 1\n  theta_max:\n    type: periodic\n    value: 1\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 248\n  parallel_chunks: 1\n  slide_direction: vertical\n  slide_region_start: 0\n  slide_region_end: 212\n  slide_pixels_per_step: 12\nmaterial_presets:\n  pure_iron_model:\n    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))\n  NdFeB_N40:\n    mu_r: 1.05\n    magnetization:\n      Br: 1.27\n      pattern: parallel\n      angle: 0\nmaterials:\n  material_92989e:\n    rgb:\n    - 146\n    - 152\n    - 158\n    preset: pure_iron_model\n  material_f7f7f7:\n    rgb:\n    - 247\n    - 247\n    - 247\n    mu_r: 1\n    jz: 0\n  material_d072a7:\n    rgb:\n    - 208\n    - 114\n    - 167\n    preset: NdFeB_N40\n    magnetization:\n      pattern: parallel_array\n      p: 4\n      angle: 0\n      cx: 0\n      cy: 0\n      direction: outward\n      orientation_offset: -45\n  material_000000:\n    rgb:\n    - 0\n    - 0\n    - 0\n    mu_r: 1\n    jz: 0\n  coil_C_neg_253f70:\n    rgb:\n    - 37\n    - 63\n    - 112\n    mu_r: 1\n    jz: 0\n  coil_C_pos_3a6ccf:\n    rgb:\n    - 58\n    - 108\n    - 207\n    mu_r: 1\n    jz: 0\n  coil_B_pos_3ad052:\n    rgb:\n    - 58\n    - 208\n    - 82\n    mu_r: 1\n    jz: 0\n  coil_B_neg_257030:\n    rgb:\n    - 37\n    - 112\n    - 48\n    mu_r: 1\n    jz: 0\n  coil_A_pos_d0533a:\n    rgb:\n    - 208\n    - 83\n    - 58\n    mu_r: 1\n    jz: 0\n  coil_A_neg_703025:\n    rgb:\n    - 112\n    - 48\n    - 37\n    mu_r: 1\n    jz: 0\nflux_linkage:\n- name: Phi_Coil_A\n  material_a: coil_A_pos_d0533a\n  material_b: coil_A_neg_703025\n- name: Phi_Coil_B\n  material_a: coil_B_pos_3ad052\n  material_b: coil_B_neg_257030\n- name: Phi_Coil_C\n  material_a: coil_C_pos_3a6ccf\n  material_b: coil_C_neg_253f70\nnonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  jacobian: tangent\n  line_search_objective: energy\n  verbose: true\n  tolerance: 0.001\n  max_iterations: 300\n  anderson:\n    enabled: false\n  eisenstat_walker:\n    enabled: true\n    gamma: 0.9\n    alpha: 2.0\n    eta_min: 1.0e-06\n    eta_max: 0.1\nexport:\n  format: tiff\n  precision: double\n"
+    },
+    "threads": 12,
+    "masks": {
+      "secant": 0,
+      "candidate": 6
+    },
+    "orders": [
+      [
+        "secant",
+        "candidate"
+      ],
+      [
+        "candidate",
+        "secant"
+      ],
+      [
+        "secant",
+        "candidate"
+      ]
+    ],
+    "power_plan_guid": "381b4222-f694-41f0-9685-ff5bb260df2e",
+    "run_waveforms": true,
+    "timeout_seconds_per_step": 600,
+    "memory_limit_bytes": 8589934592
+  },
+  "full_runs": [
+    {
+      "case": "waveform_secant",
+      "measurement_sha256": "1a192fddc92e604f06c7050dcd2e2bb847f21fdd7b2b2e970e8535ec80752cbf",
+      "exit_code": 0,
+      "converged": true,
+      "wall_seconds": 13400.433290900197,
+      "peak_private_bytes": 1053175808,
+      "peak_rss_bytes": 1057300480,
+      "steps": 248,
+      "outer_iterations": 26863,
+      "max_residual": 0.00099999517721,
+      "estimated_other_busy_cores": 0.7232800174890935
+    },
+    {
+      "case": "waveform_candidate",
+      "measurement_sha256": "53992e86e3c52eac2a9d8efb84e33bfc794d76dac6c915b918a734661859217b",
+      "exit_code": 0,
+      "converged": true,
+      "wall_seconds": 11086.565370999975,
+      "peak_private_bytes": 1850990592,
+      "peak_rss_bytes": 1854390272,
+      "steps": 248,
+      "outer_iterations": 7531,
+      "max_residual": 0.0009948413339,
+      "estimated_other_busy_cores": 0.7508045523077035
+    }
+  ]
+}

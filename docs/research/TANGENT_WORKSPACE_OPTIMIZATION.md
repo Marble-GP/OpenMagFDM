@@ -228,3 +228,98 @@ Still pending: priority 4 large-case results, same-session secant controls,
 4-thread/35H300 checks, full periodic waveform and long-run memory gates.
 Neither the >=15% secant speed gate nor the full adoption protocol is passed.
 No defaults, public YAML, release settings, tags or main-branch changes.
+
+## Priority 4 rejected; selected-candidate comparison (2026-10-09)
+
+User decision: **reject priority 4**. It is not part of the selected candidate
+or credited optimization progress. Keep its historical evidence to avoid
+repeating the hypothesis, without enabling it in further experiments.
+
+The completed mask 6/14 experiment is in
+`../bench_results/workspace_field_reuse_20261009_01/`. All 72 steps converged;
+353 outer iterations per run, identical logged numerical histories, and all
+144 Az/mu TIFF files matched corresponding reference hashes. Mask 14 reused
+fields 341 times per run; profiled field updates fell from 1476 to 1147.
+Wall-time medians were 494.335 / 487.283 seconds (1.43% reduction), but paired
+reductions were -4.54%, +1.41%, +1.43%. This does not satisfy reproducible
+three-pair improvement; limited benefit does not justify adopting the added
+state management. No removal/rebuild of the preserved experimental binary is
+needed: its switch remains OFF, as do priority 1 and public opt-in defaults.
+
+The next experiment, `run_selection_sweep.py`, compares **optimized secant, mask 0** with
+**tangent-AMG + energy merit + priorities 2+3, mask 6**, using the same preserved
+binary and physical/output settings. The secant control uses its established
+default residual merit; only candidate Jacobian/merit/optimization selection
+differs. Three pairs use AB/BA/AB order, 12 steps, 12 threads, chunk 1,
+tolerance 1e-3 and max 300. Convergence/repeat histories are checked within
+each method; different algorithms are not required to have identical histories.
+
+Waveform selection requires all 72 steps to converge, >=15% median wall-time
+reduction, shortening in each pair, candidate peak RSS/private <=2x its paired
+secant control and <=8 GiB. Failure stops after timing and is recorded, not
+used to justify a full-waveform claim. Passing selection launches one 248-step
+secant reference and one candidate with unchanged outputs and 12-pixel slides.
+The 2976-pixel angular dimension is verified to equal 248*12. Both full sweeps
+must converge before the existing periodic flux/EMF/harmonic comparator runs.
+Priority 4 is excluded throughout. No automatic release or default changes.
+
+Four-thread, 35H300, cross-platform and long-run retention review remain separate
+requirements; a timing/waveform pass alone is not final release acceptance.
+
+## Selected candidate: timing and waveform gates passed (reviewed 2026-10-10)
+
+Evidence: `../bench_results/selected_secant_20261009_01/`. The six timing runs
+and two full-revolution runs completed without guard termination; all **568/568
+steps strictly converged**. The reviewed harness hashes match the manifest.
+Priority 4 was disabled throughout (zero field reuses); priority 1 was also OFF.
+The preserved binary is still core checkpoint `ca1027a`, SHA256
+`034c389d315326835aefc2f578fd656043177e5ba906964bf1fcd7221b9ce6a0`.
+
+| Timing comparison | Optimized secant, seconds | Candidate, seconds | Reduction |
+|---|---:|---:|---:|
+| 12 steps, pair 1 | 627.840 | 491.908 | 21.65% |
+| 12 steps, pair 2 | 639.984 | 501.579 | 21.63% |
+| 12 steps, pair 3 | 635.226 | 494.767 | 22.11% |
+| 12 steps, median | 635.226 | 494.767 | **22.11%** |
+| 248 steps, one pair | 13400.433 | 11086.565 | **17.27%** |
+
+Each short secant run took 1263 outer iterations versus 353 for the candidate;
+within-method logged histories repeated exactly. Full sweeps took 26863 versus
+7531 outer iterations, with maximum final relative residuals 9.9999517721e-4
+and 9.948413339e-4 respectively. Full-sweep speed is one pair, not a repeated
+median; its saving is 2313.868 seconds (38.56 minutes). Estimated non-solver
+busy cores were 0.72–0.90 in the short runs and 0.723/0.751 in the full runs.
+
+Full-sweep peak private memory was 0.981 GiB (secant) versus 1.724 GiB
+(candidate); peak RSS was 0.985 versus 1.727 GiB. Both the paired 2x and 8-GiB
+limits passed. Candidate sampled-private maxima by elapsed-time quarter were
+1.72250, 1.72241, 1.72185 and 1.72075 GiB: no sustained growth is apparent in
+this sweep. This is not proof against all leaks or an OS pool-memory audit.
+
+All three flux channels passed the periodic waveform comparator, without
+alignment/fitting, using fundamental bin 2 and identical centered differences
+including wraparound. Worst differences across channels:
+
+| Metric | Measured maximum | Acceptance limit |
+|---|---:|---:|
+| Flux normalized RMS difference | 0.007109% | 0.1% |
+| EMF normalized RMS difference | 0.060288% | 0.5% |
+| Harmonic amplitude difference / fundamental (flux or EMF) | 0.014119% | 0.1% |
+
+These compare against a converged optimized-secant reference, not JMAG or
+physical measurements; absolute accuracy is not established by this test.
+
+Versioned evidence:
+
+- [Three-pair timing summary](results/selected_secant_20261009_summary.json)
+- [Full-waveform metrics](results/selected_secant_20261009_waveform_quality.json)
+- [Full-run measurements and input provenance](results/selected_secant_20261009_provenance.json)
+
+Decision: **retain tangent-AMG + energy + priorities 2+3 as the adoption
+candidate**. The primary Windows 12-thread timing and full-waveform gates
+passed. Priority 4 remains rejected and is not credited toward these gains.
+Remaining: 4-thread/35H300 regression, unverified platform checks (particularly
+macOS), and release integration/default-setting review. Existing Windows/Linux
+numerical tests are historical evidence, not newly executed platform builds.
+The benchmark harness/comparator unit suite was rerun successfully (11 tests).
+No main merge, public-default change, tag or release is implied by this result.

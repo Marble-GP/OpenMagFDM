@@ -1,0 +1,97 @@
+{
+  "complete": true,
+  "runs": [
+    {
+      "wall_seconds": 627.8399121998809,
+      "peak_private_bytes": 1050206208,
+      "peak_rss_bytes": 1045917696,
+      "estimated_other_busy_cores": 0.7336663232924523,
+      "cycle": 1,
+      "case": "secant",
+      "strict_converged": true,
+      "repeat_history_equal": true,
+      "outer_iterations": 1263
+    },
+    {
+      "wall_seconds": 491.90812199981883,
+      "peak_private_bytes": 1849516032,
+      "peak_rss_bytes": 1852874752,
+      "estimated_other_busy_cores": 0.7344486375372509,
+      "cycle": 1,
+      "case": "candidate",
+      "strict_converged": true,
+      "repeat_history_equal": true,
+      "outer_iterations": 353
+    },
+    {
+      "wall_seconds": 501.5789588999469,
+      "peak_private_bytes": 1847472128,
+      "peak_rss_bytes": 1851023360,
+      "estimated_other_busy_cores": 0.9048612724811971,
+      "cycle": 2,
+      "case": "candidate",
+      "strict_converged": true,
+      "repeat_history_equal": true,
+      "outer_iterations": 353
+    },
+    {
+      "wall_seconds": 639.9836972998455,
+      "peak_private_bytes": 1051025408,
+      "peak_rss_bytes": 1056108544,
+      "estimated_other_busy_cores": 0.8505343609536339,
+      "cycle": 2,
+      "case": "secant",
+      "strict_converged": true,
+      "repeat_history_equal": true,
+      "outer_iterations": 1263
+    },
+    {
+      "wall_seconds": 635.226168599911,
+      "peak_private_bytes": 1040277504,
+      "peak_rss_bytes": 1044574208,
+      "estimated_other_busy_cores": 0.7203881036655014,
+      "cycle": 3,
+      "case": "secant",
+      "strict_converged": true,
+      "repeat_history_equal": true,
+      "outer_iterations": 1263
+    },
+    {
+      "wall_seconds": 494.76668080012314,
+      "peak_private_bytes": 1848123392,
+      "peak_rss_bytes": 1851502592,
+      "estimated_other_busy_cores": 0.7420795786131859,
+      "cycle": 3,
+      "case": "candidate",
+      "strict_converged": true,
+      "repeat_history_equal": true,
+      "outer_iterations": 353
+    }
+  ],
+  "median_wall_seconds": {
+    "secant": 635.226168599911,
+    "candidate": 494.76668080012314
+  },
+  "speed_reduction": 0.22111728820834287,
+  "pairs": [
+    {
+      "cycle": 1,
+      "speed_reduction": 0.21650708653384632,
+      "memory_pass": true
+    },
+    {
+      "cycle": 2,
+      "speed_reduction": 0.21626291260830843,
+      "memory_pass": true
+    },
+    {
+      "cycle": 3,
+      "speed_reduction": 0.22111728820834287,
+      "memory_pass": true
+    }
+  ],
+  "memory_pass": true,
+  "reproducible_shortening": true,
+  "proceed_to_waveforms": true,
+  "note": "This selects a waveform candidate, not a release. Secondary/platform/retention gates remain."
+}
