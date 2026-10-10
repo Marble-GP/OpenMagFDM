@@ -1,0 +1,59 @@
+{
+  "evidence_directory": "../bench_results/direct_initialization_20261010_01",
+  "protocol": {
+    "executable_sha256": "97fd2e255095565b45e8cf4ed062c4c315b3dab0a56ec1adfd60dc07584300dd",
+    "dll_sha256": {
+      "jpeg62.dll": "efe3d322093e6cb1c9fec55038df326e8377dd4998a9cb08b2bf4b959e68bdf4",
+      "liblzma.dll": "31544da72a5481922aca4f3c48654559c4243153864669e53ec1f40efce0e98e",
+      "libpng16.dll": "80cd3c320380a75498c20ea62037e9e988abc0d7cde8cd502e6ec7cb50a8b0e0",
+      "libsharpyuv.dll": "2d11d1ecc3bc0a5c1f0bbf9f1b7ca817425ad67313a72898a575d09f3cbd91c9",
+      "libwebp.dll": "538a320e83f819159c61b1f7845151ac1d937bdf75ee65c7ed6c4c996457c506",
+      "libwebpdecoder.dll": "06f8db9b6aab1fdd12e6b8f476f41c5dc26aba2a69aabf63c537ed9b824a9695",
+      "libwebpdemux.dll": "5f473c084654b5e9126bb4ec0243fe83fbbb2ac4a8a059358f93a52558d0b099",
+      "libwebpmux.dll": "0ff043037b0ef61bcf5d4eb142a9f4e46a8cc3ff24d42e609ba1c493fb2449f1",
+      "opencv_core4.dll": "e8c1b123611002c8761ec01f759e77e75813c49f283e15554bad96c918f7b656",
+      "opencv_imgcodecs4.dll": "5d8379bf11002d6777df6f04c186eec43bfd2271a23c345e9c57741d144086fb",
+      "opencv_imgproc4.dll": "48192d2b85c312e5074752dc95a9f7087d0b04e8f49000bd5b0c156b54a5787c",
+      "tiff.dll": "21792472d65dbfb4953554dd293881e02110fea015d0272c8d626d5afce8673b",
+      "yaml-cpp.dll": "0a2b1b0ef955bfef528e6db8387fb58816fba4327a6bc838efb61eb33c65f94b",
+      "zlib1.dll": "5f2b1e2010c47b57bbf7ccbf5df397a7d2fd374cf75ec546c8453267b0eff6a0"
+    },
+    "config_sha256": "ac899fd6378d747e3fc32750964264560dc7c466ce66d49ad838a5171891941d",
+    "image_sha256": "d5c1d8c34038ff710e30d25274958f26260d043534acbc3625f8ce2096daa011",
+    "reference_sha256": "7b0277e624af0d48151c20b44a5868250f89e4442c23dec29277b2a2aeedfe3b",
+    "scripts": {
+      "run_initialization_pairs.py": "0f9b5e1e32438475cf84463fa7558e24205281ca8026f74049ec92f84d9d6035",
+      "run_comparison.py": "d5f31438b09cc8e5bf07485b764aa67598585cf322d05d9f525a318c14c3c321",
+      "run_field_reuse_pairs.py": "82425c0d8e65b4b8fc3c455cfba5f28bb9d0790076f2def5c417757b3de37752",
+      "run_selection_sweep.py": "393ff090bcfcb942b2e387520a9c268d80ed0319091d53a9fd56ff5bf474b65a"
+    },
+    "power_plan_guid": "381b4222-f694-41f0-9685-ff5bb260df2e",
+    "threads": 12,
+    "mask": 6,
+    "orders": [
+      [
+        "linear",
+        "direct"
+      ],
+      [
+        "direct",
+        "linear"
+      ],
+      [
+        "linear",
+        "direct"
+      ]
+    ],
+    "timeout_seconds": 7200,
+    "memory_limit_bytes": 8589934592
+  },
+  "binary_source_base_commit": "e80f20a438ddce4fe77709a8d4d5e7b2d4ea5767",
+  "source_note": "Core changes were uncommitted at build time; source diff is in original manifest.",
+  "parser_fix_resume": {
+    "parent_manifest_sha256": "686ab92f1e43b2ac6217308173e6237b499557bab34609d82e82bfb1114ea3ce",
+    "old_runner_sha256": "0f9b5e1e32438475cf84463fa7558e24205281ca8026f74049ec92f84d9d6035",
+    "new_runner_sha256": "23bf30124fa082349ef041a825673247255adb4452be5fee2d627c35252f548b",
+    "purpose": "Fix inline NKINIT parsing and stopped-state reporting; solver, engine and inputs unchanged",
+    "timestamp": "2026-10-10T20:30:15+0900"
+  }
+}

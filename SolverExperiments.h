@@ -7,6 +7,12 @@ namespace omfdm {
 // Research-only switches, read per solve; no process-global mutable cache and
 // no public YAML/default change. Bits correspond to priorities 1 through 4.
 struct SolverExperiments {
+    static bool directTransientStart() {
+        const char* value = std::getenv("OMFDM_NK_INITIALIZATION");
+        if (!value || std::string(value) == "linear") return false;
+        if (std::string(value) == "direct") return true;
+        throw std::invalid_argument("OMFDM_NK_INITIALIZATION must be linear or direct");
+    }
     unsigned mask = 0;
     bool materialCache() const { return mask & 1; }
     bool lazyFallback() const { return mask & 2; }

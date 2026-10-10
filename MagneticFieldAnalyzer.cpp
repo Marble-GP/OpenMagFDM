@@ -12956,7 +12956,10 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         if (has_nonlinear_materials && nonlinear_config.enabled) {
             // For nonlinear materials, use standard solve() which includes nonlinear iteration
             // This ensures mu_map is updated based on actual H-field at each transient step
+            transient_newton_seed_ready_ = step > 0 && last_nonlinear_converged_
+                && have_last_accepted_transient_state;
             solve();
+            transient_newton_seed_ready_ = false;
             prof_iters = getLastNonlinearIterations();
             // Phase V diagnostic: μ stats AT END of solve (= what gets exported).
             if (nonlinear_config.verbose) {

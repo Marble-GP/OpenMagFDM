@@ -493,6 +493,71 @@ struct SolverNumericsTest {
         std::cout << "optimization comparisons=" << cases << " field_reuses=" << field_hits
                   << " krylov_reuses=" << krylov_hits << " ls_exhaustions=" << ls_failures << '\n';
     }
+    static void initializationTests(MagneticFieldAnalyzer& a) {
+        environment("NK_PROF", "1");
+        environment("OMFDM_TANGENT_OPTIMIZATIONS", "6");
+        environment("OMFDM_TANGENT_PRECONDITIONER", "tangent-amg");
+        int cases = 0;
+        for (bool polar : {false, true}) for (bool horizontal : {false, true}) {
+            nonlinearFixture(a, polar, horizontal);
+            a.bc_inner = a.bc_outer = a.bc_left = a.bc_right = a.bc_top = a.bc_bottom = bc("dirichlet");
+            a.bc_inner.value = a.bc_outer.value = a.bc_left.value = a.bc_right.value = a.bc_top.value = a.bc_bottom.value = 0;
+            a.bc_theta_min = a.bc_theta_max = bc("periodic");
+            a.bc_theta_min.value = a.bc_theta_max.value = horizontal ? -1 : 1;
+            a.has_nonlinear_materials = true;
+            a.dd_warm_start_ = false;
+            a.coarsening_enabled = false;
+            a.nonlinear_config = MagneticFieldAnalyzer::NonlinearSolverConfig();
+            a.nonlinear_config.max_iterations = 100;
+            a.nonlinear_config.tolerance = 1e-8;
+            a.nonlinear_config.jacobian_tangent = true;
+            a.nonlinear_config.anderson.enabled = false;
+            a.Az = Eigen::MatrixXd::Zero(a.ny,a.nx);
+            a.jz_map *= 0.01; a.Jz_mag_map *= 0.01;
+            environment("OMFDM_NK_INITIALIZATION", "linear");
+            { Capture capture; a.solveNonlinearNewtonKrylov(); }
+            require(a.last_nonlinear_converged_, "initialization baseline did not converge");
+            const Eigen::MatrixXd reference = a.Az, mu = a.mu_map;
+            Eigen::VectorXd seed(a.nx*a.ny);
+            for (int row = 0; row < a.ny; ++row) for (int col = 0; col < a.nx; ++col) {
+                const int k = polar ? (horizontal ? col*a.ntheta+row : row*a.ntheta+col) : row*a.nx+col;
+                seed[k] = reference(row,col);
+            }
+            for (int scenario = 0; scenario < 5; ++scenario) {
+                a.Az = reference; a.mu_map = mu;
+                a.previous_solution = seed;
+                a.transient_newton_seed_ready_ = scenario != 1;
+                if (scenario == 2) a.previous_solution[0] = std::numeric_limits<double>::quiet_NaN();
+                if (scenario == 3) a.previous_solution.resize(1);
+                const auto tables = a.material_bh_tables;
+                if (scenario == 4) a.material_bh_tables.clear();
+                environment("OMFDM_NK_INITIALIZATION", "direct");
+                std::string log;
+                { Capture capture; a.solveNonlinearNewtonKrylov(); log = capture.stream.str(); }
+                require(!a.transient_newton_seed_ready_, "one-shot seed flag survived solve");
+                require(log.find(scenario == 0 ? "direct_used=1" : "direct_used=0") != std::string::npos,
+                        "direct initialization eligibility mismatch");
+                require(a.Az.allFinite() && a.mu_map.allFinite(), "initialization exported invalid state");
+                if (scenario != 4) {
+                    require(a.last_nonlinear_converged_, "initialization trial did not converge");
+                    require((a.Az-reference).norm() < 1e-8*std::max(1.0,reference.norm()),
+                            "direct initialization changed converged field");
+                }
+                a.material_bh_tables = tables;
+                ++cases;
+            }
+        }
+        environment("OMFDM_NK_INITIALIZATION", "typo");
+        a.transient_newton_seed_ready_ = true;
+        bool threw = false;
+        try { a.solveNonlinearNewtonKrylov(); } catch (const std::invalid_argument&) { threw = true; }
+        require(threw && !a.transient_newton_seed_ready_, "invalid mode left seed eligible");
+        environment("OMFDM_NK_INITIALIZATION", "");
+        environment("OMFDM_TANGENT_OPTIMIZATIONS", "");
+        environment("OMFDM_TANGENT_PRECONDITIONER", "");
+        environment("NK_PROF", "");
+        std::cout << "direct initialization cases=" << cases << " passed\n";
+    }
     static void innerSolverTests(MagneticFieldAnalyzer& a) {
         MagneticFieldAnalyzer::RowMatrix A(40,40), J(40,40);
         std::vector<Eigen::Triplet<double>> entries;
@@ -588,6 +653,7 @@ int main(int argc, char** argv) {
         SolverNumericsTest::accelerationTests(a);
         SolverNumericsTest::innerSolverTests(a);
         SolverNumericsTest::optimizationTests(a);
+        SolverNumericsTest::initializationTests(a);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n'; return 1;

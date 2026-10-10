@@ -695,6 +695,9 @@ private:
     Eigen::MatrixXd last_accepted_mu_map;
     cv::Mat last_accepted_material_image;
     bool have_last_accepted_transient_state = false;
+    // One-shot eligibility, set only immediately before a transient solve whose
+    // preceding step strictly converged. Consumed at NK entry, including errors.
+    bool transient_newton_seed_ready_ = false;
 
     // Phase B.6: per-rectangle-slide cumulative displacement state.
     // dx / dy can be tinyexpr formulas in $step, so we accumulate the

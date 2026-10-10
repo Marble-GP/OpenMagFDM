@@ -36,6 +36,10 @@
  * @brief Main Newton-Krylov solver
  */
 void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
+    const bool transient_seed_ready = transient_newton_seed_ready_;
+    transient_newton_seed_ready_ = false;
+    const bool direct_transient_start = omfdm::SolverExperiments::directTransientStart();
+    const auto initialization_start = omfdm::ProfileClock::now();
     last_nonlinear_iterations_ = 0;
     last_nonlinear_residual_ = std::numeric_limits<double>::infinity();
     last_nonlinear_converged_ = false;
@@ -288,6 +292,35 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
     }
 
+    // Experiment A: start directly from the previous STRICTLY converged step,
+    // in the same fixed coordinates. Never rotate a partial field or inherit mu
+    // without evaluating the new material/source layout. DD/file starts keep
+    // precedence. No-table material evaluation depends on old mu and is excluded.
+    bool direct_used = false;
+    double seed_residual = -1.0;
+    bool tables_valid = true;
+    for (const auto& entry : material_mu) {
+        if (entry.second.type == MuType::STATIC) continue;
+        const auto table = material_bh_tables.find(entry.first);
+        if (table == material_bh_tables.end() || !table->second.is_valid) tables_valid = false;
+    }
+    const int seed_size = is_polar ? nr * ntheta : nx * ny;
+    if (direct_transient_start && !loaded_warm && transient_seed_ready && !use_coarse
+            && tables_valid && previous_solution.size() == seed_size && previous_solution.allFinite()) {
+        const Eigen::MatrixXd original_Az = Az, original_mu = mu_map;
+        syncMemberAz(previous_solution);
+        updateFieldAndMu();
+        seed_residual = evaluateCurrentResidual();
+        if (std::isfinite(seed_residual) && Az.allFinite() && mu_map.allFinite()) {
+            loaded_warm = direct_used = true;
+        } else {
+            // The legacy linear initializer reads Az and mu. Its subsequent NK
+            // iteration recomputes all B/H/mu; no invalid field is exported.
+            Az = original_Az;
+            mu_map = original_mu;
+        }
+    }
+
     // Initial guess: solve linear problem with initial μ distribution. Coarse path
     // uses the FVM coarsened linear solve (sets the full interpolated member Az).
     if (VERBOSE && !loaded_warm) {
@@ -306,6 +339,13 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         buildAndSolveSystemPolar();
     } else {
         buildAndSolveSystem();
+    }
+    if (omfdm::profilingEnabled()) {
+        std::cout << "[NKINIT] requested=" << (direct_transient_start ? "direct" : "linear")
+                  << " transient_eligible=" << transient_seed_ready
+                  << " direct_used=" << direct_used << " seed_residual=" << seed_residual
+                  << " total_ms=" << omfdm::milliseconds(initialization_start, omfdm::ProfileClock::now())
+                  << std::endl;
     }
 
     // [NKPROF] temporary per-iteration phase timing (diagnostic; enabled with

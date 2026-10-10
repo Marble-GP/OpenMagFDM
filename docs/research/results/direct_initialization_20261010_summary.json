@@ -1,0 +1,605 @@
+{
+  "complete": true,
+  "runs": [
+    {
+      "wall_seconds": 528.1503640001174,
+      "peak_private_bytes": 1849528320,
+      "peak_rss_bytes": 1852628992,
+      "estimated_other_busy_cores": 2.0357898020870455,
+      "case": "linear",
+      "cycle": 1,
+      "converged": true,
+      "repeat_equal": true,
+      "initialization_gate": true,
+      "direct_starts": 0,
+      "initialization": [
+        {
+          "requested": "linear",
+          "transient_eligible": "0",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "2.4e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.4e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.4e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.9e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.4e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.3e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.4e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.4e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.2e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.6e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.3e+03"
+        }
+      ],
+      "outer_iterations": 353
+    },
+    {
+      "wall_seconds": 328.0052940000314,
+      "peak_private_bytes": 1847705600,
+      "peak_rss_bytes": 1851105280,
+      "estimated_other_busy_cores": 2.0508910597032486,
+      "case": "direct",
+      "cycle": 1,
+      "converged": true,
+      "repeat_equal": true,
+      "initialization_gate": true,
+      "direct_starts": 11,
+      "initialization": [
+        {
+          "requested": "direct",
+          "transient_eligible": "0",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "2e+03"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.14e+00",
+          "total_ms": "6.43e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "5.78e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.16e+00",
+          "total_ms": "5.76e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.18e+00",
+          "total_ms": "5.71e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.12e+00",
+          "total_ms": "6.17e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.12e+00",
+          "total_ms": "5.26e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.11e+00",
+          "total_ms": "5.64e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "6.10e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.14e+00",
+          "total_ms": "5.70e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.18e+00",
+          "total_ms": "5.70e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "5.54e+01"
+        }
+      ],
+      "outer_iterations": 211
+    },
+    {
+      "wall_seconds": 327.22998870001175,
+      "peak_private_bytes": 1848832000,
+      "peak_rss_bytes": 1852026880,
+      "estimated_other_busy_cores": 2.1806146277573455,
+      "case": "direct",
+      "cycle": 2,
+      "converged": true,
+      "repeat_equal": true,
+      "initialization_gate": true,
+      "direct_starts": 11,
+      "initialization": [
+        {
+          "requested": "direct",
+          "transient_eligible": "0",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "2.3e+03"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.14e+00",
+          "total_ms": "5.67e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "5.55e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.16e+00",
+          "total_ms": "5.47e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.18e+00",
+          "total_ms": "5.31e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.12e+00",
+          "total_ms": "5.92e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.12e+00",
+          "total_ms": "6.50e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.11e+00",
+          "total_ms": "6.62e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "6.66e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.14e+00",
+          "total_ms": "5.69e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.18e+00",
+          "total_ms": "7.15e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "6.56e+01"
+        }
+      ],
+      "outer_iterations": 211
+    },
+    {
+      "wall_seconds": 531.2080184000079,
+      "peak_private_bytes": 1850068992,
+      "peak_rss_bytes": 1853214720,
+      "estimated_other_busy_cores": 2.0227480813262315,
+      "case": "linear",
+      "cycle": 2,
+      "converged": true,
+      "repeat_equal": true,
+      "initialization_gate": true,
+      "direct_starts": 0,
+      "initialization": [
+        {
+          "requested": "linear",
+          "transient_eligible": "0",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "2e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.8e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.2e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.3e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.3e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.6e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.4e+03"
+        }
+      ],
+      "outer_iterations": 353
+    },
+    {
+      "wall_seconds": 544.4803414000198,
+      "peak_private_bytes": 1848946688,
+      "peak_rss_bytes": 1851998208,
+      "estimated_other_busy_cores": 1.744696828821309,
+      "case": "linear",
+      "cycle": 3,
+      "converged": true,
+      "repeat_equal": true,
+      "initialization_gate": true,
+      "direct_starts": 0,
+      "initialization": [
+        {
+          "requested": "linear",
+          "transient_eligible": "0",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "2e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.6e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.5e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "2e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.3e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.4e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.6e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.6e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.3e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.8e+03"
+        },
+        {
+          "requested": "linear",
+          "transient_eligible": "1",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "1.6e+03"
+        }
+      ],
+      "outer_iterations": 353
+    },
+    {
+      "wall_seconds": 341.01650839997455,
+      "peak_private_bytes": 1849630720,
+      "peak_rss_bytes": 1852944384,
+      "estimated_other_busy_cores": 1.9477612773545305,
+      "case": "direct",
+      "cycle": 3,
+      "converged": true,
+      "repeat_equal": true,
+      "initialization_gate": true,
+      "direct_starts": 11,
+      "initialization": [
+        {
+          "requested": "direct",
+          "transient_eligible": "0",
+          "direct_used": "0",
+          "seed_residual": "-1",
+          "total_ms": "2.1e+03"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.14e+00",
+          "total_ms": "5.50e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "5.48e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.16e+00",
+          "total_ms": "5.67e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.18e+00",
+          "total_ms": "5.60e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.12e+00",
+          "total_ms": "5.51e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.12e+00",
+          "total_ms": "5.76e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.11e+00",
+          "total_ms": "5.36e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "5.48e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.14e+00",
+          "total_ms": "5.39e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.18e+00",
+          "total_ms": "5.52e+01"
+        },
+        {
+          "requested": "direct",
+          "transient_eligible": "1",
+          "direct_used": "1",
+          "seed_residual": "4.13e+00",
+          "total_ms": "5.57e+01"
+        }
+      ],
+      "outer_iterations": 211
+    }
+  ],
+  "median_wall_seconds": {
+    "linear": 531.2080184000079,
+    "direct": 328.0052940000314
+  },
+  "speed_reduction": 0.38252947501060053,
+  "quality": "No full-revolution waveform gate in this short ablation; no automatic adoption."
+}
