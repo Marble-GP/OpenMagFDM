@@ -124,6 +124,117 @@ file/DD seeds, and `f41dc86` safeguarded transient history. This experiment
 extends direct NEWTON initialization to normal strictly converged transient
 history; it is not the first warm-start feature in the product.
 
+### Next gate: full revolution and large displacement (prepared 2026-10-11)
+
+The completed direct-initialization work and three-pair evidence are committed
+as `03a416f`. The next harness is `run_initialization_validation.py`; execution
+instructions are in the benchmark README. It reuses the same preserved binary
+and changes neither the solver nor public defaults.
+
+| Test | Pixels / step | Mechanical degrees / step | Points per method | Quality gate |
+|---|---:|---:|---:|---|
+| Full revolution | 12 | 1.4516 | 248 | Flux, periodic EMF, harmonics |
+| Large displacement 1 | 48 | 5.8065 | 12 | Aligned-angle flux only |
+| Large displacement 2 | 124 | 15 | 12 | Aligned-angle flux only |
+| Large displacement 3 | 248 | 30 | 12 | Aligned-angle flux only |
+
+Each pair compares LINEAR and DIRECT with tangent AMG + energy + mask 6;
+priority 4 and Anderson stay OFF. Large displacement can change iteration
+history, so cross-method history equality is not required. Strict convergence
+of every step and correct initializer selection are required. The large-step
+cases do not claim accurately resolved EMF/harmonics, even if the sampled
+positions span a revolution. Review total time, per-step iterations/residuals,
+peak memory and background CPU load; one pair is not a repeated speed claim.
+
+Binary/DLL/input/harness hashes and the power-plan GUID are pinned. Failures
+preserve diagnostics and stop launches; no silent retry or solver change is
+allowed. Reference and candidate must both be strictly converged before any
+waveform acceptance. The new harness has unit and mocked orchestration tests
+for malformed/missing initializer records, quality/convergence/memory failures,
+prepare-only, strict resume, changed inputs and incomplete-attempt preservation.
+Mocked solver runs are harness tests, not numerical/performance evidence.
+
+Preparation at `../bench_results/direct_validation_20261011_01` validated the
+preserved binary and inputs and generated all four configurations without
+launching a solver. On Windows, the expanded benchmark Python suite passed
+28/28 and the preserved direct-start build passed CTest 3/3 on 2026-10-11.
+No rebuild was performed; Linux/macOS checks remain pending.
+
+The prepared gate was executed on 2026-10-15; completed results follow.
+
+### Completed full-revolution and large-displacement gate (2026-10-15)
+
+The eight sequential runs finished at 07:47:46 JST after starting at 01:20:27
+(6 h 27 min 20 s including harness overhead). `progress.json` is `complete`,
+and all four pairs pass their numerical, initializer and memory gates.
+All **568/568 steps strictly converged** below 1e-3. DIRECT used the previous
+converged state at all 280 eligible steps; each first step retained linear
+initialization. Priority 4 and Anderson remained OFF. No binary was rebuilt.
+
+| Step angle / points | LINEAR seconds | DIRECT seconds | Time reduction | Outer iterations LINEAR -> DIRECT |
+|---|---:|---:|---:|---:|
+| 1.4516 degrees / 248 (full period) | 10,940.629 | 6,657.868 | **39.15%** | 7,531 -> 4,413 |
+| 5.8065 degrees / 12 | 1,276.453 | 596.615 | 53.26% | 702 -> 385 |
+| 15 degrees / 12 | 1,201.400 | 795.055 | 33.82% | 657 -> 460 |
+| 30 degrees / 12 | 875.726 | 870.586 | 0.59% (not a demonstrated gain) | 589 -> 621 |
+
+The full period falls from 182.34 to 110.96 minutes, saving 71.38 minutes.
+Maximum outer iterations at one step fall from 63 to 33. This extends the
+previous three-pair 12-step result (38.25% median reduction) to a complete
+revolution with waveform validation, rather than extrapolating cold starts.
+Each new displacement has only one timing pair, not three repeated pairs.
+
+Full-period errors below are maxima across all three coils; all values in
+this table are **percent**, not the dimensionless ratios in the JSON files.
+The comparator uses identical periodic centered differences, includes the
+wraparound, uses fundamental bin 2 and does not fit amplitude or phase.
+
+| Quantity | Observed maximum | Limit |
+|---|---:|---:|
+| Flux normalized RMS difference | 0.001742% | 0.1% |
+| EMF normalized RMS difference | 0.023169% | 0.5% |
+| Flux harmonic amplitude difference / fundamental | 0.000362% | 0.1% |
+| EMF harmonic amplitude difference / fundamental | 0.006172% | 0.1% |
+
+The 48/124/248-pixel cases have maximum aligned-angle flux RMS differences
+0.003604%, 0.001855% and 0.001636%, respectively (limit 0.1%). They do **not**
+validate coarse-sampled EMF or harmonics. Reference and trial are both strictly
+converged; this demonstrates agreement with the control, not JMAG accuracy.
+
+Across all runs, peak RSS is at most 1.7264 GiB and peak private memory at most
+1.7236 GiB. All paired limits pass (8 GiB and <=2x reference); small increases
+remain, including about 20 MiB for the 30-degree pair. These process peaks do
+not measure kernel pools or establish absence of a leak on their own.
+
+Estimated non-solver busy cores (LINEAR / DIRECT) were 1.485 / 1.441 for full,
+1.411 / 1.488 for 48 pixels, 1.419 / 1.338 for 124 pixels, and **3.022 / 2.390**
+for 248 pixels. Light UI/MCP development and tests overlapped the early part;
+heavy packaging, rebuilds and other solver experiments were deferred. Do not
+describe these as completely idle measurements. At 30 degrees the 5.14-second
+timing difference is inconclusive under unequal background load; outer
+iterations increase by 5.43% and the worst step increases from 86 to 95.
+The result supports reduced usefulness at large displacement, not a claim
+of divergence or an angle-independent acceleration guarantee.
+
+Decision: retain DIRECT as the selected research initialization candidate for
+small-angle sweeps and advance to the separately gated angle predictor, then
+safeguarded Anderson. Do not enable a new default or an angle-based heuristic
+from this single model. No further long run started automatically; the circuit
+initializer remains deferred. Linux/macOS numerical regression and broader
+material/thread-count coverage remain outside this completed Windows gate.
+
+Evidence: `../bench_results/direct_validation_20261011_01/` (original logs,
+measurements and fields), versioned [summary](results/direct_validation_20261015_summary.json)
+and [provenance](results/direct_validation_20261015_provenance.json). The latter
+pins binary/DLL/input/harness hashes and hashes of all eight measurements,
+logs, conditions and flux tables. Binary source provenance is distinguished
+from the later harness-preparation commit; the executable is unchanged from
+the previous experiment. On 2026-10-15, benchmark tests passed 28/28 and the
+preserved Windows build passed CTest 3/3 without a rebuild.
+The Windows release-contract smoke also passed using an isolated copy of the
+same executable/DLLs; the pinned build and original benchmark outputs were
+not overwritten. This is a solver contract check, not MCP packaged acceptance.
+
 ## B. Angle prediction (not implemented)
 
 Start with two strictly converged, adjacent, equal-angle-step states in the

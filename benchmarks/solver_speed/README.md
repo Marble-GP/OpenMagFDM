@@ -127,3 +127,57 @@ wraparound. There is no phase alignment or amplitude fitting. Flux RMS, EMF
 RMS and harmonic limits are checked separately. Missing, nonfinite, incomplete
 or unconverged data are **not assessable**, never a pass. Do not apply the
 periodic gate to a partial 12-step timing sweep.
+
+## Direct initialization: full revolution and large displacement
+
+`run_initialization_validation.py` follows the completed three-pair direct
+initialization ablation. It pins that experiment's executable, DLLs, source
+configuration and image, and generates four paired LINEAR/DIRECT tests:
+
+- Full revolution: 248 points, 12 pixels per step (about 1.452 degrees).
+- Large displacement: 12 points each at 48, 124 and 248 pixels per step
+  (about 5.806, 15 and 30 degrees).
+
+Only step count and displacement change in YAML. Both modes use tangent AMG,
+energy line search, mask 6, 12 threads, chunk 1, tolerance 1e-3 and 300 outer
+iterations. Anderson and priority-4 field reuse remain OFF. This is not an
+angle-prediction experiment and does not change product defaults.
+
+```powershell
+.\build_solver_speed\bench_py312\Scripts\python.exe benchmarks/solver_speed/run_initialization_validation.py --exe build_nonlinear_initialization/Release/MagFDMsolver.exe --reference ../bench_results/direct_initialization_20261010_01 --output ../bench_results/direct_validation_20261011_01 --prepare-only
+.\build_solver_speed\bench_py312\Scripts\python.exe benchmarks/solver_speed/run_initialization_validation.py --exe build_nonlinear_initialization/Release/MagFDMsolver.exe --reference ../bench_results/direct_initialization_20261010_01 --output ../bench_results/direct_validation_20261011_01 --resume
+.\build_solver_speed\bench_py312\Scripts\python.exe -m unittest discover -s benchmarks/solver_speed -p 'test_*.py'
+```
+
+Preparation validates inputs and saves the manifest without launching a solver.
+Execution is sequential (eight runs for `--suite all`); the full-revolution
+pair takes several hours. Use `--suite full` or `--suite large` with separate
+new output directories to isolate stages. Resume must use the original suite
+and identical scripts, configuration, binary, DLLs, source experiment and
+power-plan GUID. Incomplete attempts are retained and stop automatic resume.
+
+Every step must strictly converge with finite residual below 1e-3. The first
+step must retain linear initialization; every subsequent DIRECT step must
+actually use the eligible previous converged state. Unexpected fallback is
+retained for review, not silently counted as successful direct initialization.
+All periodic flux/EMF/harmonic gates above apply to the 248-point pair. Large
+displacements check same-angle flux NRMS <=0.1%, not sparse-sampled periodic
+EMF/harmonics. A failure stops further launches for review. No predictor or
+Anderson stage starts automatically.
+
+Time includes output completion. Process memory/CPU samples and estimated
+background load are retained; speed is reported only for valid pairs, and a
+single pair is not repeated timing evidence. Both runs must stay within 8 GiB;
+DIRECT peaks must also be at most twice LINEAR's RSS/private peaks. These
+checks do not establish absence of a memory leak or measure OS kernel pools.
+Each child has an 8-GiB and 600-seconds-per-configured-step guard; another
+running solver or insufficient free disk space prevents launch. Guards never
+stop unrelated processes. Follow `progress.json` or launcher output.
+
+Completed on 2026-10-15: all eight runs and 568 steps converged, with all four
+quality/memory gates passing. The full-period pair took 10,940.629 / 6,657.868
+seconds (39.15% reduction). At 30 degrees per step there was no meaningful
+timing gain and outer iterations increased; this gate is not an unconditional
+speed/adoption decision. See the [review and archived evidence](../../docs/research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md#completed-full-revolution-and-large-displacement-gate-2026-10-15).
+The original evidence directory is complete: do not reuse it for a new trial
+or run `--resume` merely to inspect results, since resume rewrites aggregates.
