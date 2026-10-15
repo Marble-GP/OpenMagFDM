@@ -367,7 +367,7 @@ Windows CTest 4/4, benchmark Python tests 38/38 and the release-contract smoke
 (isolated copy of the pinned executable/DLLs) were rerun on 2026-10-16.
 Linux/macOS remain unverified for these initialization changes.
 
-## C. Anderson combination (DIRECT selected; final ablation prepared 2026-10-16)
+## C. Anderson combination (DIRECT selected; final ablation running 2026-10-16)
 
 Use DIRECT (angle prediction rejected) with existing safeguarded Anderson, one fixed
 small depth; compare OFF/ON before changing other parameters. Preserve the
@@ -409,6 +409,13 @@ aligned flux and memory/load, not just a `passed` summary flag. Only a useful
 candidate proceeds to a separately reviewed full-period/large-displacement
 gate. If it is not useful, retain DIRECT alone and close this hypothesis series;
 do not start an unrestricted depth/beta search or revive angle prediction.
+
+Launch: 2026-10-16 08:00:45 JST, after protocol/test checkpoint `3ec2b29` and
+successful prepare-only validation. The first DIRECT/OFF run was observed
+advancing normally. Launcher logs are `launcher_20261016_080044.stdout.log`
+and `.stderr.log` in the new directory. Initial background estimate was 0.96
+busy cores; per-run load will be recorded for review. No completed large-model
+AA result or acceptance claim yet. Do not duplicate the running comparison.
 
 ## D. Magnetic-circuit initializer (deferred; excluded from current plan)
 
