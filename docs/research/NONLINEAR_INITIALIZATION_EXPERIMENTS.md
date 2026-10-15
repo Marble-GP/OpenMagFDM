@@ -8,7 +8,7 @@ ablations, not a simultaneous change to the accepted solver. No public YAML,
 material law, convergence tolerance, release defaults or AMG reuse changes.
 Priority 4 remains rejected/OFF; the baseline is tangent-AMG + energy, mask 6.
 
-## A. Direct transient warm start (12-step validation passed; full sweep pending)
+## A. Direct transient warm start (12-step and full-sweep validation passed)
 
 Research environment `OMFDM_NK_INITIALIZATION=linear|direct` (default linear).
 The standard NK initializer solves a linear problem each step even when a
@@ -235,7 +235,7 @@ The Windows release-contract smoke also passed using an isolated copy of the
 same executable/DLLs; the pinned build and original benchmark outputs were
 not overwritten. This is a solver contract check, not MCP packaged acceptance.
 
-## B. Angle prediction (not implemented)
+## B. Angle prediction (completed; rejected 2026-10-16)
 
 Start with two strictly converged, adjacent, equal-angle-step states in the
 same coordinates and compatible gauge: A_pred = A_prev + beta*(A_prev-A_older).
@@ -245,12 +245,146 @@ failure, restart/chunk boundary, incompatible grid/boundary/gauge or step size.
 Keep initial validation overhead in total time. Rotor-frame transport is a
 separate hypothesis, not bundled into this first predictor.
 
-## C. Anderson combination (not implemented/evaluated here)
+### Bounded implementation and safeguards
 
-Use the selected initializer with existing safeguarded Anderson, one fixed
+`OMFDM_NK_INITIALIZATION=predict` extends the research-only switch; the default
+remains `linear`, with `direct` unchanged as the ablation control. Prediction
+uses beta=1 in fixed coordinates. It first evaluates the direct seed with current
+B/H/mu, then evaluates the extrapolation with its own current B/H/mu. Accept
+only a finite prediction with a strictly smaller true residual; otherwise
+restore the direct seed and recompute its fields. No frozen-mu merit, rotor-frame
+transport, EW adjustment, line-search change or AMG hierarchy reuse is added.
+First-loop and final true-residual checks remain. The extra probes are charged
+to initialization time and process wall time, not hidden from the comparison.
+
+Prediction eligibility is tracked with per-sweep/chunk metadata, reusing the
+two existing solution vectors rather than retaining an additional long history.
+Both preceding states must be adjacent and strictly converged. Failure, skipped
+steps, restart/repeated analysis and a changed mesh/boundary/profile/gauge or
+displacement signature invalidate eligibility. NK entry consumes both one-shot
+flags before validating the experiment mode, including the exception path.
+The first step of a chunk now explicitly cannot use a preceding-run direct seed.
+
+The initial supported motion is deliberately one constant angular band on a
+polar grid (both storage orientations), with at least one radial Dirichlet
+boundary fixing the gauge. Rectangle/variable motion, multiple moving bands,
+Cartesian motion and unanchored gauges retain the direct/linear fallback.
+The signature includes resolved pixel displacement, grid coordinates, orientation,
+boundary signs/scalars/profiles and the slide region/wrap mode. No-table materials,
+coarsened states and explicit DD/file initial states retain their previous precedence.
+
+`[NKINIT]` additionally records `prediction_eligible`, `prediction_attempted`,
+`prediction_used` and `prediction_residual`. Residuals are logged at 17-digit
+precision; stream precision is restored afterward. `direct_used=1` means the
+direct transient bypass was eligible and evaluated, including when the final
+seed is the accepted prediction. Use `prediction_used` to distinguish the latter.
+
+Historical difference: `d37f02f` extrapolated the **linear AMG** initial guess
+and found plain AR(1) more useful than rotated/smoothed guesses. This experiment
+seeds the **nonlinear Newton** solve directly. A smaller initial residual does
+not prove fewer Newton iterations: only end-to-end paired measurements can
+decide whether the added predictor/probe cost is worthwhile.
+
+### Verification and launch
+
+Preserve `build_nonlinear_initialization/Release/MagFDMsolver.exe`. The new
+`build_nonlinear_prediction/` uses the same MSVC 19.44 toolchain, optimization
+settings and runtime DLL hashes, with dependency installation disabled.
+Windows Release build, CTest 4/4 and release-contract smoke passed. CTest includes
+56 predictor acceptance/rejection/fallback fixtures over both polar orientations,
+periodic/antiperiodic seams and the axis, plus history/signature/exception checks.
+An added actual sliding-sweep fixture covers both orientations, AA OFF/ON and
+repeated use of the same analyzer (32 steps). Existing residual/Jv/AA regressions
+remain enabled. Benchmark Python tests passed 38/38, including 10 new harness
+tests with mock runs; mocks are not performance evidence. Linux/macOS unverified.
+
+At 19:38 JST on 2026-10-15, launched `run_prediction_pairs.py --stage predictor`
+at `../bench_results/angle_prediction_20261015_01` after prepare-only validation.
+It runs DIRECT/PREDICT, PREDICT/DIRECT, DIRECT/PREDICT sequentially on the same
+new binary: IEEJ-D, 12 points, 12-pixel steps, 12 threads, chunk 1, mask 6,
+tangent-AMG + energy, tolerance 1e-3, max 300, Anderson OFF, priority 4 OFF.
+The estimate is 30–40 minutes, not a completion guarantee. No speed claim yet.
+
+The DIRECT controls must match the archived `1_direct` numerical histories and
+all 12 Az/Mu TIFF hashes; each mode must repeat its own histories and hashes.
+Every step must strictly converge and all expected initialization markers must
+be present. Pair quality uses aligned flux RMS <=0.1%; this short sweep does
+not establish periodic EMF/harmonic quality. Each run has a 7200-second / 8-GiB
+guard; candidate peaks must also be <=2x control. Binary/DLL/input/scripts/power
+plan are pinned. A mismatch or failed gate retains evidence and stops launches.
+Incomplete attempts are not overwritten; no automatic restart or stage chaining.
+
+Review per-pair and median time, iteration counts, predictor acceptance/rejection,
+initialization cost, memory and background load before selecting the initializer.
+If prediction is neutral or worse, retain DIRECT for the Anderson ablation.
+Only useful candidates advance to the separate full-period quality gate and
+large-displacement coverage; these have not been run for prediction yet.
+
+### Completed three-pair review and rejection (2026-10-16)
+
+All six processes finished successfully at 20:11 JST on 2026-10-15. All 72
+steps strictly converged; maximum final residual was 9.2812645201e-4. Every
+run used 211 outer and 3081 inner iterations. All 24 Az/mu TIFF hashes per
+run match the archived DIRECT reference, as do step-status records and the
+iteration/residual/inner-iteration/line-search/outcome signatures. Aligned
+flux differences are zero for all three coils in every pair.
+
+| Pair | DIRECT seconds | PREDICT seconds | Raw time reduction | Predictions used / attempted |
+|---|---:|---:|---:|---:|
+| 1 | 345.384 | 333.550 | 3.43% | 0 / 10 |
+| 2 | 332.317 | 320.019 | 3.70% | 0 / 10 |
+| 3 | 341.554 | 321.702 | 5.81% | 0 / 10 |
+| Median | 341.554 | 321.702 | 5.81% | 0 / 30 overall |
+
+Prediction was attempted at steps 3-12 and rejected every time: its true
+residual was 2.2211-2.2323 times the direct seed residual. The fixed-coordinate
+beta=1 extrapolation therefore never changed the accepted initial state.
+The reject-to-direct safeguard worked; this is NOT a nonlinear-convergence
+improvement. Total initialization cost increased in every pair (by 0.371,
+0.832 and 0.810 seconds), including probes and restoring current-law fields.
+
+Estimated non-solver busy cores were 3.344/2.970, 2.081/2.186 and 2.397/2.267
+(DIRECT/PREDICT). The raw total-time differences cannot be attributed to an
+accepted predictor, nor is a single background-load explanation established.
+Do not credit the 5.81% median difference as an algorithmic speedup. Peak RSS
+is about 1.725 GiB for both modes; these peaks alone are not a leak test.
+
+User decision: reject this bounded predictor and retain DIRECT. The research
+switch and regression fixtures remain for reproducibility, disabled in the
+selected path; no public default changes. No damping/transport/acceptance-rule
+search is added. This result does not rule out every possible angle predictor.
+The raw `passed` field means convergence/numerical/safety gates passed, not
+adoption. No new full-revolution or periodic EMF claim is made for prediction.
+
+Evidence: original `../bench_results/angle_prediction_20261015_01/`, versioned
+[summary](results/angle_prediction_20261015_summary.json) and
+[provenance](results/angle_prediction_20261015_provenance.json). Original
+outputs, manifest, scripts and binary are preserved; do not resume the finished
+experiment merely to inspect it. The binary was built from base `e8df23f` plus
+the then-uncommitted solver changes pinned in that manifest.
+
+Windows CTest 4/4, benchmark Python tests 38/38 and the release-contract smoke
+(isolated copy of the pinned executable/DLLs) were rerun on 2026-10-16.
+Linux/macOS remain unverified for these initialization changes.
+
+## C. Anderson combination (DIRECT selected; large-model trial not started)
+
+Use DIRECT (angle prediction rejected) with existing safeguarded Anderson, one fixed
 small depth; compare OFF/ON before changing other parameters. Preserve the
 true-residual/energy acceptance, bounded correction and rollback. Count extra
 QR/candidate evaluation costs, not merely outer iterations saved.
+
+`run_prediction_pairs.py --stage anderson --initializer direct|predict
+--predictor-reference <completed predictor directory>` is the second, independent
+stage. It requires a completed passing predictor experiment using the same binary
+and uses the selected initializer's archived result as a numerical OFF control.
+Only the AA block changes to `enabled: true, depth: 3, beta: 0.3`. Run OFF/ON,
+ON/OFF, OFF/ON with the same physical inputs and convergence gates. Record QR/
+candidate-evaluation time, accepted/rejected offers and actual evaluation counts;
+the ON path must actually exercise Anderson. Existing correction bounds,
+true-residual/energy checks, rejection reset and best-state rollback are unchanged.
+The actual small-sweep OFF/ON test above passed, but no large-model Anderson
+timing or adoption result is claimed before this second stage runs and is reviewed.
 
 ## D. Magnetic-circuit initializer (deferred; excluded from current plan)
 

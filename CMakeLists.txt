@@ -111,6 +111,10 @@ if(BUILD_TESTING)
     target_link_libraries(solver_numerics_test PRIVATE omfdm_core)
     add_test(NAME solver_numerics COMMAND solver_numerics_test
         ${CMAKE_CURRENT_BINARY_DIR}/solver_numerics_fixture)
+    add_executable(nonlinear_prediction_sweep_test tests/nonlinear_prediction_sweep_test.cpp)
+    target_link_libraries(nonlinear_prediction_sweep_test PRIVATE omfdm_core)
+    add_test(NAME nonlinear_prediction_sweep COMMAND nonlinear_prediction_sweep_test
+        ${CMAKE_CURRENT_BINARY_DIR}/prediction_sweep_fixture)
     add_executable(polar_magnetization_curl_test
         tests/polar_magnetization_curl_test.cpp
         PolarMagnetizationCurl.h

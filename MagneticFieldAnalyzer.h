@@ -698,6 +698,8 @@ private:
     // One-shot eligibility, set only immediately before a transient solve whose
     // preceding step strictly converged. Consumed at NK entry, including errors.
     bool transient_newton_seed_ready_ = false;
+    bool transient_newton_predictor_ready_ = false;
+    std::string nonlinearPredictionKey() const;
 
     // Phase B.6: per-rectangle-slide cumulative displacement state.
     // dx / dy can be tinyexpr formulas in $step, so we accumulate the

@@ -1,0 +1,156 @@
+{
+  "evidence_directory": "../bench_results/angle_prediction_20261015_01",
+  "review_date": "2026-10-16",
+  "decision": "Reject fixed-coordinate beta=1 angle prediction; retain DIRECT for the safeguarded Anderson comparison.",
+  "protocol": {
+    "stage": "predictor",
+    "variants": [
+      [
+        "direct_off",
+        "direct",
+        false
+      ],
+      [
+        "predict_off",
+        "predict",
+        false
+      ]
+    ],
+    "executable_sha256": "4a9a0f1d893234ff544fc51d46a61372b55dd347d96f6ae010144635a05906a1",
+    "dll_sha256": {
+      "jpeg62.dll": "efe3d322093e6cb1c9fec55038df326e8377dd4998a9cb08b2bf4b959e68bdf4",
+      "liblzma.dll": "31544da72a5481922aca4f3c48654559c4243153864669e53ec1f40efce0e98e",
+      "libpng16.dll": "80cd3c320380a75498c20ea62037e9e988abc0d7cde8cd502e6ec7cb50a8b0e0",
+      "libsharpyuv.dll": "2d11d1ecc3bc0a5c1f0bbf9f1b7ca817425ad67313a72898a575d09f3cbd91c9",
+      "libwebp.dll": "538a320e83f819159c61b1f7845151ac1d937bdf75ee65c7ed6c4c996457c506",
+      "libwebpdecoder.dll": "06f8db9b6aab1fdd12e6b8f476f41c5dc26aba2a69aabf63c537ed9b824a9695",
+      "libwebpdemux.dll": "5f473c084654b5e9126bb4ec0243fe83fbbb2ac4a8a059358f93a52558d0b099",
+      "libwebpmux.dll": "0ff043037b0ef61bcf5d4eb142a9f4e46a8cc3ff24d42e609ba1c493fb2449f1",
+      "opencv_core4.dll": "e8c1b123611002c8761ec01f759e77e75813c49f283e15554bad96c918f7b656",
+      "opencv_imgcodecs4.dll": "5d8379bf11002d6777df6f04c186eec43bfd2271a23c345e9c57741d144086fb",
+      "opencv_imgproc4.dll": "48192d2b85c312e5074752dc95a9f7087d0b04e8f49000bd5b0c156b54a5787c",
+      "tiff.dll": "21792472d65dbfb4953554dd293881e02110fea015d0272c8d626d5afce8673b",
+      "yaml-cpp.dll": "0a2b1b0ef955bfef528e6db8387fb58816fba4327a6bc838efb61eb33c65f94b",
+      "zlib1.dll": "5f2b1e2010c47b57bbf7ccbf5df397a7d2fd374cf75ec546c8453267b0eff6a0"
+    },
+    "source_config_sha256": "ac899fd6378d747e3fc32750964264560dc7c466ce66d49ad838a5171891941d",
+    "image_sha256": "d5c1d8c34038ff710e30d25274958f26260d043534acbc3625f8ce2096daa011",
+    "reference_manifest_sha256": "686ab92f1e43b2ac6217308173e6237b499557bab34609d82e82bfb1114ea3ce",
+    "reference_summary_sha256": "928b5a701598e075081a0cf723a1b7a03c0b9737ab615abbecccaaeff4d8965f",
+    "reference_measurement_sha256": "842b38258cb11b7a824857770268a4958910dde3774d1e8b02c78230805ed845",
+    "reference_fields": {
+      "Az\\step_0001.tiff": "f8d812268a6171aa1e15f436168312fdef64f5480ffa315851892ab8511090da",
+      "Az\\step_0002.tiff": "febc4c08665b0eeb66a8fc08528191c9f85329233067ee1969a7db83608aea0f",
+      "Az\\step_0003.tiff": "4103a0feab676a7710f371988d577497f855041958ae158724b9f966db56bbe6",
+      "Az\\step_0004.tiff": "fc4c17028164e9f7ea319035f9fdbda909690697977304fed0170fc32e6111b3",
+      "Az\\step_0005.tiff": "70da28e0ffce6d885230884ec6c8dcca7b3b17e757d3ef37c86b5ecdc34b7fef",
+      "Az\\step_0006.tiff": "1bdbec49a05a121d5384bad7cc72d11194b5a0eaacfb33a7f8f7acb53b32c236",
+      "Az\\step_0007.tiff": "8b0c3974ed1812aabdb568c9680fc8cf2ee563706e59f98b68ade8608ba43f59",
+      "Az\\step_0008.tiff": "f60b9e2ec9c9920a28be74a792990669af9d2a5d4e14d7fef0e595ac1104e953",
+      "Az\\step_0009.tiff": "6f4ad2accbb2e6770e7dce0214125d6099bcdacbfab85beeb61fa94b2901a9ec",
+      "Az\\step_0010.tiff": "dc3268d3ecb6efdf8527814dd012451892346915011163377955b683ffab507f",
+      "Az\\step_0011.tiff": "df088af3ee2635cbfa213f47195431ab6920368418cc4a1b16b57246bfdf0a7b",
+      "Az\\step_0012.tiff": "d9035efc705962022212973f8b9b3ea95efdeab81a621e855a5073c20b15e411",
+      "Mu\\step_0001.tiff": "b4e44461b37c174a3079f0d8843ab0dde778ed6fb850fd5a5d86b322a36da3c1",
+      "Mu\\step_0002.tiff": "fec37009ac52322e1beac1c49e84dbd6cc92d3fd21baad263c92f8fcc1ec553e",
+      "Mu\\step_0003.tiff": "1135a2bf779b956b59156468c007b5f8bcc9c26328e03ca126ff6c9758871e9b",
+      "Mu\\step_0004.tiff": "236a90badb251949af9bbbea7f5f2087a8bd617a7bfff8639619de3aa5d7203a",
+      "Mu\\step_0005.tiff": "92e29d0260be581affdeeccdb1a99d11365d3b9bff4257a8f095e4f1be172d6e",
+      "Mu\\step_0006.tiff": "14b3319d55d300fcf88b9d78e9479a1ba025389f925f14480fd6c71742ac0def",
+      "Mu\\step_0007.tiff": "6c6edeeb7da787d73df90e148b5e03f106f1f01d085d29e8d6715b032b219d03",
+      "Mu\\step_0008.tiff": "164b0355e9af65f6386618dbd8e9ba605d6e7f2de034b17aae1faf59fca095cc",
+      "Mu\\step_0009.tiff": "a6e45537d8e741a370e0fdc5ab9c01b40aed85ddbef604f639be8408dbef0581",
+      "Mu\\step_0010.tiff": "ad67903d0d83b162b8cff8afc209edffc35f793472f0190c0ba3fc8292f61621",
+      "Mu\\step_0011.tiff": "8d5177a37868c6c217ed84b1679cb46081cd3093029f7ea61ca09cf317871f63",
+      "Mu\\step_0012.tiff": "353fa9c1bf6a314119026aab1886138b1fdaa9727aa7de32ae9048cab4fa0554"
+    },
+    "predictor_reference": null,
+    "configs": {
+      "direct_off.yaml": "coordinate_system: polar\npolar_domain:\n  r_start: 0.0050633\n  r_end: 0.1\n  r_orientation: horizontal\n  theta_range: 2*pi\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0\n  outer:\n    type: dirichlet\n    value: 0\n  theta_min:\n    type: periodic\n    value: 1\n  theta_max:\n    type: periodic\n    value: 1\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 12\n  parallel_chunks: 1\n  slide_direction: vertical\n  slide_region_start: 0\n  slide_region_end: 212\n  slide_pixels_per_step: 12\nmaterial_presets:\n  pure_iron_model:\n    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))\n  NdFeB_N40:\n    mu_r: 1.05\n    magnetization:\n      Br: 1.27\n      pattern: parallel\n      angle: 0\nmaterials:\n  material_92989e:\n    rgb:\n    - 146\n    - 152\n    - 158\n    preset: pure_iron_model\n  material_f7f7f7:\n    rgb:\n    - 247\n    - 247\n    - 247\n    mu_r: 1\n    jz: 0\n  material_d072a7:\n    rgb:\n    - 208\n    - 114\n    - 167\n    preset: NdFeB_N40\n    magnetization:\n      pattern: parallel_array\n      p: 4\n      angle: 0\n      cx: 0\n      cy: 0\n      direction: outward\n      orientation_offset: -45\n  material_000000:\n    rgb:\n    - 0\n    - 0\n    - 0\n    mu_r: 1\n    jz: 0\n  coil_C_neg_253f70:\n    rgb:\n    - 37\n    - 63\n    - 112\n    mu_r: 1\n    jz: 0\n  coil_C_pos_3a6ccf:\n    rgb:\n    - 58\n    - 108\n    - 207\n    mu_r: 1\n    jz: 0\n  coil_B_pos_3ad052:\n    rgb:\n    - 58\n    - 208\n    - 82\n    mu_r: 1\n    jz: 0\n  coil_B_neg_257030:\n    rgb:\n    - 37\n    - 112\n    - 48\n    mu_r: 1\n    jz: 0\n  coil_A_pos_d0533a:\n    rgb:\n    - 208\n    - 83\n    - 58\n    mu_r: 1\n    jz: 0\n  coil_A_neg_703025:\n    rgb:\n    - 112\n    - 48\n    - 37\n    mu_r: 1\n    jz: 0\nflux_linkage:\n- name: Phi_Coil_A\n  material_a: coil_A_pos_d0533a\n  material_b: coil_A_neg_703025\n- name: Phi_Coil_B\n  material_a: coil_B_pos_3ad052\n  material_b: coil_B_neg_257030\n- name: Phi_Coil_C\n  material_a: coil_C_pos_3a6ccf\n  material_b: coil_C_neg_253f70\nnonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  jacobian: tangent\n  line_search_objective: energy\n  verbose: true\n  tolerance: 0.001\n  max_iterations: 300\n  anderson:\n    enabled: false\n  eisenstat_walker:\n    enabled: true\n    gamma: 0.9\n    alpha: 2.0\n    eta_min: 1.0e-06\n    eta_max: 0.1\nexport:\n  format: tiff\n  precision: double\n",
+      "predict_off.yaml": "coordinate_system: polar\npolar_domain:\n  r_start: 0.0050633\n  r_end: 0.1\n  r_orientation: horizontal\n  theta_range: 2*pi\npolar_boundary_conditions:\n  inner:\n    type: dirichlet\n    value: 0\n  outer:\n    type: dirichlet\n    value: 0\n  theta_min:\n    type: periodic\n    value: 1\n  theta_max:\n    type: periodic\n    value: 1\ntransient:\n  enabled: true\n  enable_sliding: true\n  total_steps: 12\n  parallel_chunks: 1\n  slide_direction: vertical\n  slide_region_start: 0\n  slide_region_end: 212\n  slide_pixels_per_step: 12\nmaterial_presets:\n  pure_iron_model:\n    B-H: ($H/(40 + 0.52*$H) + 4*pi*1e-7*$H) * (1.0/(1.0 + exp(-0.1*($H - 40))))\n  NdFeB_N40:\n    mu_r: 1.05\n    magnetization:\n      Br: 1.27\n      pattern: parallel\n      angle: 0\nmaterials:\n  material_92989e:\n    rgb:\n    - 146\n    - 152\n    - 158\n    preset: pure_iron_model\n  material_f7f7f7:\n    rgb:\n    - 247\n    - 247\n    - 247\n    mu_r: 1\n    jz: 0\n  material_d072a7:\n    rgb:\n    - 208\n    - 114\n    - 167\n    preset: NdFeB_N40\n    magnetization:\n      pattern: parallel_array\n      p: 4\n      angle: 0\n      cx: 0\n      cy: 0\n      direction: outward\n      orientation_offset: -45\n  material_000000:\n    rgb:\n    - 0\n    - 0\n    - 0\n    mu_r: 1\n    jz: 0\n  coil_C_neg_253f70:\n    rgb:\n    - 37\n    - 63\n    - 112\n    mu_r: 1\n    jz: 0\n  coil_C_pos_3a6ccf:\n    rgb:\n    - 58\n    - 108\n    - 207\n    mu_r: 1\n    jz: 0\n  coil_B_pos_3ad052:\n    rgb:\n    - 58\n    - 208\n    - 82\n    mu_r: 1\n    jz: 0\n  coil_B_neg_257030:\n    rgb:\n    - 37\n    - 112\n    - 48\n    mu_r: 1\n    jz: 0\n  coil_A_pos_d0533a:\n    rgb:\n    - 208\n    - 83\n    - 58\n    mu_r: 1\n    jz: 0\n  coil_A_neg_703025:\n    rgb:\n    - 112\n    - 48\n    - 37\n    mu_r: 1\n    jz: 0\nflux_linkage:\n- name: Phi_Coil_A\n  material_a: coil_A_pos_d0533a\n  material_b: coil_A_neg_703025\n- name: Phi_Coil_B\n  material_a: coil_B_pos_3ad052\n  material_b: coil_B_neg_257030\n- name: Phi_Coil_C\n  material_a: coil_C_pos_3a6ccf\n  material_b: coil_C_neg_253f70\nnonlinear_solver:\n  enabled: true\n  solver_type: newton-krylov\n  jacobian: tangent\n  line_search_objective: energy\n  verbose: true\n  tolerance: 0.001\n  max_iterations: 300\n  anderson:\n    enabled: false\n  eisenstat_walker:\n    enabled: true\n    gamma: 0.9\n    alpha: 2.0\n    eta_min: 1.0e-06\n    eta_max: 0.1\nexport:\n  format: tiff\n  precision: double\n"
+    },
+    "scripts": {
+      "run_prediction_pairs.py": "d48ad76819ad786e2b49ff880e9319cde8b681bb7870890e2204fa5f715f9f4b",
+      "run_comparison.py": "d5f31438b09cc8e5bf07485b764aa67598585cf322d05d9f525a318c14c3c321",
+      "run_field_reuse_pairs.py": "82425c0d8e65b4b8fc3c455cfba5f28bb9d0790076f2def5c417757b3de37752",
+      "run_initialization_pairs.py": "23bf30124fa082349ef041a825673247255adb4452be5fee2d627c35252f548b",
+      "run_initialization_validation.py": "693a6afa601ac93b00876f367553c43903b81492ee6f3ae867dd2b0882788554",
+      "run_selection_sweep.py": "393ff090bcfcb942b2e387520a9c268d80ed0319091d53a9fd56ff5bf474b65a",
+      "compare_waveforms.py": "57e49917f846d27afff005b87936b46ce37b55804b14f5d7a820014fb66bac73"
+    },
+    "threads": 12,
+    "mask": 6,
+    "orders": [
+      [
+        "direct_off",
+        "predict_off"
+      ],
+      [
+        "predict_off",
+        "direct_off"
+      ],
+      [
+        "direct_off",
+        "predict_off"
+      ]
+    ],
+    "timeout_seconds": 7200,
+    "memory_limit_bytes": 8589934592,
+    "power_plan_guid": "381b4222-f694-41f0-9685-ff5bb260df2e"
+  },
+  "binary_source_base_commit": "e8df23f369e2de195078913f29b2b62781d9d920",
+  "source_note": "The preserved binary was built before the implementation commit. Original manifest contains the source diff; listed source hashes match the current implementation. Do not rebuild the pinned executable.",
+  "experiment_source_sha256": {
+    "MagneticFieldAnalyzer.cpp": "41306ef8a7666505b4ad6bead8fbfb9ec51620174eaf9fcf50b9579561ab12cf",
+    "MagneticFieldAnalyzer.h": "6e2997283ac06e0430825cd1ea06f6d74afcb944d563186138b950ecc43502b2",
+    "MagneticFieldAnalyzer_nonlinear_newton.cpp": "d32ec3b0d8303c8516c946117677bb7b9aa8412852729d1f8b53b558804a238c",
+    "SolverExperiments.h": "601831de641d9d7faa15bfb44f28d0d682084c89946187d89be53971ea3f0f4f",
+    "TransientPredictionHistory.h": "11761ea0a344dd9a40c3b2aee8988eca4c180eb8f89591fe7f4cbc6af1b5d4ab",
+    "tests/solver_numerics_test.cpp": "cf343a43237d1bb261beff3101aa01ec4393b5a3babcf2e029599698150963f6",
+    "tests/nonlinear_prediction_sweep_test.cpp": "b4e1da84a71de5e801ed0f331e48dcd8174c632cb73f93b9e2bf6e65c09db56d",
+    "CMakeLists.txt": "4c80c1a321e0bd7cbb25a50943fe5de894f7e1ff116299315ebc23f421aa4301"
+  },
+  "manifest_sha256": "bc86ee69ea9b151532b5d7be15a3b369465f36e981a4af8b8564a9f6e3112469",
+  "summary_sha256": "b1294c393af2447883aa6ad85f6c725f1d01ca4aaa38bbd5be8b462de5f24d4e",
+  "files_sha256": {
+    "1_direct_off/measurement.json": "9ca994b7afd619ca0cc13264498a3a7234d622e8da1097786db4a0cb085ee0e0",
+    "1_direct_off/process.log": "cd6fe8b3166e05e82f48ba9d8c0e7af060adbb05356932ae6eb94300e6ae0ff5",
+    "1_direct_off/results/conditions.json": "0b7df63865a5ccc337397d8173c4bcbe09b9d3bf294c0c0aff9881ee7a65f340",
+    "1_direct_off/results/FluxLinkage/flux_linkage.csv": "8f780d6af973293d5ce392224d6155134a9e119a6908f0f8cba79c4d8fc46c6f",
+    "1_predict_off/measurement.json": "4a5aec97e1e17bd0aa4f153e64120b2755e37a379275aa1ad819971a5ce2db1b",
+    "1_predict_off/process.log": "f471c530221c44354d4bfdb506c54407b86557386bf9c489e775541d62015ed5",
+    "1_predict_off/results/conditions.json": "0b7df63865a5ccc337397d8173c4bcbe09b9d3bf294c0c0aff9881ee7a65f340",
+    "1_predict_off/results/FluxLinkage/flux_linkage.csv": "8f780d6af973293d5ce392224d6155134a9e119a6908f0f8cba79c4d8fc46c6f",
+    "2_direct_off/measurement.json": "1dc962c08c489f7d4f5b18079f651010a5dfce7e9cda2a64ce5f91258d4c70e3",
+    "2_direct_off/process.log": "34209ab4ee5e5ab080eea804134a82186db791c975f5f6656b4f2491d3d95e38",
+    "2_direct_off/results/conditions.json": "0b7df63865a5ccc337397d8173c4bcbe09b9d3bf294c0c0aff9881ee7a65f340",
+    "2_direct_off/results/FluxLinkage/flux_linkage.csv": "8f780d6af973293d5ce392224d6155134a9e119a6908f0f8cba79c4d8fc46c6f",
+    "2_predict_off/measurement.json": "afd081ddf4b98a7fe4b07dc880447fbdf52a43e32b415e2b9bd98c0d718dbe63",
+    "2_predict_off/process.log": "6db59b4e0ee36f9fb631f4eeea536bc519b12a5d0ab3b5994cd387a488a5ad6e",
+    "2_predict_off/results/conditions.json": "0b7df63865a5ccc337397d8173c4bcbe09b9d3bf294c0c0aff9881ee7a65f340",
+    "2_predict_off/results/FluxLinkage/flux_linkage.csv": "8f780d6af973293d5ce392224d6155134a9e119a6908f0f8cba79c4d8fc46c6f",
+    "3_direct_off/measurement.json": "ef8be430494dfcad934a7ebb42a53e3ff33b6e543e5d4ef5a3506248f9c63d0a",
+    "3_direct_off/process.log": "1cb873c3fe3c05109e53f05e87bccbaf0500f5fcac614e71e3652ec09935e936",
+    "3_direct_off/results/conditions.json": "0b7df63865a5ccc337397d8173c4bcbe09b9d3bf294c0c0aff9881ee7a65f340",
+    "3_direct_off/results/FluxLinkage/flux_linkage.csv": "8f780d6af973293d5ce392224d6155134a9e119a6908f0f8cba79c4d8fc46c6f",
+    "3_predict_off/measurement.json": "5823ba13fc48fcd8c4ff72cc1f75feb31518d61ff87794b9bb1fe907582ec20f",
+    "3_predict_off/process.log": "f55b5a3f611047dc0b4112d8d0185817b777c99670132c24271ecdd6afe6d6cf",
+    "3_predict_off/results/conditions.json": "0b7df63865a5ccc337397d8173c4bcbe09b9d3bf294c0c0aff9881ee7a65f340",
+    "3_predict_off/results/FluxLinkage/flux_linkage.csv": "8f780d6af973293d5ce392224d6155134a9e119a6908f0f8cba79c4d8fc46c6f"
+  },
+  "review": {
+    "strictly_converged_steps": 72,
+    "prediction_attempts": 30,
+    "prediction_accepted": 0,
+    "prediction_to_direct_residual_ratio_min": 2.221146157803302,
+    "prediction_to_direct_residual_ratio_max": 2.232314077159782,
+    "all_runs_outer_iterations": 211,
+    "all_runs_inner_iterations": 3081,
+    "field_hashes_compared": 144,
+    "all_fields_match_archived_direct": true,
+    "all_step_status_and_numerical_signatures_match_direct": true,
+    "aligned_flux_normalized_rms_max": 0,
+    "periodic_emf_evaluated": false,
+    "timing_note": "Raw median reduction is not credited as predictor acceleration: every candidate was rejected, with identical selected states and numerical histories. Background conditions differ; the precise cause of the time difference is not established."
+  }
+}

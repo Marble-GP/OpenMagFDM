@@ -1,6 +1,8 @@
 #include "MagneticFieldAnalyzer.h"
 #include "PolarMagnetizationCurl.h"
 #include "PolarGridAccess.h"
+#include "SolverExperiments.h"
+#include "TransientPredictionHistory.h"
 #include <amgcl/adapter/eigen.hpp>
 #include "tinyexpr/tinyexpr.h"
 #include <opencv2/imgproc.hpp>
@@ -12848,6 +12850,29 @@ void MagneticFieldAnalyzer::slideImageRegion() {
     }
 }
 
+std::string MagneticFieldAnalyzer::nonlinearPredictionKey() const {
+    // First bounded angle-prediction experiment: one constant angular band on
+    // a fixed polar mesh with a fixed gauge. No rectangular/variable motion,
+    // multiple rotors, Cartesian transport or free-gauge reconstruction.
+    if (coordinate_system != "polar" || !transient_config.enable_sliding ||
+            transient_config.slides.size() != 1 ||
+            (bc_inner.type != "dirichlet" && bc_outer.type != "dirichlet")) return {};
+    const auto& slide = transient_config.slides.front();
+    if (slide.kind != "band" || slide.pixels_per_step == 0 ||
+            slide.direction != (r_orientation == "horizontal" ? "vertical" : "horizontal")) return {};
+    std::ostringstream key;
+    key << std::setprecision(17) << coordinate_system << '|' << r_orientation << '|'
+        << nx << ',' << ny << ',' << nr << ',' << ntheta << ',' << dr << ',' << dtheta << ','
+        << r_start << ',' << r_end << '|' << slide.region_start << ',' << slide.region_end << ','
+        << slide.pixels_per_step << ',' << slide.wrap_mode << '|';
+    for (double r : r_coords) key << r << ',';
+    for (const auto* bc : {&bc_inner, &bc_outer, &bc_theta_min, &bc_theta_max}) {
+        key << '|' << bc->type << ',' << bc->value << ',' << bc->alpha << ',' << bc->beta << ',' << bc->gamma;
+        for (double value : bc->profile) key << ',' << value;
+    }
+    return key.str();
+}
+
 void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_dir) {
     if (!transient_config.enabled) {
         std::cout << "Transient analysis is not enabled" << std::endl;
@@ -12878,6 +12903,9 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
     }
     transient_solver_status_results.clear();
     transient_solver_status_results.reserve(expected_steps);
+    omfdm::TransientPredictionHistory prediction_history;
+    transient_newton_seed_ready_ = transient_newton_predictor_ready_ = false;
+    const bool predict_initialization = omfdm::SolverExperiments::transientInitialization() == "predict";
 
     std::cout << "\n=== Starting Transient Analysis ===" << std::endl;
     std::cout << "Total steps: " << transient_config.total_steps;
@@ -12956,10 +12984,14 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
         if (has_nonlinear_materials && nonlinear_config.enabled) {
             // For nonlinear materials, use standard solve() which includes nonlinear iteration
             // This ensures mu_map is updated based on actual H-field at each transient step
-            transient_newton_seed_ready_ = step > 0 && last_nonlinear_converged_
+            const auto prediction_key = predict_initialization ? nonlinearPredictionKey() : std::string();
+            transient_newton_seed_ready_ = step > step_begin && last_nonlinear_converged_
                 && have_last_accepted_transient_state;
-            solve();
-            transient_newton_seed_ready_ = false;
+            transient_newton_predictor_ready_ = transient_newton_seed_ready_
+                && prediction_history.ready(step, prediction_key);
+            try { solve(); }
+            catch (...) { transient_newton_seed_ready_ = transient_newton_predictor_ready_ = false; throw; }
+            transient_newton_seed_ready_ = transient_newton_predictor_ready_ = false;
             prof_iters = getLastNonlinearIterations();
             // Phase V diagnostic: μ stats AT END of solve (= what gets exported).
             if (nonlinear_config.verbose) {
@@ -13025,6 +13057,7 @@ void MagneticFieldAnalyzer::performTransientAnalysis(const std::string& output_d
                           << step + 1 << " failed the residual quality gate."
                           << std::endl;
             }
+            prediction_history.observe(step, last_nonlinear_converged_ && last_nonlinear_warm_start_safe_, prediction_key);
         } else if (use_optimized_solver) {
             // Optimized linear path for transient analysis (when no nonlinear materials)
             Eigen::SparseMatrix<double> A;

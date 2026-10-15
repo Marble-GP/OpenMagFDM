@@ -2,6 +2,7 @@
 #include "PolarGridAccess.h"
 #include "TangentKrylovWorkspace.h"
 #include "SolverExperiments.h"
+#include "TransientPredictionHistory.h"
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -558,6 +559,104 @@ struct SolverNumericsTest {
         environment("NK_PROF", "");
         std::cout << "direct initialization cases=" << cases << " passed\n";
     }
+    static void predictionTests(MagneticFieldAnalyzer& a) {
+        omfdm::TransientPredictionHistory history;
+        require(!history.ready(0,"grid"), "prediction on cold start");
+        history.observe(0,true,"grid");
+        require(!history.ready(1,"grid"), "prediction with one state");
+        history.observe(1,true,"grid");
+        require(history.ready(2,"grid"), "two strict states not eligible");
+        require(!history.ready(2,"new-grid") && !history.ready(3,"grid"), "incompatible history accepted");
+        history.observe(2,false,"grid");
+        require(!history.ready(3,"grid"), "failed state retained for prediction");
+        history.observe(3,true,"grid");
+        require(!history.ready(4,"grid"), "prediction after only one recovered state");
+        history.observe(4,true,"grid");
+        require(history.ready(5,"grid"), "prediction did not recover");
+        history.observe(5,true,"");
+        require(!history.ready(6,"grid"), "unsupported motion retained history");
+        history = omfdm::TransientPredictionHistory();
+        require(!history.ready(6,"grid"), "chunk/restart retained history");
+
+        environment("NK_PROF","1");
+        environment("OMFDM_TANGENT_OPTIMIZATIONS","6");
+        environment("OMFDM_TANGENT_PRECONDITIONER","tangent-amg");
+        int cases = 0;
+        for (bool horizontal : {false,true}) for (bool anti : {false,true}) for (bool axis : {false,true}) {
+            nonlinearFixture(a,true,horizontal);
+            if (axis) {
+                a.r_start = 0; a.r_end = (a.nr-1)*a.dr;
+                for(int k=0;k<a.nr;++k) a.r_coords[k]=k*a.dr;
+            }
+            a.bc_inner = a.bc_outer = bc("dirichlet");
+            a.bc_inner.value = a.bc_outer.value = 0;
+            a.bc_theta_min = a.bc_theta_max = bc("periodic");
+            a.bc_theta_min.value = a.bc_theta_max.value = anti ? -1 : 1;
+            a.transient_config.enable_sliding = true;
+            MagneticFieldAnalyzer::SlideRegion slide;
+            slide.direction = horizontal ? "vertical" : "horizontal";
+            slide.pixels_per_step = 1; slide.region_end = a.nr/2;
+            a.transient_config.slides = {slide};
+            const auto key = a.nonlinearPredictionKey();
+            require(!key.empty(), "supported polar motion excluded");
+            a.transient_config.slides[0].pixels_per_step = 2;
+            require(key != a.nonlinearPredictionKey(), "step change not detected");
+            a.transient_config.slides[0] = slide;
+            a.bc_inner.profile = {0,0.1};
+            require(key != a.nonlinearPredictionKey(), "boundary/gauge profile change not detected");
+            a.bc_inner.profile.clear();
+            a.dr *= 2;
+            require(key != a.nonlinearPredictionKey(), "mesh change not detected");
+            a.dr /= 2;
+            a.transient_config.slides[0].kind = "rectangle";
+            require(a.nonlinearPredictionKey().empty(), "variable rectangular motion accepted");
+            a.transient_config.slides[0] = slide;
+            a.coordinate_system = "cartesian";
+            require(a.nonlinearPredictionKey().empty(), "Cartesian motion mislabelled angular");
+            a.coordinate_system = "polar";
+            a.has_nonlinear_materials = true; a.dd_warm_start_ = false;
+            a.coarsening_enabled = false; a.adaptive_mesh_enabled = false;
+            a.nonlinear_config = MagneticFieldAnalyzer::NonlinearSolverConfig();
+            a.nonlinear_config.max_iterations = 100; a.nonlinear_config.tolerance = 1e-8;
+            a.nonlinear_config.jacobian_tangent = true; a.nonlinear_config.anderson.enabled = false;
+            a.Az = Eigen::MatrixXd::Zero(a.ny,a.nx);
+            a.jz_map *= 0.01; a.Jz_mag_map *= 0.01;
+            environment("OMFDM_NK_INITIALIZATION","linear");
+            { Capture capture; a.solveNonlinearNewtonKrylov(); }
+            require(a.last_nonlinear_converged_, "prediction reference not converged");
+            const Eigen::MatrixXd reference = a.Az, mu = a.mu_map;
+            Eigen::VectorXd seed(a.nr*a.ntheta);
+            for(int i=0;i<a.nr;++i) for(int j=0;j<a.ntheta;++j)
+                seed[i*a.ntheta+j] = horizontal ? reference(j,i) : reference(i,j);
+            for (int scenario=0;scenario<7;++scenario) {
+                a.Az=reference; a.mu_map=mu;
+                a.previous_solution=0.9*seed; a.previous_previous_solution=0.8*seed;
+                a.transient_newton_seed_ready_=true; a.transient_newton_predictor_ready_=scenario!=2;
+                if(scenario==1) a.previous_previous_solution=2.0*seed;
+                if(scenario==3) a.previous_previous_solution[0]=std::numeric_limits<double>::quiet_NaN();
+                if(scenario==4) a.previous_previous_solution.resize(1);
+                if(scenario==5) a.previous_previous_solution.setConstant(std::numeric_limits<double>::max());
+                if(scenario==6) a.transient_newton_seed_ready_=false;
+                environment("OMFDM_NK_INITIALIZATION","predict");
+                std::string log;
+                { Capture capture; a.solveNonlinearNewtonKrylov(); log=capture.stream.str(); }
+                require(!a.transient_newton_seed_ready_ && !a.transient_newton_predictor_ready_, "prediction flags survived solve");
+                require(log.find(scenario==0 ? "prediction_used=1" : "prediction_used=0")!=std::string::npos,
+                        "prediction accept/reject mismatch");
+                require(a.last_nonlinear_converged_ && a.Az.allFinite() && a.mu_map.allFinite(), "prediction fallback not converged/finite");
+                require((a.Az-reference).norm()<1e-8*std::max(1.0,reference.norm()), "prediction changed final field");
+                ++cases;
+            }
+        }
+        environment("OMFDM_NK_INITIALIZATION","typo");
+        a.transient_newton_seed_ready_=a.transient_newton_predictor_ready_=true;
+        bool threw=false;
+        try { a.solveNonlinearNewtonKrylov(); } catch(const std::invalid_argument&) { threw=true; }
+        require(threw && !a.transient_newton_seed_ready_ && !a.transient_newton_predictor_ready_, "exception retained prediction flags");
+        environment("OMFDM_NK_INITIALIZATION",""); environment("NK_PROF","");
+        environment("OMFDM_TANGENT_OPTIMIZATIONS",""); environment("OMFDM_TANGENT_PRECONDITIONER","");
+        std::cout << "prediction acceptance/fallback cases=" << cases << " passed\n";
+    }
     static void innerSolverTests(MagneticFieldAnalyzer& a) {
         MagneticFieldAnalyzer::RowMatrix A(40,40), J(40,40);
         std::vector<Eigen::Triplet<double>> entries;
@@ -654,6 +753,7 @@ int main(int argc, char** argv) {
         SolverNumericsTest::innerSolverTests(a);
         SolverNumericsTest::optimizationTests(a);
         SolverNumericsTest::initializationTests(a);
+        SolverNumericsTest::predictionTests(a);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n'; return 1;

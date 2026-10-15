@@ -181,3 +181,37 @@ timing gain and outer iterations increased; this gate is not an unconditional
 speed/adoption decision. See the [review and archived evidence](../../docs/research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md#completed-full-revolution-and-large-displacement-gate-2026-10-15).
 The original evidence directory is complete: do not reuse it for a new trial
 or run `--resume` merely to inspect results, since resume rewrites aggregates.
+
+## Angle prediction, then safeguarded Anderson
+
+Use the separate `build_nonlinear_prediction/` build; do not overwrite the
+preserved direct-start binary. `run_prediction_pairs.py` compares three 12-step
+pairs in AB/BA/AB order. Prediction is fixed beta=1 and residual-gated; AA is a
+separate stage with fixed depth=3/beta=.3, not a simultaneous algorithm change.
+
+```powershell
+.\build_solver_speed\bench_py312\Scripts\python.exe -m unittest discover -s benchmarks/solver_speed -p 'test_*.py'
+.\build_solver_speed\bench_py312\Scripts\python.exe benchmarks/solver_speed/run_prediction_pairs.py --exe build_nonlinear_prediction/Release/MagFDMsolver.exe --reference ../bench_results/direct_initialization_20261010_01 --output ../bench_results/angle_prediction_20261015_01 --stage predictor --prepare-only
+.\build_solver_speed\bench_py312\Scripts\python.exe benchmarks/solver_speed/run_prediction_pairs.py --exe build_nonlinear_prediction/Release/MagFDMsolver.exe --reference ../bench_results/direct_initialization_20261010_01 --output ../bench_results/angle_prediction_20261015_01 --stage predictor --resume
+```
+
+The directory above completed on 2026-10-15. Review on 2026-10-16 rejected
+the predictor: 0/30 candidates accepted, unchanged convergence histories and
+fields. Its raw time difference is not credited as a predictor speedup.
+Inspect the archived results; do not resume/reaggregate a completed experiment.
+Use a new output directory for
+fresh experiments. To resume use identical pinned binary/DLL/input/harness/power
+plan; incomplete attempts stop for review and are never automatically overwritten.
+
+The selected initializer is DIRECT. Start the independent AA stage with
+`--stage anderson --initializer direct --predictor-reference
+../bench_results/angle_prediction_20261015_01` and a **new** output directory,
+first with `--prepare-only`, then `--resume`. A completed passing predictor stage
+with the same binary is mandatory. No next stage is launched automatically.
+
+Both stages require strict convergence, repeatable within-mode histories and
+fields, unchanged archived OFF/control results, aligned flux RMS <=0.1%, actual
+initializer/AA use and paired memory limits. Background CPU load is retained.
+Total time includes prediction probes and output drain. These 12 points do not
+validate periodic EMF/harmonics. See the [research report](../../docs/research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md)
+for supported motion, safeguards and remaining full-revolution gates.

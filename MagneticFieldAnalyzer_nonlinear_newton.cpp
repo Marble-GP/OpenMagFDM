@@ -37,8 +37,10 @@
  */
 void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     const bool transient_seed_ready = transient_newton_seed_ready_;
-    transient_newton_seed_ready_ = false;
-    const bool direct_transient_start = omfdm::SolverExperiments::directTransientStart();
+    const bool predictor_ready = transient_newton_predictor_ready_;
+    transient_newton_seed_ready_ = transient_newton_predictor_ready_ = false;
+    const auto initialization_mode = omfdm::SolverExperiments::transientInitialization();
+    const bool direct_transient_start = initialization_mode != "linear";
     const auto initialization_start = omfdm::ProfileClock::now();
     last_nonlinear_iterations_ = 0;
     last_nonlinear_residual_ = std::numeric_limits<double>::infinity();
@@ -298,6 +300,8 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
     // precedence. No-table material evaluation depends on old mu and is excluded.
     bool direct_used = false;
     double seed_residual = -1.0;
+    bool prediction_attempted = false, prediction_used = false;
+    double prediction_residual = -1.0;
     bool tables_valid = true;
     for (const auto& entry : material_mu) {
         if (entry.second.type == MuType::STATIC) continue;
@@ -321,6 +325,27 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         }
     }
 
+    // Experiment B: fixed-coordinate equal-angle extrapolation, beta=1. Both
+    // candidates use CURRENT B/H/mu and the same true residual; never frozen mu.
+    // A rejected/nonfinite proposal restores the direct seed and recomputes its
+    // fields. The first loop evaluation and final fresh residual stay intact.
+    if (initialization_mode == "predict" && predictor_ready && direct_used &&
+            previous_previous_solution.size() == seed_size && previous_previous_solution.allFinite()) {
+        prediction_attempted = true;
+        const Eigen::VectorXd prediction = 2.0 * previous_solution - previous_previous_solution;
+        if (prediction.allFinite()) {
+            syncMemberAz(prediction);
+            updateFieldAndMu();
+            prediction_residual = evaluateCurrentResidual();
+            prediction_used = std::isfinite(prediction_residual) && prediction_residual < seed_residual
+                && Az.allFinite() && mu_map.allFinite();
+        }
+        if (!prediction_used) {
+            syncMemberAz(previous_solution);
+            updateFieldAndMu();
+        }
+    }
+
     // Initial guess: solve linear problem with initial μ distribution. Coarse path
     // uses the FVM coarsened linear solve (sets the full interpolated member Az).
     if (VERBOSE && !loaded_warm) {
@@ -341,11 +366,16 @@ void MagneticFieldAnalyzer::solveNonlinearNewtonKrylov() {
         buildAndSolveSystem();
     }
     if (omfdm::profilingEnabled()) {
-        std::cout << "[NKINIT] requested=" << (direct_transient_start ? "direct" : "linear")
+        const auto previous_precision = std::cout.precision();
+        std::cout << "[NKINIT] requested=" << initialization_mode
                   << " transient_eligible=" << transient_seed_ready
-                  << " direct_used=" << direct_used << " seed_residual=" << seed_residual
+                  << " direct_used=" << direct_used << " seed_residual=" << std::setprecision(17) << seed_residual
+                  << " prediction_eligible=" << predictor_ready
+                  << " prediction_attempted=" << prediction_attempted << " prediction_used=" << prediction_used
+                  << " prediction_residual=" << prediction_residual
                   << " total_ms=" << omfdm::milliseconds(initialization_start, omfdm::ProfileClock::now())
                   << std::endl;
+        std::cout.precision(previous_precision);
     }
 
     // [NKPROF] temporary per-iteration phase timing (diagnostic; enabled with
