@@ -15,6 +15,11 @@ const FIELD_CACHE_ARRAY_OVERHEAD_BYTES = 64;
 const AppState = {
     currentTab: 'config',
     configData: null,
+    loadedConfigFile: null,
+    configLoadGeneration: 0,
+    configLoadPending: false,
+    configSaving: false,
+    runPreparing: false,
     uploadedImage: null,
     uploadedImageFilename: null,  // Uploaded image filename on server
     currentStep: 1,
@@ -115,6 +120,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     initCustomSelect();
     await refreshConfigList();
     await loadConfig();
+    Workbench.mount();
     await refreshImageList();
     await refreshResultsList();
 
@@ -157,6 +163,8 @@ function switchTab(tabName) {
     // Update active tab button
     document.querySelectorAll('.tab').forEach(tab => {
         tab.classList.toggle('active', tab.dataset.tab === tabName);
+        tab.setAttribute('aria-selected', String(tab.dataset.tab === tabName));
+        tab.tabIndex = tab.dataset.tab === tabName ? 0 : -1;
     });
 
     // Update active tab content
@@ -165,6 +173,8 @@ function switchTab(tabName) {
     });
 
     AppState.currentTab = tabName;
+    Workbench.schedule();
+    if (tabName === 'config') requestAnimationFrame(() => AppState.aceEditor?.resize());
 
     // Tab-specific initialization
     if (tabName === 'dashboard' && !AppState.gridStack) {
@@ -173,6 +183,7 @@ function switchTab(tabName) {
     if (tabName === 'files') {
         initializeFileManager();
     }
+    if (tabName === 'integrations') MCPPanel.refresh();
 }
 
 // ===== User Management =====
@@ -231,114 +242,18 @@ async function initializeConfigEditor() {
         useSoftTabs: true
     });
 
-    // Add custom YAML autocompleter with context awareness
+    // Shared, path-aware analysis config assistance (also tested outside Ace).
     const yamlCompleter = {
         getCompletions: function(editor, session, pos, prefix, callback) {
-            if (!AppState.yamlSchema) {
-                callback(null, []);
-                return;
+            if (!AppState.yamlSchema) { callback(null, []); return; }
+            const result = OpenMagYaml.complete(editor.getValue(), pos, AppState.yamlSchema, jsyaml);
+            const context = result.context;
+            // Preserve existing block snippets; never insert a block into a scalar value.
+            if (context && !context.valueMode) {
+                const path = context.path.filter(p => typeof p !== 'number');
+                addContextSnippets(result.items, path.at(-1), path.at(-2), false, null);
             }
-
-            const completions = [];
-            const keywords = AppState.yamlSchema.keywords;
-
-            // Detect whether cursor is in a "value position" (after "key: ") vs a "key position".
-            // Value position example: "    type: d"  (lineKey="type", prefix="d")
-            // Key position example:   "    ty"       (isValuePosition=false)
-            const lineBeforeCursor = session.getLine(pos.row).substring(0, pos.column);
-            const valuePositionMatch = lineBeforeCursor.match(/^\s*([\w-]+):\s+\S*$/);
-            const isValuePosition = !!valuePositionMatch;
-            const lineKey = valuePositionMatch ? valuePositionMatch[1] : null;
-
-            // Get parent context (nest recognition)
-            const contextPath = getContextPath(editor, session, pos);
-            const parentContext = contextPath.length > 0 ? contextPath[contextPath.length - 1] : null;
-            const grandparentContext = contextPath.length > 1 ? contextPath[contextPath.length - 2] : null;
-            let availableKeywords = [];
-
-            if (parentContext) {
-                const parentInfo = keywords[parentContext];
-
-                // Check if parent accepts any child (like materials)
-                if (parentInfo && parentInfo.acceptsAnyChild) {
-                    // We're inside a container that accepts any child name
-                    // Show the properties that can be used inside those children
-                    if (parentInfo.childrenProperties) {
-                        availableKeywords = parentInfo.childrenProperties;
-                    }
-                }
-                // Normal parent with defined children (e.g., anderson has children: ["enabled", "depth", "beta"])
-                else if (parentInfo && parentInfo.children) {
-                    availableKeywords = parentInfo.children;
-                }
-                // Check if grandparent accepts any child (we're inside a specific material)
-                else if (grandparentContext) {
-                    const grandparentInfo = keywords[grandparentContext];
-                    if (grandparentInfo && grandparentInfo.acceptsAnyChild && grandparentInfo.childrenProperties) {
-                        availableKeywords = grandparentInfo.childrenProperties;
-                    }
-                } else {
-                    // Parent doesn't have specific children, show all
-                    availableKeywords = Object.keys(keywords);
-                }
-            } else {
-                // Top level - show only keywords that have no validParents
-                // (i.e. genuine root-level keys). Pre-BJ-fix this returned
-                // Object.keys(keywords), which surfaced per-material keys
-                // like `coarsen`/`coarsen_ratio` at the document root and
-                // led users to write `coarsen: true` outside any material
-                // block, where the parser silently ignores it.
-                availableKeywords = Object.keys(keywords).filter(k => {
-                    const info = keywords[k];
-                    return !info || !info.validParents || info.validParents.length === 0;
-                });
-            }
-
-            // Add keyword completions
-            for (const keyword of availableKeywords) {
-                const info = keywords[keyword];
-                if (!info) continue;
-
-                if (!isValuePosition) {
-                    // At key position: show "keyword: " completion
-                    completions.push({
-                        caption: keyword,
-                        value: keyword + ': ',
-                        meta: info.type || 'keyword',
-                        score: 1000,
-                        docHTML: `<b>${keyword}</b><br>${info.description}<br><code>${info.example || ''}</code>`
-                    });
-                }
-
-                // Add value suggestions
-                if (info.values) {
-                    info.values.forEach(val => {
-                        if (isValuePosition && lineKey === keyword) {
-                            // In value position for this keyword: suggest only the value (not "keyword: value")
-                            completions.push({
-                                caption: val,
-                                value: val,
-                                meta: 'value',
-                                score: 900,
-                                docHTML: `<b>${keyword}: ${val}</b><br>${info.description || ''}`
-                            });
-                        } else if (!isValuePosition) {
-                            // At key position: suggest full "keyword: value" pair
-                            completions.push({
-                                caption: `${keyword}: ${val}`,
-                                value: `${keyword}: ${val}`,
-                                meta: 'value',
-                                score: 900
-                            });
-                        }
-                    });
-                }
-            }
-
-            // Add snippets based on context
-            addContextSnippets(completions, parentContext, grandparentContext, isValuePosition, lineKey);
-
-            callback(null, completions);
+            callback(null, result.items);
         }
     };
 
@@ -707,112 +622,8 @@ function getIndentLevel(line) {
 
 // YAML validation function with linting
 function validateYAML(editor) {
-    const content = editor.getValue();
-    const annotations = [];
-
-    try {
-        // Parse YAML for syntax errors
-        const yaml = window.jsyaml || jsyaml;
-        const parsed = yaml.load(content);
-
-        // Validate against schema
-        if (AppState.yamlSchema) {
-            validateAgainstSchema(editor, parsed, annotations);
-        }
-    } catch (error) {
-        // YAML syntax error
-        const lineMatch = error.message.match(/at line (\d+)/);
-        const line = lineMatch ? parseInt(lineMatch[1]) - 1 : 0;
-
-        annotations.push({
-            row: line,
-            column: 0,
-            text: `Syntax error: ${error.message}`,
-            type: 'error'
-        });
-    }
-
-    editor.session.setAnnotations(annotations);
-}
-
-function validateAgainstSchema(editor, parsed, annotations) {
-    if (!parsed || typeof parsed !== 'object') return;
-
-    const keywords = AppState.yamlSchema.keywords;
-    const session = editor.session;
-    const lines = session.getDocument().getAllLines();
-
-    // Check each line for unknown keywords
-    lines.forEach((line, idx) => {
-        const match = line.match(/^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:/);
-        if (match) {
-            const keyword = match[1];
-
-            // Get full context path for this line
-            const contextPath = getContextPathForLine(session, idx);
-            const parentContext = contextPath.length > 0 ? contextPath[contextPath.length - 1] : null;
-            const grandparentContext = contextPath.length > 1 ? contextPath[contextPath.length - 2] : null;
-
-            if (parentContext) {
-                const parentInfo = keywords[parentContext];
-
-                // Check if parent accepts any child (like materials)
-                if (parentInfo && parentInfo.acceptsAnyChild) {
-                    // Any child name is allowed, don't validate
-                    return;
-                }
-
-                // Check if grandparent accepts any child (we're inside a specific material)
-                if (grandparentContext) {
-                    const grandparentInfo = keywords[grandparentContext];
-                    if (grandparentInfo && grandparentInfo.acceptsAnyChild) {
-                        // Check if keyword is in childrenProperties
-                        if (grandparentInfo.childrenProperties &&
-                            !grandparentInfo.childrenProperties.includes(keyword)) {
-                            annotations.push({
-                                row: idx,
-                                column: match.index,
-                                text: `Unknown property '${keyword}' in material definition. Valid properties: ${grandparentInfo.childrenProperties.join(', ')}`,
-                                type: 'warning'
-                            });
-                        }
-                        return;
-                    }
-                }
-
-                // Normal parent with defined children
-                if (parentInfo && parentInfo.children) {
-                    // Check if keyword is valid child
-                    if (!parentInfo.children.includes(keyword) && !keywords[keyword]) {
-                        annotations.push({
-                            row: idx,
-                            column: match.index,
-                            text: `Unknown keyword '${keyword}' in '${parentContext}' context. Valid keywords: ${parentInfo.children.join(', ')}`,
-                            type: 'warning'
-                        });
-                    }
-                } else if (!keywords[keyword]) {
-                    // Parent doesn't have children list, check if keyword exists globally
-                    annotations.push({
-                        row: idx,
-                        column: match.index,
-                        text: `Unknown keyword '${keyword}' in '${parentContext}' context`,
-                        type: 'warning'
-                    });
-                }
-            } else {
-                // Top level - check if keyword exists in schema
-                if (!keywords[keyword]) {
-                    annotations.push({
-                        row: idx,
-                        column: match.index,
-                        text: `Unknown top-level keyword '${keyword}'`,
-                        type: 'warning'
-                    });
-                }
-            }
-        }
-    });
+    editor.session.setAnnotations(OpenMagYaml.analyze(
+        editor.getValue(), AppState.yamlSchema || {keywords: {}}, jsyaml));
 }
 
 function getContextPathForLine(session, lineNum) {
@@ -884,61 +695,68 @@ async function loadSelectedConfig() {
 }
 
 async function loadConfig() {
-    const fileName = document.getElementById('configFileSelect').value || 'sample_config.yaml';
-
+    const select = document.getElementById('configFileSelect');
+    const fileName = select.value || 'sample_config.yaml';
+    if (AppState.configSaving || (Workbench.dirty() && !confirm('Discard unsaved configuration changes and load another file?'))) {
+        select.value = AppState.loadedConfigFile || fileName;
+        return false;
+    }
+    const generation = ++AppState.configLoadGeneration;
+    const priorText = AppState.aceEditor?.getValue();
+    AppState.configLoadPending = true;
+    Workbench.refresh();
     try {
         const response = await fetch(`/api/config?file=${encodeURIComponent(fileName)}&userId=${AppState.userId}`);
         if (!response.ok) throw new Error('Failed to load configuration');
-
         const config = await response.text();
-
-        // Set value in Ace Editor
-        if (AppState.aceEditor) {
-            AppState.aceEditor.setValue(config, -1); // -1 moves cursor to start
-        }
-
+        if (generation !== AppState.configLoadGeneration) return false;
+        if (AppState.aceEditor?.getValue() !== priorText) throw new Error('Loading cancelled: the editor changed while the file was loading.');
         AppState.configData = config;
+        AppState.configRevision = response.headers?.get('X-File-Revision') || null;
+        AppState.loadedConfigFile = fileName;
+        if (AppState.aceEditor) AppState.aceEditor.setValue(config, -1);
         showStatus('configStatus', `Configuration loaded: ${fileName}`, 'success');
+        return true;
     } catch (error) {
-        showStatus('configStatus', `Error loading config: ${error.message}`, 'error');
+        if (generation === AppState.configLoadGeneration) {
+            select.value = AppState.loadedConfigFile || '';
+            showStatus('configStatus', `Error loading config: ${error.message}`, 'error');
+        }
+        return false;
+    } finally {
+        if (generation === AppState.configLoadGeneration) AppState.configLoadPending = false;
+        Workbench.refresh();
     }
 }
 
 async function saveConfig() {
-    const fileName = document.getElementById('configFileSelect').value || 'sample_config.yaml';
-
-    if (!AppState.aceEditor) {
-        showStatus('configStatus', 'Editor not initialized', 'error');
-        return;
-    }
-
+    const fileName = AppState.loadedConfigFile;
+    if (!AppState.aceEditor || !fileName || AppState.configSaving || AppState.configLoadPending) return false;
     const yamlContent = AppState.aceEditor.getValue();
-
+    AppState.configSaving = true;
+    Workbench.refresh();
     try {
         const response = await fetch('/api/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                file: fileName,
-                userId: AppState.userId,
-                content: yamlContent
-            })
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({file: fileName, userId: AppState.userId, content: yamlContent, expectedRevision: AppState.configRevision ?? null})
         });
-
         const result = await response.json();
-
-        if (!response.ok) {
-            throw new Error(result.error || 'Failed to save configuration');
-        }
-
+        if (!response.ok) throw new Error(result.error || 'Failed to save configuration');
+        AppState.configRevision = result.revision || null;
         AppState.configData = yamlContent;
         showStatus('configStatus', `Configuration saved: ${fileName}`, 'success');
+        return true;
     } catch (error) {
         showStatus('configStatus', `Error saving config: ${error.message}`, 'error');
+        return false;
+    } finally {
+        AppState.configSaving = false;
+        Workbench.refresh();
     }
 }
 
 async function saveConfigAs() {
+    if (AppState.configSaving || AppState.configLoadPending) return;
     let newFileName = prompt('Enter new config file name:', 'my_config.yaml');
     if (!newFileName) return;
 
@@ -954,6 +772,8 @@ async function saveConfigAs() {
 
     const yamlContent = AppState.aceEditor.getValue();
 
+    AppState.configSaving = true;
+    Workbench.refresh();
     try {
         const response = await fetch('/api/config', {
             method: 'POST',
@@ -961,7 +781,8 @@ async function saveConfigAs() {
             body: JSON.stringify({
                 file: newFileName,
                 userId: AppState.userId,
-                content: yamlContent
+                content: yamlContent,
+                expectedRevision: null
             })
         });
 
@@ -971,6 +792,9 @@ async function saveConfigAs() {
             throw new Error(result.error || 'Failed to save configuration');
         }
 
+        AppState.configData = yamlContent;
+        AppState.loadedConfigFile = newFileName;
+        AppState.configRevision = result.revision || null;
         showStatus('configStatus', `Configuration saved as: ${newFileName}`, 'success');
 
         // Refresh file list and select the new file
@@ -978,6 +802,9 @@ async function saveConfigAs() {
         document.getElementById('configFileSelect').value = newFileName;
     } catch (error) {
         showStatus('configStatus', `Error saving config: ${error.message}`, 'error');
+    } finally {
+        AppState.configSaving = false;
+        Workbench.refresh();
     }
 }
 
@@ -1067,7 +894,8 @@ function loadSelectedImage() {
 
     AppState.uploadedImageFilename = filename;
     const img = document.getElementById('uploadedImage');
-    img.src = `/uploads/${AppState.userId}/${filename}`;
+    img.src = `/uploads/${AppState.userId}/${filename}?reload=${Date.now()}`;
+    AppState.imageSelectedAt = Date.now();
     img.classList.remove('hidden');
     document.getElementById('detectColorsBtn').style.display = 'block';
     document.getElementById('polarizeBtn').style.display = 'block';
@@ -1090,7 +918,7 @@ async function deleteSelectedImage() {
 
     try {
         const response = await fetch(`/api/images/${filename}?userId=${AppState.userId}`, {
-            method: 'DELETE'
+            method: 'DELETE', headers: {'If-Match': (await workspaceFileMeta(`images/${filename}`)).revision}
         });
 
         if (!response.ok) throw new Error('Failed to delete image');
@@ -5173,8 +5001,15 @@ async function importUserData(input) {
         const fd = new FormData();
         fd.append('backup', file, file.name);
         fd.append('userId', AppState.userId);
-        const res = await fetch('/api/import', { method: 'POST', body: fd }).then(r => r.json());
-        if (!res.success) throw new Error(res.error || 'import failed');
+        const preview = await fetch('/api/import', { method: 'POST', body: fd }).then(r => r.json());
+        if (!preview.success) throw new Error(preview.error || 'Backup inspection failed');
+        const replacements = preview.files.filter(f => f.expectedRevision !== null).length;
+        if (!preview.files.length || !confirm(`Import ${preview.files.length} file(s)?\n${replacements} existing file(s) will be permanently replaced.\n\nUnsaved editor contents will not be changed.`)) {
+            await fetch(`/api/import/${preview.transferId}?userId=${encodeURIComponent(AppState.userId)}`, {method:'DELETE'});
+            return;
+        }
+        const res = await fetch('/api/import/commit', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:AppState.userId,transferId:preview.transferId,files:preview.files.map(f=>({id:f.id,revision:f.expectedRevision}))})}).then(r=>r.json());
+        if (!res.success) throw new Error(`${res.error || 'Import failed'} (${res.applied?.length || 0} file(s) applied)`);
         const w = res.written || {};
         const nSkip = (res.skipped || []).filter(Boolean).length;
         // Refresh the lists so the restored content shows up immediately.
@@ -5317,7 +5152,7 @@ async function deleteConfig() {
 
     try {
         const response = await fetch(`/api/config/${filename}?userId=${AppState.userId}`, {
-            method: 'DELETE'
+            method: 'DELETE', headers: {'If-Match': AppState.configRevision || (await workspaceFileMeta(`configs/${filename}`)).revision}
         });
 
         if (!response.ok) throw new Error('Failed to delete config');
@@ -6312,6 +6147,12 @@ async function loadQuickPreviewFromResult(resultPath, loadContext = null) {
 }
 
 async function runSolver() {
+    if (AppState.runPreparing || document.getElementById('solverBtn').disabled) return;
+    AppState.runPreparing = true;
+    let runRequest;
+    try { runRequest = await Workbench.prepareRun(); }
+    finally { AppState.runPreparing = false; }
+    if (!runRequest) return;
     const btn = document.getElementById('solverBtn');
     const stopBtn = document.getElementById('stopBtn');
 
@@ -6369,12 +6210,7 @@ async function runSolver() {
         const response = await fetch('/api/solve-stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                configFile: configFile,
-                imageFile: AppState.uploadedImageFilename,
-                userId: AppState.userId,
-                materialLibraryFile: AppState.selectedLibrary || null
-            })
+            body: JSON.stringify(runRequest)
         });
 
         if (!response.ok) {
@@ -12549,7 +12385,9 @@ function userFileKey(file) {
 function visibleUserFiles() {
     const files = AppState.userFiles || [];
     const filter = document.getElementById('fileManagerFilter')?.value || 'all';
-    return filter === 'all' ? files : files.filter(file => file.category === filter);
+    const categoryFiles = filter === 'all' ? files : files.filter(file => file.category === filter);
+    return WorkspaceCore.files(categoryFiles, document.getElementById('fileManagerSearch')?.value || '',
+        document.getElementById('fileManagerSort')?.value || 'modified');
 }
 
 function updateUserFileSelectionControls() {
@@ -12718,15 +12556,23 @@ async function fileManagerDownload(button) {
     }
 }
 
+async function workspaceFileMeta(id) {
+    const response = await fetch(`/api/workspace/file?userId=${encodeURIComponent(AppState.userId)}&id=${encodeURIComponent(id)}`);
+    const data = await response.json();
+    if (!response.ok || !data.file) throw new Error(data.error || 'File no longer exists; refresh the list');
+    return data.file;
+}
+
 async function fileManagerDelete(button) {
     const file = fileManagerRow(button);
     if (!file) return;
-    if (!confirm(`Delete ${USER_FILE_CATEGORY_LABEL[file.category]} file "${file.name}"?\n\nThis action cannot be undone.`)) return;
     try {
+        const meta = await workspaceFileMeta(`${file.category}/${file.name}`);
+        if (!confirm(`Permanently delete "${file.name}" (${meta.size.toLocaleString()} bytes)?\n\nThis action cannot be undone.`)) return;
         const response = await fetch('/api/user-files', {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: AppState.userId, ...file }),
+            body: JSON.stringify({ userId: AppState.userId, ...file, revision: meta.revision }),
         });
         const result = await response.json();
         if (!response.ok || !result.success) throw new Error(result.error || 'Delete failed');
@@ -12745,6 +12591,9 @@ async function deleteSelectedUserFiles() {
     const selected = (AppState.userFiles || [])
         .filter(file => AppState.userFileSelection.has(userFileKey(file)));
     if (selected.length === 0) return;
+    try {
+        for (const file of selected) file.revision = (await workspaceFileMeta(`${file.category}/${file.name}`)).revision;
+    } catch (e) { fileManagerStatus(e.message, 'error'); return; }
     if (!confirm(`Delete ${selected.length} selected item(s)?\n\nThis action cannot be undone.`)) return;
 
     const deleteOne = async file => {
@@ -12755,6 +12604,7 @@ async function deleteSelectedUserFiles() {
                 userId: AppState.userId,
                 category: file.category,
                 name: file.name,
+                revision: file.revision,
             }),
         });
         const result = await response.json();
@@ -12907,7 +12757,7 @@ async function deleteOutput(folderName) {
 
     try {
         const response = await fetch(`/api/user-outputs/${folderName}?userId=${AppState.userId}`, {
-            method: 'DELETE'
+            method: 'DELETE', headers: {'If-Match': (await workspaceFileMeta(`results/${folderName}`)).revision}
         });
 
         const result = await response.json();
@@ -13256,7 +13106,7 @@ async function bulkDeleteOutputs() {
         const response = await fetch('/api/user-outputs/bulk', {
             method: 'DELETE',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: AppState.userId, folderNames })
+            body: JSON.stringify({ userId: AppState.userId, files: await Promise.all(folderNames.map(async name => ({name, revision:(await workspaceFileMeta(`results/${name}`)).revision}))) })
         });
 
         const result = await response.json();
@@ -13296,7 +13146,7 @@ async function renameOutput(folderName) {
         const response = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/rename`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: AppState.userId, newName })
+            body: JSON.stringify({ userId: AppState.userId, newName, revision: (await workspaceFileMeta(`results/${folderName}`)).revision })
         });
 
         const result = await response.json();
@@ -13337,7 +13187,7 @@ async function editDescription(folderName) {
         const updateResponse = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: AppState.userId, description: newDesc })
+            body: JSON.stringify({ userId: AppState.userId, description: newDesc, expectedRevision: result.revision })
         });
 
         const updateResult = await updateResponse.json();
@@ -14137,13 +13987,22 @@ async function refreshLibraryList() {
     }
 }
 
+function libraryDirty() {
+    return !!AppState.currentLibraryFile && AppState.libraryAceEditor?.getValue() !== AppState.librarySavedContent;
+}
 async function selectLibraryFile(filename) {
+    if (AppState.librarySaving || (libraryDirty() && !confirm('Discard unsaved material-library changes and reload?'))) return false;
+    const generation = AppState.libraryLoadGeneration = (AppState.libraryLoadGeneration || 0) + 1;
+    const priorText = AppState.libraryAceEditor?.getValue();
     try {
         const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}?userId=${AppState.userId}`);
         if (!response.ok) throw new Error('Failed to load file');
         const content = await response.text();
-
+        if (generation !== AppState.libraryLoadGeneration) return false;
+        if (priorText !== AppState.libraryAceEditor?.getValue()) throw new Error('Loading cancelled: material editor changed while loading.');
         AppState.currentLibraryFile = filename;
+        AppState.librarySavedContent = content;
+        AppState.libraryRevision = response.headers?.get('X-File-Revision') || null;
         if (AppState.libraryAceEditor) {
             AppState.libraryAceEditor.setValue(content, -1);
         }
@@ -14728,11 +14587,15 @@ function uploadLibrary() {
 }
 
 async function newLibrary() {
+    if (AppState.librarySaving || (libraryDirty() && !confirm('Discard unsaved material-library changes?'))) return;
     const name = prompt('New library filename (must end with .yaml):');
     if (!name) return;
     const filename = (name.endsWith('.yaml') || name.endsWith('.yml')) ? name : name + '.yaml';
 
     AppState.currentLibraryFile = filename;
+    AppState.libraryRevision = null;
+    AppState.librarySavedContent = null;
+    AppState.libraryLoadGeneration = (AppState.libraryLoadGeneration || 0) + 1;
     if (AppState.libraryAceEditor) {
         AppState.libraryAceEditor.setValue(LIB_TEMPLATE, -1);
     }
@@ -14767,7 +14630,7 @@ async function handleLibraryUpload(event) {
 }
 
 async function saveLibrary() {
-    if (!AppState.libraryAceEditor) return;
+    if (!AppState.libraryAceEditor || AppState.librarySaving) return;
 
     let filename = AppState.currentLibraryFile;
     if (!filename) {
@@ -14778,11 +14641,13 @@ async function saveLibrary() {
     }
 
     const content = AppState.libraryAceEditor.getValue();
+    AppState.librarySaving = true;
+    AppState.libraryLoadGeneration = (AppState.libraryLoadGeneration || 0) + 1;
     try {
         const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content, userId: AppState.userId })
+            body: JSON.stringify({ content, userId: AppState.userId, expectedRevision: AppState.libraryRevision ?? null })
         });
         const result = await response.json();
         if (!result.success) throw new Error(result.error);
@@ -14790,10 +14655,12 @@ async function saveLibrary() {
         document.getElementById('libDeleteBtn').style.display = 'inline-block';
         document.getElementById('libUseBtn').style.display = 'inline-block';
         document.getElementById('libraryListStatus').textContent = 'Saved';
+        AppState.libraryRevision = result.revision || null;
+        AppState.librarySavedContent = content;
         await refreshLibraryList();
     } catch (e) {
         document.getElementById('libraryListStatus').textContent = `Save error: ${e.message}`;
-    }
+    } finally { AppState.librarySaving = false; }
 }
 
 async function deleteLibrary() {
@@ -14803,7 +14670,7 @@ async function deleteLibrary() {
 
     try {
         const response = await fetch(`/api/material-libraries/${encodeURIComponent(filename)}?userId=${AppState.userId}`, {
-            method: 'DELETE'
+            method: 'DELETE', headers: {'If-Match': AppState.libraryRevision || (await workspaceFileMeta(`libraries/${filename}`)).revision}
         });
         const result = await response.json();
         if (!result.success) throw new Error(result.error);

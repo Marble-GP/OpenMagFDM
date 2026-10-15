@@ -1,0 +1,21 @@
+#tab-integrations { max-width:1300px; width:100%; }
+#tab-integrations h3 { margin:0 0 12px; font-size:15px; }
+#tab-integrations .workspace-card { margin-top:18px; }
+.mcp-row { display:flex; align-items:center; flex-wrap:wrap; gap:16px; margin:12px 0; }
+#tab-integrations label { font-size:13px; display:inline-flex; align-items:center; gap:8px; }
+#tab-integrations input:not([type=checkbox]), #tab-integrations textarea { border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:white; color:var(--ink); }
+#mcpPairCode { width:min(420px,50vw); }
+#mcpPort { width:100px; }
+#mcpSetup,#mcpToken { width:100%; box-sizing:border-box; font:12px/1.5 Consolas,monospace!important; resize:vertical; margin:10px 0; }
+#mcpNewSecret label { display:block; width:100%; }
+#mcpPermissions, .mcp-permissions { border:1px solid var(--line); padding:12px; margin:10px 0; display:flex; flex-wrap:wrap; gap:12px 18px; }
+.mcp-warning { color:#9b3e13!important; }
+#mcpMessage { padding:10px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.mcp-connection,.mcp-job { border-top:1px solid var(--line); padding:12px 0; overflow-wrap:anywhere; }
+.mcp-actions { display:flex; gap:8px; flex-wrap:wrap; margin:8px 0; }
+#mcpActivity ul { font-size:12px; line-height:1.6; padding-left:20px; }
+#tab-integrations [hidden] { display:none!important; }
+.mcp-external { border:1px solid #dfb65e; background:#fff8e6; padding:12px; margin:12px 0; color:#624800; }
+.mcp-external[hidden] { display:none!important; }
+.mcp-external button { margin-left:12px; }
+@media(max-width:650px) { #mcpPairForm label { display:block; } #mcpPairCode { width:100%; } }

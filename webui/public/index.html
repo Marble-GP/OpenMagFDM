@@ -1147,28 +1147,73 @@
         }
         .polar-dirty-badge.active { display: inline-block; }
     </style>
+    <link rel="stylesheet" href="workspace.css">
+    <link rel="stylesheet" href="mcp-panel.css">
 </head>
 <body>
     <div class="container">
         <!-- Header -->
         <header>
-            <h1>OpenMagFDM - Integrated Environment</h1>
-            <p>Finite Difference Method for 2D Magnetic Field Analysis</p>
-            <p style="font-size: 0.75rem; opacity: 0.7; margin-top: 5px;">User ID: <span id="userIdDisplay"></span></p>
+            <div class="workspace-brand"><small>Magnetic analysis workspace</small><h1>OpenMagFDM</h1></div>
+            <div class="workspace-user">2D field analysis<br>Workspace: <span id="userIdDisplay"></span></div>
         </header>
 
         <!-- Tabs Navigation -->
-        <div class="tabs">
-            <button class="tab active" data-tab="config">Config Editor</button>
-            <button class="tab" data-tab="run">Run & Preview</button>
-            <button class="tab" data-tab="dashboard">Dashboard</button>
-            <button class="tab" data-tab="files">File Manager</button>
+        <div class="tabs" role="tablist" aria-label="Analysis workflow">
+            <button class="tab active" role="tab" id="nav-config" aria-controls="tab-config" aria-selected="true" data-tab="config">01 · Configuration<small>YAML, materials & validation</small></button>
+            <button class="tab" role="tab" id="nav-run" aria-controls="tab-run" aria-selected="false" data-tab="run">02 · Model & Run<small>Prepare inputs & calculate</small></button>
+            <button class="tab" role="tab" id="nav-dashboard" aria-controls="tab-dashboard" aria-selected="false" data-tab="dashboard">03 · Results<small>Fields, waveforms & inspection</small></button>
+            <button class="tab" role="tab" id="nav-files" aria-controls="tab-files" aria-selected="false" data-tab="files">04 · Files<small>Manage, import & export</small></button>
+            <button class="tab" role="tab" id="nav-integrations" aria-controls="tab-integrations" aria-selected="false" data-tab="integrations">05 · Help &amp; Integrations<small>Local MCP connections &amp; activity</small></button>
+        </div>
+        <div class="workspace-context" aria-label="Current workspace context">
+            <strong id="workspaceConfig">Loading configuration…</strong>
+            <span id="workspaceSaved" role="status">Loading</span>
+            <span id="workspaceImage">No image selected</span>
+            <span id="workspaceRun" role="status">Idle</span>
+            <span id="workspaceResult">No result loaded</span>
         </div>
 
-        <!-- Tab 1: Config Editor -->
+        <div id="mcpExternalChanges" class="mcp-external" role="status" hidden></div>
+
+        <!-- Help and local agent connection management -->
+        <div class="tab-content" id="tab-integrations">
+            <h2>Local agent connections</h2>
+            <p class="page-intro">MCP lets an agent operate this workspace. Connections stay on this PC; permissions never grant access to another user's files.</p>
+            <div id="mcpMessage" role="status" aria-live="polite"></div>
+            <section class="workspace-card" id="mcpPairSection">
+                <h3>1. Pair this browser</h3>
+                <p>Copy the confirmation code from the OpenMagFDM server window. To retrieve a fresh code, run the same executable with <code>--mcp-admin-code</code>. Pairing only unlocks management; it does not enable MCP.</p>
+                <form id="mcpPairForm" class="mcp-row"><label>Confirmation code <input id="mcpPairCode" type="password" autocomplete="off" required></label><button class="btn-primary" type="submit">Pair browser</button></form>
+            </section>
+            <div id="mcpManagement" hidden>
+                <section class="workspace-card">
+                    <h3>2. Enable local access</h3>
+                    <p id="mcpListenerStatus" role="status"></p>
+                    <form id="mcpSettingsForm" class="mcp-row"><label><input id="mcpEnabled" type="checkbox"> Enable MCP</label><label>Port <input id="mcpPort" type="number" min="1024" max="65535" value="3001" required></label><button class="btn-primary" type="submit">Apply</button></form>
+                    <p>ON/OFF is remembered after restart. Turning MCP OFF blocks agent access but keeps running analyses alive. Stop them explicitly below if needed.</p>
+                </section>
+                <section class="workspace-card">
+                    <h3>3. Create a connection</h3>
+                    <form id="mcpCreateForm"><div class="mcp-row"><label>Connection name <input id="mcpConnectionName" maxlength="80" required placeholder="Local analysis agent"></label><span>Assigned workspace: <strong id="mcpAssignedUser"></strong></span></div>
+                        <fieldset id="mcpPermissions"><legend>Allowed operations</legend></fieldset>
+                        <p class="mcp-warning">Delete permanently removes files, without a recycle bin or an approval dialog. Replace permits overwriting an unchanged revision. Grant these only when needed.</p>
+                        <button type="submit" class="btn-primary">Create connection</button>
+                    </form>
+                    <div id="mcpNewSecret" hidden><label>Token — shown only now. Store it in your client's secret/header settings, not in a URL.<textarea id="mcpToken" readonly rows="2" autocomplete="off"></textarea></label><button id="mcpHideSecret" class="btn-secondary">Clear token from this page</button></div>
+                </section>
+                <section class="workspace-card"><h3>Connections</h3><div id="mcpConnections"></div></section>
+                <section class="workspace-card"><h3>4. Configure your client</h3><p>HTTP clients: use the local URL and an Authorization header with <code>Bearer &lt;token&gt;</code>. stdio clients: copy the command/arguments shown below. Keep OpenMagFDM running. A bridge does not start a second server or re-enable access.</p>
+                    <textarea id="mcpSetup" readonly rows="8" aria-label="Client connection settings"></textarea><button id="mcpCopySetup" class="btn-secondary">Copy settings</button>
+                    <p>Use Test on a connection to exercise HTTP authentication and a read-only workspace request. Client-specific configuration files are never modified automatically.</p>
+                </section>
+            </div>
+            <section class="workspace-card"><h3>Workspace activity</h3><p>Saved-file changes are reported here. Your editor draft and current image are never replaced automatically. Reload a changed file explicitly; a stale save is rejected.</p><button id="mcpRefreshActivity" class="btn-secondary">Refresh activity</button><div id="mcpActivity" aria-live="polite"></div></section>
+        </div>
         <div class="tab-content active" id="tab-config">
             <div class="config-section">
                 <h2>YAML Configuration</h2>
+                <p class="page-intro">Define the model, review inline diagnostics, then prepare the image in Model &amp; Run. Ctrl/Cmd + S saves your changes.</p>
                 <div class="button-group">
                     <label>Config File:
                         <select id="configFileSelect" onchange="loadSelectedConfig()" style="width: 300px; padding: 8px; margin-left: 10px; border: 1px solid #dee2e6; border-radius: 3px;">
@@ -1190,13 +1235,27 @@
                         </span>
                     </span>
                 </div>
-                <div id="yamlEditor" class="yaml-editor"></div>
+                <div class="editor-workspace">
+                    <div id="yamlEditor" class="yaml-editor" aria-label="Analysis YAML editor"></div>
+                    <aside class="problems-panel" aria-label="Configuration diagnostics">
+                        <h3>Problems <span id="problemCount"></span></h3>
+                        <p>Click an item to jump to its source. Formula values and external files still require solver-side checks.</p>
+                        <div id="workspaceProblems"></div>
+                        <button class="btn-primary" onclick="switchTab('run')">Review model &amp; run →</button>
+                    </aside>
+                </div>
                 <div id="configStatus" style="margin-top: 10px;"></div>
             </div>
         </div>
 
         <!-- Tab 2: Run & Preview -->
         <div class="tab-content" id="tab-run">
+            <section class="workspace-card" aria-labelledby="reviewHeading">
+                <h2 id="reviewHeading">Execution review</h2>
+                <p id="workspaceReviewNote">Authored settings, before formula evaluation. The selected image below is the image sent to the solver.</p>
+                <dl class="review-grid" id="workspaceReview"></dl>
+                <button class="btn-secondary" onclick="switchTab('config')">Edit configuration</button>
+            </section>
             <div class="run-section">
                 <!-- Left Panel: Image Upload -->
                 <div class="panel">
@@ -1519,6 +1578,10 @@
                             <option value="results">Analysis results</option>
                         </select>
                         <span id="userFileSelectedCount" style="color:#666; font-size:0.9rem;">0 selected</span>
+                        <input type="search" id="fileManagerSearch" aria-label="Search files by name" placeholder="Search filenames…" oninput="renderUserFiles()">
+                        <select id="fileManagerSort" aria-label="Sort files" onchange="renderUserFiles()">
+                            <option value="modified">Recently modified</option><option value="name">Name A–Z</option><option value="size">Largest first</option>
+                        </select>
                     </div>
                     <div id="fileManagerStatus" style="margin-bottom: 10px;"></div>
                     <div id="userFilesList">
@@ -2094,6 +2157,10 @@
     <script src="https://cdn.jsdelivr.net/npm/gridstack@9/dist/gridstack-all.js"></script>
 
     <!-- Application JavaScript -->
+    <script src="yaml-intellisense.js"></script>
+    <script src="workspace-core.js"></script>
+    <script src="workspace.js"></script>
+    <script src="mcp-panel.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

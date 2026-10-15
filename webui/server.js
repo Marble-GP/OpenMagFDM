@@ -5,6 +5,9 @@ const fsSync = require('fs');
 const { spawn } = require('child_process');
 const multer = require('multer');
 const yaml = require('js-yaml');
+const workspaceCore = require('./public/workspace-core');
+const editorSchema = require('./public/yaml-schema.json');
+const { Workspace: AutomationWorkspace } = require('./automation/workspace');
 // NOTE: TIFF decoding is intentionally NOT done on the server. geotiff's CJS
 // entry pulls in ESM-only quick-lru/web-worker, which breaks when this file
 // is bundled by `pkg` (Node 18 has no CJS->ESM bridge for require()). Instead
@@ -34,7 +37,7 @@ const BASE_DIR = isPkg ? path.dirname(process.execPath) : path.join(__dirname, '
 // アップロードディレクトリの設定
 const UPLOAD_DIR = path.join(BASE_DIR, 'uploads');
 const DEFAULT_SOLVER_PATH = isPkg
-    ? path.join(BASE_DIR, 'MagFDMsolver.exe')  // pkg版ではexeが同じディレクトリにある
+    ? path.join(BASE_DIR, process.platform === 'win32' ? 'MagFDMsolver.exe' : 'MagFDMsolver')
     : path.join(BASE_DIR, 'build', 'MagFDMsolver');
 // Override for release-contract tests and managed deployments. The packaged
 // default remains the solver executable beside the pkg binary.
@@ -119,7 +122,7 @@ const FINAL_SHUTDOWN_FORCE_WAIT_MS = positiveIntegerFromEnv('FINAL_SHUTDOWN_FORC
 
 function normalizeUserId(userId) {
     const safe = String(userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
-    return safe || 'default';
+    return (process.platform === 'win32' ? safe.toLowerCase() : safe) || 'default';
 }
 
 function resolveUserFilePath(baseDir, fileName, label) {
@@ -841,132 +844,18 @@ const storage = multer.diskStorage({
     }
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ storage, limits: {fileSize: MAX_IMAGE_SIZE, files: 1, fields: 16} });
 
-// ===== Minimal ZIP reader/writer (zero-dependency, Node built-in zlib) =====
-// Used by the user-content backup export/import. STORE + DEFLATE only, no
-// data-descriptors, UTF-8 names — enough for a faithful backup archive that
-// standard tools (Explorer / unzip / python zipfile) open, and robust enough
-// to read a zip they produced (we parse the central directory).
-const zlib = require('zlib');
-const ZIP_CRC_TABLE = (() => {
-    const t = new Int32Array(256);
-    for (let n = 0; n < 256; n++) {
-        let c = n;
-        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
-        t[n] = c;
-    }
-    return t;
-})();
-function zipCrc32(buf) {
-    let c = ~0;
-    for (let i = 0; i < buf.length; i++) c = ZIP_CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-    return (~c) >>> 0;
-}
-// entries: [{ name: 'configs/x.yaml', data: Buffer }] -> Buffer (a .zip)
-function zipBuild(entries) {
-    const parts = [], central = [];
-    let offset = 0;
-    for (const e of entries) {
-        const nameBuf = Buffer.from(e.name, 'utf8');
-        const crc = zipCrc32(e.data);
-        const comp = zlib.deflateRawSync(e.data);
-        const lfh = Buffer.alloc(30);
-        lfh.writeUInt32LE(0x04034b50, 0); lfh.writeUInt16LE(20, 4);
-        lfh.writeUInt16LE(0x0800, 6);     lfh.writeUInt16LE(8, 8);   // UTF-8 flag, DEFLATE
-        lfh.writeUInt16LE(0, 10);         lfh.writeUInt16LE(0, 12);
-        lfh.writeUInt32LE(crc, 14);       lfh.writeUInt32LE(comp.length, 18);
-        lfh.writeUInt32LE(e.data.length, 22); lfh.writeUInt16LE(nameBuf.length, 26);
-        lfh.writeUInt16LE(0, 28);
-        parts.push(lfh, nameBuf, comp);
-        const cdh = Buffer.alloc(46);
-        cdh.writeUInt32LE(0x02014b50, 0); cdh.writeUInt16LE(20, 4); cdh.writeUInt16LE(20, 6);
-        cdh.writeUInt16LE(0x0800, 8);     cdh.writeUInt16LE(8, 10);
-        cdh.writeUInt16LE(0, 12);         cdh.writeUInt16LE(0, 14);
-        cdh.writeUInt32LE(crc, 16);       cdh.writeUInt32LE(comp.length, 20);
-        cdh.writeUInt32LE(e.data.length, 24); cdh.writeUInt16LE(nameBuf.length, 28);
-        cdh.writeUInt16LE(0, 30); cdh.writeUInt16LE(0, 32); cdh.writeUInt16LE(0, 34);
-        cdh.writeUInt16LE(0, 36); cdh.writeUInt32LE(0, 38); cdh.writeUInt32LE(offset, 42);
-        central.push(cdh, nameBuf);
-        offset += 30 + nameBuf.length + comp.length;
-    }
-    const centralBuf = Buffer.concat(central);
-    const eocd = Buffer.alloc(22);
-    eocd.writeUInt32LE(0x06054b50, 0);
-    eocd.writeUInt16LE(entries.length, 8); eocd.writeUInt16LE(entries.length, 10);
-    eocd.writeUInt32LE(centralBuf.length, 12); eocd.writeUInt32LE(offset, 16);
-    return Buffer.concat([...parts, centralBuf, eocd]);
-}
-// Buffer (a .zip) -> [{ name, data: Buffer }] (via the central directory)
-function zipRead(buf) {
-    let eocd = -1;
-    const minStart = Math.max(0, buf.length - 22 - 65535);
-    for (let i = buf.length - 22; i >= minStart; i--) {
-        if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
-    }
-    if (eocd < 0) throw new Error('Not a zip file');
-    const count = buf.readUInt16LE(eocd + 10);
-    let cd = buf.readUInt32LE(eocd + 16);
-    const out = [];
-    for (let n = 0; n < count; n++) {
-        if (buf.readUInt32LE(cd) !== 0x02014b50) throw new Error('Corrupt zip central directory');
-        const method = buf.readUInt16LE(cd + 10);
-        const compSize = buf.readUInt32LE(cd + 20);
-        const nameLen = buf.readUInt16LE(cd + 28);
-        const extraLen = buf.readUInt16LE(cd + 30);
-        const commentLen = buf.readUInt16LE(cd + 32);
-        const lho = buf.readUInt32LE(cd + 42);
-        const name = buf.toString('utf8', cd + 46, cd + 46 + nameLen);
-        const lNameLen = buf.readUInt16LE(lho + 26);
-        const lExtraLen = buf.readUInt16LE(lho + 28);
-        const dataStart = lho + 30 + lNameLen + lExtraLen;
-        const comp = buf.slice(dataStart, dataStart + compSize);
-        const data = (method === 8) ? zlib.inflateRawSync(comp) : Buffer.from(comp);
-        if (!name.endsWith('/')) out.push({ name, data });   // skip directory entries
-        cd += 46 + nameLen + extraLen + commentLen;
-    }
-    return out;
-}
-// Recursively collect files under `dir` as { rel, data } (rel uses forward slashes).
-async function walkFiles(dir, base) {
-    const out = [];
-    let names;
-    try { names = await fs.readdir(dir); } catch { return out; }
-    for (const name of names) {
-        const full = path.join(dir, name);
-        let st;
-        try { st = await fs.stat(full); } catch { continue; }
-        const rel = base ? `${base}/${name}` : name;
-        if (st.isDirectory()) {
-            out.push(...await walkFiles(full, rel));
-        } else if (st.isFile()) {
-            out.push({ rel, data: await fs.readFile(full) });
-        }
-    }
-    return out;
-}
-
-// Like walkFiles but returns { rel, size } via stat only (no file reads) — used
-// by the backup-manifest so listing a large results tree stays cheap.
-async function walkStats(dir, base) {
-    const out = [];
-    let names;
-    try { names = await fs.readdir(dir); } catch { return out; }
-    for (const name of names) {
-        const full = path.join(dir, name);
-        let st;
-        try { st = await fs.stat(full); } catch { continue; }
-        const rel = base ? `${base}/${name}` : name;
-        if (st.isDirectory()) out.push(...await walkStats(full, rel));
-        else if (st.isFile()) out.push({ path: rel, size: st.size });
-    }
-    return out;
-}
+// Backup ZIP IO is streamed by automation/gui-backup.js and transfers.js.
 
 // JSONボディパーサー。上限を引き上げるのは /api/export の選択エントリ配列
 // (多数のファイルパス) を受けるため。個々の config 保存は handler 側で
 // MAX_FILE_SIZE (100KB) を別途強制するので、この上限緩和による回帰はない。
 app.use(express.json({ limit: '25mb' }));
+// Register revision-aware GUI file adapters before legacy endpoints. Solver jobs
+// and MCP share the same active-output protection and per-workspace mutation lock.
+require('./automation/gui-files').installFileRoutes(app, BASE_DIR,
+    (user, id) => automation.jobs.busy(user, id));
 
 // 静的ファイルの提供 (use BASE_DIR for pkg compatibility)
 const PUBLIC_DIR = isPkg ? path.join(BASE_DIR, 'public') : path.join(__dirname, 'public');
@@ -1062,73 +951,9 @@ async function initializeUserDir(userId) {
 }
 
 // Helper: Enforce file count limit (keep newest 20 files)
-async function enforceFileLimit(userId) {
-    const userDir = getUserDir(userId);
-    try {
-        await ensureDir(userDir);
-        const files = await fs.readdir(userDir);
-        const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
-
-        if (yamlFiles.length > MAX_FILES_PER_USER) {
-            // Get file stats with modification times
-            const fileStats = await Promise.all(
-                yamlFiles.map(async (file) => {
-                    const filePath = path.join(userDir, file);
-                    const stats = await fs.stat(filePath);
-                    return { file, mtime: stats.mtime };
-                })
-            );
-
-            // Sort by modification time (oldest first)
-            fileStats.sort((a, b) => a.mtime - b.mtime);
-
-            // Delete oldest files
-            const filesToDelete = fileStats.slice(0, yamlFiles.length - MAX_FILES_PER_USER);
-            for (const { file } of filesToDelete) {
-                await fs.unlink(path.join(userDir, file));
-                console.log(`Deleted old file: ${userId}/${file}`);
-            }
-        }
-    } catch (error) {
-        console.error(`Error enforcing file limit for ${userId}:`, error);
-    }
-}
-
-// Helper: Enforce image count limit for user (LRU - delete oldest)
-async function enforceImageLimit(userId) {
-    const userUploadDir = getUserUploadsDir(userId);
-    try {
-        await fs.access(userUploadDir);
-        const files = await fs.readdir(userUploadDir);
-        const imageFiles = files.filter(f => /\.(png|jpg|jpeg|bmp)$/i.test(f));
-
-        if (imageFiles.length > MAX_IMAGES_PER_USER) {
-            // Get file stats with modification times
-            const fileStats = await Promise.all(
-                imageFiles.map(async (file) => {
-                    const filePath = path.join(userUploadDir, file);
-                    const stats = await fs.stat(filePath);
-                    return { file, mtime: stats.mtime };
-                })
-            );
-
-            // Sort by modification time (oldest first)
-            fileStats.sort((a, b) => a.mtime - b.mtime);
-
-            // Delete oldest files
-            const filesToDelete = fileStats.slice(0, imageFiles.length - MAX_IMAGES_PER_USER);
-            for (const { file } of filesToDelete) {
-                await fs.unlink(path.join(userUploadDir, file));
-                console.log(`Deleted old image: ${userId}/${file}`);
-            }
-        }
-    } catch (error) {
-        // Directory doesn't exist yet, ignore
-        if (error.code !== 'ENOENT') {
-            console.error(`Error enforcing image limit for ${userId}:`, error);
-        }
-    }
-}
+// Quotas are enforced before publishing by AutomationWorkspace.write.
+// Never evict a user's existing data as a side effect of creating a new file.
+async function enforceImageLimit() {}
 
 // Helper: Ensure directory exists, create if not
 async function ensureDir(dirPath) {
@@ -1216,18 +1041,21 @@ app.get('/api/config', async (req, res) => {
         // Initialize user directory if needed
         await initializeUserDir(userId);
 
-        const userConfigPath = getUserConfigPath(userId, fileName);
-
-        let configData;
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        let configData, revision = '';
         try {
-            // Try to load user-specific config
-            configData = await fs.readFile(userConfigPath, 'utf8');
+            // Text and its revision must be from the same locked snapshot.
+            const data = await ws.read(`configs/${fileName}`, {text:true, length:524288});
+            if (data.nextOffset !== null) return res.status(413).json({error:'Configuration is too large'});
+            configData = data.content; revision = data.revision;
         } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
             // File doesn't exist, return default config
             configData = await fs.readFile(CONFIG_PATH, 'utf8');
         }
 
         // Return as plain text (YAML)
+        res.set('X-File-Revision', revision);
         res.type('text/plain').send(configData);
     } catch (error) {
         res.status(500).json({
@@ -1264,183 +1092,38 @@ app.post('/api/config', async (req, res) => {
         // Initialize user directory if needed
         await initializeUserDir(userId || 'default');
 
-        // Enforce file count limit
-        await enforceFileLimit(userId || 'default');
-
-        const userConfigPath = getUserConfigPath(userId || 'default', file);
-
-        // Save to user-specific file
-        await fs.writeFile(userConfigPath, content, 'utf8');
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        const meta = await ws.write(`configs/${file}`, Buffer.from(content), req.body.expectedRevision ?? null);
 
         res.json({
             success: true,
             message: 'Configuration saved successfully',
-            path: userConfigPath
+            revision: meta.revision
         });
     } catch (error) {
-        res.status(500).json({
+        res.status(error.statusCode || 500).json({
             success: false,
             error: error.message
         });
     }
 });
 
-// ===== User content backup: export / import (ZIP) =====
-// The browser userId is a cookie and server-side user directories are pruned
-// after USER_EXPIRY_DAYS of inactivity, so clearing the browser or a long
-// absence loses access to a user's content. These endpoints let a user
-// download a standard .zip of their content and restore it later (into
-// whatever userId the current browser has). Zero new dependencies: the zip is
-// built/parsed with the helpers above (Node built-in zlib); multer (already a
-// dependency) receives the file on import.
-//
-// Archive layout (top-level folder = category):
-//   configs/<file>            (USER_CONFIGS_DIR/<userId>/)
-//   images/<file>             (UPLOAD_DIR/<userId>/)
-//   libraries/<file>          (USER_LIBS_DIR/<userId>/)
-//   results/<run>/<path...>   (OUTPUTS_DIR/<userId>/ — nested, opt-in: large)
-const BACKUP_CATS = {
-    configs:   { dir: getUserDir,        recursive: false },
-    images:    { dir: getUserUploadsDir, recursive: false },
-    libraries: { dir: getUserLibsDir,    recursive: false },
-    results:   { dir: (u) => path.join(OUTPUTS_DIR, u.replace(/[^a-zA-Z0-9_-]/g, '')), recursive: true },
-};
-
-// GET /api/backup-manifest?userId=X -> per-category file list with sizes (no
-// content), so the export modal can show a checkbox list + a running size total
-// without transferring any file data. Cheap even for a large results tree.
-app.get('/api/backup-manifest', async (req, res) => {
-    try {
-        const userId = req.query.userId || 'default';
-        const categories = {};
-        let totalSize = 0;
-        for (const cat of Object.keys(BACKUP_CATS)) {
-            const files = await walkStats(BACKUP_CATS[cat].dir(userId), '');
-            files.sort((a, b) => a.path.localeCompare(b.path));
-            categories[cat] = files;
-            for (const f of files) totalSize += f.size;
-        }
-        res.json({ success: true, categories, totalSize });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Resolve a "<category>/<relative...>" archive entry name to an absolute path
-// inside that category's user directory (or null if invalid / traversal).
-function resolveBackupEntry(userId, entryName) {
-    const parts = String(entryName).split('/').filter(p => p && p !== '.' && p !== '..');
-    if (parts.length < 2) return null;
-    const spec = BACKUP_CATS[parts[0]];
-    if (!spec) return null;
-    if (!spec.recursive && parts.length !== 2) return null;   // flat categories: no subfolders
-    return { cat: parts[0], full: path.join(spec.dir(userId), ...parts.slice(1)) };
-}
-
-// Build + stream a .zip backup. Two forms:
-//   GET  /api/export?userId=X&include=configs,images,libraries[,results]
-//        -> whole categories (default = all except results).
-//   POST /api/export  { userId, entries: ["configs/a.yaml", "results/run1/x.tiff", ...] }
-//        -> exactly the selected files (used by the file-picker modal). Sent as
-//        a blob so the browser can save it (POST can't navigate to a download).
-async function buildBackupZip(userId, entryNames) {
-    const entries = [];
-    for (const name of entryNames) {
-        const r = resolveBackupEntry(userId, name);
-        if (!r) continue;
-        let data;
-        try { data = await fs.readFile(r.full); } catch { continue; }
-        entries.push({ name, data });
-    }
-    return zipBuild(entries);
-}
-function sendBackupZip(res, zip) {
-    const stamp = new Date().toISOString().slice(0, 10);
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="omfdm-backup-${stamp}.zip"`);
-    res.send(zip);
-}
-app.get('/api/export', async (req, res) => {
-    try {
-        const userId = req.query.userId || 'default';
-        const include = (req.query.include || 'configs,images,libraries')
-            .split(',').map(s => s.trim()).filter(c => BACKUP_CATS[c]);
-        const names = [];
-        for (const cat of include) {
-            for (const f of await walkStats(BACKUP_CATS[cat].dir(userId), '')) names.push(`${cat}/${f.path}`);
-        }
-        sendBackupZip(res, await buildBackupZip(userId, names));
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-app.post('/api/export', async (req, res) => {
-    try {
-        const { userId, entries } = req.body || {};
-        if (!Array.isArray(entries)) return res.status(400).json({ success: false, error: 'entries[] required' });
-        sendBackupZip(res, await buildBackupZip(userId || 'default', entries));
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// POST /api/import (multipart: field 'backup' = the .zip, field 'userId')
-//   -> restores every entry into the current user's directories, routed by the
-//   top-level folder. Backward compatible: a legacy JSON backup is also accepted.
-app.post('/api/import', upload.single('backup'), async (req, res) => {
-    const tmpPath = req.file && req.file.path;
-    try {
-        const userId = (req.body && req.body.userId) || 'default';
-        if (!req.file) return res.status(400).json({ success: false, error: 'No backup file uploaded' });
-        const raw = await fs.readFile(tmpPath);
-        await initializeUserDir(userId);
-
-        // Sanitize a zip entry path: split into "<category>/<relative...>",
-        // reject traversal, and resolve to an absolute path inside the category dir.
-        const resolveEntry = (entryName) => {
-            const parts = entryName.split('/').filter(p => p && p !== '.' && p !== '..');
-            if (parts.length < 2) return null;
-            const cat = parts[0];
-            const spec = BACKUP_CATS[cat];
-            if (!spec) return null;
-            if (!spec.recursive && parts.length !== 2) return null;   // flat categories: no subfolders
-            const relParts = parts.slice(1);
-            return { cat, full: path.join(spec.dir(userId), ...relParts) };
-        };
-
-        const written = { configs: 0, images: 0, libraries: 0, results: 0 };
-        const skipped = [];
-        let items;
-        // ZIP (starts with 'PK\x03\x04' or 'PK\x05\x06') else try legacy JSON.
-        if (raw.length >= 2 && raw[0] === 0x50 && raw[1] === 0x4b) {
-            items = zipRead(raw).map(e => ({ name: e.name, data: e.data }));
-        } else {
-            const manifest = JSON.parse(raw.toString('utf8'));
-            if (!manifest || manifest.format !== 'omfdm-backup' || !Array.isArray(manifest.files)) {
-                throw new Error('Not an OpenMagFDM backup file');
-            }
-            const catMap = { config: 'configs', upload: 'images', library: 'libraries' };
-            items = manifest.files.map(f => ({
-                name: `${catMap[f.category] || f.category}/${f.name}`,
-                data: f.encoding === 'base64' ? Buffer.from(f.content, 'base64') : Buffer.from(f.content, 'utf8'),
-            }));
-        }
-        for (const it of items) {
-            const r = resolveEntry(it.name);
-            if (!r) { skipped.push(it.name); continue; }
-            await fs.mkdir(path.dirname(r.full), { recursive: true }).catch(() => {});
-            await fs.writeFile(r.full, it.data);
-            written[r.cat] = (written[r.cat] || 0) + 1;
-        }
-        res.json({ success: true, written, skipped });
-    } catch (error) {
-        res.status(400).json({ success: false, error: error.message });
-    } finally {
-        if (tmpPath) { fs.unlink(tmpPath).catch(() => {}); }
-    }
-});
+// Backup GUI and MCP use the same streaming, scoped and revision-aware service.
+require('./automation/gui-backup').installBackupRoutes(app, BASE_DIR, () => automation,
+    multer({storage, limits:{fileSize:1024*1024*1024, files:1, fields:16}}));
 
 // Validate YAML configuration without saving
+// Side-effect-free versioned inspection, shared with the GUI. Text only;
+// never accepts file paths or commands. User IDs are not authentication.
+app.post('/api/config/inspect', (req, res) => {
+    const content = req.body?.content;
+    if (typeof content !== 'string' || Buffer.byteLength(content, 'utf8') > 1024 * 1024) {
+        return res.status(400).json({version: 1, error: 'content must be YAML text up to 1 MiB'});
+    }
+    try { res.json(workspaceCore.inspect(content, editorSchema, yaml)); }
+    catch (_) { res.status(400).json({version: 1, error: 'Configuration could not be inspected'}); }
+});
+
 app.post('/api/validate-config', async (req, res) => {
     try {
         const { config } = req.body;
@@ -1525,16 +1208,14 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
         // Create user upload directory if it doesn't exist
         await fs.mkdir(userUploadDir, { recursive: true });
 
-        // Enforce image limit before upload
-        await enforceImageLimit(userId);
-
         // Use original filename
         const filename = req.file.originalname;
         const oldPath = req.file.path;
-        const newPath = path.join(userUploadDir, filename);
-
-        // Move file to user directory
-        await fs.rename(oldPath, newPath);
+        const imageBuffer = await fs.readFile(oldPath);
+        require('./automation/images').inspectImage(imageBuffer);
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        await ws.write(`images/${filename}`, imageBuffer, null, {permission:'images'});
+        await fs.unlink(oldPath);
 
         res.json({
             success: true,
@@ -1543,7 +1224,7 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
             originalName: req.file.originalname
         });
     } catch (error) {
-        res.status(500).json({
+        res.status(error.statusCode || 500).json({
             success: false,
             error: error.message
         });
@@ -2839,8 +2520,9 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
         } else {
             outName = await chooseOutputFilename(uploadsDir, filename, output_filename);
         }
-        const outPath = path.join(uploadsDir, outName);
-        await warped.writeAsync(outPath);
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        const previous = preview ? await ws.describe(`images/${outName}`).catch(e => { if(e.code!=='ENOENT') throw e; return null; }) : null;
+        await ws.write(`images/${outName}`, await warped.getBufferAsync(Jimp.MIME_PNG), previous?.revision ?? null, {permission:'images'});
 
         // Best-effort: enforce per-user image cap only for permanent saves;
         // the preview file is overwritten so it doesn't contribute to the cap.
@@ -3405,25 +3087,8 @@ app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
     }
 });
 
-app.post('/api/preprocess-filter/quantize', async (req, res) => {
-    try {
-        const Jimp = require('jimp');
-        const {
-            userId = 'default', filename,
-            rareThreshold = 0.005,
-            nTargets = 8,
-            minTargetDist = 30,
-            despeckleRadius = 1,
-            bilateralSigmaSpatial = 0,
-            bilateralSigmaColor   = 20,
-            minIslandSize = 0,
-            preview = false,
-            output_filename,
-        } = req.body || {};
-
-        if (!filename) {
-            return res.status(400).json({ success: false, error: 'filename required' });
-        }
+function quantizeImage(src, params = {}) {
+    const { rareThreshold = 0.005, nTargets = 8, minTargetDist = 30, despeckleRadius = 1, bilateralSigmaSpatial = 0, bilateralSigmaColor = 20, minIslandSize = 0 } = params;
         const N = Math.max(1, Math.min(64, Math.floor(nTargets)));
         const RT = Math.max(0, Math.min(1, Number(rareThreshold)));
         const MTD = Math.max(0, Number(minTargetDist));     // RGB Euclidean
@@ -3438,9 +3103,6 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
         // count get dissolved into the local majority colour.
         const MIS = Math.max(0, Math.min(1024, Math.floor(minIslandSize)));
 
-        const uploadsDir = getUserUploadsDir(userId);
-        const srcPath = path.join(uploadsDir, filename);
-        const src = await Jimp.read(srcPath);
         const W = src.bitmap.width;
         const H = src.bitmap.height;
         const totalPixels = W * H;
@@ -3476,7 +3138,7 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
             .sort((a, b) => b.count - a.count);
 
         if (sorted.length === 0) {
-            return res.status(400).json({ success: false, error: 'No opaque pixels in source' });
+            throw new Error('No opaque pixels in source');
         }
 
         // Eligible = above threshold; if the threshold is so strict that
@@ -3604,6 +3266,35 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
             }
         }
 
+
+    return { image: out, targets: targets.map(t => ({rgb:[t.r,t.g,t.b], ratio:t.ratio, count:t.count})), unique_colors_in: sorted.length, n_targets_used: K, looks_noisy: sorted.length > 1000 };
+}
+
+app.post('/api/preprocess-filter/quantize', async (req, res) => {
+    try {
+        const Jimp = require('jimp');
+        const {
+            userId = 'default', filename,
+            rareThreshold = 0.005,
+            nTargets = 8,
+            minTargetDist = 30,
+            despeckleRadius = 1,
+            bilateralSigmaSpatial = 0,
+            bilateralSigmaColor   = 20,
+            minIslandSize = 0,
+            preview = false,
+            output_filename,
+        } = req.body || {};
+
+        if (!filename) {
+            return res.status(400).json({ success: false, error: 'filename required' });
+        }
+        const uploadsDir = getUserUploadsDir(userId);
+        const src = await Jimp.read(path.join(uploadsDir, filename));
+        const result = quantizeImage(src, req.body || {});
+        const out = result.image;
+        const K = result.n_targets_used;
+
         // Filename: preview overwrites a deterministic file per source so we
         // don't pile up uploads; final goes through chooseOutputFilename.
         let outName;
@@ -3615,8 +3306,9 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
                 || `${filename.replace(/\.[^.]+$/, '')}_uniformN${K}.png`;
             outName = await chooseOutputFilename(uploadsDir, filename, suggested);
         }
-        const outPath = path.join(uploadsDir, outName);
-        await out.writeAsync(outPath);
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        const previous = preview ? await ws.describe(`images/${outName}`).catch(e => { if(e.code!=='ENOENT') throw e; return null; }) : null;
+        await ws.write(`images/${outName}`, await out.getBufferAsync(Jimp.MIME_PNG), previous?.revision ?? null, {permission:'images'});
 
         if (!preview && typeof enforceImageLimit === 'function') {
             try { await enforceImageLimit(userId); } catch { /* ignore */ }
@@ -3627,18 +3319,10 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
             filename: outName,
             path: `/uploads/${userId}/${outName}`,
             preview: !!preview,
-            targets: targets.map(t => ({
-                rgb: [t.r, t.g, t.b],
-                ratio: Number(t.ratio.toFixed(6)),
-                count: t.count,
-            })),
-            unique_colors_in: sorted.length,
-            n_targets_used: K,
-            // Heuristic: an image with thousands of unique RGB values and a
-            // long ratio tail is the canonical "JPEG-AA noise" case. Surface
-            // this so the UI can show a recommendation badge without having
-            // to recompute on the client.
-            looks_noisy: sorted.length > 1000,
+            targets: result.targets,
+            unique_colors_in: result.unique_colors_in,
+            n_targets_used: result.n_targets_used,
+            looks_noisy: result.looks_noisy,
         });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
@@ -3679,64 +3363,7 @@ app.get('/api/images', async (req, res) => {
 });
 
 // 画像ファイルの削除
-app.delete('/api/images/:filename', async (req, res) => {
-    try {
-        const { filename } = req.params;
-        const { userId } = req.query;
-
-        // Sanitize filename to prevent directory traversal
-        const safeFilename = path.basename(filename);
-        const userUploadDir = getUserUploadsDir(userId || 'default');
-        const filePath = path.join(userUploadDir, safeFilename);
-
-        await fs.unlink(filePath);
-
-        res.json({
-            success: true,
-            message: 'Image deleted successfully'
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // Configファイルの削除
-app.delete('/api/config/:filename', async (req, res) => {
-    try {
-        const { filename } = req.params;
-        const { userId } = req.query;
-
-        const userDir = getUserDir(userId || 'default');
-        const filePath = path.join(userDir, filename);
-
-        await fs.unlink(filePath);
-
-        // 削除後、ファイルが残っているかチェック
-        const files = await fs.readdir(userDir);
-        const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
-
-        // ファイルがすべて削除された場合、デフォルトのsample_config.yamlをコピー
-        if (yamlFiles.length === 0) {
-            const defaultConfig = await fs.readFile(CONFIG_PATH, 'utf8');
-            const defaultConfigPath = path.join(userDir, 'sample_config.yaml');
-            await fs.writeFile(defaultConfigPath, defaultConfig, 'utf8');
-        }
-
-        res.json({
-            success: true,
-            message: 'Config deleted successfully'
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // ソルバーの実行（ストリーミングなし）
 app.post('/api/solve', async (req, res) => {
     let finishStartOperation = () => {};
@@ -4248,44 +3875,6 @@ app.get('/api/user-files', async (req, res) => {
 
 // Delete one item from the unified File Manager.  Existing category-specific
 // routes remain available for backwards compatibility with older clients.
-app.delete('/api/user-files', async (req, res) => {
-    try {
-        const userIdKey = (req.body && req.body.userId || 'default')
-            .replace(/[^a-zA-Z0-9_-]/g, '');
-        const category = req.body && req.body.category;
-        const name = path.basename(String(req.body && req.body.name || ''));
-        if (!name || name !== String(req.body && req.body.name || '') ||
-            !['configs', 'images', 'libraries', 'results'].includes(category)) {
-            return res.status(400).json({ success: false, error: 'Invalid file selection' });
-        }
-
-        let target;
-        if (category === 'configs') {
-            if (!/\.ya?ml$/i.test(name)) throw new Error('Only YAML configs can be deleted');
-            target = path.join(getUserDir(userIdKey), name);
-        } else if (category === 'images') {
-            if (!/\.(png|jpe?g|bmp)$/i.test(name)) throw new Error('Unsupported image type');
-            target = path.join(getUserUploadsDir(userIdKey), name);
-        } else if (category === 'libraries') {
-            if (!/\.ya?ml$/i.test(name)) throw new Error('Only YAML libraries can be deleted');
-            target = path.join(getUserLibsDir(userIdKey), name);
-        } else {
-            target = path.join(OUTPUTS_DIR, userIdKey, name);
-            if (!await isAnalysisResult(target)) {
-                return res.status(400).json({ success: false, error: 'Not a completed analysis result' });
-            }
-        }
-
-        await fs.rm(target, { recursive: category === 'results', force: false });
-        res.json({ success: true, category, name });
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            return res.status(404).json({ success: false, error: 'File not found' });
-        }
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
 // ===== Output File Management API =====
 
 /**
@@ -4487,394 +4076,10 @@ app.get('/api/user-outputs', async (req, res) => {
 // Delete multiple output folders (bulk delete)
 // NOTE: This route must be defined BEFORE /api/user-outputs/:folderName
 // to prevent Express from matching "bulk" as a :folderName parameter.
-app.delete('/api/user-outputs/bulk', async (req, res) => {
-    try {
-        const { userId, folderNames } = req.body;
-        const userIdKey = userId || 'default';
-
-        // Validate inputs
-        if (!Array.isArray(folderNames) || folderNames.length === 0) {
-            return res.status(400).json({
-                success: false,
-                error: 'folderNames must be a non-empty array'
-            });
-        }
-
-        if (folderNames.length > 100) {
-            return res.status(400).json({
-                success: false,
-                error: 'Cannot delete more than 100 folders at once'
-            });
-        }
-
-        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
-        const resolvedUserOutputDir = path.resolve(userOutputDir);
-
-        const results = [];
-
-        for (const folderName of folderNames) {
-            const result = { name: folderName };
-
-            try {
-                const safeFolderName = path.basename(folderName);
-                const folderPath = path.join(userOutputDir, safeFolderName);
-                const resolvedFolderPath = path.resolve(folderPath);
-
-                // Security check
-                if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
-                    result.success = false;
-                    result.error = 'Path traversal detected';
-                    results.push(result);
-                    continue;
-                }
-
-                // Check if exists
-                try {
-                    await fs.access(folderPath);
-                } catch {
-                    result.success = false;
-                    result.error = 'Folder not found';
-                    results.push(result);
-                    continue;
-                }
-
-                // Verify it's an analysis result
-                if (!await isAnalysisResult(folderPath)) {
-                    result.success = false;
-                    result.error = 'Not an analysis result folder';
-                    results.push(result);
-                    continue;
-                }
-
-                // Delete folder
-                await fs.rm(folderPath, { recursive: true, force: true });
-
-                console.log(`Bulk deleted: ${safeUserId}/${safeFolderName}`);
-
-                result.success = true;
-                results.push(result);
-
-            } catch (error) {
-                result.success = false;
-                result.error = error.message;
-                results.push(result);
-            }
-        }
-
-        // Check if any failed
-        const failedCount = results.filter(r => !r.success).length;
-        const successCount = results.filter(r => r.success).length;
-
-        res.json({
-            success: true,
-            message: `Deleted ${successCount} folder(s), ${failedCount} failed`,
-            results: results
-        });
-
-    } catch (error) {
-        console.error('Error in bulk delete:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // Delete a specific output folder
-app.delete('/api/user-outputs/:folderName', async (req, res) => {
-    try {
-        const { folderName } = req.params;
-        const { userId } = req.query;
-        const userIdKey = userId || 'default';
-
-        // Sanitize inputs to prevent directory traversal
-        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const safeFolderName = path.basename(folderName); // Prevent path traversal
-
-        const userOutputDir = path.join(OUTPUTS_DIR, `${safeUserId}`);
-        const folderPath = path.join(userOutputDir, safeFolderName);
-
-        // Security check: ensure the resolved path is within user's output directory
-        const resolvedFolderPath = path.resolve(folderPath);
-        const resolvedUserOutputDir = path.resolve(userOutputDir);
-
-        if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
-            return res.status(403).json({
-                success: false,
-                error: 'Access denied: Path traversal detected'
-            });
-        }
-
-        // Check if folder exists and is an analysis result
-        try {
-            await fs.access(folderPath);
-        } catch {
-            return res.status(404).json({
-                success: false,
-                error: 'Output folder not found'
-            });
-        }
-
-        // Verify it's an analysis result folder
-        if (!await isAnalysisResult(folderPath)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Not an analysis result folder'
-            });
-        }
-
-        // Delete the folder recursively
-        await fs.rm(folderPath, { recursive: true, force: true });
-
-        console.log(`Deleted output folder: ${safeUserId}/${safeFolderName}`);
-
-        res.json({
-            success: true,
-            message: 'Output folder deleted successfully'
-        });
-
-    } catch (error) {
-        console.error('Error deleting output folder:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // Rename an output folder
-app.put('/api/user-outputs/:folderName/rename', async (req, res) => {
-    try {
-        const { folderName } = req.params;
-        const { userId, newName } = req.body;
-        const userIdKey = userId || 'default';
-
-        // Sanitize inputs
-        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const safeFolderName = path.basename(folderName);
-        const safeNewName = path.basename(newName).replace(/[^a-zA-Z0-9_\-\.]/g, '_');
-
-        // Validate new name
-        if (!safeNewName || safeNewName.length === 0 || safeNewName.length > 100) {
-            return res.status(400).json({
-                success: false,
-                error: 'Invalid folder name (1-100 characters, alphanumeric and _-. only)'
-            });
-        }
-
-        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
-        const oldPath = path.join(userOutputDir, safeFolderName);
-        const newPath = path.join(userOutputDir, safeNewName);
-
-        // Security check
-        const resolvedOldPath = path.resolve(oldPath);
-        const resolvedNewPath = path.resolve(newPath);
-        const resolvedUserOutputDir = path.resolve(userOutputDir);
-
-        if (!resolvedOldPath.startsWith(resolvedUserOutputDir) ||
-            !resolvedNewPath.startsWith(resolvedUserOutputDir)) {
-            return res.status(403).json({
-                success: false,
-                error: 'Access denied: Path traversal detected'
-            });
-        }
-
-        // Check if old folder exists and is an analysis result
-        try {
-            await fs.access(oldPath);
-        } catch {
-            return res.status(404).json({
-                success: false,
-                error: 'Output folder not found'
-            });
-        }
-
-        if (!await isAnalysisResult(oldPath)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Not an analysis result folder'
-            });
-        }
-
-        // Check if new name already exists
-        try {
-            await fs.access(newPath);
-            return res.status(409).json({
-                success: false,
-                error: 'Folder with this name already exists'
-            });
-        } catch {
-            // Good - new path doesn't exist
-        }
-
-        // Rename folder
-        await fs.rename(oldPath, newPath);
-
-        console.log(`Renamed output folder: ${safeUserId}/${safeFolderName} -> ${safeNewName}`);
-
-        res.json({
-            success: true,
-            message: 'Folder renamed successfully',
-            newName: safeNewName
-        });
-
-    } catch (error) {
-        console.error('Error renaming output folder:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // Get description for an output folder
-app.get('/api/user-outputs/:folderName/description', async (req, res) => {
-    try {
-        const { folderName } = req.params;
-        const { userId } = req.query;
-        const userIdKey = userId || 'default';
-
-        // Sanitize inputs
-        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const safeFolderName = path.basename(folderName);
-
-        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
-        const folderPath = path.join(userOutputDir, safeFolderName);
-        const descPath = path.join(folderPath, 'description.txt');
-
-        // Security check
-        const resolvedFolderPath = path.resolve(folderPath);
-        const resolvedUserOutputDir = path.resolve(userOutputDir);
-
-        if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
-            return res.status(403).json({
-                success: false,
-                error: 'Access denied: Path traversal detected'
-            });
-        }
-
-        // Check if folder exists
-        try {
-            await fs.access(folderPath);
-        } catch {
-            return res.status(404).json({
-                success: false,
-                error: 'Output folder not found'
-            });
-        }
-
-        // Verify it's an analysis result
-        if (!await isAnalysisResult(folderPath)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Not an analysis result folder'
-            });
-        }
-
-        // Read description file (if exists)
-        let description = '';
-        try {
-            description = await fs.readFile(descPath, 'utf8');
-        } catch {
-            // File doesn't exist - return empty string
-            description = '';
-        }
-
-        res.json({
-            success: true,
-            description: description
-        });
-
-    } catch (error) {
-        console.error('Error reading description:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // Update description for an output folder
-app.put('/api/user-outputs/:folderName/description', async (req, res) => {
-    try {
-        const { folderName } = req.params;
-        const { userId, description } = req.body;
-        const userIdKey = userId || 'default';
-
-        // Sanitize inputs
-        const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
-        const safeFolderName = path.basename(folderName);
-
-        // Validate description length
-        if (description && description.length > 10000) {
-            return res.status(400).json({
-                success: false,
-                error: 'Description too long (max 10000 characters)'
-            });
-        }
-
-        const userOutputDir = path.join(OUTPUTS_DIR, safeUserId);
-        const folderPath = path.join(userOutputDir, safeFolderName);
-        const descPath = path.join(folderPath, 'description.txt');
-
-        // Security check
-        const resolvedFolderPath = path.resolve(folderPath);
-        const resolvedUserOutputDir = path.resolve(userOutputDir);
-
-        if (!resolvedFolderPath.startsWith(resolvedUserOutputDir)) {
-            return res.status(403).json({
-                success: false,
-                error: 'Access denied: Path traversal detected'
-            });
-        }
-
-        // Check if folder exists
-        try {
-            await fs.access(folderPath);
-        } catch {
-            return res.status(404).json({
-                success: false,
-                error: 'Output folder not found'
-            });
-        }
-
-        // Verify it's an analysis result
-        if (!await isAnalysisResult(folderPath)) {
-            return res.status(400).json({
-                success: false,
-                error: 'Not an analysis result folder'
-            });
-        }
-
-        // Write or delete description file
-        if (description && description.trim().length > 0) {
-            await fs.writeFile(descPath, description, 'utf8');
-            console.log(`Updated description for: ${safeUserId}/${safeFolderName}`);
-        } else {
-            // Delete file if description is empty
-            try {
-                await fs.unlink(descPath);
-                console.log(`Deleted description for: ${safeUserId}/${safeFolderName}`);
-            } catch {
-                // File doesn't exist - ignore
-            }
-        }
-
-        res.json({
-            success: true,
-            message: 'Description updated successfully'
-        });
-
-    } catch (error) {
-        console.error('Error updating description:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
 // ============================================================
 // Field Query: Get field values at a physical coordinate
 // ============================================================
@@ -4986,20 +4191,21 @@ app.get('/api/results/:resultFolder/field-at-point', async (req, res) => {
 // ============================================================
 
 // Submit async solve job (non-blocking, returns jobId immediately)
-app.post('/api/jobs', async (req, res) => {
+async function submitAnalysisJob(input, options = {}) {
+    const guard = options.guard || (() => {});
     let finishStartOperation = () => {};
     let mergedTempPath = null;
     let jobStarted = false;
     let solverProcess = null;
     let outputPath = null;
     try {
-        assertRequestOpen(req, res);
-        const { configFile, imageFile, userId, materialLibraryFile } = req.body;
+        guard();
+        const { configFile, imageFile, userId, materialLibraryFile } = input;
         const userIdKey = normalizeUserId(userId);
         finishStartOperation = beginSolverStartOperation(userIdKey);
 
         if (!configFile || !imageFile) {
-            return res.status(400).json({ success: false, error: 'configFile and imageFile are required' });
+            throw makeProcessError('configFile and imageFile are required', 'INVALID_INPUT', 400);
         }
 
         cleanupExpiredJobs(Date.now(), Math.max(0, MAX_JOB_RECORDS - 1));
@@ -5022,34 +4228,34 @@ app.post('/api/jobs', async (req, res) => {
 
         // Build paths
         const userDir = getUserDir(userIdKey);
-        const configPath = resolveUserFilePath(userDir, configFile, 'configFile');
+        const configPath = options.prepared?.configPath || resolveUserFilePath(userDir, configFile, 'configFile');
         const userUploadDir = getUserUploadsDir(userIdKey);
-        const imagePath = resolveUserFilePath(userUploadDir, imageFile, 'imageFile');
+        const imagePath = options.prepared?.imagePath || resolveUserFilePath(userUploadDir, imageFile, 'imageFile');
 
         // Validate files exist
         await fs.access(configPath);
         await fs.access(imagePath);
         await fs.access(SOLVER_PATH);
-        assertRequestOpen(req, res);
+        guard();
 
         // Merge material library if provided
         let effectiveConfigPath = configPath;
-        if (materialLibraryFile) {
+        if (materialLibraryFile && !options.prepared) {
             const libDir = getUserLibsDir(userIdKey);
             const libPath = resolveUserFilePath(libDir, materialLibraryFile, 'materialLibraryFile');
             const configYaml = await fs.readFile(configPath, 'utf8');
             const libYaml = await fs.readFile(libPath, 'utf8');
-            assertRequestOpen(req, res);
+            guard();
             const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
             mergedTempPath = path.join(userDir, `.merged_${require('crypto').randomUUID()}.yaml`);
             await fs.writeFile(mergedTempPath, mergedYaml);
-            assertRequestOpen(req, res);
+            guard();
             effectiveConfigPath = mergedTempPath;
         }
 
-        const jobId = require('crypto').randomUUID();
-        outputPath = await prepareUserOutputDirectory(userIdKey);
-        assertRequestOpen(req, res);
+        const jobId = options.jobId || require('crypto').randomUUID();
+        outputPath = options.prepared?.outputPath || await prepareUserOutputDirectory(userIdKey);
+        guard();
 
         // Repeat capacity checks after file I/O so another request cannot claim
         // this user's slot while the job is being prepared.
@@ -5070,7 +4276,7 @@ app.post('/api/jobs', async (req, res) => {
         if (jobs.size >= MAX_JOB_RECORDS) {
             throw makeProcessError('Job history capacity is temporarily full', 'JOB_HISTORY_LIMIT', 503);
         }
-        assertRequestOpen(req, res);
+        guard();
 
         const job = {
             jobId,
@@ -5079,6 +4285,8 @@ app.post('/api/jobs', async (req, res) => {
             progress: 0,
             log: [],
             resultPath: null,
+            outputPath,
+            source: options.source || 'gui',
             exitCode: null,
             completed: false,
             converged: false,
@@ -5093,7 +4301,10 @@ app.post('/api/jobs', async (req, res) => {
         // Spawn solver in background
         solverProcess = spawnTrackedSolver(
             [effectiveConfigPath, imagePath, outputPath],
-            { purpose: 'job', userId: userIdKey, jobId }
+            { purpose: 'job', userId: userIdKey, jobId },
+            // Diagnostic CSVs / DD scratch files use relative paths inside C++.
+            // An automation run must keep those inside its assigned result.
+            options.prepared ? {cwd: outputPath, windowsHide: true} : {}
         );
         job.process = solverProcess;
         jobs.set(jobId, job);
@@ -5148,6 +4359,7 @@ app.post('/api/jobs', async (req, res) => {
                 job.progress = 100;
             }
             cleanMergedTemp();
+            if (options.onFinalized) void trackCleanup(options.onFinalized(job).catch(error => console.error('Job record persistence failed:', error.code || 'IO_ERROR')));
             console.log(`Job ${jobId} finished with code ${code}`);
         };
 
@@ -5169,14 +4381,21 @@ app.post('/api/jobs', async (req, res) => {
         });
         solverProcess.once('close', (code) => finalizeJob(code, processError));
 
-        res.json({ success: true, jobId, status: 'running' });
+        return { success: true, jobId, status: 'running' };
     } catch (error) {
         if (!jobStarted && mergedTempPath) void unlinkTemporaryFile(mergedTempPath);
         if (!solverProcess && outputPath) void removeEmptyOutputDirectory(outputPath);
-        if (res.destroyed || res.writableEnded || res.headersSent) return;
-        res.status(error.statusCode || 500).json({ success: false, error: error.message });
+        throw error;
     } finally {
         finishStartOperation();
+    }
+}
+
+app.post('/api/jobs', async (req, res) => {
+    try {
+        res.json(await submitAnalysisJob(req.body, { guard: () => assertRequestOpen(req, res) }));
+    } catch (error) {
+        if (!res.destroyed && !res.writableEnded && !res.headersSent) res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
@@ -5316,8 +4535,10 @@ app.post('/api/material-libraries', upload.single('library'), async (req, res) =
             return res.status(400).json({ success: false, error: `YAML parse error: ${yamlErr.message}` });
         }
 
-        await fs.writeFile(destPath, content, 'utf8');
-        res.json({ success: true, filename });
+        if(Buffer.byteLength(content)>MAX_FILE_SIZE) return res.status(413).json({success:false,error:'YAML limit is 100 KiB'});
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        const meta = await ws.write(`libraries/${filename}`, Buffer.from(content), null);
+        res.json({ success: true, filename, revision: meta.revision });
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -5335,13 +4556,16 @@ app.get('/api/material-libraries/:filename', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Invalid filename' });
         }
 
-        const content = await fs.readFile(filePath, 'utf8');
-        res.type('text/plain').send(content);
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        const data = await ws.read(`libraries/${filename}`, {text:true, length:524288});
+        if (data.nextOffset !== null) return res.status(413).json({error:'Library is too large'});
+        res.set('X-File-Revision', data.revision);
+        res.type('text/plain').send(data.content);
     } catch (error) {
         if (error.code === 'ENOENT') {
             res.status(404).json({ success: false, error: 'Library file not found' });
         } else {
-            res.status(500).json({ success: false, error: error.message });
+            res.status(error.statusCode || 500).json({ success: false, error: error.message });
         }
     }
 });
@@ -5376,36 +4600,16 @@ app.put('/api/material-libraries/:filename', async (req, res) => {
             return res.status(400).json({ success: false, error: 'Invalid filename' });
         }
 
-        await fs.writeFile(filePath, content, 'utf8');
-        res.json({ success: true, filename });
+        if (Buffer.byteLength(content) > MAX_FILE_SIZE) return res.status(413).json({success:false,error:'YAML limit is 100 KiB'});
+        const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+        const meta = await ws.write(`libraries/${filename}`, Buffer.from(content), req.body.expectedRevision ?? null);
+        res.json({ success: true, filename, revision: meta.revision });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(error.statusCode || 500).json({ success: false, error: error.message });
     }
 });
 
 // Delete a library file
-app.delete('/api/material-libraries/:filename', async (req, res) => {
-    try {
-        const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
-        const filename = path.basename(req.params.filename);
-        const libDir = getUserLibsDir(userId);
-        const filePath = path.join(libDir, filename);
-
-        if (!path.resolve(filePath).startsWith(path.resolve(libDir))) {
-            return res.status(400).json({ success: false, error: 'Invalid filename' });
-        }
-
-        await fs.unlink(filePath);
-        res.json({ success: true, message: `Deleted ${filename}` });
-    } catch (error) {
-        if (error.code === 'ENOENT') {
-            res.status(404).json({ success: false, error: 'Library file not found' });
-        } else {
-            res.status(500).json({ success: false, error: error.message });
-        }
-    }
-});
-
 // ルートへのアクセス
 app.get('/', (req, res) => {
     res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
@@ -5863,6 +5067,12 @@ function startServer() {
     if (shuttingDown) throw new Error('Server has already started shutting down');
     startJobCleanupTimer();
     httpServer = app.listen(PORT, logServerStarted);
+    if (process.env.OPENMAGFDM_SKIP_INIT !== '1') void automation.init().then(() => {
+        if (automation.ready) {
+            console.log(`MCP management pairing code: ${automation.access.pairingCode}`);
+            console.log('Help / Integrations: pair your browser to manage local agent connections.');
+        } else console.error(automation.error);
+    });
     installShutdownHandlers();
     return httpServer;
 }
@@ -5870,6 +5080,7 @@ function startServer() {
 function shutdownServer(reason = 'shutdown') {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
+    const automationClosed = automation.close();
     if (jobCleanupTimer) {
         clearInterval(jobCleanupTimer);
         jobCleanupTimer = null;
@@ -5904,7 +5115,7 @@ function shutdownServer(reason = 'shutdown') {
             }, SHUTDOWN_TIMEOUT_MS);
         });
 
-        const orderlyShutdown = Promise.all([serverClosed, childrenStopped, childrenClosed])
+        const orderlyShutdown = Promise.all([serverClosed, childrenStopped, childrenClosed, automationClosed])
             .then(() => waitForSolverStartOperations())
             .then(() => waitForPendingCleanups());
         await Promise.race([orderlyShutdown, deadline]);
@@ -5951,12 +5162,20 @@ function shutdownServer(reason = 'shutdown') {
     return shutdownPromise;
 }
 
+const { AutomationRuntime } = require('./automation/runtime');
+const automation = new AutomationRuntime(BASE_DIR, {
+    jobs, submitAnalysisJob, mergeLibraryIntoConfig, isChildRunning, terminateChildProcess, userHasActiveSolver,
+    detectPolarGeometry, warpPolar, quantizeImage
+});
+automation.install(app);
+
 if (process.env.OPENMAGFDM_NO_LISTEN !== '1') startServer();
 
 module.exports = {
     app,
     startServer,
     shutdownServer,
+    automation,
     _test: {
         activeJobs,
         appendCappedLog,

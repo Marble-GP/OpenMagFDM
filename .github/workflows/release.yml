@@ -322,19 +322,19 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v6
       with:
-        node-version: '18'
+        node-version: '24'
 
     - name: Install dependencies and create standalone package
       run: |
         cd webui
-        npm install
-        npm install -g pkg
+        npm ci
+        npm test
         mkdir -p ../release
 
         # Create standalone executables for each platform
-        pkg package.json --targets node18-linux-x64 --output ../release/webui-server-linux
-        pkg package.json --targets node18-win-x64 --output ../release/webui-server-win.exe
-        pkg package.json --targets node18-macos-x64 --output ../release/webui-server-macos
+        npx --no-install pkg package.json --targets node24-linux-x64 --output ../release/webui-server-linux
+        npx --no-install pkg package.json --targets node24-win-x64 --output ../release/webui-server-win.exe
+        npx --no-install pkg package.json --targets node24-macos-x64 --output ../release/webui-server-macos
 
     - name: Create WebUI packages
       run: |

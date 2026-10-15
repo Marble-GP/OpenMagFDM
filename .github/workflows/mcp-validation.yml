@@ -1,0 +1,31 @@
+name: Embedded MCP validation (no release)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+      - run: npm ci
+        working-directory: webui
+      - run: npm test
+        working-directory: webui
+      - run: node tools/build-mcp-package.cjs
+        working-directory: webui
+      - name: Packaged HTTP and stdio without Node on the child PATH
+        shell: bash
+        working-directory: webui
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then EXE=../build_mcp/webui-server.exe; else EXE=../build_mcp/webui-server; fi
+          node tests/packaged_mcp_smoke.cjs --exe "$EXE"
