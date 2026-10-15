@@ -367,7 +367,7 @@ Windows CTest 4/4, benchmark Python tests 38/38 and the release-contract smoke
 (isolated copy of the pinned executable/DLLs) were rerun on 2026-10-16.
 Linux/macOS remain unverified for these initialization changes.
 
-## C. Anderson combination (DIRECT selected; large-model trial not started)
+## C. Anderson combination (DIRECT selected; final ablation prepared 2026-10-16)
 
 Use DIRECT (angle prediction rejected) with existing safeguarded Anderson, one fixed
 small depth; compare OFF/ON before changing other parameters. Preserve the
@@ -385,6 +385,30 @@ the ON path must actually exercise Anderson. Existing correction bounds,
 true-residual/energy checks, rejection reset and best-state rollback are unchanged.
 The actual small-sweep OFF/ON test above passed, but no large-model Anderson
 timing or adoption result is claimed before this second stage runs and is reviewed.
+
+After the predictor rejection checkpoint `d82fee0`, the user authorized this
+as the final bounded hypothesis comparison. Use the unchanged
+`build_nonlinear_prediction/Release/MagFDMsolver.exe` (SHA256
+`4a9a0f1d893234ff544fc51d46a61372b55dd347d96f6ae010144635a05906a1`)
+and a new directory `../bench_results/direct_anderson_20261016_01`.
+The solver implementation, EW/line search, AA correction/rollback safeguards,
+AMG rebuild policy and all public defaults remain unchanged. Prediction and
+priority 4 are OFF. The only paired configuration change is the AA block.
+
+Four additional mocked orchestration regressions verify DIRECT selection after
+a rejected predictor, prepare-only/AB-BA-AB ordering/duplicate-free resume,
+rejection of AA ON with no evaluations or OFF with unexpected evaluations,
+and stopping on an out-of-tolerance final residual without a speed claim.
+The benchmark suite passed 42/42 on 2026-10-16. These mocks do not count as
+real-model performance evidence. The preceding CTest 4/4 and isolated
+release-contract smoke passed with the same binary; no rebuild is needed.
+
+Acceptance review must include AA accepted/rejected counts, evaluation/QR
+overhead, outer/inner iterations, total time including output completion,
+aligned flux and memory/load, not just a `passed` summary flag. Only a useful
+candidate proceeds to a separately reviewed full-period/large-displacement
+gate. If it is not useful, retain DIRECT alone and close this hypothesis series;
+do not start an unrestricted depth/beta search or revive angle prediction.
 
 ## D. Magnetic-circuit initializer (deferred; excluded from current plan)
 

@@ -209,6 +209,17 @@ The selected initializer is DIRECT. Start the independent AA stage with
 first with `--prepare-only`, then `--resume`. A completed passing predictor stage
 with the same binary is mandatory. No next stage is launched automatically.
 
+The final DIRECT/AA comparison was authorized after rejection checkpoint
+`d82fee0`. Preserve the same executable and use this new output directory:
+
+```powershell
+.\build_solver_speed\bench_py312\Scripts\python.exe benchmarks/solver_speed/run_prediction_pairs.py --exe build_nonlinear_prediction/Release/MagFDMsolver.exe --reference ../bench_results/direct_initialization_20261010_01 --output ../bench_results/direct_anderson_20261016_01 --stage anderson --initializer direct --predictor-reference ../bench_results/angle_prediction_20261015_01 --prepare-only
+.\build_solver_speed\bench_py312\Scripts\python.exe benchmarks/solver_speed/run_prediction_pairs.py --exe build_nonlinear_prediction/Release/MagFDMsolver.exe --reference ../bench_results/direct_initialization_20261010_01 --output ../bench_results/direct_anderson_20261016_01 --stage anderson --initializer direct --predictor-reference ../bench_results/angle_prediction_20261015_01 --resume
+```
+
+Check progress and running processes before using these commands: once launched,
+do not start a duplicate or resume a completed output merely to review it.
+
 Both stages require strict convergence, repeatable within-mode histories and
 fields, unchanged archived OFF/control results, aligned flux RMS <=0.1%, actual
 initializer/AA use and paired memory limits. Background CPU load is retained.
