@@ -8,6 +8,13 @@ const { fail, userKey, noLinks, locked } = require('./workspace');
 const PERMISSIONS = Object.freeze(['read', 'edit', 'images', 'run', 'cancel', 'delete', 'replace']);
 const hash = text => crypto.createHash('sha256').update(text).digest('hex');
 const random = () => crypto.randomBytes(32).toString('base64url');
+// Never resolve security-sensitive Windows utilities through PATH: Git Bash
+// also ships whoami.exe, but it does not support the Windows /user arguments.
+function windowsSystemCommand(name, root = process.env.SystemRoot || process.env.WINDIR) {
+    if (!['whoami.exe', 'icacls.exe'].includes(name) || typeof root !== 'string' || !/^[A-Za-z]:[\\/]/.test(root))
+        fail('PRIVATE_STORAGE', 'Cannot locate Windows system utilities');
+    return path.win32.join(root, 'System32', name);
+}
 function privateDirectory(base) {
     const home = process.platform === 'win32' ? process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local') : path.join(os.homedir(), '.local', 'share');
     return path.join(home, 'OpenMagFDM', 'automation', hash(path.resolve(base)).slice(0, 20));
@@ -16,10 +23,13 @@ async function restrict(directory) {
     await noLinks(directory, { missing: true });
     await fs.mkdir(directory, { recursive: true, mode: 0o700 });
     if (process.platform === 'win32') {
-        const identity = execFileSync('whoami.exe', ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true });
+        let identity;
+        try { identity = execFileSync(windowsSystemCommand('whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true, stdio:['ignore','pipe','pipe'] }); }
+        catch { fail('PRIVATE_STORAGE_IDENTITY', 'Cannot determine the Windows account for private storage'); }
         const sid = identity.match(/S-1-5-[0-9-]+/);
         if (!sid) fail('PRIVATE_STORAGE', 'Cannot determine the current Windows user');
-        execFileSync('icacls.exe', [directory, '/inheritance:r', '/grant:r', `*${sid[0]}:(OI)(CI)F`, '*S-1-5-18:(OI)(CI)F'], { windowsHide: true, stdio: 'pipe' });
+        try { execFileSync(windowsSystemCommand('icacls.exe'), [directory, '/inheritance:r', '/grant:r', `*${sid[0]}:(OI)(CI)F`, '*S-1-5-18:(OI)(CI)F'], { windowsHide: true, stdio: 'pipe' }); }
+        catch { fail('PRIVATE_STORAGE_ACL', 'Cannot protect private storage with Windows access permissions'); }
     } else await fs.chmod(directory, 0o700);
 }
 async function atomicJSON(filename, data) {
@@ -190,4 +200,4 @@ class Access {
     }
     async flush() { await Promise.allSettled([...this.auditWrites, this.pairingWrite]); }
 }
-module.exports = { Access, PERMISSIONS, privateDirectory, atomicJSON, localRequest, hash };
+module.exports = { Access, PERMISSIONS, privateDirectory, atomicJSON, localRequest, hash, windowsSystemCommand };

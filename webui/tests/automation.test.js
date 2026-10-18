@@ -32,6 +32,14 @@ async function fixture(t) {
     t.after(async()=>{await runtime.close();await noLinks(temp);assert.ok(path.basename(temp).startsWith('omfdm-mcp-'));await fs.rm(temp,{recursive:true,force:true});});
     return {temp,base,runtime,actor,other,wa,wb,a,b,backend,starts:()=>starts};
 }
+test('Windows security utilities always use System32, never Git Bash PATH',()=>{
+    const {windowsSystemCommand}=require('../automation/access');
+    assert.equal(windowsSystemCommand('whoami.exe','C:\\Windows'),'C:\\Windows\\System32\\whoami.exe');
+    assert.equal(windowsSystemCommand('icacls.exe','D:/Windows'),'D:\\Windows\\System32\\icacls.exe');
+    for(const root of ['', 'relative', '\\\\server\\Windows'])assert.throws(()=>windowsSystemCommand('whoami.exe',root),{code:'PRIVATE_STORAGE'});
+    assert.throws(()=>windowsSystemCommand('../whoami.exe','C:\\Windows'),{code:'PRIVATE_STORAGE'});
+});
+
 test('trusted browsers persist with hashed tokens, expire, and can be forgotten without revoking agents',async t=>{
     const f=await fixture(t);
     const {Access,hash}=require('../automation/access');

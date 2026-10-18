@@ -36,7 +36,8 @@ async function main(){
         };
     delete env.SOLVER_PATH; // Exercise the actual distribution layout, not a development override.
     let output='';const child=spawn(exe,[],{cwd:base,env,windowsHide:true,stdio:['ignore','pipe','pipe']});
-    child.stdout.on('data',b=>{output=(output+b).slice(-65536);});child.stderr.on('data',()=>{});
+    let stderr='';
+    child.stdout.on('data',b=>{output=(output+b).slice(-65536);});child.stderr.on('data',b=>{stderr=(stderr+b).slice(-65536);});
     let cookie='',csrf='';const url=`http://127.0.0.1:${port}`;const clients=[];
     const admin=async(endpoint,method='GET',body)=>{
         const response=await fetch(url+endpoint,{method,headers:{'Content-Type':'application/json',Cookie:cookie,'X-Omfdm-Csrf':csrf},...(body===undefined?{}:{body:JSON.stringify(body)})});
@@ -46,7 +47,12 @@ async function main(){
     try {
         let code;const deadline=Date.now()+30000;
         while(!(code=/MCP management pairing code: ([A-Za-z0-9_-]+)/.exec(output)?.[1])){
-            if(child.exitCode!==null||Date.now()>deadline)throw Error('Packaged WebUI did not initialize MCP management');await delay(100);
+            // Report only the sanitized initialization code, never raw output:
+            // stdout may contain the private pairing code.
+            const failure=/MCP unavailable \(([A-Z0-9_]+)\)/.exec(stderr)?.[1];
+            if(failure||child.exitCode!==null||child.signalCode!==null||Date.now()>deadline)
+                throw Error(`Packaged WebUI did not initialize MCP management (${failure||'STARTUP_TIMEOUT_OR_EXIT'}; exit=${child.exitCode}, signal=${child.signalCode})`);
+            await delay(100);
         }
         assert.equal((await fetch(url+'/api/mcp/status')).status,401);
         csrf=(await admin('/api/mcp/pair','POST',{code})).csrf;
