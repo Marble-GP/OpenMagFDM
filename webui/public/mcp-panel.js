@@ -32,6 +32,10 @@ const MCPPanel=(()=>{
             el('mcpPairSection').hidden=true;el('mcpManagement').hidden=false;
             el('mcpAssignedUser').textContent=AppState.userId;
             el('mcpEnabled').checked=status.enabled;el('mcpPort').value=status.port;
+            el('mcpBrowserStatus').textContent=status.browser?.remember?`Browser trusted until ${new Date(status.browser.expires).toLocaleString()}`:'Browser paired for this session.';
+            const solver=await api('/api/mcp/solver');
+            el('mcpSolverStatus').textContent=`Solver: ${solver.available?'Found':'Not found'} (${solver.source||'unavailable'}) — ${solver.path||''}${solver.activePath&&solver.activePath!==solver.path?' — restart required':''}`;
+            if(document.activeElement!==el('mcpSolverPath'))el('mcpSolverPath').value=solver.savedPath||'';
             el('mcpListenerStatus').textContent=status.error||`${status.listening?'Listening':'OFF'} · ${status.url}`;
             if(status.auditError||status.auditDropped)el('mcpListenerStatus').textContent+=` · Audit warning: ${status.auditError||''} ${status.auditDropped||0} records dropped`;
             const list=el('mcpConnections');list.replaceChildren();
@@ -60,7 +64,7 @@ const MCPPanel=(()=>{
                     const select=el('resultSelect'),folder=j.resultId.split('/')[1];
                     const option=Array.from(select.options).find(o=>o.value.split('/').pop()===folder);
                     if(!option){message('Result is not available yet. Refresh after the first output is written.');return;}
-                    select.value=option.value;switchTab('dashboard');await loadSelectedResult();
+                    select.value=option.value;updateCustomSelectDisplay(option.value);switchTab('dashboard');await loadSelectedResult();
                 }));container.append(row);
             }
             const list=node('ul');for(const e of data.events.slice(-20).reverse())list.append(node('li',`${e.at} · ${e.client} · ${e.operation} · ${e.target||''} · ${e.code}`));container.append(list);
@@ -95,7 +99,9 @@ const MCPPanel=(()=>{
     }
     document.addEventListener('DOMContentLoaded',()=>{
         permissions(el('mcpPermissions'));
-        el('mcpPairForm').addEventListener('submit',async e=>{e.preventDefault();try{const r=await api('/api/mcp/pair','POST',{code:el('mcpPairCode').value});csrf=r.csrf;el('mcpPairCode').value='';message('Browser paired.');await refresh();}catch(e){message(e.message);}});
+        el('mcpPairForm').addEventListener('submit',async e=>{e.preventDefault();try{const r=await api('/api/mcp/pair','POST',{code:el('mcpPairCode').value,remember:el('mcpRemember').checked});csrf=r.csrf;el('mcpPairCode').value='';message('Browser paired.');await refresh();}catch(e){message(e.message);}});
+        el('mcpForgetBrowser').onclick=async()=>{try{await api('/api/mcp/forget-browser','POST',{});csrf=null;el('mcpToken').value='';el('mcpNewSecret').hidden=true;await refresh();message('Browser forgotten. Agent connections are unchanged.');}catch(e){message(e.message);}};
+        el('mcpSolverForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/mcp/solver','PUT',{path:el('mcpSolverPath').value.trim()});await refresh();message('Solver setting saved. Restart the server when no analyses are running.');}catch(e){message(e.message);}});
         el('mcpSettingsForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/mcp/settings','PUT',{enabled:el('mcpEnabled').checked,port:Number(el('mcpPort').value)});message('Access settings saved.');await refresh();}catch(e){message(e.message);}});
         el('mcpCreateForm').addEventListener('submit',async e=>{e.preventDefault();try{const c=await api('/api/mcp/connections','POST',{name:el('mcpConnectionName').value,user:AppState.userId,permissions:selected(el('mcpPermissions'))});el('mcpToken').value=c.token;el('mcpNewSecret').hidden=false;await setup(c.id);await refresh();message('Connection created. Store the token now if using HTTP directly.');}catch(e){message(e.message);}});
         el('mcpHideSecret').onclick=()=>{el('mcpToken').value='';el('mcpNewSecret').hidden=true;};

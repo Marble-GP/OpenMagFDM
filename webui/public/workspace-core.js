@@ -10,7 +10,13 @@
         try { doc = yaml.load(content); } catch (_) { doc = null; }
         const object = doc && typeof doc === 'object' && !Array.isArray(doc);
         const scalar = (v, fallback) => ['number', 'string', 'boolean'].includes(typeof v) ? String(v) : fallback;
-        const summary = object ? {
+        const library = object && Object.hasOwn(doc, 'material_presets') && !Object.hasOwn(doc, 'materials');
+        const presets = library && doc.material_presets;
+        const summary = library ? {
+            kind: 'materials',
+            materialCount: presets && typeof presets === 'object' && !Array.isArray(presets) ? Object.keys(presets).length : 0,
+        } : object ? {
+            kind: 'config',
             coordinates: scalar(doc.coordinate_system, 'cartesian (default)'),
             solver: scalar(doc.nonlinear_solver?.solver_type, 'solver default'),
             nonlinear: scalar(doc.nonlinear_solver?.enabled, 'false (default)'),

@@ -118,6 +118,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await initializeConfigEditor();
     initializeDashboard();
     initCustomSelect();
+    ResultsWorkspace.refresh();
     await refreshConfigList();
     await loadConfig();
     Workbench.mount();
@@ -5166,26 +5167,16 @@ async function deleteConfig() {
 }
 
 // ===== Result Management =====
+let resultListGeneration = 0;
 async function refreshResultsList() {
+    const generation = ++resultListGeneration;
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.listLoading();
     try {
         const response = await fetch(`/api/results?userId=${AppState.userId}`);
         if (!response.ok) throw new Error('Failed to load results');
 
         const result = await response.json();
-        const select = document.getElementById('resultSelect');
-        const customOptions = document.getElementById('resultSelectOptions');
-        const currentValue = select.value;
-
-        // Clear both native and custom selects
-        select.innerHTML = '<option value="">Select result...</option>';
-        customOptions.innerHTML = '';
-
-        // Add default option to custom select
-        const defaultOption = document.createElement('div');
-        defaultOption.className = 'custom-select-option';
-        defaultOption.setAttribute('data-value', '');
-        defaultOption.innerHTML = '<div class="custom-select-option-main">Select result...</div>';
-        customOptions.appendChild(defaultOption);
+        if (!Array.isArray(result.results)) throw new Error('Invalid result list');
 
         // Fetch descriptions for all results in parallel
         const resultsWithDescriptions = await Promise.all(
@@ -5208,6 +5199,22 @@ async function refreshResultsList() {
             })
         );
 
+        // A late refresh must neither overwrite a newer list nor undo a choice
+        // made while descriptions were loading. Keep the old list on failure.
+        if (generation !== resultListGeneration) return result.results;
+        const select = document.getElementById('resultSelect');
+        const customOptions = document.getElementById('resultSelectOptions');
+        const currentValue = select.value;
+        select.innerHTML = '<option value="">Select result...</option>';
+        customOptions.innerHTML = '';
+        const defaultOption = document.createElement('div');
+        defaultOption.className = 'custom-select-option';
+        defaultOption.setAttribute('data-value', '');
+        defaultOption.setAttribute('role', 'option');
+        defaultOption.tabIndex = -1;
+        defaultOption.innerHTML = '<div class="custom-select-option-main">Select result...</div>';
+        customOptions.appendChild(defaultOption);
+
         resultsWithDescriptions.forEach(res => {
             // Add to native select (for compatibility)
             const option = document.createElement('option');
@@ -5219,6 +5226,8 @@ async function refreshResultsList() {
             const customOption = document.createElement('div');
             customOption.className = 'custom-select-option';
             customOption.setAttribute('data-value', res.path);
+            customOption.setAttribute('role', 'option');
+            customOption.tabIndex = -1;
 
             const mainText = document.createElement('div');
             mainText.className = 'custom-select-option-main';
@@ -5250,13 +5259,15 @@ async function refreshResultsList() {
         // Restore selection if it still exists
         if (result.results.map(r => r.path).includes(currentValue)) {
             select.value = currentValue;
-            updateCustomSelectDisplay(currentValue);
         }
+        updateCustomSelectDisplay(select.value);
+        if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.listReady(result.results.length);
 
         // Return the results for use in loadResults()
         return result.results;
     } catch (error) {
         console.error('Error loading results list:', error);
+        if (generation === resultListGeneration && typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.listFailed(error);
         return [];
     }
 }
@@ -5267,10 +5278,15 @@ function updateCustomSelectDisplay(value) {
     const options = document.querySelectorAll('#resultSelectOptions .custom-select-option');
 
     // Remove 'selected' class from all options
-    options.forEach(opt => opt.classList.remove('selected'));
+    options.forEach(opt => {
+        opt.classList.remove('selected');
+        opt.setAttribute('aria-selected', String(opt.getAttribute('data-value') === value));
+    });
+    display.textContent = value ? value.split(/[\\/]/).pop() : 'Select result...';
 
     if (!value) {
         display.textContent = 'Select result...';
+        if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
         return;
     }
 
@@ -5282,6 +5298,7 @@ function updateCustomSelectDisplay(value) {
         const mainText = selectedOption.querySelector('.custom-select-option-main');
         display.textContent = mainText ? mainText.textContent : 'Select result...';
     }
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
 }
 
 // Initialize custom select event handlers
@@ -5290,45 +5307,68 @@ function initCustomSelect() {
     const trigger = document.getElementById('resultSelectTrigger');
     const options = document.getElementById('resultSelectOptions');
     const nativeSelect = document.getElementById('resultSelect');
+    const setOpen = open => {
+        container.classList.toggle('open', open);
+        trigger.setAttribute('aria-expanded', String(open));
+    };
+    const choose = option => {
+        nativeSelect.value = option.getAttribute('data-value');
+        updateCustomSelectDisplay(nativeSelect.value);
+        setOpen(false);
+        trigger.focus();
+        nativeSelect.dispatchEvent(new Event('change'));
+    };
 
     // Toggle dropdown on trigger click
     trigger.addEventListener('click', (e) => {
         e.stopPropagation();
-        container.classList.toggle('open');
+        setOpen(!container.classList.contains('open'));
     });
+    trigger.addEventListener('keydown', e => {
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            setOpen(true);
+            const entries = Array.from(options.querySelectorAll('.custom-select-option'));
+            const selected = entries.find(entry => entry.getAttribute('data-value') === nativeSelect.value);
+            (selected || entries[0])?.focus();
+        }
+    });
+    options.addEventListener('keydown', e => {
+        const entries = Array.from(options.querySelectorAll('.custom-select-option'));
+        const index = entries.indexOf(e.target.closest('.custom-select-option'));
+        if (index < 0) return;
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(entries[index]); }
+        else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
+            e.preventDefault();
+            const next = e.key === 'Home' ? 0 : e.key === 'End' ? entries.length - 1
+                : (index + (e.key === 'ArrowDown' ? 1 : -1) + entries.length) % entries.length;
+            entries[next].focus();
+        }
+    });
+    nativeSelect.addEventListener('change', () => updateCustomSelectDisplay(nativeSelect.value));
 
     // Handle option selection
     options.addEventListener('click', (e) => {
         const option = e.target.closest('.custom-select-option');
-        if (option) {
-            const value = option.getAttribute('data-value');
-
-            // Update native select
-            nativeSelect.value = value;
-
-            // Update custom select display
-            updateCustomSelectDisplay(value);
-
-            // Close dropdown
-            container.classList.remove('open');
-
-            // Trigger change event on native select
-            nativeSelect.dispatchEvent(new Event('change'));
-        }
+        if (option) choose(option);
     });
 
     // Close dropdown when clicking outside
     document.addEventListener('click', (e) => {
         if (!container.contains(e.target)) {
-            container.classList.remove('open');
+            setOpen(false);
         }
     });
 
     // Close on Escape key
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && container.classList.contains('open')) {
-            container.classList.remove('open');
+            setOpen(false);
+            trigger.focus();
         }
+    });
+    container.addEventListener('focusout', e => {
+        if (!container.contains(e.relatedTarget)) setOpen(false);
     });
 }
 
@@ -5350,12 +5390,13 @@ function assertResultLoadCurrent(context) {
     }
 }
 
-async function loadSelectedResult() {
+async function loadSelectedResult({ refreshData = false, preserveStep = false } = {}) {
     const select = document.getElementById('resultSelect');
     const resultPath = select.value;
 
     if (!resultPath) {
         showStatus('solverStatus', 'Please select a result to load', 'error');
+        if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.chooseResult();
         return;
     }
 
@@ -5370,12 +5411,13 @@ async function loadSelectedResult() {
     };
     AppState.resultLoadController = controller;
 
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.beginLoad(loadContext);
+
     const previousResult = AppState.resultsData.currentResult;
-    if (previousResult !== resultPath) {
-        // Stop scheduling old dashboard work immediately. Field caches remain
-        // usable until the new result has passed its validation phase.
-        pauseAnimation();
-    }
+    const previousStep = AppState.currentStep;
+    // Also stop on same-result reload: an animation must not advance the step
+    // while refreshed metadata and plots are being committed.
+    pauseAnimation();
     invalidateDashboardRenders(`result load requested: ${resultPath}`);
 
     try {
@@ -5407,16 +5449,18 @@ async function loadSelectedResult() {
 
         // Commit result-dependent state atomically only after both requests
         // have completed and this selection is still the newest request.
-        if (previousResult !== resultPath) {
+        if (previousResult !== resultPath || refreshData) {
             invalidateFieldLoads(`result switch: ${previousResult || '(none)'} -> ${resultPath}`);
             clearFieldDataCache('result switch');
             clearCoarseningMaskCache();
         }
         AppState.totalSteps = stepsData.steps || 1;
-        AppState.currentStep = 1;
+        AppState.currentStep = preserveStep && previousResult === resultPath
+            ? Math.max(1, Math.min(previousStep, AppState.totalSteps)) : 1;
         AppState.resultsData.currentResult = resultPath;
         AppState.analysisConditions = analysisConditions;
         loadContext.analysisConditions = analysisConditions;
+        if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
         console.log('Analysis conditions loaded:', AppState.analysisConditions);
 
         updateExportFormatBadge();
@@ -5431,13 +5475,13 @@ async function loadSelectedResult() {
 
         if (stepSlider) {
             stepSlider.max = AppState.totalSteps;
-            stepSlider.value = 1;
+            stepSlider.value = AppState.currentStep;
         }
         if (totalStepsDisplay) {
             totalStepsDisplay.textContent = AppState.totalSteps;
         }
         if (currentStepDisplay) {
-            currentStepDisplay.textContent = 1;
+            currentStepDisplay.textContent = AppState.currentStep;
         }
 
         showStatus('solverStatus', `Loaded result: ${resultPath} (${AppState.totalSteps} steps)`, 'success');
@@ -5446,6 +5490,7 @@ async function loadSelectedResult() {
     } catch (error) {
         if (error && error.name === 'AbortError') return;
         if (isResultLoadCurrent(loadContext)) {
+            if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.loadFailed(loadContext, error);
             const committedResult = AppState.resultsData.currentResult;
             controller.abort();
             if (committedResult) {
@@ -5463,6 +5508,7 @@ async function loadSelectedResult() {
             controller.abort();
             AppState.resultLoadController = null;
         }
+        if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.finishLoad(loadContext);
     }
 }
 
@@ -6483,7 +6529,21 @@ function setupPaletteDragDrop() {
     const canvas = document.querySelector('#dashboard-grid');
 
     paletteItems.forEach(item => {
+        item.tabIndex = 0;
+        item.setAttribute('role', 'button');
+        item.setAttribute('aria-label', `Add ${plotDefinitions[item.dataset.plotType]?.name || 'plot'}`);
+        item.addEventListener('click', () => addPlotWidget(item.dataset.plotType));
+        item.addEventListener('keydown', e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                addPlotWidget(item.dataset.plotType);
+            }
+        });
         item.addEventListener('dragstart', (e) => {
+            if (typeof ResultsWorkspace !== 'undefined' && !ResultsWorkspace.canAddPlot()) {
+                e.preventDefault();
+                return;
+            }
             e.dataTransfer.effectAllowed = 'copy';
             e.dataTransfer.setData('text/plain', item.dataset.plotType);
             e.dataTransfer.setData('plot-type', item.dataset.plotType);
@@ -6506,10 +6566,6 @@ function setupPaletteDragDrop() {
         const plotType = e.dataTransfer.getData('plot-type') || e.dataTransfer.getData('text/plain');
 
         if (plotType && plotDefinitions[plotType]) {
-            // Hide empty canvas message
-            const emptyCanvas = document.getElementById('emptyCanvas');
-            if (emptyCanvas) emptyCanvas.style.display = 'none';
-
             // Calculate drop position
             const rect = canvas.getBoundingClientRect();
             const x = Math.floor((e.clientX - rect.left) / (rect.width / 12));
@@ -6522,6 +6578,7 @@ function setupPaletteDragDrop() {
 
 // Add plot widget to dashboard
 async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
+    if (typeof ResultsWorkspace !== 'undefined' && !ResultsWorkspace.canAddPlot()) return;
     const plotDef = plotDefinitions[plotType];
     if (!plotDef) {
         console.error(`Unknown plot type: ${plotType}`);
@@ -6548,6 +6605,7 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
                     </button>
                 </div>
             </div>
+            <div class="plot-source" data-state="loading">Waiting for data…</div>
             <div class="plot-container" id="${containerId}">
                 <div style="text-align: center; padding: 20px; color: #999;">Loading...</div>
             </div>
@@ -6569,6 +6627,7 @@ async function addPlotWidget(plotType, x = 0, y = 0, w = 4, h = 3) {
         widget.setAttribute('data-plot-id', plotId);
         widget.setAttribute('data-plot-type', plotType);
     }
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
 
     // Set initial tile movability (default is move mode, so movable is true)
     if (widget && AppState.gridStack) {
@@ -6697,9 +6756,11 @@ function showPlotMessage(container, html, renderContext = null) {
     assertRenderContextCurrent(renderContext, container);
     preparePlotlyContainer(container, renderContext);
     container.innerHTML = html;
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.plotStatus(renderContext, 'unavailable');
 }
 
 function invalidateDashboardRenders(reason = '') {
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.invalidatePlots();
     AppState.dashboardRenderGeneration++;
     if (AppState.dashboardRenderController) {
         AppState.dashboardRenderController.abort();
@@ -6756,6 +6817,7 @@ function createDashboardRenderContext(
     };
     AppState.containerRenderTokens.set(containerId, token);
     if (container) container._activeRenderToken = token;
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.plotStatus(context, 'loading');
     return context;
 }
 
@@ -6908,6 +6970,7 @@ async function newPlotForRender(graphDiv, traces, layout, config, renderContext 
         purgeOwnedStaleRender(graphDiv, renderContext);
         throw createAbortError('Plot render superseded after Plotly commit');
     }
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.plotStatus(renderContext, 'ready', traces);
     return plot;
 }
 
@@ -6955,6 +7018,7 @@ function removePlot(plotId) {
         cleanupPlotWidgetElement(item.el);
         AppState.gridStack.removeWidget(item.el);
     }
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
 }
 
 // ===== Interaction Mode Toggle =====
@@ -7276,6 +7340,10 @@ function updateAllPlots() {
         step: AppState.currentStep,
         controller,
     };
+    if (typeof ResultsWorkspace !== 'undefined') {
+        ResultsWorkspace.invalidatePlots();
+        ResultsWorkspace.refresh();
+    }
     const queued = AppState.dashboardRenderQueue
         .catch(error => console.error('Previous dashboard render failed:', error))
         .then(() => runDashboardRenderRequest(request))
@@ -7758,6 +7826,7 @@ function clearDashboard() {
         AppState.containerRenderTokens.clear();
         AppState.gridStack.removeAll();
     }
+    if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
 }
 
 function saveLayout() {

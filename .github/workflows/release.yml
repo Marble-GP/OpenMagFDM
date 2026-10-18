@@ -13,6 +13,11 @@ env:
   BUILD_TYPE: Release
 
 jobs:
+  validate-mcp:
+    uses: ./.github/workflows/mcp-validation.yml
+    permissions:
+      contents: read
+
   build-linux:
     runs-on: ubuntu-latest
 
@@ -417,14 +422,14 @@ jobs:
 
     - name: Create NSIS installer script
       env:
-        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.6.2")
+        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.7.0")
         # for tag-triggered runs and the branch name for manual dispatch.
-        # We extract the numeric "1.6.2" form, with a hardcoded fallback so
+        # We extract the numeric "1.7.0" form, with a hardcoded fallback so
         # a workflow_dispatch from a feature branch still produces a
         # reasonable installer label.
         TAG_NAME: ${{ github.ref_name }}
       run: |
-        $version = "1.6.2"
+        $version = "1.7.0"
         if ($env:TAG_NAME -match '^v?(\d+\.\d+\.\d+)') {
             $version = $matches[1]
         }
@@ -493,10 +498,12 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [build-linux, build-windows, build-macos, build-webui-standalone, build-windows-installer]
+    needs: [build-linux, build-windows, build-macos, build-webui-standalone, build-windows-installer, validate-mcp]
     if: startsWith(github.ref, 'refs/tags/')
 
     steps:
+    - uses: actions/checkout@v7
+
     - name: Download all artifacts
       uses: actions/download-artifact@v8
       with:
@@ -505,6 +512,7 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v3
       with:
+        body_path: docs/RELEASE_NOTES_v1.7.0.md
         files: |
           artifacts/OpenMagFDM-Linux-x86_64/OpenMagFDM-Linux-x86_64.tar.gz
           artifacts/OpenMagFDM-Windows-x86_64/OpenMagFDM-Windows-x86_64.zip

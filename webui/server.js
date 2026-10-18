@@ -36,12 +36,9 @@ const BASE_DIR = isPkg ? path.dirname(process.execPath) : path.join(__dirname, '
 
 // アップロードディレクトリの設定
 const UPLOAD_DIR = path.join(BASE_DIR, 'uploads');
-const DEFAULT_SOLVER_PATH = isPkg
-    ? path.join(BASE_DIR, process.platform === 'win32' ? 'MagFDMsolver.exe' : 'MagFDMsolver')
-    : path.join(BASE_DIR, 'build', 'MagFDMsolver');
-// Override for release-contract tests and managed deployments. The packaged
-// default remains the solver executable beside the pkg binary.
-const SOLVER_PATH = process.env.SOLVER_PATH || DEFAULT_SOLVER_PATH;
+// Explicit environment override > saved administrator setting > standard layouts.
+const solverLocation = require('./automation/solver-location');
+let SOLVER_PATH = solverLocation.locate(BASE_DIR).path;
 const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
 const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
 const OUTPUTS_DIR = path.join(BASE_DIR, 'outputs');
@@ -5164,6 +5161,8 @@ function shutdownServer(reason = 'shutdown') {
 
 const { AutomationRuntime } = require('./automation/runtime');
 const automation = new AutomationRuntime(BASE_DIR, {
+    configureSolver: saved => { SOLVER_PATH = solverLocation.locate(BASE_DIR,saved).path; },
+    solverStatus: () => ({...solverLocation.locate(BASE_DIR,automation.access.state.solverPath),activePath:SOLVER_PATH}),
     jobs, submitAnalysisJob, mergeLibraryIntoConfig, isChildRunning, terminateChildProcess, userHasActiveSolver,
     detectPolarGeometry, warpPolar, quantizeImage
 });

@@ -32,6 +32,60 @@ async function fixture(t) {
     t.after(async()=>{await runtime.close();await noLinks(temp);assert.ok(path.basename(temp).startsWith('omfdm-mcp-'));await fs.rm(temp,{recursive:true,force:true});});
     return {temp,base,runtime,actor,other,wa,wb,a,b,backend,starts:()=>starts};
 }
+test('trusted browsers persist with hashed tokens, expire, and can be forgotten without revoking agents',async t=>{
+    const f=await fixture(t);
+    const {Access,hash}=require('../automation/access');
+    const a=f.runtime.access;
+    const temporary=a.pair(a.pairingCode);
+    const remembered=a.pair(a.pairingCode,true);
+    await a.saveBrowsers();await a.flush();
+    const raw=await fs.readFile(a.filename,'utf8');
+    assert.ok(!raw.includes(remembered.token));
+    const restored=new Access(f.base,{directory:a.directory});await restored.init();
+    const request=token=>({socket:{remoteAddress:'127.0.0.1'},headers:{host:'localhost:3000',cookie:`omfdm_admin=${token}`,'x-omfdm-csrf':remembered.csrf}});
+    assert.throws(()=>restored.admin(request(temporary.token)),{code:'ADMIN_REQUIRED'});
+    assert.equal(restored.admin(request(remembered.token),true).remember,true);
+    assert.throws(()=>restored.admin({...request(remembered.token),headers:{...request(remembered.token).headers,'x-omfdm-csrf':'wrong'}},true),{code:'CSRF'});
+    assert.equal(restored.state.enabled,true);
+    await restored.forgetBrowser(request(remembered.token));
+    assert.throws(()=>restored.admin(request(remembered.token)),{code:'ADMIN_REQUIRED'});
+    assert.equal(restored.state.connections.find(c=>c.id===f.a.id).revoked,false);
+    const expired=restored.pair(restored.pairingCode,true);
+    restored.sessions.get(hash(expired.token)).expires=Date.now()-1;
+    assert.throws(()=>restored.admin(request(expired.token)),{code:'ADMIN_REQUIRED'});
+    await restored.saveBrowsers();await restored.flush();
+    assert.equal(restored.state.trustedBrowsers.length,0);
+});
+
+test('management cookies, solver settings and logout require paired CSRF-protected access',async t=>{
+    const f=await fixture(t),express=require('express'),app=express();app.use(express.json());f.runtime.install(app);
+    const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});
+    t.after(()=>new Promise(resolve=>server.close(resolve)));
+    const url=`http://127.0.0.1:${server.address().port}`;
+    const pair=await fetch(url+'/api/mcp/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:f.runtime.access.pairingCode,remember:true})});
+    const cookie=pair.headers.get('set-cookie');
+    assert.match(cookie,/HttpOnly/);assert.match(cookie,/SameSite=Strict/);assert.match(cookie,/Max-Age=2592000/);
+    const {csrf}=await pair.json();const headers={'Content-Type':'application/json',Cookie:cookie.split(';')[0],'X-Omfdm-Csrf':csrf};
+    assert.equal((await fetch(url+'/api/mcp/solver',{method:'PUT',headers:{...headers,'X-Omfdm-Csrf':'wrong'},body:JSON.stringify({path:process.execPath})})).status,403);
+    const saved=await fetch(url+'/api/mcp/solver',{method:'PUT',headers,body:JSON.stringify({path:process.execPath})});
+    assert.equal(saved.status,200);assert.equal((await saved.json()).restartRequired,true);
+    assert.equal(f.runtime.access.state.solverPath,process.execPath);
+    assert.equal((await fetch(url+'/api/mcp/forget-browser',{method:'POST',headers,body:'{}'})).status,200);
+    assert.equal((await fetch(url+'/api/mcp/status',{headers})).status,401);
+});
+
+test('MCP listener and saved solver setting restore on runtime restart',async t=>{
+    const f=await fixture(t);
+    f.runtime.access.state.port=0;await f.runtime.reconfigure();
+    const port=f.runtime.listener.address().port;
+    await f.runtime.access.change(s=>{s.port=port;s.solverPath=process.execPath;});
+    await f.runtime.close();
+    let configured;
+    const restored=new AutomationRuntime(f.base,{...f.backend,configureSolver:p=>{configured=p;}},{directory:f.runtime.access.directory});
+    try {await restored.init();assert.equal(restored.status().listening,true);assert.equal(configured,process.execPath);assert.equal(restored.access.state.connections.length,2);}
+    finally {await restored.close();}
+});
+
 test('workspace IDs reject traversal, absolute paths, aliases, device names and links',async t=>{
     const f=await fixture(t);
     for(const id of ['../user_b/x','configs/../user_b/x','configs/C:/x','configs/\\server\\x','configs/a:secret','configs/%2e%2e/x','configs/NUL.txt','configs/a.','configs/.hidden','configs//x'])await assert.rejects(f.wa.resolve(id,{create:true}));

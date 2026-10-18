@@ -32,6 +32,20 @@ test('file search/sort is nonmutating and stable for unknown dates', () => {
     assert.equal(core.files(input,'','size')[0].name,'other.png');
     assert.equal(input[0].name,'model10.yaml');
 });
+
+test('material library inspection counts presets without inventing solver settings', () => {
+    const content = fs.readFileSync(require.resolve('../../general_materials.yaml'), 'utf8');
+    const r = core.inspect(content, schema, yaml);
+    assert.equal(r.valid, true);
+    assert.deepEqual(r.summary, {kind:'materials', materialCount:Object.keys(yaml.load(content).material_presets).length});
+    assert.ok(r.summary.materialCount > 0);
+    assert.deepEqual(core.inspect('material_presets: {}', schema, yaml).summary, {kind:'materials', materialCount:0});
+    const config = core.inspect('materials: {air: {mu_r: 1}}', schema, yaml);
+    assert.equal(config.summary.kind, 'config');
+    assert.equal(config.summary.materialCount, 1);
+    assert.equal(config.summary.coordinates, 'cartesian (default)');
+    assert.equal(core.inspect('material_presets: [', schema, yaml).summary, null);
+});
 test('cancelled load retains text and restores selected filename', async () => {
     const f=fixture(); f.edit('draft'); f.select.value='b.yaml'; f.context.confirm=()=>false;
     f.context.fetch=()=>{throw Error('must not fetch');};

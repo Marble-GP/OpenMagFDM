@@ -7,6 +7,37 @@ run → inspect results → manage files. Preserve existing image preprocessing,
 material libraries, plots, file operations and bounded-memory solver lifecycle.
 No solver rebuild, long benchmark, deployment or release in this work.
 
+## Results usability follow-up — 2026-10-17
+
+- Result selection, load/reload, polar display options and format diagnostics
+  now live in Results. Model & Run links directly to the loader. The empty
+  canvas guides users to load data, run an analysis or import a backup.
+- The loaded result is distinct from the selection awaiting Load. Load errors
+  and list-refresh errors are shown locally in Results. A failed validation
+  retains/re-finalizes the committed result; stale requests cannot overwrite
+  the latest selection, loaded state or notice.
+- Every plot identifies its result and field step, or its actually rendered
+  timeline point count/range. Coordinates and polar display mode are included.
+  During updates, old plots are hidden (without destroying layout dimensions)
+  until the generation-checked render completes. Missing data/error messages
+  are not labelled as successfully plotted data. No new field/trace cache.
+- The palette supports click, Enter/Space and drag-and-drop. The result picker
+  supports arrows, Home/End, Enter/Space and Escape. Removing the last plot
+  restores the empty-state actions. Step/animation controls are unavailable
+  until data is loaded.
+- **Refresh list** only refreshes available result names. **Reload loaded data**
+  reloads the committed result even if another name is selected, refreshes
+  field caches and detected steps, pauses animation and preserves the current
+  step within the new bounds. Timeline rendering continues to read fresh data.
+- `node --test --test-concurrency=1 tests/*.test.js` from `webui`: **83/83 passed**
+  (15 new Results tests), including real load/render lifecycle races, retained
+  result on failed validation, cache-refresh targeting, timeline counts, safe
+  text rendering and result-list refresh races. Syntax checks passed.
+- Browser automation currently exposes no browser surfaces; desktop/narrow
+  layout and real pointer/keyboard operation remain a manual acceptance gate.
+  This follow-up does not change solver code, MCP permissions, release defaults,
+  tags, or merge state.
+
 ## Implementation slices
 
 1. Responsive workspace shell: persistent workflow navigation, restrained

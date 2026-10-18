@@ -154,7 +154,7 @@ async function execute(name,input,actor,services) {
     }
 }
 function createToolServer(invoke) {
-    const server=new McpServer({name:'OpenMagFDM',version:'1.6.2'},{instructions:'Operate only on assigned workspace IDs. Never supply OS paths. Inspect revisions before writes; deletion is permanent. Editor validation is not physical validation. Nonconverged outputs are diagnostic, not converged solutions.'});
+    const server=new McpServer({name:'OpenMagFDM',version:'1.7.0'},{instructions:'Operate only on assigned workspace IDs. Never supply OS paths. Inspect revisions before writes; deletion is permanent. Editor validation is not physical validation. Nonconverged outputs are diagnostic, not converged solutions.'});
     for(const [name,permission,description,shape] of definitions) server.registerTool(name,{
         description,inputSchema:z.object(shape).strict(),outputSchema:outputs[name],
         annotations:{readOnlyHint:permission==='read'&&!name.startsWith('transfer_'),destructiveHint:['delete','edit','images'].includes(permission),openWorldHint:false}

@@ -1,10 +1,23 @@
-# OpenMagFDM WebUI v1.6.2
+# OpenMagFDM WebUI v1.7.0
 
 The WebUI is the browser-based editor, preprocessor, solver launcher and result
 viewer for OpenMagFDM. It runs on Node.js/Express and is also distributed as a
 standalone executable built with `pkg`.
 
+## Agent / MCP setup
+
+See the [MCP connection manual in the main README](../README.md#mcp-setup) for
+GUI pairing, workspace assignment, permissions, Codex HTTP/stdio examples,
+read-only acceptance prompts and troubleshooting. Embedded MCP is available
+in v1.7.0 and is initially OFF; local connections are scoped to an assigned user.
+The [MCP integration notes](../docs/MCP_INTEGRATION.md) track tested behavior
+and remaining limitations. Existing client settings are never edited automatically.
+
 ## Start
+
+Use Node.js **24.x** for the source distribution, or the packaged executable
+which includes its own runtime. Keep the WebUI server running when using MCP;
+`--mcp-stdio` only bridges to that existing server.
 
 ```bash
 cd webui
@@ -32,7 +45,15 @@ package or in the configured development paths. Use `GET /api/health` and
 - Export/import selected user content as a standard ZIP backup from File
   Manager; the YAML editor remains focused on editing configuration content.
 
-## v1.6.2 behaviours
+## v1.7.0 additions
+
+- Local HTTP/stdio MCP, permission management and warning-aware analysis results.
+- Optional 30-day browser trust; Forget this browser revokes GUI management only.
+- Automatic solver detection, with GUI path settings applied at the next startup.
+- YAML assistance, safe reloads and explicit Results source/loading guidance.
+- See [release notes](../docs/RELEASE_NOTES_v1.7.0.md) for verification and limitations.
+
+## Retained v1.6.2 behaviours
 
 - Fixed the Input Image preview feedback loop: ruler canvases and the zoom
   stage now stay inside a bounded viewport instead of expanding the image
@@ -89,7 +110,7 @@ The authoritative YAML contract is in `../docs/CONFIGURATION.md`.
 
 - Keep `public/yaml-schema.json`, generated templates in `public/app.js`,
   `sample_config.yaml`, and `docs/CONFIGURATION.md` synchronized.
-- Add no server dependency without checking Node 18 `pkg` compatibility.
+- Add no server dependency without checking Node 24 / `@yao-pkg/pkg` compatibility.
   ESM-only transitive dependencies have broken standalone builds before.
 - After JavaScript edits run:
 

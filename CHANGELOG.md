@@ -3,6 +3,19 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/research/`.
 
+## 1.7.0 — 2026-10-19
+
+- Refresh the WebUI workspace, result loading guidance and YAML assistance.
+- Add scoped local MCP access over HTTP and stdio, typed tools, revision checks,
+  idempotent analyses, warning-aware results and connection management.
+- Add optional 30-day browser trust and GUI-persisted solver location settings;
+  preserve MCP startup settings and automatically detect standard solver layouts.
+- Include solver optimization research and numerical regression coverage without
+  silently enabling every experimental option.
+- Validate native MCP packages on all three release platforms before publication.
+
+See `docs/RELEASE_NOTES_v1.7.0.md` for setup, verification and known limitations.
+
 ## 1.6.2 — 2026-08-07
 
 - Fixed an infinite-growth feedback loop in the Run & Preview Input Image

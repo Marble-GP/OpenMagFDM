@@ -65,6 +65,12 @@ class Access {
                 ids.add(c.id);
             }
             this.state = state;
+            if (state.trustedBrowsers !== undefined && (!Array.isArray(state.trustedBrowsers) || state.trustedBrowsers.length > 16)) throw Error('Invalid browser count');
+            if (state.solverPath !== undefined && typeof state.solverPath !== 'string') throw Error('Invalid solver setting');
+            for (const entry of state.trustedBrowsers || []) {
+                if (!/^[a-f0-9]{64}$/.test(entry.hash) || !/^[A-Za-z0-9_-]{43}$/.test(entry.csrf) || !Number.isFinite(entry.expires)) throw Error('Invalid browser session');
+                if (entry.expires > Date.now()) this.sessions.set(entry.hash, {csrf:entry.csrf,expires:entry.expires,remember:true});
+            }
         } catch (e) { if (e.code !== 'ENOENT') throw e; await atomicJSON(this.filename, this.state); }
         await atomicJSON(path.join(this.directory, 'pairing.json'), { code: this.pairingCode });
         this.ready = true;
@@ -128,7 +134,7 @@ class Access {
         };
         return actor;
     }
-    pair(code) {
+    pair(code, remember = false) {
         if (Date.now() < this.blockedUntil) fail('RATE_LIMITED', 'Wait before retrying pairing', 429);
         if (!this.pairingCode || typeof code !== 'string' || hash(code) !== hash(this.pairingCode)) {
             if (++this.failures >= 5) { this.blockedUntil = Date.now() + 60000; this.failures = 0; }
@@ -140,8 +146,21 @@ class Access {
         const token = random(), csrf = random();
         for (const [key, value] of this.sessions) if (value.expires < Date.now()) this.sessions.delete(key);
         if (this.sessions.size >= 16) this.sessions.delete(this.sessions.keys().next().value);
-        this.sessions.set(hash(token), { csrf, expires: Date.now() + 24 * 3600 * 1000 });
-        return { token, csrf };
+        const maxAge = (remember ? 30 : 1) * 24 * 3600 * 1000;
+        this.sessions.set(hash(token), { csrf, expires: Date.now() + maxAge, remember });
+        return { token, csrf, maxAge };
+    }
+    async saveBrowsers() {
+        await this.change(next => {
+            next.trustedBrowsers = [...this.sessions].filter(([,s])=>s.remember && s.expires>Date.now())
+                .map(([hash,s])=>({hash,csrf:s.csrf,expires:s.expires}));
+        });
+    }
+    async forgetBrowser(req) {
+        this.admin(req,true);
+        const token = /(?:^|;\s*)omfdm_admin=([A-Za-z0-9_-]+)/.exec(req.headers.cookie || '')?.[1];
+        this.sessions.delete(hash(token));
+        await this.saveBrowsers();
     }
     admin(req, mutate = false) {
         localRequest(req);

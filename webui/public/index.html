@@ -1184,9 +1184,17 @@
             <section class="workspace-card" id="mcpPairSection">
                 <h3>1. Pair this browser</h3>
                 <p>Copy the confirmation code from the OpenMagFDM server window. To retrieve a fresh code, run the same executable with <code>--mcp-admin-code</code>. Pairing only unlocks management; it does not enable MCP.</p>
-                <form id="mcpPairForm" class="mcp-row"><label>Confirmation code <input id="mcpPairCode" type="password" autocomplete="off" required></label><button class="btn-primary" type="submit">Pair browser</button></form>
+                <form id="mcpPairForm" class="mcp-row"><label>Confirmation code <input id="mcpPairCode" type="password" autocomplete="off" required></label><label><input id="mcpRemember" type="checkbox"> Trust this browser for 30 days (private computer only)</label><button class="btn-primary" type="submit">Pair browser</button></form>
             </section>
             <div id="mcpManagement" hidden>
+                <section class="workspace-card">
+                    <h3>Local startup settings</h3>
+                    <p id="mcpBrowserStatus"></p><button id="mcpForgetBrowser" class="btn-secondary">Forget this browser</button>
+                    <p>Forgetting this browser does not revoke agent connections or stop analyses.</p>
+                    <p id="mcpSolverStatus" role="status"></p>
+                    <form id="mcpSolverForm" class="mcp-row"><label>Solver executable — full path <input id="mcpSolverPath" type="text" placeholder="Empty = automatic detection"></label><button type="submit" class="btn-primary">Save for next startup</button></form>
+                    <p>Automatic detection checks beside the server, build/Release, then build. SOLVER_PATH overrides this setting. Only select a trusted executable. Restart the server after saving, when no analyses are running.</p>
+                </section>
                 <section class="workspace-card">
                     <h3>2. Enable local access</h3>
                     <p id="mcpListenerStatus" role="status"></p>
@@ -1349,47 +1357,8 @@
                 <!-- Right Panel: Solver Control -->
                 <div class="panel">
                     <h3>Solver Control</h3>
-                    <div style="margin-bottom: 10px;">
-                        <label>Result:</label>
-                        <div id="resultSelectContainer" class="custom-select" style="width: 100%; margin-top: 5px;">
-                            <div class="custom-select-trigger" id="resultSelectTrigger">
-                                <span id="resultSelectDisplay">Select result...</span>
-                                <span class="custom-select-arrow">▼</span>
-                            </div>
-                            <div class="custom-select-options" id="resultSelectOptions">
-                                <div class="custom-select-option" data-value="">Select result...</div>
-                            </div>
-                        </div>
-                        <!-- Hidden select for compatibility -->
-                        <select id="resultSelect" style="display: none;">
-                            <option value="">Select result...</option>
-                        </select>
-                    </div>
-                    <div class="button-group">
-                        <button class="btn-secondary" onclick="loadSelectedResult()">Load Selected Result</button>
-                        <button class="btn-secondary" onclick="refreshResultsList()">Refresh List</button>
-                    </div>
-
-                    <!-- Export format diagnostic (set from conditions.json after a result is loaded) -->
-                    <div id="resultMetaBadge" style="margin-top: 8px; font-size: 0.85em; color: #555; min-height: 1.2em;"></div>
-
-                    <!-- Polar Coordinate Controls -->
-                    <div id="polarControls" style="margin-top: 15px; padding: 10px; background: #f0f4ff; border-radius: 5px; display: none;">
-                        <h4 style="margin: 0 0 10px 0; font-size: 0.9rem; color: #667eea;">Polar Coordinate Options</h4>
-                        <div style="margin-bottom: 8px;">
-                            <label style="display: flex; align-items: center; cursor: pointer;">
-                                <input type="checkbox" id="polarCartesianTransform" onchange="toggleCartesianTransform()" style="margin-right: 8px;">
-                                <span style="font-size: 0.85rem;">Cartesian Transform (Arc/Donut view)</span>
-                            </label>
-                        </div>
-                        <div style="margin-bottom: 8px;">
-                            <label style="display: flex; align-items: center; cursor: pointer;">
-                                <input type="checkbox" id="polarFullModel" onchange="toggleFullModel()" style="margin-right: 8px;">
-                                <span style="font-size: 0.85rem;">Full Model (×<span id="fullModelMultiplier">N</span>)</span>
-                            </label>
-                        </div>
-                        <div id="polarInfo" style="font-size: 0.75rem; color: #666; margin-top: 8px;"></div>
-                    </div>
+                    <p class="page-intro">Run with the saved inputs, then open Results to load data and explore plots.</p>
+                    <button class="btn-secondary" onclick="ResultsWorkspace.chooseResult()">Open Results / load data</button>
 
                     <div class="button-group" style="margin-top: 15px;">
                         <button class="btn-primary" onclick="runSolver()" id="solverBtn">Run Solver</button>
@@ -1429,10 +1398,50 @@
 
         <!-- Tab 3: Dashboard -->
         <div class="tab-content" id="tab-dashboard">
+            <section class="workspace-card results-source" aria-labelledby="resultsHeading">
+                <h2 id="resultsHeading">Results</h2>
+                <p>1. Choose a result and load it. 2. Add a plot. 3. Change the field step or explore the timeline.</p>
+                <div class="results-loader">
+                    <div class="results-picker">
+                        <label id="resultPickerLabel">Result to load</label>
+                        <div id="resultSelectContainer" class="custom-select">
+                            <button type="button" class="custom-select-trigger" id="resultSelectTrigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="resultSelectOptions" aria-labelledby="resultPickerLabel resultSelectDisplay">
+                                <span id="resultSelectDisplay">Select result...</span>
+                                <span class="custom-select-arrow" aria-hidden="true">▼</span>
+                            </button>
+                            <div class="custom-select-options" id="resultSelectOptions" role="listbox" aria-labelledby="resultPickerLabel"></div>
+                        </div>
+                        <select id="resultSelect" style="display: none;" aria-label="Result to load">
+                            <option value="">Select result...</option>
+                        </select>
+                    </div>
+                    <button class="btn-primary" id="loadResultBtn" onclick="loadSelectedResult()" disabled>Load selected</button>
+                    <button class="btn-secondary" id="refreshResultListBtn" onclick="refreshResultsList()">Refresh list</button>
+                    <button class="btn-secondary" id="reloadResultBtn" onclick="ResultsWorkspace.reload()" disabled>Reload loaded data</button>
+                </div>
+                <p id="resultSelectionHint">Selecting a result does not change the plots until you load it.</p>
+                <p id="resultLoadStatus" role="status" aria-live="polite"></p>
+                <dl class="results-current">
+                    <div><dt>Loaded result</dt><dd id="loadedResultName">None</dd></div>
+                    <div><dt>Coordinates</dt><dd id="loadedResultCoordinates">—</dd></div>
+                    <div><dt>Requested field step</dt><dd id="loadedResultStep">—</dd></div>
+                </dl>
+                <p class="results-step-hint">Each plot identifies its data source below its title. Timelines show the available series, not just the selected field step. Use Reload loaded data to fetch progress from a running analysis.</p>
+                <details id="resultDisplayOptions" hidden>
+                    <summary>Display options &amp; data format</summary>
+                    <div id="resultMetaBadge"></div>
+                    <div id="polarControls" style="display: none;">
+                        <label><input type="checkbox" id="polarCartesianTransform" onchange="toggleCartesianTransform()"> Cartesian Transform (Arc/Donut view)</label>
+                        <label><input type="checkbox" id="polarFullModel" onchange="toggleFullModel()"> Full Model (×<span id="fullModelMultiplier">N</span>)</label>
+                        <div id="polarInfo"></div>
+                    </div>
+                </details>
+            </section>
             <div class="dashboard-container">
                 <!-- Widget Palette -->
                 <div class="widget-palette">
-                    <h3>Plot Palette</h3>
+                    <h3>Add a plot</h3>
+                    <p class="page-intro">Click, press Enter, or drag a plot onto the canvas.</p>
 
                     <div class="palette-section">
                         <div class="palette-section-title">2D Distributions</div>
@@ -1537,11 +1546,17 @@
                         <label style="margin-left: 15px;">Step: <span id="currentStep">1</span>/<span id="totalStepsDisplay">1</span></label>
                         <input type="range" id="stepSlider" min="1" max="1" value="1" style="width: 200px; margin-left: 10px;" oninput="setStep(parseInt(this.value))">
                     </div>
-                    <div class="grid-stack" id="dashboard-grid">
-                        <div class="empty-canvas" id="emptyCanvas">
-                            <div class="empty-canvas-text">Drag & Drop plots from the palette</div>
-                            <div class="empty-canvas-hint">Select analysis results first, then add plots</div>
+                    <div class="empty-canvas" id="emptyCanvas">
+                        <h3 id="resultsEmptyTitle">Load a result to start exploring</h3>
+                        <p id="resultsEmptyHint">Choose a saved result above, or run an analysis to create one.</p>
+                        <div class="button-group">
+                            <button class="btn-primary" id="resultsEmptyLoad" onclick="ResultsWorkspace.chooseResult()">Choose a result</button>
+                            <button class="btn-primary" id="resultsEmptyAdd" onclick="addPlotWidget('b_magnitude', 0, 0, 6, 3)" hidden>Add |B| distribution</button>
+                            <button class="btn-secondary" onclick="switchTab('run')">Go to Run &amp; Preview</button>
+                            <button class="btn-secondary" onclick="switchTab('files')">Open File Manager / import</button>
                         </div>
+                    </div>
+                    <div class="grid-stack" id="dashboard-grid">
                     </div>
                 </div>
             </div>
@@ -2160,6 +2175,7 @@
     <script src="yaml-intellisense.js"></script>
     <script src="workspace-core.js"></script>
     <script src="workspace.js"></script>
+    <script src="results-workspace.js"></script>
     <script src="mcp-panel.js"></script>
     <script src="app.js"></script>
 </body>

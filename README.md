@@ -3,9 +3,9 @@
 OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対して磁界計算を行うツール群です。
 コアは C++ で書かれた数値ソルバー(MagFDMsolver)と、結果の可視化や操作を行う Node.js ベースの WebUI から構成されています。
 
-> **Current release: v1.6.2** — 正規のYAML仕様は
+> **Current version: v1.7.0** — 正規のYAML仕様は
 > [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)、変更点は
-> [`docs/RELEASE_NOTES_v1.6.2.md`](docs/RELEASE_NOTES_v1.6.2.md)、全体履歴は
+> [`docs/RELEASE_NOTES_v1.7.0.md`](docs/RELEASE_NOTES_v1.7.0.md)、全体履歴は
 > [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
 
 <!-- <img width="1452" height="914" alt="thumbnail" src="https://github.com/user-attachments/assets/5b6d7e0b-32bf-48f7-bb47-30206aad8b22" /> -->
@@ -39,7 +39,114 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 - WebUI によるインタラクティブな結果確認（REST API による外部制御にも対応）
 - File Manager で YAML 設定、入力画像、材料ライブラリ、解析結果を一元管理
 
-## v1.6.1 リリース候補
+<a id="mcp-setup"></a>
+
+普段の起動を簡単にするには、初回ペアリング時に **Trust this browser for 30 days** を選択してください。
+MCPのON/OFF・接続設定は再起動後も復元されます。信頼を解除する場合は **Forget this browser** を使います。
+ソルバーは配布フォルダー内から自動検出します。開発版などで見つからない場合は、
+**Help & Integrations → Local startup settings** に実行ファイルの絶対パスを保存し、解析終了後にサーバーを再起動してください。
+通常は環境変数不要です。既存の `SOLVER_PATH` がある場合は保存設定より優先されます。
+
+## MCP接続：エージェントからOpenMagFDMを操作する
+
+**組み込みMCPはv1.7.0で追加されました。以前の配布物には対応しません。初回はOFFで、同じPCからの接続に限定します。**
+MCP対応版では、同じPC上のエージェントから、割り当てたユーザーの設定・材料・画像・結果を
+参照し、許可した場合だけ編集・解析開始などを行えます。ソルバーの設定方式は変わりません。
+
+### 1. WebUIで接続を用意する
+
+1. MCP対応の `webui-server.exe` を起動し、そのサーバーのWebUIを開きます。
+   開発用はNode.js **24.x**で `cd webui` → `npm ci` → `npm start`。
+   接続中もサーバーは起動したままにしてください。配布exeに追加Nodeのインストールは不要です。
+2. **05 · Help & Integrations** → **Pair browser** へ進み、サーバーのCLIウィンドウに
+   表示される `MCP management pairing code` を入力します。
+   見失った場合は、起動中サーバーと**同じexe**を `--mcp-admin-code` 付きで実行すると確認できます。
+   このコードはブラウザー管理用で、エージェント用トークンとは別です。
+3. **Enable MCP** をチェックし **Apply**。`Listening` と接続URLを確認します。
+   初回はOFF、既定URLは `http://127.0.0.1:3001/mcp` です。
+4. **Assigned workspace** が、操作したいファイルのユーザーIDであることを確認し、
+   接続名を付けて **Create connection**。最初は **Read files & results** のみを推奨します。
+   このユーザーIDは接続後にエージェントから変更できません。
+5. 作成した接続の **Test** を押します。成功すればサーバー側の認証・閲覧経路は正常です。
+   **Settings** でHTTPのURLとstdioの `command` / `args` を再表示できます。
+   **Copy settings** の内容は汎用の接続情報であり、CodexのTOMLへそのまま貼り付けるものではありません。
+
+### 2. エージェントに登録する
+
+標準接続は **Streamable HTTP** です。同じWindows PCのCodexでは、トークンを手作業で
+受け渡さずに済む **stdioブリッジ**から試すと簡単です。どちらも同じMCPサーバー・権限を使います。
+
+#### Codex：stdioの例
+
+Codexの `~/.codex/config.toml`（Windowsでは通常 `%USERPROFILE%\.codex\config.toml`）に
+次を追加します。既存の設定は残し、同名の `[mcp_servers.openmagfdm]` を重複作成しないでください。
+**パスと接続IDは例です。GUIのSettingsにある `stdio.command` と `stdio.args` に置き換えます。**
+
+```toml
+[mcp_servers.openmagfdm]
+command = 'C:\OpenMagFDM\webui-server.exe'
+args = ["--mcp-stdio", "--connection", "<GUIに表示された接続ID>"]
+```
+
+開発用のSettingsでは `command` がNodeの絶対パス、`args` の先頭が
+`webui/launcher.js` の絶対パスになります。省略せず、表示された順序で登録してください。
+stdioは既存サーバーへの橋渡しだけを起動します。サーバーの自動起動やMCPの自動ONはしません。
+サーバーと同じOSユーザー・同じアプリ設置場所の接続プロファイルを使用します。
+
+#### Codex：HTTPの例（stdioとの二重登録は不要）
+
+```toml
+[mcp_servers.openmagfdm]
+url = "http://127.0.0.1:3001/mcp"
+bearer_token_env_var = "OPENMAGFDM_MCP_TOKEN"
+```
+
+URLはGUIの表示に合わせます。接続作成時に一度だけ表示されたトークンを、**Codexを起動する
+プロセスの環境変数** `OPENMAGFDM_MCP_TOKEN` に設定してください。別のターミナルでの設定は、
+起動済みIDE等へ自動反映されません。トークンをチャット・URL・リポジトリ・コマンド引数に貼らないでください。
+これはOpenMagFDM専用のBearerトークンで、OpenAI APIキーではありません。OAuthログインは使用しません。
+
+他のMCPクライアントでは、Streamable HTTPのURLと `Authorization: Bearer <token>` を登録するか、
+stdioの `command` / `args` をそのクライアントの設定形式で登録します。
+設定後はクライアントのMCP接続を再起動し、新規セッションで確認してください。
+Codex CLIの `codex mcp list` は登録確認、セッション内の `/mcp` は接続確認に使えます。
+設定形式は[OpenAI公式MCPガイド](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)に基づきます。
+
+### 3. 最初は閲覧だけを試す
+
+エージェントへ、例えば次のように依頼します。
+
+> OpenMagFDMのMCPツールだけを使って接続を確認してください。
+> workspace_statusで割当ユーザーと権限を確認し、保存済み設定・画像・結果を一覧してください。
+> 結果があれば1件の条件・ステップ数・収束状態・警告を要約してください。
+> シェルや直接ファイルアクセスで代用せず、ファイル変更・削除・解析開始はしないでください。
+> 収束状態がunknownなら、収束済みと判断しないでください。
+
+GUIの **Workspace activity** に操作が表示され、エージェントの報告と一致すれば基本確認は完了です。
+編集や解析も試す場合は、検証用の入力を用意してから必要な権限だけを追加します。
+ファイルの保存、画像加工、解析開始、停止、完全削除・置換は別権限です。
+
+### 4. 接続できないとき／安全上の注意
+
+- **Testは成功、エージェントは失敗**：GUIのTestはクライアント設定までは検証しません。
+  URLの `/mcp`、HTTP認証、stdioの絶対パス・引数・接続ID、クライアント再起動を確認します。
+- **接続拒否／OFF**：サーバーが起動中か、Enable MCPをApplyしたか、`Listening` かを確認します。
+  ポート競合時はGUIで未使用ポートへ変更し、HTTPクライアントのURLも更新します。
+- **別ユーザーのファイルが見えない**：正常な制限です。ブラウザーのCookie、`localhost` と
+  `127.0.0.1` の使い分けなどでGUIのユーザーIDが異なる場合があるため、Assigned workspaceを確認します。
+  ファイルがある同じGUIワークスペースから新しい接続を作り直します。
+- **stdioだけ失敗**：別コピーのexe、WSL／別OSユーザー、アプリ移動後では同じプロファイルを読めません。
+  起動中サーバーのSettingsにあるコマンドを使ってください。
+- **権限不足／更新競合**：必要権限をGUIで確認し、競合時は対象を再取得します。無条件上書きはしません。
+- **トークン紛失・漏洩**：古い接続を **Revoke** して作り直します。接続情報はユーザーバックアップに含まれません。
+- MCPは**同じPCのループバック接続専用**です。クラウド上のエージェントからURLを指定するだけでは届きません。
+  接続のためにWebUIを外部公開したり、ポートを転送したりしないでください。
+- MCPのOFF・失効・クライアント切断は開始済み解析を止めません。停止はGUIから行います。
+  サーバー自体を終了すると子ソルバーも終了します。削除権限での操作は**完全削除・復元不可**です。
+
+権限一覧、ツール仕様、検証済み／未完了項目は[組み込みMCP詳細](docs/MCP_INTEGRATION.md)を参照してください。
+
+## 過去版の主な変更：v1.6.1
 
 v1.6.1では、v1.6.0のDD性能回帰を修正し、極座標の軸を含む
 `r_start: 0`、物理寸法[m]によるスライド領域、Cartesian/Linearテンプレート、
@@ -282,7 +389,7 @@ bash run_test.sh ../../build/MagFDMsolver
 - OpenCV
 - yaml-cpp
 - libtiff
-- Node.js 18.x 以降 (WebUI を使う場合)
+- Node.js 24.x (現在の開発版WebUIを使う場合)
 
 ### ビルド方法 (C++ ソルバー)
 
@@ -305,8 +412,8 @@ make -j$(nproc)
 
 ```bash
 cd webui
-npm install    # 初回のみ
-node server.js
+npm ci        # 初回のみ
+npm start
 ```
 
 ブラウザで `http://localhost:3000` にアクセスしてください。

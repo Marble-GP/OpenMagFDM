@@ -18,7 +18,7 @@ class AutomationRuntime {
     }
     async init() {
         this.initializing=(async()=>{
-            try {await this.access.init();await this.jobs.init();if(this.closed){this.access.ready=false;return;}this.ready=true;await this.reconfigure();}
+            try {await this.access.init();this.backend.configureSolver?.(this.access.state.solverPath);await this.jobs.init();if(this.closed){this.access.ready=false;return;}this.ready=true;await this.reconfigure();}
             catch(e){this.error=`MCP unavailable (${e.code||'INITIALIZATION_FAILED'})`;this.access.ready=false;this.ready=false;}
         })();
         return this.initializing;
@@ -84,12 +84,26 @@ class AutomationRuntime {
         app.post('/api/mcp/pair',async(req,res)=>{
             try{
                 localRequest(req);if(!this.ready)fail('UNAVAILABLE',this.error||'MCP is initializing',503);
-                const pair=this.access.pair(req.body?.code);
-                res.cookie('omfdm_admin',pair.token,{httpOnly:true,sameSite:'strict',maxAge:24*3600*1000,path:'/api/mcp'});
+                const remember=req.body?.remember===true;
+                const pair=this.access.pair(req.body?.code,remember);
+                try {await this.access.saveBrowsers();} catch(e) {this.access.sessions.delete(require('./access').hash(pair.token));throw e;}
+                res.cookie('omfdm_admin',pair.token,{httpOnly:true,sameSite:'strict',...(remember?{maxAge:pair.maxAge}:{}),path:'/api/mcp'});
                 res.set('Cache-Control','no-store').json({csrf:pair.csrf});
             }catch(e){res.status(e.statusCode||500).json({error:e.statusCode?e.message:'Pairing failed',code:e.code||'INTERNAL_ERROR'});}
         });
-        app.get('/api/mcp/status',route((req,res,session)=>({...this.status(),csrf:session.csrf})));
+        app.get('/api/mcp/status',route((req,res,session)=>({...this.status(),csrf:session.csrf,browser:{remember:!!session.remember,expires:session.expires}})));
+        app.post('/api/mcp/forget-browser',route(async(req,res)=>{
+            await this.access.forgetBrowser(req);
+            res.clearCookie('omfdm_admin',{httpOnly:true,sameSite:'strict',path:'/api/mcp'});
+            return {forgotten:true};
+        },true));
+        app.get('/api/mcp/solver',route(()=>({...this.backend.solverStatus?.(),savedPath:this.access.state.solverPath||''})));
+        app.put('/api/mcp/solver',route(async req=>{
+            const filename=req.body?.path;
+            if(filename!=='')require('./solver-location').validate(filename);
+            await this.access.change(next=>{next.solverPath=filename;});
+            return {saved:true,restartRequired:true};
+        },true));
         app.put('/api/mcp/settings',route(async req=>{
             const {enabled,port}=req.body||{};
             if(typeof enabled!=='boolean'||!Number.isInteger(port)||port<1024||port>65535)fail('INVALID_INPUT','Expected enabled:boolean and port:1024..65535');

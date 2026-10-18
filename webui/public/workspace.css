@@ -75,3 +75,46 @@ input, select { max-width:100%; color:var(--ink); }
  .run-section { grid-template-columns:minmax(0,1fr); } .user-file-item { flex-wrap:wrap; } .user-file-actions { margin-left:auto; }
 }
 @media (prefers-reduced-motion:reduce) { *,*::before,*::after { transition:none!important; animation:none!important; scroll-behavior:auto!important; } }
+
+/* Results: distinguish selection, loaded source and each completed plot. */
+#tab-dashboard [hidden] { display:none!important; }
+.results-loader { display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px; margin:16px 0 8px; }
+.results-picker { flex:1 1 300px; min-width:0; }
+.results-picker label { display:block; font-size:12px; margin-bottom:6px; font-weight:600; }
+.results-picker .custom-select { width:100%; }
+.results-picker .custom-select-trigger { width:100%; text-align:left; color:var(--ink); background:white; font-weight:400; }
+#resultSelectDisplay { overflow-wrap:anywhere; min-width:0; }
+.custom-select-option:focus-visible, .palette-item:focus-visible { outline:3px solid var(--accent); outline-offset:-3px; }
+#resultLoadStatus { margin-top:10px; padding:10px 12px; border-radius:6px; background:var(--accent-soft); overflow-wrap:anywhere; }
+#resultLoadStatus[data-state=error] { background:#fff1eb; color:#943d20; }
+.results-current { display:grid; grid-template-columns:minmax(0,2fr) 1fr 1fr; gap:16px; margin:16px 0 8px; }
+.results-current dt { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+.results-current dd { margin:5px 0 0; font-weight:600; font-size:14px; overflow-wrap:anywhere; }
+#resultDisplayOptions { margin-top:12px; font-size:12px; color:var(--muted); }
+#resultDisplayOptions summary { cursor:pointer; padding:6px 0; }
+#polarControls label { display:inline-flex; align-items:center; gap:6px; margin:10px 16px 10px 0; }
+#tab-dashboard .dashboard-container { height:auto; min-height:450px; gap:16px; }
+#tab-dashboard .widget-palette { width:210px; border:1px solid var(--line); border-radius:9px; }
+#tab-dashboard .widget-palette h3 { color:var(--ink); border-color:var(--line); }
+#tab-dashboard .dashboard-canvas { min-width:0; padding:0; background:transparent; }
+#tab-dashboard .dashboard-controls { box-shadow:none; border:1px solid var(--line); }
+#tab-dashboard .dashboard-controls[aria-disabled=true] { opacity:.5; }
+#tab-dashboard .palette-item { cursor:pointer; padding:9px 10px; }
+#tab-dashboard .palette-item[aria-disabled=true] { opacity:.6; }
+#tab-dashboard .empty-canvas { padding:35px 20px; background:white; border:1px dashed #b1c7d0; border-radius:9px; color:var(--ink); }
+#tab-dashboard .empty-canvas p { margin:12px 0 20px; color:var(--muted); font-size:13px; line-height:1.6; }
+#tab-dashboard .empty-canvas .button-group { justify-content:center; }
+.plot-source { flex-shrink:0; padding:6px 10px; font-size:11px; line-height:1.4; color:var(--muted); border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
+.plot-source[data-state=loading] { background:#e5f4f4; }
+.plot-source[data-state=unavailable] { background:#fff1eb; }
+/* Keep dimensions for Plotly but never label an old image as the requested step. */
+.plot-source[data-state=loading] + .plot-container { visibility:hidden; }
+@media (max-width:1000px) {
+ #tab-dashboard .dashboard-container { flex-direction:column; }
+ #tab-dashboard .widget-palette { width:100%; max-height:240px; }
+ #tab-dashboard .palette-section { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+ #tab-dashboard .palette-section-title { width:100%; }
+ #tab-dashboard .palette-item { margin:0; }
+ .results-current { grid-template-columns:1fr 1fr; }
+ .results-current > div:first-child { grid-column:1/-1; }
+}
