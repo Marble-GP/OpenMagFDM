@@ -44,6 +44,7 @@ const AppState = {
     fieldPreloadController: null,
     fieldDecodeTail: Promise.resolve(), // serializes memory-heavy TIFF/JSON decoding
     fieldDecodeReservedBytes: 0,
+    fieldWorkerReservedBytes: 0,
     fieldPayloadStagingBytes: 0,
     fieldViewPins: new Map(), // AbortSignal -> { fields: Map<cacheKey, bytes> }
     fieldViewPinRefs: new WeakMap(), // decoded array -> { bytes, count }
@@ -66,6 +67,7 @@ const AppState = {
     // Polar coordinate transform options
     isPolarCoordinates: false,  // True if current result uses polar coordinates
     polarCartesianTransform: false,  // Apply cartesian transform (arc/donut view)
+    polarAspectLocked: true,
     polarFullModel: false,  // Expand to full model
     polarFullModelMultiplier: 1,  // Multiplier for full model (N in 2π/N)
     // Plot zoom state preservation
@@ -112,7 +114,9 @@ function flipVertical(data) {
 
 // ===== Initialization =====
 document.addEventListener('DOMContentLoaded', async () => {
+    if (typeof ApiSession !== 'undefined') { await ApiSession.ready; if (ApiSession.identity.mode === 'shared' && !ApiSession.identity.workspace) return; }
     initializeUserId();
+    void restoreFileOperations();
     initializeTabs();
     initInputImageViewer();
     await initializeConfigEditor();
@@ -190,7 +194,7 @@ function switchTab(tabName) {
 // ===== User Management =====
 function initializeUserId() {
     // Get or create user ID from cookie
-    let userId = getCookie('magfdm_user_id');
+    let userId = typeof ApiSession !== 'undefined' && ApiSession.identity?.mode === 'shared' ? ApiSession.identity.workspace : getCookie('magfdm_user_id');
     if (!userId) {
         userId = 'user_' + Math.random().toString(36).substr(2, 9);
     }
@@ -5513,6 +5517,7 @@ async function loadSelectedResult({ refreshData = false, preserveStep = false } 
 }
 
 async function finalizeCommittedResult(loadContext) {
+    if (typeof ResultImprovements !== 'undefined' && AppState.resultsData.currentResult) void ResultImprovements.description(AppState.resultsData.currentResult.split(/[\\/]/).pop());
     assertResultLoadCurrent(loadContext);
     await Promise.all([
         loadQuickPreviewFromResult(loadContext.resultPath, loadContext),
@@ -6193,237 +6198,19 @@ async function loadQuickPreviewFromResult(resultPath, loadContext = null) {
 }
 
 async function runSolver() {
-    if (AppState.runPreparing || document.getElementById('solverBtn').disabled) return;
+    if (AppState.runPreparing) return;
     AppState.runPreparing = true;
-    let runRequest;
-    try { runRequest = await Workbench.prepareRun(); }
-    finally { AppState.runPreparing = false; }
-    if (!runRequest) return;
-    const btn = document.getElementById('solverBtn');
-    const stopBtn = document.getElementById('stopBtn');
-
-    btn.disabled = true;
-    btn.textContent = 'Running...';
-    stopBtn.style.display = 'inline-block';
-
-    const outputDiv = document.getElementById('solverOutput');
-    const progressContainer = document.getElementById('solverProgressContainer');
-    const progressBar = document.getElementById('solverProgressBar');
-    const progressText = document.getElementById('solverProgressText');
-    const progressPercent = document.getElementById('solverProgressPercent');
-
-    outputDiv.textContent = '';
-    progressContainer.style.display = 'block';
-    progressBar.style.width = '0%';
-    progressBar.style.background = 'linear-gradient(90deg, #667eea 0%, #764ba2 100%)';  // Reset to default color
-    progressText.textContent = 'Initializing...';
-    progressPercent.textContent = '0%';
-
-    // Performance optimization: Buffer output updates
-    let outputBuffer = [];
-    let lastUpdateTime = 0;
-    const UPDATE_INTERVAL = 100; // Update DOM every 100ms
-    const MAX_LOG_LINES = 1000; // Keep only last 1000 lines
-
-    function flushOutputBuffer() {
-        if (outputBuffer.length === 0) return;
-
-        const lines = outputDiv.textContent.split('\n');
-        const newLines = lines.concat(outputBuffer);
-
-        // Keep only last MAX_LOG_LINES
-        if (newLines.length > MAX_LOG_LINES) {
-            const excess = newLines.length - MAX_LOG_LINES;
-            newLines.splice(0, excess);
-        }
-
-        outputDiv.textContent = newLines.join('\n');
-        outputBuffer = [];
-        outputDiv.scrollTop = outputDiv.scrollHeight;
-    }
-
+    const button = document.getElementById('solverBtn'); button.disabled = true;
     try {
-        // Check if image is uploaded
-        if (!AppState.uploadedImageFilename) {
-            throw new Error('Please upload a material image first');
-        }
-
-        // Get config file path
-        const configSelect = document.getElementById('configFileSelect');
-        const configFile = configSelect ? configSelect.value : 'sample_config.yaml';
-
-        // Use fetch to POST the request body, then manually handle SSE
-        const response = await fetch('/api/solve-stream', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(runRequest)
-        });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({ error: 'Solver execution failed' }));
-            throw new Error(errorData.error || 'Solver execution failed');
-        }
-
-        // Process SSE stream
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-            const { done, value } = await reader.read();
-
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
-
-            // Process complete SSE messages
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const data = JSON.parse(line.substring(6));
-
-                    // Buffer output log (performance optimization)
-                    if (data.message) {
-                        outputBuffer.push(data.message);
-
-                        // Throttle DOM updates - flush every UPDATE_INTERVAL ms
-                        const now = Date.now();
-                        if (now - lastUpdateTime >= UPDATE_INTERVAL) {
-                            flushOutputBuffer();
-                            lastUpdateTime = now;
-                        }
-                    }
-
-                    // Update progress bar (lightweight DOM updates)
-                    if (data.type === 'progress') {
-                        const percentage = data.percentage || 0;
-                        progressBar.style.width = percentage + '%';
-                        progressPercent.textContent = percentage + '%';
-                        progressText.textContent = `Step ${data.step} / ${data.total}`;
-                    } else if (data.type === 'status') {
-                        progressText.textContent = data.message || 'Processing...';
-                    } else if (data.type === 'complete') {
-                        progressBar.style.width = '100%';
-                        progressPercent.textContent = '100%';
-                        progressText.textContent = 'Completed successfully';
-                    } else if (data.type === 'done') {
-                        // Flush remaining buffer
-                        flushOutputBuffer();
-
-                        if (data.exitCode === 0 && data.success) {
-                            progressBar.style.width = '100%';
-                            progressPercent.textContent = '100%';
-                            progressText.textContent = 'Completed successfully';
-                            showStatus('solverStatus', 'Solver completed successfully', 'success');
-                            // Load results and update dashboard
-                            await loadResults();
-                        } else if (data.exitCode === 2 && data.completed) {
-                            progressBar.style.width = '100%';
-                            progressPercent.textContent = '100%';
-                            progressBar.style.background = 'linear-gradient(90deg, #ffc107 0%, #ff9800 100%)';
-                            progressText.textContent = 'Completed with nonlinear convergence warnings';
-                            // Exit code 2 still has intentional diagnostic
-                            // output. Make it available exactly like a
-                            // successful run, then leave the warning visible.
-                            await loadResults();
-                            showStatus(
-                                'solverStatus',
-                                'Solver completed with a nonlinear convergence warning. Diagnostic results were loaded; do not treat them as converged.',
-                                'warning'
-                            );
-                        } else if (data.exitCode === null || data.stopped) {
-                            progressBar.style.background = 'linear-gradient(90deg, #ffc107 0%, #ff9800 100%)';
-                            progressText.textContent = 'Stopped by user';
-                            showStatus('solverStatus', 'Solver stopped by user', 'warning');
-                        } else {
-                            throw new Error(data.message || 'Solver failed');
-                        }
-                    } else if (data.type === 'error') {
-                        // Stderr lines (including nonlinear WARNINGs) are log
-                        // entries. A startup/spawn failure carries an explicit
-                        // `error` field because no final `done` event is
-                        // guaranteed in that case.
-                        if (data.success === false && data.error) {
-                            throw new Error(data.error);
-                        }
-                    }
-                }
-            }
-        }
-
-    } catch (error) {
-        // Flush buffer before showing error
-        flushOutputBuffer();
-
-        showStatus('solverStatus', `Solver error: ${error.message}`, 'error');
-        outputBuffer.push(`\nError: ${error.message}`);
-        flushOutputBuffer();
-        progressBar.style.background = 'linear-gradient(90deg, #dc3545 0%, #c82333 100%)';
-        progressText.textContent = 'Error occurred';
-    } finally {
-        // Ensure all buffered messages are displayed
-        flushOutputBuffer();
-
-        btn.disabled = false;
-        btn.textContent = 'Run Solver';
-        stopBtn.style.display = 'none';
-
-        // Hide only an unambiguously successful run. Warning-complete runs
-        // keep the amber progress state visible for review.
-        setTimeout(() => {
-            if (progressText.textContent === 'Completed successfully') {
-                progressContainer.style.display = 'none';
-            }
-        }, 3000);
-    }
+        const request = await Workbench.prepareRun();
+        if (request) await JobsPanel.submit(request);
+    } catch(error) { showStatus('solverStatus', error.message + '. Retry uses the same request key.', 'error'); }
+    finally { AppState.runPreparing = false; button.disabled = false; }
 }
-
 async function stopSolver() {
-    // Show confirmation dialog
-    if (!confirm('解析を停止しますか？\n\nAre you sure you want to stop the calculation?')) {
-        return;
-    }
-
-    try {
-        const response = await fetch('/api/stop-solver', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                userId: AppState.userId
-            })
-        });
-
-        const result = await response.json();
-
-        if (response.ok && result.success) {
-            showStatus('solverStatus', 'Solver stopped by user', 'warning');
-
-            const outputDiv = document.getElementById('solverOutput');
-            outputDiv.textContent += '\n\n=== Solver stopped by user ===\n';
-            outputDiv.scrollTop = outputDiv.scrollHeight;
-
-            const progressText = document.getElementById('solverProgressText');
-            progressText.textContent = 'Stopped by user';
-
-            const progressBar = document.getElementById('solverProgressBar');
-            progressBar.style.background = 'linear-gradient(90deg, #ffc107 0%, #ff9800 100%)';
-        } else {
-            throw new Error(result.error || 'Failed to stop solver');
-        }
-    } catch (error) {
-        console.error('Error stopping solver:', error);
-        showStatus('solverStatus', `Error stopping solver: ${error.message}`, 'error');
-    } finally {
-        // Reset button states
-        const btn = document.getElementById('solverBtn');
-        const stopBtn = document.getElementById('stopBtn');
-
-        btn.disabled = false;
-        btn.textContent = 'Run Solver';
-        stopBtn.style.display = 'none';
-    }
+    if (!confirm('Cancel the selected analysis?')) return;
+    try { await JobsPanel.cancel(); }
+    catch(error) { showStatus('solverStatus',error.message,'error'); }
 }
 
 async function loadResults() {
@@ -6709,6 +6496,7 @@ function removeZoomTracking(plotDiv) {
 }
 
 function purgePlotlyTree(root) {
+    if (typeof FieldGPU !== 'undefined') {FieldGPU.remove(root);root?.querySelectorAll?.('[id]').forEach(node=>FieldGPU.remove(node));}
     if (!root || typeof Plotly === 'undefined' || typeof Plotly.purge !== 'function') return;
 
     const graphDivs = new Set();
@@ -6736,9 +6524,16 @@ function purgePlotlyTree(root) {
     delete root._fluxLinkagePlotDiv;
 }
 
-function preparePlotlyContainer(container, renderContext = null) {
+function preparePlotlyContainer(container, renderContext = null, preserve = false) {
     if (!container) return;
     assertRenderContextCurrent(renderContext, container);
+    if (preserve && (container._fullLayout && typeof Plotly.react === 'function' || typeof FieldGPU !== 'undefined' && FieldGPU.has(container))) {
+        container._preservePlot = true;
+        if (renderContext) container._plotlyRenderToken = renderContext.token;
+        return;
+    }
+    container._preservePlot = false;
+    if (typeof FieldGPU !== 'undefined') FieldGPU.remove(container);
     purgePlotlyTree(container);
     container.innerHTML = '';
     // Claim the cleared container for the new render immediately. Otherwise a
@@ -6754,6 +6549,12 @@ function preparePlotlyContainer(container, renderContext = null) {
 function showPlotMessage(container, html, renderContext = null) {
     if (!container) return;
     assertRenderContextCurrent(renderContext, container);
+    if (container._preservePlot && (container._fullLayout || typeof FieldGPU !== 'undefined' && FieldGPU.has(container))) {
+        container.dataset.pendingError = html.replace(/<[^>]*>/g,'');
+        container.title = container.dataset.pendingError + ' (previous step retained)';
+        if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.plotStatus(renderContext,'unavailable');
+        return;
+    }
     preparePlotlyContainer(container, renderContext);
     container.innerHTML = html;
     if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.plotStatus(renderContext, 'unavailable');
@@ -6880,6 +6681,7 @@ function snapshotPolarView(analysisConditions) {
         || 0;
     return Object.freeze({
         isPolar,
+        aspectLocked: AppState.polarAspectLocked,
         cartesianTransform: isPolar && AppState.polarCartesianTransform,
         fullModel: isPolar && AppState.polarFullModel,
         fullModelMultiplier: isPolar ? calculateFullModelMultiplier(thetaRange) : 1,
@@ -6940,6 +6742,7 @@ function assertRenderContextCurrent(renderContext, container = null) {
 
 function purgeOwnedStaleRender(graphDiv, renderContext) {
     if (!graphDiv || !renderContext) return;
+    if (graphDiv._preservePlot) return;
     if (graphDiv._plotlyRenderToken === renderContext.token ||
         graphDiv._activeRenderToken === renderContext.token) {
         purgePlotlyTree(graphDiv);
@@ -6947,11 +6750,32 @@ function purgeOwnedStaleRender(graphDiv, renderContext) {
 }
 
 async function newPlotForRender(graphDiv, traces, layout, config, renderContext = null) {
+    const previous=graphDiv._plotlyPending;
+    let release;
+    const pending=new Promise(resolve=>{release=resolve;});
+    graphDiv._plotlyPending=pending;
+    try {
+        if(previous)await previous;
+        assertRenderContextCurrent(renderContext,graphDiv);
+        return await commitPlotForRender(graphDiv,traces,layout,config,renderContext);
+    } finally {
+        release();
+        if(graphDiv._plotlyPending===pending)delete graphDiv._plotlyPending;
+    }
+}
+
+async function commitPlotForRender(graphDiv, traces, layout, config, renderContext = null) {
     assertRenderContextCurrent(renderContext);
     if (renderContext) graphDiv._plotlyRenderToken = renderContext.token;
     let plot;
+    if (typeof FieldGPU !== 'undefined' && FieldGPU.has(graphDiv)) {FieldGPU.remove(graphDiv);graphDiv.replaceChildren();}
     try {
-        plot = await Plotly.newPlot(graphDiv, traces, layout, config);
+        const renderStarted = Date.now();
+        plot = graphDiv._preservePlot && graphDiv._fullLayout && typeof Plotly.react === 'function'
+            ? await Plotly.react(graphDiv, traces, layout, config)
+            : await Plotly.newPlot(graphDiv, traces, layout, config);
+        if (graphDiv.dataset) {graphDiv.dataset.renderMs = String(Date.now() - renderStarted);graphDiv.dataset.fieldBackend='plotly';delete graphDiv.dataset.pendingError;}
+        if (typeof FieldMetrics !== 'undefined') FieldMetrics.record('plotly-commit',Date.now()-renderStarted,{container:graphDiv.id,step:renderContext?.step});
     } catch (error) {
         // Widget cleanup can run while Plotly is still constructing a graph.
         // If that detached graph later rejects, purge it regardless of token
@@ -6976,7 +6800,7 @@ async function newPlotForRender(graphDiv, traces, layout, config, renderContext 
 
 function discardStaleRender(container, renderContext) {
     if (!container || !renderContext) return;
-    if (container._activeRenderToken === renderContext.token) {
+    if (container._activeRenderToken === renderContext.token && !container._preservePlot) {
         preparePlotlyContainer(container);
     }
 }
@@ -7610,6 +7434,7 @@ function invalidateFieldLoads(reason = '') {
 }
 
 async function preloadAllSteps() {
+    if(typeof NeighborPreload!=='undefined')NeighborPreload.cancel();
     const currentResult = AppState.resultsData.currentResult;
     if (!currentResult || AppState.totalSteps <= 0) {
         alert('Please select analysis results first');
@@ -7620,6 +7445,7 @@ async function preloadAllSteps() {
     AppState.fieldPreloadController?.abort();
     const preloadController = new AbortController();
     AppState.fieldPreloadController = preloadController;
+    AppState.preloadOutcome = 'Loading Az + Mu';
 
     const btn = document.getElementById('preloadBtn');
     if (!btn) return;
@@ -7788,14 +7614,17 @@ async function preloadAllSteps() {
             : stoppedForError
                 ? `Stopped ${loadedSteps}/${AppState.totalSteps}`
                 : 'Preloaded ✓';
+        AppState.preloadOutcome = btn.textContent;
         setTimeout(() => {
             btn.textContent = originalText;
         }, (stoppedForBudget || stoppedForError) ? 3000 : 2000);
 
     } catch (error) {
         if (error && error.name === 'AbortError') {
+            AppState.preloadOutcome = 'Cancelled';
             console.log('Preload cancelled because the field-data context changed');
         } else {
+            AppState.preloadOutcome = error.message;
             console.error('Preload error:', error);
             alert(`Preload failed: ${error.message}`);
         }
@@ -7814,7 +7643,9 @@ function setStep(step) {
     const slider = document.getElementById('stepSlider');
     if (slider) slider.value = step;
     document.getElementById('currentStep').textContent = step;
-    return updateAllPlots();
+    const result=updateAllPlots();
+    if(typeof NeighborPreload!=='undefined')Promise.resolve(result).then(()=>NeighborPreload.schedule(step)).catch(()=>{});
+    return result;
 }
 
 function clearDashboard() {
@@ -7895,7 +7726,7 @@ function reserveFieldDecodeWorkspace(bytes, label = 'field decode') {
         AppState.dataCacheBytes +
             AppState.fieldPayloadStagingBytes +
             AppState.fieldViewPinnedBytes +
-            AppState.fieldDecodeReservedBytes >
+            AppState.fieldDecodeReservedBytes + (typeof FieldGPU === 'undefined' ? 0 : FieldGPU.residentBytes) + (AppState.fieldWorkerReservedBytes || 0) >
             FIELD_WORKING_MEMORY_BUDGET_BYTES
     ) {
         const oldestKey = AppState.dataCacheLru.keys().next().value;
@@ -7906,7 +7737,7 @@ function reserveFieldDecodeWorkspace(bytes, label = 'field decode') {
         AppState.dataCacheBytes +
         AppState.fieldPayloadStagingBytes +
         AppState.fieldViewPinnedBytes +
-        AppState.fieldDecodeReservedBytes;
+        AppState.fieldDecodeReservedBytes + (typeof FieldGPU === 'undefined' ? 0 : FieldGPU.residentBytes) + (AppState.fieldWorkerReservedBytes || 0);
     if (estimatedWorkingBytes > FIELD_WORKING_MEMORY_BUDGET_BYTES) {
         const error = new Error(
             `${label} was stopped before allocating about ` +
@@ -7996,6 +7827,7 @@ async function fetchDecodedFieldPayload(
 ) {
     return await runSerializedFieldDecode(async () => {
         const file = `${dataType}/${formatStepFilename(step)}`;
+        const fetchStarted = Date.now();
         const response = await fetch(
             `/api/load-field?result=${encodeURIComponent(resultPath)}&file=${file}`,
             { signal }
@@ -8018,8 +7850,11 @@ async function fetchDecodedFieldPayload(
                 'TIFF response'
             );
             const arrayBuffer = await response.arrayBuffer();
+            if (typeof FieldMetrics !== 'undefined') FieldMetrics.record('fetch',Date.now()-fetchStarted,{result:resultPath,field:dataType,step});
+            const decodeStarted = Date.now();
             if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
             const decoded = await decodeTiffArrayBuffer(arrayBuffer, signal);
+            if (typeof FieldMetrics !== 'undefined') FieldMetrics.record('decode',Date.now()-decodeStarted,{result:resultPath,field:dataType,step});
             if (signal?.aborted) throw createAbortError('TIFF decode cancelled');
             const payload = {
                 data: decoded.data,
@@ -9075,7 +8910,7 @@ async function renderAzBoundary(containerId, step, renderContext = null) {
         // Get input image URL (material image as background for field lines)
         const inputImgUrl = `/api/get-step-input-image?result=${encodeURIComponent(resultPath)}&step=${step}&t=${Date.now()}`;
 
-        preparePlotlyContainer(container, renderContext);
+        preparePlotlyContainer(container, renderContext, true);
         const size = getContainerSize(container);
 
         const coordSys = AppState.analysisConditions?.coordinate_system || 'cartesian';
@@ -9087,13 +8922,24 @@ async function renderAzBoundary(containerId, step, renderContext = null) {
 
             // Step 1: Draw contour lines to canvas (in polar coordinates)
             // numLines is auto-calculated based on image size
-            const contourCanvas = drawContourToCanvas(azData);
+            const contourCanvas = await contourCanvasInWorker(azData, renderContext);
 
             // Step 2: Apply dilation to thicken lines (prevent breakage during transformation)
             dilateImage(contourCanvas, 1);
 
             // Step 3: Load input image (material image) to canvas
-            const inputCanvas = await loadImageToCanvas(inputImgUrl, renderContext.controller.signal);
+            const inputCanvas = await optionalMaterialCanvas(inputImgUrl, azData, renderContext, container);
+
+            if (typeof FieldGPU !== 'undefined' && document.getElementById('fieldRenderer')?.value === 'gpu') {
+                const makeTransparent = canvas => {
+                    const ctx=canvas.getContext('2d'),image=ctx.getImageData(0,0,canvas.width,canvas.height);
+                    for(let n=0;n<image.data.length;n+=4) if(image.data[n]+image.data[n+1]+image.data[n+2]<=90)image.data[n+3]=0;
+                    ctx.putImageData(image,0,0);
+                };
+                makeTransparent(contourCanvas);makeTransparent(inputCanvas);
+                const merged=mergeImages(contourCanvas,inputCanvas);
+                if(FieldGPU.renderImage(container,azData,merged,'Az field lines + material image',renderContext))return;
+            }
 
             // Step 4: Transform both images to cartesian coordinates
             // For contour: preserveColors=false (convert black to transparent)
@@ -9131,7 +8977,7 @@ async function renderAzBoundary(containerId, step, renderContext = null) {
                 xaxis: {
                     title: 'X [mm]',
                     range: [xMin, xMax],
-                    ...(AppState.polarFullModel && { scaleanchor: 'y', scaleratio: 1 })
+                    ...(AppState.polarAspectLocked && { scaleanchor: 'y', scaleratio: 1 })
                 },
                 yaxis: {
                     title: 'Y [mm]',
@@ -9161,7 +9007,8 @@ async function renderAzBoundary(containerId, step, renderContext = null) {
         } else {
             // Original Plotly contour approach for non-transformed coordinates
             const azFlipped = flipVertical(azData);
-            const transparentInputUrl = await makeBlackTransparent(inputImgUrl, 30, renderContext.controller.signal);
+            const backgroundCanvas = await optionalMaterialCanvas(inputImgUrl, azData, renderContext, container);
+            const transparentInputUrl = await makeBlackTransparent(backgroundCanvas.toDataURL(), 30, renderContext.controller.signal);
 
             const rows = azFlipped.length;
             const cols = azFlipped[0].length;
@@ -9323,7 +9170,7 @@ async function renderAzEdge(containerId, step, renderContext = null) {
             console.log('Using edge detection with polar coordinate transformation');
 
             // Step 1: Draw contour lines to canvas (in polar coordinates)
-            const contourCanvas = drawContourToCanvas(azData);
+            const contourCanvas = await contourCanvasInWorker(azData, renderContext);
 
             // Step 2: Apply dilation to thicken lines
             dilateImage(contourCanvas, 1);
@@ -9361,7 +9208,7 @@ async function renderAzEdge(containerId, step, renderContext = null) {
                 xaxis: {
                     title: 'X [mm]',
                     range: [xMin, xMax],
-                    ...(AppState.polarFullModel && { scaleanchor: 'y', scaleratio: 1 })
+                    ...(AppState.polarAspectLocked && { scaleanchor: 'y', scaleratio: 1 })
                 },
                 yaxis: {
                     title: 'Y [mm]',
@@ -12135,8 +11982,9 @@ async function plotHeatmap(elementOrId, data, title, usePhysicalAxes = false, us
         return;
     }
 
+    if (typeof FieldGPU !== 'undefined' && FieldGPU.render(container, data, title, usePhysicalAxes, useHarmonicMean, renderContext)) return;
     // Clear container before plotting
-    preparePlotlyContainer(container, renderContext);
+    preparePlotlyContainer(container, renderContext, true);
 
     // Get container size
     const size = getContainerSize(container);
@@ -12203,7 +12051,7 @@ async function plotHeatmap(elementOrId, data, title, usePhysicalAxes = false, us
             xaxis = {
                 title: 'X [mm]',
                 range: [-r_o * 1000, r_o * 1000],
-                ...(polarView.fullModel && { scaleanchor: 'y', scaleratio: 1 })
+                ...(polarView.aspectLocked !== false && { scaleanchor: 'y', scaleratio: 1 })
             };
             yaxis = {
                 title: 'Y [mm]',
@@ -12472,7 +12320,7 @@ function updateUserFileSelectionControls() {
         selectAll.disabled = visible.length === 0;
     }
     const deleteButton = document.getElementById('deleteSelectedUserFilesBtn');
-    if (deleteButton) deleteButton.disabled = totalSelected === 0;
+    if (deleteButton) deleteButton.disabled = totalSelected === 0 || !!AppState.fileDeleteBusy;
     const count = document.getElementById('userFileSelectedCount');
     if (count) count.textContent = `${totalSelected} selected`;
 }
@@ -12521,6 +12369,7 @@ function userFileHtml(file) {
         <div class="user-file-actions">
             <button class="btn-secondary btn-small" onclick="fileManagerOpen(this)">${openLabel}</button>
             ${download}
+            ${file.category === 'results' ? `<button class="btn-secondary btn-small" onclick="editDescription(fileManagerRow(this).name)">Memo</button>` : ''}
             <button class="btn-delete btn-small" onclick="fileManagerDelete(this)">Delete</button>
         </div>
     </div>`;
@@ -12634,93 +12483,64 @@ async function workspaceFileMeta(id) {
 
 async function fileManagerDelete(button) {
     const file = fileManagerRow(button);
-    if (!file) return;
-    try {
-        const meta = await workspaceFileMeta(`${file.category}/${file.name}`);
-        if (!confirm(`Permanently delete "${file.name}" (${meta.size.toLocaleString()} bytes)?\n\nThis action cannot be undone.`)) return;
-        const response = await fetch('/api/user-files', {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ userId: AppState.userId, ...file, revision: meta.revision }),
-        });
-        const result = await response.json();
-        if (!response.ok || !result.success) throw new Error(result.error || 'Delete failed');
-        await refreshUserFiles();
-        if (file.category === 'configs') await refreshConfigList();
-        if (file.category === 'images') await refreshImageList();
-        if (file.category === 'results') await refreshResultsList();
-        if (file.category === 'results') clearFilePreview({ hide: true });
-        fileManagerStatus(`Deleted ${file.name}`, 'success');
-    } catch (error) {
-        fileManagerStatus(`Delete failed: ${error.message}`, 'error');
-    }
+    if (file) return deleteUserFiles([file]);
 }
 
 async function deleteSelectedUserFiles() {
-    const selected = (AppState.userFiles || [])
-        .filter(file => AppState.userFileSelection.has(userFileKey(file)));
-    if (selected.length === 0) return;
-    try {
-        for (const file of selected) file.revision = (await workspaceFileMeta(`${file.category}/${file.name}`)).revision;
-    } catch (e) { fileManagerStatus(e.message, 'error'); return; }
-    if (!confirm(`Delete ${selected.length} selected item(s)?\n\nThis action cannot be undone.`)) return;
+    if (AppState.fileDeleteBusy) return;
+    const selected = (AppState.userFiles || []).filter(file => AppState.userFileSelection.has(userFileKey(file)));
+    return deleteUserFiles(selected);
+}
 
-    const deleteOne = async file => {
-        const response = await fetch('/api/user-files', {
-            method: 'DELETE',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                userId: AppState.userId,
-                category: file.category,
-                name: file.name,
-                revision: file.revision,
-            }),
-        });
-        const result = await response.json();
-        if (!response.ok || !result.success) {
-            throw new Error(`${file.name}: ${result.error || 'Delete failed'}`);
-        }
-        return file;
-    };
-
-    const deleteButton = document.getElementById('deleteSelectedUserFilesBtn');
-    if (deleteButton) deleteButton.disabled = true;
-    fileManagerStatus(`Deleting ${selected.length} selected item(s)...`, 'info');
-    const settled = [];
-    const concurrency = 8;
-    for (let offset = 0; offset < selected.length; offset += concurrency) {
-        const batch = selected.slice(offset, offset + concurrency);
-        settled.push(...await Promise.allSettled(batch.map(deleteOne)));
-        fileManagerStatus(
-            `Deleting selected items... ${Math.min(offset + batch.length, selected.length)}/${selected.length}`,
-            'info'
-        );
-    }
-    const deleted = settled
-        .filter(result => result.status === 'fulfilled')
-        .map(result => result.value);
-    const failures = settled.filter(result => result.status === 'rejected');
-    deleted.forEach(file => AppState.userFileSelection.delete(userFileKey(file)));
-
-    await refreshUserFiles();
-    const categories = new Set(deleted.map(file => file.category));
-    const refreshes = [];
-    if (categories.has('configs')) refreshes.push(refreshConfigList());
-    if (categories.has('images')) refreshes.push(refreshImageList());
-    if (categories.has('results')) refreshes.push(refreshResultsList());
-    await Promise.allSettled(refreshes);
-    if (categories.has('results')) clearFilePreview({ hide: true });
+async function deleteUserFiles(selected) {
+    if (AppState.fileDeleteBusy || !selected.length || !confirm(`Delete ${selected.length} selected item(s)? This action cannot be undone.`)) return;
+    selected.forEach(file=>AppState.userFileSelection.add(userFileKey(file)));
+    AppState.fileDeleteBusy = true;
     updateUserFileSelectionControls();
-
-    if (failures.length > 0) {
-        const firstError = failures[0].reason?.message || 'Unknown error';
-        fileManagerStatus(
-            `Deleted ${deleted.length}; ${failures.length} failed. ${firstError}`,
-            'error'
-        );
-    } else {
-        fileManagerStatus(`Deleted ${deleted.length} selected item(s).`, 'success');
+    try {
+        const files = [], metadataStarted=performance.now();
+        for (const file of selected) {
+            fileManagerStatus(`Checking ${files.length + 1}/${selected.length}: ${file.name}`, 'info');
+            const response = await fetch(`/api/workspace/file?userId=${encodeURIComponent(AppState.userId)}&id=${encodeURIComponent(`${file.category}/${file.name}`)}`, {signal:AbortSignal.timeout(30000)});
+            const data = await response.json();
+            if (!response.ok || !data.file) throw Error(data.error || 'File metadata unavailable');
+            files.push({id:`${file.category}/${file.name}`, revision:data.file.revision});
+        }
+        if(typeof FieldMetrics!=='undefined')FieldMetrics.record('delete-metadata',performance.now()-metadataStarted,{count:files.length});
+        const response = await fetch('/api/file-operations', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({userId:AppState.userId, files}), signal:AbortSignal.timeout(30000)});
+        const data = await response.json();
+        if (!response.ok || !data.success) throw Error(data.error || 'Delete request failed');
+        await watchFileOperation(data.operation);
+    } catch (error) {
+        fileManagerStatus(`${error.message}. Check operation status before retrying.`, 'error');
+    } finally {
+        AppState.fileDeleteBusy = false;
+        const refreshStarted=performance.now();
+        try {await refreshUserFiles();}
+        finally {updateUserFileSelectionControls();if(typeof FieldMetrics!=='undefined')FieldMetrics.record('delete-list-refresh',performance.now()-refreshStarted);}
     }
+}
+
+async function watchFileOperation(operation) {
+    const user = AppState.userId;
+    while (operation.status === 'running') {
+        fileManagerStatus(`${operation.id}: ${operation.results.length}/${operation.total} ${operation.current || ''}`, 'info');
+        await new Promise(resolve => setTimeout(resolve, 750));
+        if (AppState.userId !== user) return;
+        const response = await fetch(`/api/file-operations/${operation.id}?userId=${encodeURIComponent(user)}`, {signal:AbortSignal.timeout(30000)});
+        const data = await response.json();
+        if (!response.ok || !data.success) throw Error(data.error || 'Operation status unavailable');
+        operation = data.operation;
+    }
+    for (const result of operation.results) if (result.success) {
+        const file = (AppState.userFiles || []).find(f => `${f.category}/${f.name}` === result.id);
+        if (file) AppState.userFileSelection.delete(userFileKey(file));
+    }
+    if(typeof FieldMetrics!=='undefined')for(const result of operation.results)FieldMetrics.record('delete-server',result.elapsedMs||0,{operation:operation.id,id:result.id,success:result.success});
+    const failures = operation.results.filter(r => !r.success);
+    fileManagerStatus(`${operation.status}: ${operation.results.filter(r=>r.success).length} deleted, ${failures.length} failed. ${failures[0]?.error || operation.message || ''}`, failures.length || operation.status !== 'complete' ? 'error' : 'success');
+    await Promise.allSettled([refreshResultsList(), refreshConfigList(), refreshImageList()]);
+    clearFilePreview({hide:true});
 }
 
 /**
@@ -12905,6 +12725,7 @@ function clearFilePreview({
  */
 async function showOutputPreview(folderName) {
     console.log('showOutputPreview called:', folderName);
+    void ResultImprovements.description(folderName);
 
     const previewPanel = document.getElementById('filePreviewPanel');
     const descDiv = document.getElementById('previewDescription');
@@ -13240,6 +13061,12 @@ async function renameOutput(folderName) {
  * @param {string} folderName - Folder name
  */
 async function editDescription(folderName) {
+    switchTab('dashboard');
+    await ResultImprovements.description(folderName);
+    document.getElementById('resultMemoEditor').scrollIntoView({block: 'nearest'});
+}
+
+async function legacyEditDescription(folderName) {
     try {
         // Fetch current description
         const response = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`);
@@ -14776,4 +14603,18 @@ function clearActiveLibrary() {
     document.getElementById('activeLibraryBadge').style.display = 'none';
     // Clear cookie
     setCookie('magfdm_last_library', '', -1);
+}
+
+async function restoreFileOperations() {
+    try {
+        const response = await fetch(`/api/file-operations?userId=${encodeURIComponent(AppState.userId)}`);
+        const data = await response.json();
+        if (!response.ok || !data.success) return;
+        const pending = data.operations.find(op => op.status === 'running');
+        const last = pending || data.operations.at(-1);
+        if (!last) return;
+        AppState.fileDeleteBusy = !!pending; updateUserFileSelectionControls();
+        await watchFileOperation(last);
+    } catch(error) { fileManagerStatus(error.message,'error'); }
+    finally {AppState.fileDeleteBusy=false;updateUserFileSelectionControls();}
 }

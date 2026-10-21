@@ -58,7 +58,7 @@ class AutomationRuntime {
         });
     }
     async close(){
-        this.closed=true;this.ready=false;this.access.ready=false;
+        this.closed=true;this.jobs.stop();this.ready=false;this.access.ready=false;
         await this.initializing;
         await locked(`${this.access.filename}:listener`,()=>this.stopListener());
         await this.transfers.close();await this.images.close?.();await this.access.flush();

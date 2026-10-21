@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-project(MagFDMsolver VERSION 1.7.0 LANGUAGES CXX)
+project(MagFDMsolver VERSION 1.7.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,6 +48,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 # Requires CPU with AVX2 (Intel Haswell 2013+, AMD Excavator 2015+, Zen 2017+).
 if(MSVC)
     target_compile_options(omfdm_core PUBLIC
+        /utf-8
         $<$<CONFIG:Release>:/O2;/arch:AVX2;/fp:fast>
         $<$<CONFIG:RelWithDebInfo>:/O2;/arch:AVX2;/fp:fast>
     )
@@ -97,6 +98,13 @@ target_link_libraries(omfdm_core PUBLIC
 )
 target_include_directories(omfdm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${TIFF_INCLUDE_DIRS})
 target_link_libraries(MagFDMsolver PRIVATE omfdm_core)
+
+if(BUILD_TESTING)
+    add_executable(input_snapshot_test tests/input_snapshot_test.cpp)
+    target_include_directories(input_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(input_snapshot_test PRIVATE yaml-cpp::yaml-cpp)
+    add_test(NAME input_snapshot COMMAND input_snapshot_test "${CMAKE_CURRENT_BINARY_DIR}/snapshot-test-artifacts")
+endif()
 
 # v1.6 domain-decomposition wall-time benchmark (reuses the analyzer as patch solvers)
 add_executable(dd_bench dd_bench.cpp)

@@ -312,3 +312,20 @@ test('missing data uses the real message lifecycle and never remains labelled as
     assert.equal(c.container.getAttribute('aria-busy'), 'false');
     assert.match(c.container.innerHTML, /No data available/);
 });
+
+test('overlapping Plotly updates serialize commits and skip superseded pending steps',async()=>{
+    const f=fixture(),c=f.plot();
+    vm.runInContext(slice('function createDashboardRenderContext','function createFilePreviewRenderContext'),f.context);
+    vm.runInContext(slice('function isRenderContextCurrent','function discardStaleRender'),f.context);
+    f.state.resultsData.currentResult='A';f.state.currentStep=1;
+    const wait=deferred(),calls=[];
+    c.container._fullLayout={};c.container._preservePlot=true;
+    f.context.Plotly.react=(container,traces)=>{calls.push(traces[0].step);return calls.length===1?wait.promise:Promise.resolve({});};
+    const render=step=>{f.state.currentStep=step;const ctx=f.context.createDashboardRenderContext(c.containerId,'A',step);return f.context.newPlotForRender(c.container,[{step}],{},{},ctx);};
+    const first=render(1),second=render(2),third=render(3);
+    const firstRejected=assert.rejects(first,{name:'AbortError'}),secondRejected=assert.rejects(second,{name:'AbortError'});
+    assert.deepEqual(calls,[1]);wait.resolve({});
+    await Promise.all([firstRejected,secondRejected,third]);
+    assert.deepEqual(calls,[1,3]);assert.equal(f.counters.purges,0);
+    assert.match(c.content.label.textContent,/Step 3/);assert.equal(c.container._plotlyPending,undefined);
+});

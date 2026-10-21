@@ -13,13 +13,14 @@ class WorkspaceError extends Error {
 function fail(code, message, status) { throw new WorkspaceError(code, message, status); }
 function userKey(user) {
     if (typeof user !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(user)) fail('INVALID_USER', 'Invalid workspace identity');
-    return process.platform === 'win32' ? user.toLowerCase() : user;
+    return require('./identity-context').authorizeUser(process.platform === 'win32' ? user.toLowerCase() : user);
 }
 function segments(value, internal = false) {
     if (typeof value !== 'string' || !value || value.length > 1024 || /[\\:\x00-\x1f\x7f%]/.test(value)) fail('INVALID_PATH', 'Use a workspace file ID, not a filesystem path');
     const parts = value.split('/');
-    for (const s of parts) {
-        if (!s || s === '.' || s === '..' || /[. ]$/.test(s) || /[<>"|?*]/.test(s) || (!internal && s.startsWith('.')) || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(s)) fail('INVALID_PATH', 'Invalid workspace file ID');
+    for (const [index,s] of parts.entries()) {
+        const snapshot = parts[0] === 'results' && index === 2 && s === '.inputs';
+        if (!s || s === '.' || s === '..' || /[. ]$/.test(s) || /[<>"|?*]/.test(s) || (!internal && s.startsWith('.') && !snapshot) || /^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(s)) fail('INVALID_PATH', 'Invalid workspace file ID');
     }
     return parts;
 }
@@ -57,7 +58,7 @@ class Workspace {
     async resolve(id, { create = false, internal = false } = {}) {
         const [category, ...tail] = segments(id, internal);
         if (!Object.hasOwn(roots, category) || !tail.length) fail('INVALID_PATH', 'A category and filename are required');
-        const root = path.join(this.base, roots[category], this.user);
+        const root = path.join(require('./storage').root(this.base, roots[category]), this.user);
         const target = path.join(root, ...tail);
         if (!path.relative(root, target) || path.relative(root, target).startsWith('..') || path.isAbsolute(path.relative(root, target))) fail('INVALID_PATH', 'Invalid target');
         await noLinks(target, { missing: create });
@@ -65,7 +66,7 @@ class Workspace {
     }
     async init() {
         for (const folder of Object.values(roots)) {
-            const root = path.join(this.base, folder, this.user);
+            const root = path.join(require('./storage').root(this.base, folder), this.user);
             await noLinks(root, { missing: true });
             await fs.mkdir(root, { recursive: true });
         }
@@ -89,7 +90,9 @@ class Workspace {
             const children = (await fs.readdir(dir, { withFileTypes: true })).sort((a,b) => a.name.localeCompare(b.name));
             for (const e of children) {
                 if (++visited > 10000) fail('LIMIT_EXCEEDED', 'Directory exceeds the 10000-entry operation limit', 413);
-                const nextId = `${id}/${e.name}`; const isHidden = hidden || e.name.startsWith('.');
+                const nextId = `${id}/${e.name}`;
+                const snapshot = /^results\/[^/]+$/.test(id) && e.name === '.inputs';
+                const isHidden = hidden || (e.name.startsWith('.') && !snapshot);
                 const p = await this.resolve(nextId, {internal: isHidden});
                 const st = await fs.lstat(p);
                 if (st.isDirectory()) await visit(p, nextId, depth + 1, isHidden);
@@ -101,7 +104,7 @@ class Workspace {
             }
         };
         if (Object.hasOwn(roots, prefix)) {
-            const root = path.join(this.base, roots[prefix], this.user);
+            const root = path.join(require('./storage').root(this.base, roots[prefix]), this.user);
             try { await visit(root, prefix); } catch (e) { if (e.code !== 'ENOENT') throw e; }
         } else await visit(await this.resolve(prefix), prefix);
         return entries;
@@ -113,12 +116,12 @@ class Workspace {
             if (!Object.hasOwn(roots, c)) fail('INVALID_PATH', 'Unknown category');
             if (category && prefix && category !== c) fail('INVALID_PATH', 'Prefix and category must agree');
             const parent = prefix || c;
-            const dir = prefix ? await this.resolve(prefix, {create: true}) : path.join(this.base, roots[c], this.user);
+            const dir = prefix ? await this.resolve(prefix, {create: true}) : path.join(require('./storage').root(this.base, roots[c]), this.user);
             await noLinks(dir, {missing: true});
             let handle;
             try { handle = await fs.opendir(dir); } catch (e) { if (e.code === 'ENOENT') continue; throw e; }
             for await (const e of handle) {
-                if (e.name.startsWith('.')) continue;
+                if (e.name.startsWith('.') && !(e.name === '.inputs' && /^results\/[^/]+$/.test(parent))) continue;
                 if (++total > 100000) fail('LIMIT_EXCEEDED', 'Directory exceeds the 100000-entry listing limit', 413);
                 if (total <= offset || items.length >= limit) continue;
                 const id = `${parent}/${e.name}`, p = await this.resolve(id), stat = await fs.lstat(p);

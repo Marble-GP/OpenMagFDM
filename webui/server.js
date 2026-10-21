@@ -14,6 +14,14 @@ const { Workspace: AutomationWorkspace } = require('./automation/workspace');
 // the server streams raw TIFF bytes and the browser decodes them via the
 // vendored UMD bundle at /lib/geotiff.js.
 
+function resolveResultDirectory(value) {
+    const parts = String(value || '').replace(/\\/g,'/').split('/');
+    if (parts.length !== 3 || parts[0] !== 'outputs' || !parts[2] || parts[2] === '..' || parts[2] === '.' || /[:%]/.test(parts[2])) throw makeProcessError('Invalid result identifier','INVALID_PATH',400);
+    const user = normalizeUserId(parts[1]);
+    if (user !== parts[1]) throw makeProcessError('Invalid workspace','INVALID_PATH',400);
+    return path.join(OUTPUTS_DIR,user,parts[2]);
+}
+
 // Count transient analysis step files in a directory listing. Accepts both
 // CSV (legacy) and TIFF (v1.4 default) outputs. Same step number written in
 // both formats is counted once. Used by /api/detect-steps, /api/results,
@@ -41,7 +49,9 @@ const solverLocation = require('./automation/solver-location');
 let SOLVER_PATH = solverLocation.locate(BASE_DIR).path;
 const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
 const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
-const OUTPUTS_DIR = path.join(BASE_DIR, 'outputs');
+const serverSettings = require('./automation/storage').configure(BASE_DIR);
+const accounts = new (require('./automation/accounts').Accounts)(BASE_DIR,serverSettings);
+const OUTPUTS_DIR = require('./automation/storage').root(BASE_DIR, 'outputs');
 const USER_LIBS_DIR = path.join(BASE_DIR, 'user-libs');
 
 // 基本ディレクトリを同期的に作成（Multerが使用する前に必要）
@@ -119,6 +129,7 @@ const FINAL_SHUTDOWN_FORCE_WAIT_MS = positiveIntegerFromEnv('FINAL_SHUTDOWN_FORC
 
 function normalizeUserId(userId) {
     const safe = String(userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+    require('./automation/identity-context').authorizeUser(safe);
     return (process.platform === 'win32' ? safe.toLowerCase() : safe) || 'default';
 }
 
@@ -849,6 +860,18 @@ const upload = multer({ storage, limits: {fileSize: MAX_IMAGE_SIZE, files: 1, fi
 // (多数のファイルパス) を受けるため。個々の config 保存は handler 側で
 // MAX_FILE_SIZE (100KB) を別途強制するので、この上限緩和による回帰はない。
 app.use(express.json({ limit: '25mb' }));
+accounts.install(app);
+app.use(async(req,res,next)=>{
+    try {
+        if(req.query.result) {
+            const result = resolveResultDirectory(req.query.result);
+            const file = req.query.file;
+            if(file) require('./automation/workspace').segments(file);
+            await require('./automation/workspace').noLinks(file?path.join(result,file):result,{missing:true});
+        }
+        next();
+    } catch(error) {res.status(error.statusCode||400).json({success:false,error:error.message});}
+});
 // Register revision-aware GUI file adapters before legacy endpoints. Solver jobs
 // and MCP share the same active-output protection and per-workspace mutation lock.
 require('./automation/gui-files').installFileRoutes(app, BASE_DIR,
@@ -861,10 +884,10 @@ app.use(express.static(PUBLIC_DIR));
 app.use('/icon', express.static(ICON_DIR));
 
 // 親ディレクトリのCSVファイルへのアクセス
-app.use('/data', express.static(BASE_DIR));
+app.use('/data', (req,res) => res.status(410).json({success:false,error:'Use an authenticated result endpoint'}));
 
 // ユーザーごとのアップロード画像へのアクセス
-app.use('/uploads', express.static(UPLOAD_DIR));
+app.get('/uploads/:user/:filename',async(req,res)=>{try {const ws=new AutomationWorkspace(BASE_DIR,req.params.user);res.sendFile(await ws.resolve(`images/${req.params.filename}`));}catch(error){res.status(error.statusCode||404).end();}});
 
 // ===== API エンドポイント =====
 
@@ -1002,7 +1025,7 @@ async function cleanupExpiredUsers() {
 
 // Run initialization and cleanup on server start
 if (process.env.OPENMAGFDM_SKIP_INIT !== '1') {
-    initializeDirectories().then(() => cleanupExpiredUsers());
+    initializeDirectories();
 }
 
 // Get list of YAML files for a user
@@ -3362,398 +3385,21 @@ app.get('/api/images', async (req, res) => {
 // 画像ファイルの削除
 // Configファイルの削除
 // ソルバーの実行（ストリーミングなし）
-app.post('/api/solve', async (req, res) => {
-    let finishStartOperation = () => {};
-    let solverProcess = null;
-    let claimedUserId = null;
-    let outputPath = null;
-    try {
-        assertRequestOpen(req, res);
-        const { configFile, imageFile, userId } = req.body;
-        const userIdKey = normalizeUserId(userId);
-        finishStartOperation = beginSolverStartOperation(userIdKey);
-        if (userHasActiveSolver(userIdKey)) {
-            return res.status(409).json({
-                success: false,
-                error: 'A solver process is already running for this user'
-            });
-        }
-        claimLegacyResponsePermit(res);
+// All execution now belongs to the durable job service. Old response-bound
+// solve clients must migrate rather than silently restart on reconnection.
+for (const endpoint of ['/api/solve','/api/solve-stream','/api/stop-solver']) {
+    app.post(endpoint, (req,res)=>res.status(410).json({success:false,code:'DEPRECATED',error:'Use /api/jobs with an idempotencyKey; cancel by job ID'}));
+}
 
-        const userDir = getUserDir(userIdKey);
-        const configPath = configFile
-            ? resolveUserFilePath(userDir, configFile, 'configFile')
-            : CONFIG_PATH;
-        const userUploadDir = getUserUploadsDir(userIdKey);
-        const imagePath = resolveUserFilePath(userUploadDir, imageFile, 'imageFile');
-
-        await fs.access(configPath);
-        await fs.access(imagePath);
-        await fs.access(SOLVER_PATH);
-        assertRequestOpen(req, res);
-
-        // Use the same user-scoped output layout as the streaming and job
-        // APIs so warning-complete results remain discoverable in the UI.
-        outputPath = await prepareUserOutputDirectory(userIdKey);
-        assertRequestOpen(req, res);
-        console.log('Executing legacy solver without a shell:', SOLVER_PATH);
-
-        if (userHasActiveSolver(userIdKey)) {
-            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
-        }
-        assertRequestOpen(req, res);
-        solverProcess = spawnTrackedSolver(
-            [configPath, imagePath, outputPath],
-            { purpose: 'legacy', userId: userIdKey }
-        );
-        if (!claimRunningProcess(userIdKey, solverProcess, 'legacy')) {
-            void terminateChildProcess(solverProcess);
-            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
-        }
-        claimedUserId = userIdKey;
-
-        let stdout = '';
-        let stderr = '';
-        let outputOverflow = false;
-        let finalized = false;
-        let processError = null;
-        terminateOnPrematureResponseClose(res, solverProcess, 'Legacy solve');
-
-        const appendOutput = (target, data) => {
-            const appended = appendBoundedText(target, data.toString());
-            if (appended.overflow && !outputOverflow) {
-                outputOverflow = true;
-                void terminateChildProcess(solverProcess);
-            }
-            return appended.text;
-        };
-
-        solverProcess.stdout.on('data', data => { stdout = appendOutput(stdout, data); });
-        solverProcess.stderr.on('data', data => { stderr = appendOutput(stderr, data); });
-
-        solverProcess.once('error', (error) => {
-            processError = error;
-            console.error('Solver error:', error);
-            if (isChildRunning(solverProcess)) void terminateChildProcess(solverProcess);
-        });
-
-        solverProcess.once('close', (code, signal) => {
-            deleteRunningProcessIfSame(userIdKey, solverProcess);
-            if (finalized || res.destroyed || res.writableEnded) return;
-            finalized = true;
-
-            if (outputOverflow) {
-                return sendLegacyJson(res, 500, {
-                    success: false,
-                    exitCode: code,
-                    error: `Solver output exceeded ${LEGACY_OUTPUT_LIMIT_CHARS} characters`,
-                    stderr: boundedLegacyResponseText(stderr)
-                });
-            }
-
-            if (processError) {
-                return sendLegacyJson(res, 500, {
-                    success: false,
-                    exitCode: code,
-                    error: processError.message,
-                    stderr: boundedLegacyResponseText(stderr)
-                });
-            }
-
-            const outcome = classifySolverExit(code);
-            if (outcome.warning) {
-                return sendLegacyJson(res, 200, {
-                    ...outcome,
-                    exitCode: code,
-                    resultPath: outputPath,
-                    stdout: boundedLegacyResponseText(stdout),
-                    stderr: boundedLegacyResponseText(stderr)
-                });
-            }
-            if (!outcome.success) {
-                const reason = signal ? `signal ${signal}` : `exit code ${code}`;
-                return sendLegacyJson(res, 500, {
-                    success: false,
-                    exitCode: code,
-                    error: `Solver failed with ${reason}`,
-                    stderr: boundedLegacyResponseText(stderr)
-                });
-            }
-
-            sendLegacyJson(res, 200, {
-                ...outcome,
-                exitCode: code,
-                resultPath: outputPath,
-                stdout: boundedLegacyResponseText(stdout)
-            });
-        });
-    } catch (error) {
-        if (solverProcess) {
-            void terminateChildProcess(solverProcess).then(() => {
-                if (claimedUserId) deleteRunningProcessIfSame(claimedUserId, solverProcess);
-            });
-        } else if (outputPath) {
-            void removeEmptyOutputDirectory(outputPath);
-        }
-        if (res.destroyed || res.writableEnded || res.headersSent) return;
-        res.status(error.statusCode || 500).json({
-            success: false,
-            error: error.message
-        });
-    } finally {
-        finishStartOperation();
-    }
-});
-
-// ソルバーの実行（プログレス付きSSEストリーミング）
-app.post('/api/solve-stream', async (req, res) => {
-    let finishStartOperation = () => {};
-    let mergedTempPath = null;
-    let solverProcess = null;
-    let claimedUserId = null;
-    let outputPath = null;
-    try {
-        assertRequestOpen(req, res);
-        const { configFile, imageFile, userId, materialLibraryFile } = req.body;
-        const userIdKey = normalizeUserId(userId);
-        finishStartOperation = beginSolverStartOperation(userIdKey);
-        if (userHasActiveSolver(userIdKey)) {
-            return res.status(409).json({
-                success: false,
-                error: 'A solver process is already running for this user'
-            });
-        }
-
-        const userDir = getUserDir(userIdKey);
-        const configPath = configFile
-            ? resolveUserFilePath(userDir, configFile, 'configFile')
-            : CONFIG_PATH;
-        const userUploadDir = getUserUploadsDir(userIdKey);
-        const imagePath = resolveUserFilePath(userUploadDir, imageFile, 'imageFile');
-
-        await fs.access(configPath);
-        await fs.access(imagePath);
-        await fs.access(SOLVER_PATH);
-        assertRequestOpen(req, res);
-
-        let effectiveConfigPath = configPath;
-        if (materialLibraryFile) {
-            const libDir = getUserLibsDir(userIdKey);
-            const libPath = resolveUserFilePath(libDir, materialLibraryFile, 'materialLibraryFile');
-            const configYaml = await fs.readFile(configPath, 'utf8');
-            const libYaml = await fs.readFile(libPath, 'utf8');
-            assertRequestOpen(req, res);
-            const mergedYaml = mergeLibraryIntoConfig(configYaml, libYaml);
-            mergedTempPath = path.join(userDir, `.merged_${require('crypto').randomUUID()}.yaml`);
-            await fs.writeFile(mergedTempPath, mergedYaml);
-            assertRequestOpen(req, res);
-            effectiveConfigPath = mergedTempPath;
-        }
-
-        outputPath = await prepareUserOutputDirectory(userIdKey);
-        assertRequestOpen(req, res);
-        console.log(`Output directory for user ${userIdKey}: ${outputPath}`);
-        if (userHasActiveSolver(userIdKey)) {
-            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
-        }
-        assertRequestOpen(req, res);
-        solverProcess = spawnTrackedSolver(
-            [effectiveConfigPath, imagePath, outputPath],
-            { purpose: 'stream', userId: userIdKey }
-        );
-        if (!claimRunningProcess(userIdKey, solverProcess, 'stream')) {
-            void terminateChildProcess(solverProcess);
-            throw makeProcessError('A solver process is already running for this user', 'SOLVER_ALREADY_RUNNING', 409);
-        }
-        claimedUserId = userIdKey;
-
-        // Install disconnect cleanup immediately after claiming the child. This
-        // covers errors thrown by header setup/flush as well as later SSE loss.
-        terminateOnPrematureResponseClose(res, solverProcess, 'Streaming solve');
-
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.flushHeaders();
-        console.log('Executing solver with streaming:', SOLVER_PATH);
-        console.log(`Registered solver process for user: ${userIdKey}`);
-
-        let stdoutPartial = '';
-        let stderrPartial = '';
-        let finalized = false;
-        let processError = null;
-        const cleanMergedTemp = () => {
-            if (!mergedTempPath) return;
-            const toDelete = mergedTempPath;
-            mergedTempPath = null;
-            void unlinkTemporaryFile(toDelete);
-        };
-        const backpressure = createSseBackpressureController(res, solverProcess);
-        const sendSse = (data, priority = false) => {
-            if (res.destroyed || res.writableEnded) return false;
-            // Slow/disconnected clients must not make Node's outgoing queue grow
-            // without bound. Preserve progress and the single terminal event;
-            // verbose log/status/error events may be dropped under pressure.
-            if (!priority && res.writableLength >= MAX_SSE_BUFFER_BYTES) return false;
-            try {
-                const writable = res.write(`data: ${JSON.stringify(data)}\n\n`);
-                if (!writable) backpressure.pause();
-                return writable;
-            } catch {
-                return false;
-            }
-        };
-        const sendStdoutLine = (line) => {
-            if (!line.trim()) return;
-            let progressData = { type: 'log', message: line };
-            const stepMatch = line.match(/---\s*Step\s+(\d+)\s*\/\s*(\d+)\s*---/i);
-            if (stepMatch) {
-                const current = parseInt(stepMatch[1]);
-                const total = parseInt(stepMatch[2]);
-                progressData = {
-                    type: 'progress',
-                    step: current,
-                    total,
-                    percentage: Math.round(((current - 1) / total) * 100),
-                    message: line
-                };
-            }
-            if (line.includes('Solving linear system') ||
-                line.includes('Using AMGCL') ||
-                line.includes('Using direct solver')) {
-                progressData.type = 'status';
-            }
-            if (line.includes('completed successfully')) progressData.type = 'complete';
-            sendSse(progressData, progressData.type === 'progress');
-        };
-
-        solverProcess.stdout.on('data', (data) => {
-            const parsed = splitCappedLines(stdoutPartial, data.toString());
-            stdoutPartial = parsed.partial;
-            for (const line of parsed.lines) sendStdoutLine(line);
-        });
-
-        solverProcess.stderr.on('data', (data) => {
-            const parsed = splitCappedLines(stderrPartial, data.toString());
-            stderrPartial = parsed.partial;
-            for (const line of parsed.lines) {
-                if (line.trim()) sendSse({ type: 'error', message: line });
-            }
-        });
-
-        solverProcess.once('close', (code) => {
-            deleteRunningProcessIfSame(userIdKey, solverProcess);
-            cleanMergedTemp();
-            console.log(`Solver process exited with code ${code}`);
-            if (finalized) return;
-            finalized = true;
-
-            if (stdoutPartial.trim()) sendStdoutLine(truncateLogLine(stdoutPartial.trim()));
-            if (stderrPartial.trim()) {
-                sendSse({ type: 'error', message: truncateLogLine(stderrPartial.trim()) });
-            }
-            const outcome = processError
-                ? { ...classifySolverExit(-1), message: processError.message }
-                : classifySolverExit(code);
-            sendSse({
-                type: 'done',
-                ...outcome,
-                exitCode: code,
-                resultPath: outcome.completed ? outputPath : null
-            }, true);
-            if (!res.destroyed && !res.writableEnded) {
-                try { res.end(); } catch { /* connection already gone */ }
-            }
-        });
-
-        solverProcess.once('error', (error) => {
-            processError = error;
-            console.error('Solver process error:', error);
-            sendSse({ type: 'error', success: false, error: error.message });
-            if (isChildRunning(solverProcess)) void terminateChildProcess(solverProcess);
-        });
-    } catch (error) {
-        if (solverProcess) {
-            void terminateChildProcess(solverProcess).then(() => {
-                if (claimedUserId) deleteRunningProcessIfSame(claimedUserId, solverProcess);
-                if (mergedTempPath) {
-                    const toDelete = mergedTempPath;
-                    mergedTempPath = null;
-                    void unlinkTemporaryFile(toDelete);
-                }
-            });
-        } else if (mergedTempPath) {
-            void unlinkTemporaryFile(mergedTempPath);
-        }
-        if (!solverProcess && outputPath) void removeEmptyOutputDirectory(outputPath);
-        console.error('Error starting solver:', error);
-        if (res.destroyed || res.writableEnded) return;
-        if (!res.headersSent) {
-            return res.status(error.statusCode || 500).json({ success: false, error: error.message });
-        }
-        if (!res.destroyed && !res.writableEnded) {
-            try {
-                res.write(`data: ${JSON.stringify({ type: 'error', success: false, error: error.message })}\n\n`);
-                res.end();
-            } catch { /* connection already gone */ }
-        }
-    } finally {
-        finishStartOperation();
-    }
-});
-
-// ソルバーの停止
-app.post('/api/stop-solver', async (req, res) => {
-    try {
-        const { userId } = req.body;
-        const userIdKey = normalizeUserId(userId);
-        const entry = runningProcesses.get(userIdKey);
-
-        if (!entry) {
-            return res.status(404).json({
-                success: false,
-                error: 'No running solver process found for this user'
-            });
-        }
-
-        const solverProcess = entry.process;
-        if (!isChildRunning(solverProcess)) {
-            deleteRunningProcessIfSame(userIdKey, solverProcess);
-            return res.json({ success: true, message: 'Solver process was already stopped' });
-        }
-
-        console.log(`Stopping solver process for user: ${userIdKey}`);
-        const termination = await terminateChildProcess(solverProcess);
-        if (!termination.exited) {
-            return res.status(500).json({
-                success: false,
-                error: 'Solver process did not exit after forced termination'
-            });
-        }
-        deleteRunningProcessIfSame(userIdKey, solverProcess);
-
-        res.json({
-            success: true,
-            message: 'Solver process stopped successfully'
-        });
-
-    } catch (error) {
-        console.error('Error stopping solver:', error);
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// 出力ファイルの一覧
+// List results using logical paths, independent of the physical storage root.
 app.get('/api/results', async (req, res) => {
     try {
         const { userId } = req.query;
-        const userIdKey = userId || 'default';
+        const userIdKey = normalizeUserId(userId);
 
         // User-specific output directory
         const userOutputDir = path.join(OUTPUTS_DIR, `${userIdKey}`);
+        await require('./automation/workspace').noLinks(userOutputDir,{missing:true});
 
         // Check if user output directory exists
         try {
@@ -3819,7 +3465,7 @@ app.get('/api/results', async (req, res) => {
 // one response so the UI does not need to know the server's directory layout.
 app.get('/api/user-files', async (req, res) => {
     try {
-        const userIdKey = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const userIdKey = normalizeUserId(req.query.userId);
         const files = [];
         const addRegularFiles = async (dir, category, kind, predicate) => {
             let names;
@@ -3995,7 +3641,7 @@ app.get('/api/solver/info', async (req, res) => {
 app.get('/api/user-outputs', async (req, res) => {
     try {
         const { userId } = req.query;
-        const userIdKey = userId || 'default';
+        const userIdKey = normalizeUserId(userId);
 
         // Sanitize userId to prevent directory traversal
         const safeUserId = userIdKey.replace(/[^a-zA-Z0-9_-]/g, '');
@@ -4092,7 +3738,7 @@ app.get('/api/results/:resultFolder/field-at-point', async (req, res) => {
         const { resultFolder } = req.params;
         const { userId, x, y, step } = req.query;
 
-        const userIdKey = (userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
+        const userIdKey = normalizeUserId(userId);
         const safeFolderName = path.basename(resultFolder);
         const folderPath = path.join(OUTPUTS_DIR, userIdKey, safeFolderName);
 
@@ -4388,88 +4034,53 @@ async function submitAnalysisJob(input, options = {}) {
     }
 }
 
+async function browserJobsReady() {
+    await automation.initializing;
+    if (!automation.ready) { await automation.init(); }
+    if (!automation.ready) throw makeProcessError('Job service unavailable', 'UNAVAILABLE', 503);
+    return automation.jobs;
+}
 app.post('/api/jobs', async (req, res) => {
     try {
-        res.json(await submitAnalysisJob(req.body, { guard: () => assertRequestOpen(req, res) }));
-    } catch (error) {
-        if (!res.destroyed && !res.writableEnded && !res.headersSent) res.status(error.statusCode || 500).json({ success: false, error: error.message });
-    }
-});
-
-// List jobs for a user
-app.get('/api/jobs', (req, res) => {
-    try {
-        const { userId } = req.query;
-        const userIdKey = normalizeUserId(userId);
-        cleanupExpiredJobs();
-
-        const userJobs = Array.from(jobs.values())
-            .filter(j => j.userId === userIdKey)
-            .map(({ jobId, status, progress, resultPath, exitCode, completed, converged, warning, message, created, finished }) =>
-                ({ jobId, status, progress, resultPath, exitCode, completed, converged, warning, message, created, finished }))
-            .sort((a, b) => new Date(b.created) - new Date(a.created));
-
-        res.json({ success: true, jobs: userJobs });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Get single job status and log tail
-app.get('/api/jobs/:jobId', (req, res) => {
-    try {
-        cleanupExpiredJobs();
-        const job = jobs.get(req.params.jobId);
-        if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
-
-        const logTail = job.log.slice(-50);
-        res.json({
-            success: true,
-            jobId: job.jobId,
-            status: job.status,
-            progress: job.progress,
-            resultPath: job.resultPath,
-            exitCode: job.exitCode,
-            completed: job.completed,
-            converged: job.converged,
-            warning: job.warning,
-            message: job.message,
-            created: job.created,
-            finished: job.finished,
-            logTail
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// Cancel a running job
-app.delete('/api/jobs/:jobId', async (req, res) => {
-    try {
-        cleanupExpiredJobs();
-        const job = jobs.get(req.params.jobId);
-        if (!job) return res.status(404).json({ success: false, error: 'Job not found' });
-
-        if (!job.process || !isChildRunning(job.process)) {
-            return res.json({ success: true, message: `Job already ${job.status}` });
+        const service = await browserJobsReady();
+        const user = normalizeUserId(req.body.userId);
+        if(runningProcesses.has(user))throw makeProcessError('An interactive solver is already running','SOLVER_ALREADY_RUNNING',409);
+        const ws = new AutomationWorkspace(BASE_DIR, user);
+        const reference = async (category, name) => {
+            const id = `${category}/${name}`;
+            return {id, revision:(await ws.describe(id)).revision};
+        };
+        if (typeof req.body.idempotencyKey !== 'string' || !req.body.idempotencyKey || req.body.idempotencyKey.length > 128) throw makeProcessError('idempotencyKey is required', 'INVALID_INPUT',400);
+        const prior = service.records.find(j => j.key === `gui:${user}:${req.body.idempotencyKey}`);
+        const requestHash = require('node:crypto').createHash('sha256').update(JSON.stringify({configFile:req.body.configFile,imageFile:req.body.imageFile,materialLibraryFile:req.body.materialLibraryFile})).digest('hex');
+        if (prior) {
+            if (prior.browserRequestHash !== requestHash) throw makeProcessError('Idempotency key reused with different inputs','IDEMPOTENCY_CONFLICT',409);
+            return res.json({success:true,...service.public(prior)});
         }
-
-        const solverProcess = job.process;
-        job.cancelRequested = true;
-        job.status = 'cancelling';
-        job.message = 'Cancellation requested';
-        void terminateChildProcess(solverProcess).then((termination) => {
-            if (!termination.exited && job.process === solverProcess) {
-                job.log = appendCappedLog(job.log, '[error] Solver did not exit after forced termination');
-                job.message = 'Cancellation requested, but the solver has not exited';
-            }
-        });
-
-        res.status(202).json({ success: true, status: 'cancelling', message: 'Job cancellation requested' });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+        const input = {config:await reference('configs',req.body.configFile),image:await reference('images',req.body.imageFile),idempotencyKey:req.body.idempotencyKey,browserRequestHash:requestHash};
+        if (req.body.materialLibraryFile) input.library = await reference('libraries',req.body.materialLibraryFile);
+        const job = await service.start({id:`gui:${user}`,user,name:'WebUI',guard:()=>{}},input);
+        const record = service.records.find(j => j.jobId === job.jobId); record.browserRequestHash = requestHash; await service.save();
+        res.status(202).json({success:true,...job});
+    } catch (error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
 });
+app.post('/api/jobs/resume', async (req,res) => {
+    try { res.json({success:true,jobs:await (await browserJobsReady()).resume(normalizeUserId(req.body.userId))}); }
+    catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
+});
+app.get('/api/jobs', async (req,res) => {
+    try { res.json({success:true,jobs:(await browserJobsReady()).list(normalizeUserId(req.query.userId))}); }
+    catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
+});
+app.get('/api/jobs/:jobId', async (req,res) => {
+    try { res.json({success:true,...(await browserJobsReady()).get(normalizeUserId(req.query.userId),req.params.jobId)}); }
+    catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
+});
+app.delete('/api/jobs/:jobId', async (req,res) => {
+    try { res.status(202).json({success:true,...await (await browserJobsReady()).cancel(normalizeUserId(req.query.userId),req.params.jobId,()=>{})}); }
+    catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
+});
+
 
 // =====================================================
 // Material Library API
@@ -4677,7 +4288,7 @@ app.get('/api/detect-steps', async (req, res) => {
             return res.json({ success: false, error: 'Result path required' });
         }
 
-        const azFolder = path.join(BASE_DIR, resultPath, 'Az');
+        const azFolder = path.join(resolveResultDirectory(resultPath), 'Az');
         const files = await fs.readdir(azFolder);
 
         const steps = countTransientSteps(files);
@@ -4730,8 +4341,8 @@ app.get('/api/load-field', async (req, res) => {
         }
 
         const base = file.replace(/\.(csv|tiff)$/i, '');
-        const tiffPath = path.join(BASE_DIR, resultPath, base + '.tiff');
-        const csvPath  = path.join(BASE_DIR, resultPath, base + '.csv');
+        const tiffPath = path.join(resolveResultDirectory(resultPath), base + '.tiff');
+        const csvPath  = path.join(resolveResultDirectory(resultPath), base + '.csv');
 
         const preferCsv = prefer === 'csv';
         const order = preferCsv ? [csvPath, tiffPath] : [tiffPath, csvPath];
@@ -4769,7 +4380,7 @@ app.get('/api/get-flux-linkage', async (req, res) => {
         if (!resultPath) {
             return res.json({ success: false, error: 'Missing result parameter' });
         }
-        const csvPath = path.join(BASE_DIR, resultPath, 'FluxLinkage', 'flux_linkage.csv');
+        const csvPath = path.join(resolveResultDirectory(resultPath), 'FluxLinkage', 'flux_linkage.csv');
         if (!await fileExists(csvPath)) {
             return res.json({
                 success: false,
@@ -4827,7 +4438,7 @@ app.get('/api/load-csv', async (req, res) => {
             return res.json({ success: false, error: 'Missing parameters' });
         }
 
-        const filePath = path.join(BASE_DIR, resultPath, file);
+        const filePath = path.join(resolveResultDirectory(resultPath), file);
         const content = await fs.readFile(filePath, 'utf8');
 
         // CSVをパース
@@ -4854,7 +4465,7 @@ app.get('/api/load-csv-raw', async (req, res) => {
             return res.status(400).send('Missing parameters');
         }
 
-        const filePath = path.join(BASE_DIR, resultPath, file);
+        const filePath = path.join(resolveResultDirectory(resultPath), file);
         const content = await fs.readFile(filePath, 'utf8');
 
         // Timeline CSVs may grow while a solve is running. Prevent browser or
@@ -4879,7 +4490,7 @@ app.get('/api/load-conditions', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const conditionsPath = path.join(BASE_DIR, resultPath, 'conditions.json');
+        const conditionsPath = path.join(resolveResultDirectory(resultPath), 'conditions.json');
 
         // ファイルが存在するか確認
         await fs.access(conditionsPath);
@@ -4904,7 +4515,7 @@ app.get('/api/get-boundary-image', async (req, res) => {
         }
 
         const stepName = `step_${String(step).padStart(4, '0')}`;
-        const imagePath = path.join(BASE_DIR, resultPath, 'BoundaryImg', `${stepName}.png`);
+        const imagePath = path.join(resolveResultDirectory(resultPath), 'BoundaryImg', `${stepName}.png`);
 
         // ファイルが存在するか確認
         await fs.access(imagePath);
@@ -4917,6 +4528,15 @@ app.get('/api/get-boundary-image', async (req, res) => {
 });
 
 // ステップ入力画像の取得
+app.get('/api/get-original-input',async(req,res)=>{
+    try {
+        const root=resolveResultDirectory(req.query.result),directory=path.join(root,'.inputs');
+        const name=(await fs.readdir(directory)).find(name=>/^model\.[A-Za-z0-9]+$/.test(name));
+        if(!name)return res.status(404).send('Original input was not saved in this result');
+        const filename=path.join(directory,name);await require('./automation/workspace').noLinks(filename);res.sendFile(filename);
+    }catch(error){res.status(error.statusCode||404).send('Original input unavailable');}
+});
+
 app.get('/api/get-step-input-image', async (req, res) => {
     try {
         const resultPath = req.query.result;
@@ -4927,7 +4547,7 @@ app.get('/api/get-step-input-image', async (req, res) => {
         }
 
         const stepName = `step_${String(step).padStart(4, '0')}`;
-        const imagePath = path.join(BASE_DIR, resultPath, 'InputImg', `${stepName}.png`);
+        const imagePath = path.join(resolveResultDirectory(resultPath), 'InputImg', `${stepName}.png`);
 
         // ファイルが存在するか確認
         await fs.access(imagePath);
@@ -4952,7 +4572,7 @@ app.get('/api/get-coarsening-mask', async (req, res) => {
 
         // Format step number with leading zeros (step_0001.png)
         const stepStr = String(step).padStart(4, '0');
-        const maskPath = path.join(BASE_DIR, resultPath, 'CoarseningMask', `step_${stepStr}.png`);
+        const maskPath = path.join(resolveResultDirectory(resultPath), 'CoarseningMask', `step_${stepStr}.png`);
 
         // Check if file exists
         await fs.access(maskPath);
@@ -4973,7 +4593,7 @@ app.get('/api/get-log', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const logPath = path.join(BASE_DIR, resultPath, 'log.txt');
+        const logPath = path.join(resolveResultDirectory(resultPath), 'log.txt');
 
         // Check if file exists
         await fs.access(logPath);
@@ -4995,7 +4615,7 @@ app.get('/api/get-conditions', async (req, res) => {
             return res.status(400).send('Missing result parameter');
         }
 
-        const conditionsPath = path.join(BASE_DIR, resultPath, 'conditions.json');
+        const conditionsPath = path.join(resolveResultDirectory(resultPath), 'conditions.json');
 
         // Check if file exists
         await fs.access(conditionsPath);
@@ -5026,7 +4646,7 @@ function logServerStarted() {
     console.log('  POST /api/config          - Save YAML configuration');
     console.log('  POST /api/upload-image    - Upload material image');
     console.log('  GET  /api/images          - List uploaded images');
-    console.log('  POST /api/solve           - Run FDM solver');
+    console.log('  POST /api/jobs            - Queue a persistent analysis (idempotencyKey required)');
     console.log('  GET  /api/results         - List result files');
     console.log('  GET  /api/detect-steps    - Detect number of transient steps');
     console.log('  GET  /api/load-csv        - Load CSV file for specific step');
@@ -5062,8 +4682,24 @@ function installShutdownHandlers() {
 function startServer() {
     if (httpServer) return httpServer;
     if (shuttingDown) throw new Error('Server has already started shutting down');
+    if (process.env.OPENMAGFDM_SKIP_INIT !== '1') {
+        const directory=require('./automation/access').privateDirectory(BASE_DIR);
+        fsSync.mkdirSync(directory,{recursive:true});
+        const lockFile=path.join(directory,'server-lock.json');
+        if(fsSync.existsSync(lockFile)) {
+            const previous=JSON.parse(fsSync.readFileSync(lockFile,'utf8'));
+            let alive=true;try{process.kill(previous.pid,0);}catch(error){if(error.code==='ESRCH')alive=false;else throw error;}
+            if(alive)throw Error('Another server is using this workspace');
+            fsSync.unlinkSync(lockFile);
+        }
+        fsSync.writeFileSync(lockFile,JSON.stringify({pid:process.pid}),{flag:'wx',mode:0o600});
+        process.once('exit',()=>{try{if(JSON.parse(fsSync.readFileSync(lockFile,'utf8')).pid===process.pid)fsSync.unlinkSync(lockFile);}catch{}});
+    }
     startJobCleanupTimer();
-    httpServer = app.listen(PORT, logServerStarted);
+    if(serverSettings.mode==='shared') {
+        if(!serverSettings.tlsCert||!serverSettings.tlsKey) throw Error('Shared mode requires TLS certificate and key');
+        httpServer=require('node:https').createServer({cert:fsSync.readFileSync(serverSettings.tlsCert),key:fsSync.readFileSync(serverSettings.tlsKey)},app).listen(PORT,serverSettings.host||'0.0.0.0',logServerStarted);
+    } else httpServer = app.listen(PORT, '127.0.0.1', logServerStarted);
     if (process.env.OPENMAGFDM_SKIP_INIT !== '1') void automation.init().then(() => {
         if (automation.ready) {
             console.log(`MCP management pairing code: ${automation.access.pairingCode}`);
@@ -5163,7 +4799,7 @@ const { AutomationRuntime } = require('./automation/runtime');
 const automation = new AutomationRuntime(BASE_DIR, {
     configureSolver: saved => { SOLVER_PATH = solverLocation.locate(BASE_DIR,saved).path; },
     solverStatus: () => ({...solverLocation.locate(BASE_DIR,automation.access.state.solverPath),activePath:SOLVER_PATH}),
-    jobs, submitAnalysisJob, mergeLibraryIntoConfig, isChildRunning, terminateChildProcess, userHasActiveSolver,
+    jobs, submitAnalysisJob, mergeLibraryIntoConfig, isChildRunning, terminateChildProcess, userHasActiveSolver, getSolverVersion, maxConcurrentJobs: MAX_CONCURRENT_JOBS, workspaceEnabled: user=>accounts.workspaceEnabled(user),
     detectPolarGeometry, warpPolar, quantizeImage
 });
 automation.install(app);

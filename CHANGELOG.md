@@ -3,6 +3,15 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/research/`.
 
+## 1.7.1 — 2026-10-22 (release preparation)
+
+- Unify WebUI/MCP jobs with durable queues, reconnectable controls, idempotency and frozen inputs.
+- Add result descriptions, aspect locking, image-independent field lines and tracked asynchronous deletion.
+- Retain plots during step preparation and expose preload/cache diagnostics.
+- Add CLI storage migration and account/workspace management with explicit HTTPS sharing.
+- Keep existing 2D YAML semantics; exclude experimental GPU and 3D features from release packages.
+- See `docs/RELEASE_NOTES_v1.7.1.md` for API migration and remaining release acceptance checks.
+
 ## 1.7.0 — 2026-10-19
 
 - Refresh the WebUI workspace, result loading guidance and YAML assistance.

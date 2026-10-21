@@ -200,4 +200,4 @@ class Access {
     }
     async flush() { await Promise.allSettled([...this.auditWrites, this.pairingWrite]); }
 }
-module.exports = { Access, PERMISSIONS, privateDirectory, atomicJSON, localRequest, hash, windowsSystemCommand };
+module.exports = { Access, PERMISSIONS, privateDirectory, atomicJSON, localRequest, hash, windowsSystemCommand, ensurePrivateDirectory:restrict };

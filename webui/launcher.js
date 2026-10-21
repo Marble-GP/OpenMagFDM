@@ -2,7 +2,9 @@
 // Dispatch BEFORE loading server.js: a stdio client must never start another WebUI.
 const path=require('node:path');
 const base=process.pkg?path.dirname(process.execPath):path.join(__dirname,'..');
-if(process.argv.includes('--mcp-stdio')) {
+if(['users','workspaces','storage','network'].includes(process.argv[2])) {
+    require('./automation/admin-cli').run(base,process.argv.slice(2)).catch(error=>{console.error(error.message);process.exitCode=1;});
+} else if(process.argv.includes('--mcp-stdio')) {
     require('./automation/bridge').start(base,process.argv).catch(()=>{console.error('MCP connection unavailable. Start OpenMagFDM, enable MCP, and check the connection profile in Help / Integrations.');process.exitCode=1;});
 } else if(process.argv.includes('--mcp-admin-code')) {
     const {privateDirectory}=require('./automation/access');

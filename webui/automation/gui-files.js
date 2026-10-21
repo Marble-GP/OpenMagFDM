@@ -3,6 +3,13 @@
 // The legacy GUI workspace selector is not an authentication mechanism.
 const {Workspace, fail} = require('./workspace');
 function installFileRoutes(app, base, busy) {
+    const {FileOperations} = require('./operations');
+    const {privateDirectory} = require('./access');
+    let operations;
+    const getOperations = async () => {
+        operations ||= new FileOperations(base, privateDirectory(base), busy);
+        await operations.ready; return operations;
+    };
     const workspace = req => {
         const user = req.body?.userId || req.query.userId || 'default';
         return new Workspace(base, user, {busy: id => busy(user, id)});
@@ -18,6 +25,9 @@ function installFileRoutes(app, base, busy) {
         try { res.json({success: true, ...await fn(req, workspace(req))}); }
         catch (e) { res.status(e.statusCode || (e.code === 'ENOENT' ? 404 : 500)).json({success: false, code: e.code || 'OPERATION_FAILED', error: e.statusCode ? e.message : 'File operation failed'}); }
     };
+    app.post('/api/file-operations', route(async (req, ws) => ({operation: await (await getOperations()).start(ws.user, req.body.files)})));
+    app.get('/api/file-operations', route(async (req, ws) => ({operations: (await getOperations()).list(ws.user)})));
+    app.get('/api/file-operations/:id', route(async (req, ws) => ({operation: (await getOperations()).get(ws.user, req.params.id)})));
     app.get('/api/workspace/file', route(async (req, ws) => {
         try { return {file: await ws.describe(req.query.id)}; }
         catch (e) { if (e.code === 'ENOENT') return {file: null}; throw e; }

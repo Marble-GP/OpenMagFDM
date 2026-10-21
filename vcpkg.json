@@ -1,6 +1,6 @@
 {
   "name": "openmagfdm",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "dependencies": [
     "eigen3",
     "opencv4",

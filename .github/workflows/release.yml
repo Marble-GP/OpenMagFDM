@@ -54,6 +54,7 @@ jobs:
         cp -r webui release/OpenMagFDM-Linux/
         cp -r sample_config.yaml release/OpenMagFDM-Linux/
         cp general_materials.yaml release/OpenMagFDM-Linux/
+        python3 tools/stage-release.py release/OpenMagFDM-Linux
         cd release
         tar -czf OpenMagFDM-Linux-x86_64.tar.gz OpenMagFDM-Linux
 
@@ -128,6 +129,7 @@ jobs:
         Copy-Item -Recurse webui release/OpenMagFDM-Windows/
         Copy-Item sample_config.yaml release/OpenMagFDM-Windows/
         Copy-Item general_materials.yaml release/OpenMagFDM-Windows/
+        python tools/stage-release.py release/OpenMagFDM-Windows
 
         # Debug: Show directory structure
         Write-Host "=== Workspace structure ==="
@@ -309,6 +311,7 @@ jobs:
         cp -r webui release/OpenMagFDM-macOS/
         cp sample_config.yaml release/OpenMagFDM-macOS/
         cp general_materials.yaml release/OpenMagFDM-macOS/
+        python3 tools/stage-release.py release/OpenMagFDM-macOS
         cd release
         tar -czf OpenMagFDM-macOS-x86_64.tar.gz OpenMagFDM-macOS
 
@@ -356,6 +359,7 @@ jobs:
         cp ../CHANGELOG.md OpenMagFDM-WebUI-Linux/
         cp ../sample_config.yaml OpenMagFDM-WebUI-Linux/   # default config the server loads on startup
         cp ../general_materials.yaml OpenMagFDM-WebUI-Linux/
+        python3 ../tools/stage-release.py OpenMagFDM-WebUI-Linux
         tar -czf OpenMagFDM-WebUI-Linux.tar.gz OpenMagFDM-WebUI-Linux
 
         # Windows
@@ -368,6 +372,7 @@ jobs:
         cp ../CHANGELOG.md OpenMagFDM-WebUI-Windows/
         cp ../sample_config.yaml OpenMagFDM-WebUI-Windows/   # default config the server loads on startup
         cp ../general_materials.yaml OpenMagFDM-WebUI-Windows/
+        python3 ../tools/stage-release.py OpenMagFDM-WebUI-Windows
         zip -r OpenMagFDM-WebUI-Windows.zip OpenMagFDM-WebUI-Windows
 
         # macOS
@@ -381,6 +386,7 @@ jobs:
         cp ../CHANGELOG.md OpenMagFDM-WebUI-macOS/
         cp ../sample_config.yaml OpenMagFDM-WebUI-macOS/   # default config the server loads on startup
         cp ../general_materials.yaml OpenMagFDM-WebUI-macOS/
+        python3 ../tools/stage-release.py OpenMagFDM-WebUI-macOS
         tar -czf OpenMagFDM-WebUI-macOS.tar.gz OpenMagFDM-WebUI-macOS
 
     - name: Upload artifacts
@@ -422,14 +428,14 @@ jobs:
 
     - name: Create NSIS installer script
       env:
-        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.7.0")
+        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.7.1")
         # for tag-triggered runs and the branch name for manual dispatch.
-        # We extract the numeric "1.7.0" form, with a hardcoded fallback so
+        # We extract the numeric "1.7.1" form, with a hardcoded fallback so
         # a workflow_dispatch from a feature branch still produces a
         # reasonable installer label.
         TAG_NAME: ${{ github.ref_name }}
       run: |
-        $version = "1.7.0"
+        $version = "1.7.1"
         if ($env:TAG_NAME -match '^v?(\d+\.\d+\.\d+)') {
             $version = $matches[1]
         }
@@ -512,7 +518,7 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v3
       with:
-        body_path: docs/RELEASE_NOTES_v1.7.0.md
+        body_path: docs/RELEASE_NOTES_v1.7.1.md
         files: |
           artifacts/OpenMagFDM-Linux-x86_64/OpenMagFDM-Linux-x86_64.tar.gz
           artifacts/OpenMagFDM-Windows-x86_64/OpenMagFDM-Windows-x86_64.zip

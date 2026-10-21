@@ -1,10 +1,12 @@
 {
   "name": "magfdm-visualizer",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "Web UI for MagFDMsolver visualization",
   "main": "server.js",
   "bin": "launcher.js",
-  "engines": { "node": ">=24 <25" },
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "start": "node launcher.js",
     "dev": "node launcher.js",
@@ -31,6 +33,20 @@
     "js-yaml": "^4.1.0",
     "multer": "^1.4.5-lts.1"
   },
-  "devDependencies": { "@yao-pkg/pkg": "6.23.0" },
-  "pkg": { "scripts": ["server.js", "automation/**/*.js", "public/workspace-core.js", "public/yaml-intellisense.js", "node_modules/@modelcontextprotocol/server/dist/**/*.cjs", "node_modules/@modelcontextprotocol/client/dist/**/*.cjs"], "assets": ["public/yaml-schema.json"] }
+  "devDependencies": {
+    "@yao-pkg/pkg": "6.23.0"
+  },
+  "pkg": {
+    "scripts": [
+      "server.js",
+      "automation/**/*.js",
+      "public/workspace-core.js",
+      "public/yaml-intellisense.js",
+      "node_modules/@modelcontextprotocol/server/dist/**/*.cjs",
+      "node_modules/@modelcontextprotocol/client/dist/**/*.cjs"
+    ],
+    "assets": [
+      "public/yaml-schema.json"
+    ]
+  }
 }

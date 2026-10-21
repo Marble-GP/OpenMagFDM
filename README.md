@@ -3,10 +3,13 @@
 OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対して磁界計算を行うツール群です。
 コアは C++ で書かれた数値ソルバー(MagFDMsolver)と、結果の可視化や操作を行う Node.js ベースの WebUI から構成されています。
 
-> **Current version: v1.7.0** — 正規のYAML仕様は
+> **Current version: v1.7.1** — 正規のYAML仕様は
 > [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)、変更点は
-> [`docs/RELEASE_NOTES_v1.7.0.md`](docs/RELEASE_NOTES_v1.7.0.md)、全体履歴は
+> [`docs/RELEASE_NOTES_v1.7.1.md`](docs/RELEASE_NOTES_v1.7.1.md)、全体履歴は
 > [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
+
+永続ジョブ・共有HTTPS・保存先移行の手順と未完了の検証項目は
+[`docs/V1_7_1_OPERATIONS.md`](docs/V1_7_1_OPERATIONS.md)にまとめています。
 
 <!-- <img width="1452" height="914" alt="thumbnail" src="https://github.com/user-attachments/assets/5b6d7e0b-32bf-48f7-bb47-30206aad8b22" /> -->
 [!['チュートリアル動画'](https://github.com/user-attachments/assets/5b6d7e0b-32bf-48f7-bb47-30206aad8b22)](https://youtu.be/YvBkXMhFDTs)

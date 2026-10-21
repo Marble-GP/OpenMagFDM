@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <yaml-cpp/yaml.h>
 #include "json.hpp"
+#include "InputSnapshot.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -23,7 +24,7 @@ using json = nlohmann::json;
 
 namespace {
 #ifndef OPENMAGFDM_VERSION_STRING
-#define OPENMAGFDM_VERSION_STRING "1.7.0"
+#define OPENMAGFDM_VERSION_STRING "1.7.1"
 #endif
 constexpr const char* OPENMAGFDM_VERSION = OPENMAGFDM_VERSION_STRING;
 }
@@ -615,6 +616,8 @@ int main(int argc, char* argv[]) {
         std::cout << "\nOutput folder not specified. Using timestamp: " << base_folder << std::endl;
     }
 
+    base_folder = std::filesystem::absolute(base_folder).string();
+
     // Create the output folder before exporting conditions.json.  Native
     // filesystem APIs handle spaces and nested user paths consistently on
     // Windows, macOS, and Linux (the old shell mkdir could fail silently).
@@ -633,6 +636,8 @@ int main(int argc, char* argv[]) {
     std::cout.rdbuf(&tee_buffer);
 
     try {
+        omfdm::saveInputSnapshot(base_folder, config_path, image_path, OPENMAGFDM_VERSION);
+        std::filesystem::current_path(base_folder);
         // Export analysis conditions to JSON (before initialization)
         std::cout << "\n=== Exporting Conditions ===" << std::endl;
         exportConditionsJSON(base_folder + "/conditions.json", config_path, image_path);

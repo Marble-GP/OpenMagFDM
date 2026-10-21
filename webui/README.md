@@ -1,4 +1,9 @@
-# OpenMagFDM WebUI v1.7.0
+# OpenMagFDM WebUI v1.7.1
+
+This checkout contains v2 development changes. See the
+[v2 implementation and operations notes](../docs/V1_7_1_OPERATIONS.md) for
+persistent jobs, shared HTTPS accounts, storage migration and experimental GPU
+rendering, including uncompleted acceptance tests and retired API endpoints.
 
 The WebUI is the browser-based editor, preprocessor, solver launcher and result
 viewer for OpenMagFDM. It runs on Node.js/Express and is also distributed as a
@@ -37,7 +42,7 @@ package or in the configured development paths. Use `GET /api/health` and
 - Detect and interactively correct polar geometry, then warp and insert YAML.
 - Generate a Cartesian/Linear template directly from an existing strip image.
 - Preview permanent-magnet directions, including polar coordinate conversion.
-- Launch/stop analyses and follow streaming logs.
+- Queue/cancel persistent analyses and reconnect to their progress and logs.
 - View TIFF or CSV fields, flux linkage, energy, force and torque timelines.
 - Manage configurations, uploaded analysis images, material libraries and
   result folders together from the File Manager tab, including select-all and
@@ -131,7 +136,7 @@ node --test tests/process_lifecycle.test.js
 - Configuration: `/api/config*`, `/api/validate-config`
 - Images/preprocess: `/api/images*`, `/api/materials/detect`,
   `/api/preprocess-filter/*`, `/api/preprocess-polar/*`
-- Solver/jobs: `/api/solve*`, `/api/stop-solver`, `/api/jobs*`
+- Solver/jobs: `/api/jobs*` (legacy solve/stop routes return HTTP 410)
 - Results/files: `/api/results*`, `/api/user-files`, `/api/user-outputs*`, `/api/load-field`,
   `/api/get-flux-linkage`
 - Libraries/backups: `/api/material-libraries*`, `/api/backup-manifest`,

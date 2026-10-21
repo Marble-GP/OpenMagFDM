@@ -1,0 +1,77 @@
+[
+  {
+    "file": "plotly.js",
+    "url": "https://cdn.plot.ly/plotly-2.27.0.min.js",
+    "sha256": "7f4930eba8f8541dbec28dca5bd5f787f8eef1cde0369ac9657b70bed230b3e0"
+  },
+  {
+    "file": "gridstack.min.css",
+    "url": "https://cdn.jsdelivr.net/npm/gridstack@9.5.1/dist/gridstack.min.css",
+    "sha256": "f64d3f9de138f87c0e3061206197e3a7cdc1ae4edf2e3dc6717500470bc17b8f"
+  },
+  {
+    "file": "gridstack-extra.min.css",
+    "url": "https://cdn.jsdelivr.net/npm/gridstack@9.5.1/dist/gridstack-extra.min.css",
+    "sha256": "2c4fbb95648502ecee4ba9b16a099563391a94c86632f555282ce2068dcba038"
+  },
+  {
+    "file": "gridstack-all.js",
+    "url": "https://cdn.jsdelivr.net/npm/gridstack@9.5.1/dist/gridstack-all.js",
+    "sha256": "bacf86f82bcfc05a8ec7a683de24cc0596db52930a61bb485a6fd7fa084a5a67"
+  },
+  {
+    "file": "js-yaml.min.js",
+    "url": "https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js",
+    "sha256": "45dc3dd03dc07a06705a2c2989b8c7f709013f04bd5386e3279d4e447f07ebd7"
+  },
+  {
+    "file": "ace/ace.js",
+    "url": "https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/ace.js",
+    "sha256": "3e5201f177b67a9f0d41b88443769e8d313166294a7cd08cf5891acd4df8aa3c"
+  },
+  {
+    "file": "ace/ext-language_tools.js",
+    "url": "https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/ext-language_tools.js",
+    "sha256": "35d9b72dcfcc16e9032d486d1c8a4575e56723e8cbd2bd6b5da176f31eb73f8a"
+  },
+  {
+    "file": "ace/mode-yaml.js",
+    "url": "https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/mode-yaml.js",
+    "sha256": "25afd0b54386dae0f9389c14c25c149d14ff86a6ec23e94391469f7a83bd302b"
+  },
+  {
+    "file": "ace/worker-yaml.js",
+    "url": "https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/worker-yaml.js",
+    "sha256": "d23ba434c505648724922c660856944a7bc807619bb2c5ce7a69975f092f90b9"
+  },
+  {
+    "file": "ace/theme-monokai.js",
+    "url": "https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/theme-monokai.js",
+    "sha256": "d8a164b9d4eb6af1bd915bc733658b26f5b3afdd135fe0c673a4f6431a06d64f"
+  },
+  {
+    "file": "ace/ext-searchbox.js",
+    "url": "https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/ext-searchbox.js",
+    "sha256": "426a5545d13b834f47c46df457be92b3b8b8a1d848e6fd9fea4183bc0a61ddff"
+  },
+  {
+    "file": "plotly-LICENSE",
+    "url": "https://cdn.jsdelivr.net/npm/plotly.js@2.27.0/LICENSE",
+    "sha256": "67a26cf80f03ff388f26945dfc1f6caed1a0746ff43871190339b3aee49b94bb"
+  },
+  {
+    "file": "gridstack-LICENSE",
+    "url": "https://cdn.jsdelivr.net/npm/gridstack@9.5.1/LICENSE",
+    "sha256": "85d658234d18753809b8a786281339cd63fa8e0c7a99948103779e48b44ccd84"
+  },
+  {
+    "file": "ace-LICENSE",
+    "url": "https://cdn.jsdelivr.net/npm/ace-builds@1.32.2/LICENSE",
+    "sha256": "850f545c5254e8c08204edb2a6d50bbb72727c38a82982c17a84bebf6064cdf8"
+  },
+  {
+    "file": "js-yaml-LICENSE",
+    "url": "https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/LICENSE",
+    "sha256": "a07bc24468b9654ce76a547d47a2db282d07733b715db4c73a98bd63961f9550"
+  }
+]

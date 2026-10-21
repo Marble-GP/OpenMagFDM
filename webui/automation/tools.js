@@ -39,6 +39,7 @@ const definitions = [
     ['analysis_list','read','List this workspace\'s automation analyses, including interrupted records.',{}],
     ['analysis_get','read','Get owned job progress, convergence/warnings and bounded log tail.',{jobId:z.uuid()}],
     ['analysis_cancel','cancel','Request cancellation of a job in this workspace.',{jobId:z.uuid()}],
+    ['analysis_resume','run','Resume held queued jobs in this workspace after a server restart. Interrupted computations are not resumed.',{}],
     ['result_summary','read','Get conditions, recorded convergence/warnings and available Az steps. Unknown convergence is never reported as success.',{id,...page}],
     ['results_table','read','Read a bounded row/column window of a CSV field or waveform; no full-matrix buffering.',{id,row:page.offset,rows:z.number().int().min(1).max(200).default(50),column:page.offset,columns:z.number().int().min(1).max(200).default(20)}],
     ['result_description','edit','Set a result description without changing calculation data.',{id,content:z.string().max(8192),expectedRevision:expected}]
@@ -62,7 +63,7 @@ const outputs={
     transfer_release:z.object({released:z.uuid()}),
     backup_preview:z.object({files:z.array(z.object({id,size:z.number(),expectedRevision:expected})),permanentReplacement:z.boolean()}),
     backup_import:z.object({applied:z.array(id)}),
-    analysis_start:job,analysis_get:job.extend({logTail:z.array(z.string())}),analysis_cancel:job.extend({logTail:z.array(z.string())}),analysis_list:z.object({jobs:z.array(job)}),
+    analysis_start:job,analysis_get:job.extend({logTail:z.array(z.string())}),analysis_cancel:job.extend({logTail:z.array(z.string())}),analysis_list:z.object({jobs:z.array(job)}),analysis_resume:z.object({jobs:z.array(job)}),
     result_summary:z.object({id,status:z.string(),converged:z.boolean().nullable(),conditions:z.unknown(),steps:z.array(z.number()),totalSteps:z.number(),nextOffset:z.number().nullable(),warnings:z.array(z.string())}),
     results_table:z.object({row:z.number(),column:z.number(),rows:z.array(z.array(z.string())),nextRow:z.number().nullable()})
 };
@@ -98,6 +99,7 @@ async function table(ws,input) {
     return {row:input.row,column:input.column,rows,nextRow:rows.length===input.rows?input.row+rows.length:null};
 }
 async function execute(name,input,actor,services) {
+    if(!(await services.backend.workspaceEnabled?.(actor.user) ?? true)) fail('FORBIDDEN','Workspace is unassigned or disabled',403);
     const ws=new Workspace(services.base,actor.user,{guard:actor.guard,busy:id=>services.jobs.busy(actor.user,id)});
     switch(name) {
         case 'workspace_status': return {workspace:actor.user,permissions:services.access.state.connections.find(c=>c.id===actor.id).permissions,jobs:services.jobs.list(actor.user)};
@@ -127,6 +129,7 @@ async function execute(name,input,actor,services) {
         case 'analysis_list': return {jobs:services.jobs.list(actor.user)};
         case 'analysis_get': return services.jobs.get(actor.user,input.jobId);
         case 'analysis_cancel': return services.jobs.cancel(actor.user,input.jobId,actor.guard);
+        case 'analysis_resume': return {jobs:await services.jobs.resume(actor.user)};
         case 'result_summary': {
             if(!/^results\/[^/]+$/.test(input.id))fail('INVALID_INPUT','Expected a result directory ID');
             await ws.resolve(input.id);

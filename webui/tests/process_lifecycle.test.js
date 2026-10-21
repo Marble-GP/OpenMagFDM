@@ -206,7 +206,7 @@ test('SSE backpressure timeout destroys a stalled response and terminates the ch
     assert.deepEqual(child.killCalls, ['SIGTERM']);
 });
 
-test('interactive and job endpoints reject cross-mode overlap for one user', async (t) => {
+test('retired interactive endpoints cannot launch a parallel execution manager', async (t) => {
     lifecycle.jobs.clear();
     lifecycle.runningProcesses.clear();
     const httpServer = server.startServer();
@@ -228,7 +228,9 @@ test('interactive and job endpoints reject cross-mode overlap for one user', asy
     const interactiveResponse = await postJson(httpServer, '/api/solve', {
         userId: 'shared-user'
     });
-    assert.equal(interactiveResponse.statusCode, 409);
+    assert.equal(interactiveResponse.statusCode, 410);
+    assert.deepEqual(jobChild.killCalls, []);
+    for(const endpoint of ['/api/solve-stream','/api/stop-solver'])assert.equal((await postJson(httpServer,endpoint,{userId:'shared-user'})).statusCode,410);
 
     lifecycle.jobs.clear();
     const interactiveChild = fakeChild();

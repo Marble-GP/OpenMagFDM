@@ -6,16 +6,16 @@
     <title>OpenMagFDM - Integrated Environment</title>
 
     <!-- External Libraries -->
-    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@9/dist/gridstack.min.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/gridstack@9/dist/gridstack-extra.min.css" />
+    <script src="vendor/plotly.js"></script>
+    <link rel="stylesheet" href="vendor/gridstack.min.css" />
+    <link rel="stylesheet" href="vendor/gridstack-extra.min.css" />
 
     <!-- Ace Editor for YAML Editing with Syntax Highlighting and Autocomplete -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/ace.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.2/ext-language_tools.js"></script>
+    <script src="vendor/ace/ace.js"></script>
+    <script src="vendor/ace/ext-language_tools.js"></script>
 
     <!-- js-yaml for YAML parsing and validation -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+    <script src="vendor/js-yaml.min.js"></script>
 
     <!-- Vendored geotiff UMD bundle for client-side TIFF decoding. Served by
          server.js as a static file so the standalone (pkg) build works
@@ -1375,7 +1375,8 @@
                             <div id="solverProgressBar" style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); height: 100%; width: 0%; transition: width 0.3s ease;"></div>
                         </div>
                     </div>
-                    <div id="solverOutput" style="background: #f8f9fa; padding: 10px; margin-top: 15px; border-radius: 5px; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap;"></div>
+                    <section><h4>Analysis jobs</h4><div id="jobsConnection" role="status"></div><div id="analysisJobs"></div></section>
+<div id="solverOutput" style="background: #f8f9fa; padding: 10px; margin-top: 15px; border-radius: 5px; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap;"></div>
                 </div>
 
                 <!-- Results Preview (Full Width) -->
@@ -1421,6 +1422,13 @@
                 </div>
                 <p id="resultSelectionHint">Selecting a result does not change the plots until you load it.</p>
                 <p id="resultLoadStatus" role="status" aria-live="polite"></p>
+                <section id="resultMemoEditor" hidden><p><a id="resultOriginalInput" target="_blank" rel="noopener">Original input image (initial state)</a></p>
+                    <label for="resultMemoText">Description / メモ — <span id="resultMemoTitle"></span></label>
+                    <textarea id="resultMemoText" rows="4" style="display:block;width:100%;box-sizing:border-box" disabled></textarea>
+                    <button id="resultMemoSave" class="btn-primary" onclick="ResultImprovements.save()" disabled>保存</button>
+                    <button class="btn-secondary" onclick="ResultImprovements.description(document.getElementById('resultMemoTitle').textContent)">再読込</button>
+                    <span id="resultMemoStatus" role="status"></span>
+                </section>
                 <dl class="results-current">
                     <div><dt>Loaded result</dt><dd id="loadedResultName">None</dd></div>
                     <div><dt>Coordinates</dt><dd id="loadedResultCoordinates">—</dd></div>
@@ -1431,6 +1439,7 @@
                     <summary>Display options &amp; data format</summary>
                     <div id="resultMetaBadge"></div>
                     <div id="polarControls" style="display: none;">
+                        <label><input type="checkbox" id="polarAspectLocked" checked onchange="ResultImprovements.aspect(this.checked)"> 縦横比を固定 (XY)</label>
                         <label><input type="checkbox" id="polarCartesianTransform" onchange="toggleCartesianTransform()"> Cartesian Transform (Arc/Donut view)</label>
                         <label><input type="checkbox" id="polarFullModel" onchange="toggleFullModel()"> Full Model (×<span id="fullModelMultiplier">N</span>)</label>
                         <div id="polarInfo"></div>
@@ -1540,7 +1549,12 @@
                                 <option value="100">Very Fast</option>
                             </select>
                         </label>
-                        <button id="preloadBtn" class="btn-secondary" onclick="preloadAllSteps()" style="min-width: 100px; margin-left: 10px;">Preload All</button>
+                        <label>Renderer <select id="fieldRenderer" onchange="refreshAllPlots()"><option value="auto">Auto (validated legacy)</option><option value="legacy">Legacy</option></select></label>
+                        <button id="preloadBtn" class="btn-secondary" onclick="preloadAllSteps()" style="min-width: 100px; margin-left: 10px;">Preload All</button><p id="fieldCacheStatus" role="status"></p>
+                        <label>Benchmark minutes <input id="benchmarkMinutes" type="number" min="1" max="30" value="1" style="width:4em"></label>
+                        <button onclick="FieldMetrics.benchmark()">Measure step changes</button>
+                        <button id="benchmarkStop" disabled onclick="FieldMetrics.stop()">Stop</button>
+                        <button onclick="FieldMetrics.csv()">Export timing CSV</button><span id="benchmarkStatus" role="status"></span>
 
                         <!-- Step Slider -->
                         <label style="margin-left: 15px;">Step: <span id="currentStep">1</span>/<span id="totalStepsDisplay">1</span></label>
@@ -2169,7 +2183,7 @@
     </div>
 
     <!-- GridStack.js -->
-    <script src="https://cdn.jsdelivr.net/npm/gridstack@9/dist/gridstack-all.js"></script>
+    <script src="vendor/gridstack-all.js"></script>
 
     <!-- Application JavaScript -->
     <script src="yaml-intellisense.js"></script>
@@ -2177,6 +2191,11 @@
     <script src="workspace.js"></script>
     <script src="results-workspace.js"></script>
     <script src="mcp-panel.js"></script>
+    <script src="auth-client.js"></script>
     <script src="app.js"></script>
+    <script src="result-improvements.js"></script>
+    <script src="jobs-panel.js"></script>
+    <script src="field-metrics.js"></script>
+    <script src="neighbor-preload.js"></script>
 </body>
 </html>
