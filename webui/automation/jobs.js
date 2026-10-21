@@ -169,6 +169,7 @@ class AnalysisJobs {
                         if (seen.has(obj)) fail('INVALID_CONFIG', 'Recursive/aliased configuration objects are not supported for automation');
                         seen.add(obj);
                         for (const [k,v] of Object.entries(obj)) {
+                            if (obj === parsed && k === 'model_3d') continue; // inactive 3D inputs must not constrain 2D jobs
                             if (++visited > 50000) fail('LIMIT_EXCEEDED', 'Configuration is too complex');
                             if (REFERENCE_KEYS.has(k) && v !== '') {
                                 if (typeof v !== 'string') fail('INVALID_PATH', 'File references must be workspace IDs');

@@ -43,7 +43,7 @@ test('queue freezes inputs, deduplicates, recovers held jobs and cancels without
     const jobs=new Map(),callbacks=new Map();let starts=0;
     const backend={jobs,maxConcurrentJobs:1,async submitAnalysisJob(input,options){starts++;jobs.set(options.jobId,{jobId:options.jobId,userId:input.userId,status:'running',process:{},log:[]});callbacks.set(options.jobId,options.onFinalized);}};
     const service=new AnalysisJobs(base,{directory},backend);await service.init();
-    const ws=new Workspace(base,'wa');await ws.init();await fs.writeFile(await ws.resolve('configs/model.yaml',{create:true}),'coordinate_system: cartesian\n');await fs.writeFile(await ws.resolve('images/model.png',{create:true}),'image bytes');
+    const ws=new Workspace(base,'wa');await ws.init();await fs.writeFile(await ws.resolve('configs/model.yaml',{create:true}),'coordinate_system: cartesian\nmodel_3d:\n  geometry: {voxels: missing.vti}\n  initial_az_path: missing-inactive.bin\n');await fs.writeFile(await ws.resolve('images/model.png',{create:true}),'image bytes');
     const input={config:{id:'configs/model.yaml',revision:(await ws.describe('configs/model.yaml')).revision},image:{id:'images/model.png',revision:(await ws.describe('images/model.png')).revision},idempotencyKey:'1'};
     const actor={id:'a',name:'test',user:'wa',guard:()=>{}};
     const first=await service.start(actor,input);assert.equal(first.status,'running');
@@ -52,6 +52,7 @@ test('queue freezes inputs, deduplicates, recovers held jobs and cancels without
     await fs.writeFile(await ws.resolve('images/model.png'),'changed source');
     const record=service.records.find(r=>r.jobId===second.jobId);
     assert.equal(await fs.readFile(record.prepared.imagePath,'utf8'),'image bytes');
+    assert.match(await fs.readFile(record.prepared.configPath,'utf8'), /missing-inactive.bin/);
     const restored=new AnalysisJobs(base,{directory},{...backend,jobs:new Map()});await restored.init();
     assert.equal(restored.get('wa',first.jobId).status,'interrupted');assert.equal(restored.get('wa',second.jobId).status,'held');
     assert.equal((await restored.cancel('wa',second.jobId,()=>{})).status,'cancelled');assert.equal(starts,1);

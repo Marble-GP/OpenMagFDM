@@ -8,7 +8,7 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 > [`docs/RELEASE_NOTES_v1.7.1.md`](docs/RELEASE_NOTES_v1.7.1.md)、全体履歴は
 > [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
 
-永続ジョブ・共有HTTPS・保存先移行の手順と未完了の検証項目は
+この作業ツリーのv2開発状況、永続ジョブ・共有HTTPS・保存先移行の手順と未完了の検証項目は
 [`docs/V1_7_1_OPERATIONS.md`](docs/V1_7_1_OPERATIONS.md)にまとめています。
 
 <!-- <img width="1452" height="914" alt="thumbnail" src="https://github.com/user-attachments/assets/5b6d7e0b-32bf-48f7-bb47-30206aad8b22" /> -->
@@ -18,6 +18,12 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 ## 概要
 
 本プロジェクトは上記の二つの主要コンポーネント（C++ ソルバーと WebUI）で構成されています。
+
+v2.0.0に向けた3D入力の試作として、STEPの閉じたソリッドから材料ID付きボクセル格子
+（`.vti`）と四角形の表面メッシュ（`.vtp`）を生成する独立C++ツール
+[MagVoxelizer](tools/voxelizer/README.md)を追加しています。サンプルSTEP・使用方法・検証範囲はリンク先を参照してください。
+ブラウザーで粒度ごとの生成・描画負荷を比較するローカルHTMLツールは
+[Voxel Lab](tools/voxelizer/browserlab/README.md)を参照してください。
 
 - コア: C++ ソルバー（C++17 準拠）
 - ビルド: CMake を使用

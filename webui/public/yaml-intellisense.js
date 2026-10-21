@@ -13,7 +13,7 @@
         'polar_boundary_conditions', 'boundary_conditions', 'materials', 'material_presets',
         'flux_linkage', 'transient', 'nonlinear_solver', 'domain_decomposition', 'export', 'image_path'];
     const extra = {
-        '': ['dx', 'dy', 'polar', 'boundary'], // accepted legacy CLI aliases, not suggested
+        '': ['dx', 'dy', 'polar', 'boundary', 'model_3d'], // accepted inactive extension and legacy aliases, not suggested
         'nonlinear_solver': ['initial_az_path', 'gmres_restart', 'jacobian', 'line_search_objective',
             'use_galerkin_coarsening', 'use_matrix_free_jv', 'use_phase6_precond_jfnk',
             'precond_update_frequency', 'precond_verbose', 'fine_finishing_iterations',
@@ -40,6 +40,7 @@
         'image_path': {type: 'string', description: 'Model image path used by the WebUI. Does not define grid spacing.'},
     };
     function children(path, schema, includeHidden = true) {
+        if (path[0] === 'model_3d') return null; // independent schema, preserved without 2D interpretation
         const p = pattern(path);
         if (!path.length) return [...rootKeys, ...(includeHidden ? extra[''] : [])];
         if (path[0] === 'polar') return children(['polar_domain', ...path.slice(1)], schema, includeHidden);
@@ -146,6 +147,7 @@
             } else {
                 const allowed = children(path, schema);
                 for (const [key, v] of Object.entries(value)) {
+                    if (path.length === 0 && key === 'model_3d') continue;
                     const at = [...path, key];
                     if (allowed && !allowed.includes(key)) { report(at, `Unknown or misplaced key; allowed here: ${allowed.join(', ')}.`); continue; }
                     // Named material and variable entries are not keyword definitions.

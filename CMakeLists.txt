@@ -100,6 +100,9 @@ target_include_directories(omfdm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE
 target_link_libraries(MagFDMsolver PRIVATE omfdm_core)
 
 if(BUILD_TESTING)
+    add_executable(yaml_dimension_compat_test tests/yaml_dimension_compat_test.cpp)
+    target_link_libraries(yaml_dimension_compat_test PRIVATE omfdm_core)
+    add_test(NAME yaml_dimension_compat COMMAND yaml_dimension_compat_test "${CMAKE_CURRENT_BINARY_DIR}/dimension-compat")
     add_executable(input_snapshot_test tests/input_snapshot_test.cpp)
     target_include_directories(input_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(input_snapshot_test PRIVATE yaml-cpp::yaml-cpp)

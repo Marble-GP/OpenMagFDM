@@ -1,0 +1,12 @@
+{
+  "name": "openmagfdm-voxel-browser-lab",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor": "node prepare-vendor.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "three": "0.186.1"
+  }
+}

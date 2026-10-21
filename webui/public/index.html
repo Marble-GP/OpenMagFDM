@@ -1549,7 +1549,7 @@
                                 <option value="100">Very Fast</option>
                             </select>
                         </label>
-                        <label>Renderer <select id="fieldRenderer" onchange="refreshAllPlots()"><option value="auto">Auto (validated legacy)</option><option value="legacy">Legacy</option></select></label>
+                        <label>Renderer <select id="fieldRenderer" onchange="refreshAllPlots()"><option value="auto">Auto (validated legacy)</option><option value="legacy">Legacy</option><option value="gpu">GPU (experimental)</option></select></label>
                         <button id="preloadBtn" class="btn-secondary" onclick="preloadAllSteps()" style="min-width: 100px; margin-left: 10px;">Preload All</button><p id="fieldCacheStatus" role="status"></p>
                         <label>Benchmark minutes <input id="benchmarkMinutes" type="number" min="1" max="30" value="1" style="width:4em"></label>
                         <button onclick="FieldMetrics.benchmark()">Measure step changes</button>
@@ -2195,6 +2195,7 @@
     <script src="app.js"></script>
     <script src="result-improvements.js"></script>
     <script src="jobs-panel.js"></script>
+    <script src="field-gpu.js"></script>
     <script src="field-metrics.js"></script>
     <script src="neighbor-preload.js"></script>
 </body>

@@ -1,0 +1,11 @@
+{
+  "name": "openmagfdm-voxelizer",
+  "version": "0.1.0",
+  "builtin-baseline": "5d57f5a0a5469a23e005fc79a7c1814ab4fc967e",
+  "dependencies": [
+    {
+      "name": "opencascade",
+      "default-features": false
+    }
+  ]
+}

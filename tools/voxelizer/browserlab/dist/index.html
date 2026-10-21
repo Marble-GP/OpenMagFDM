@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OpenMagFDM · Voxel Lab</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="importmap">{"imports":{"three":"/vendor/three.module.js"}}</script>
+</head>
+<body>
+<header><div class="brand"><span class="mark">▦</span><div>OpenMagFDM <b>Voxel Lab</b><small>STEP → VOXELS → BROWSER PERFORMANCE</small></div></div><span class="connection" id="connection">接続中</span></header>
+<main>
+  <aside>
+    <section><div class="eyebrow">01 / MODEL</div><h2>形状を読み込む</h2>
+      <label class="drop">STEP / STP ファイルを選択<input id="file" type="file" accept=".step,.stp"></label>
+      <button id="sample" class="secondary wide">サンプル：7部品のローター</button>
+      <p id="modelInfo" class="muted">CADを選ぶと表示用メッシュを作成します。データはこのPC内で処理します。</p>
+    </section>
+    <section><div class="eyebrow">02 / GRID</div><h2>粒度と解析領域</h2>
+      <div class="two"><label>ボクセル辺長 <span>mm</span><input id="pitch" type="number" value="0.5" min=".001" max="1000" step=".05"></label>
+      <label>周囲の空気 <span>mm / 片側</span><input id="margin" type="number" value="2" min="0" max="1000" step=".5"></label></div>
+      <p class="hint">辺長を小さくするほど細かい格子になります。半分にするとセル数は概ね8倍。</p>
+      <button id="generate" class="primary wide" disabled>この粒度でボクセル生成</button>
+      <div id="downloads" hidden><a id="downloadVti">VTIを保存</a><a id="downloadManifest">条件JSON</a></div>
+    </section>
+    <section><div class="eyebrow">03 / DISPLAY</div><h2>描画条件</h2>
+      <label>表示対象<select id="display"><option value="voxel">ボクセル</option><option value="cad">STEP形状</option><option value="both">重ねて表示</option></select></label>
+      <label>ボクセルの描画方式<select id="mode"><option value="surface">表面抽出 — 材料境界だけ描画</option><option value="instances">全セル — InstancedMesh</option></select></label>
+      <div class="checkrow"><label><input id="air" type="checkbox"> 空気も描画</label><label><input id="wire" type="checkbox"> ワイヤー</label></div>
+      <label>部品の不透明度 <output id="solidValue">1.00</output><input id="solidAlpha" type="range" min="0" max="1" step=".01" value="1"></label>
+      <label>空気の不透明度 <output id="airValue">0.06</output><input id="airAlpha" type="range" min="0" max="1" step=".01" value=".06"></label>
+      <div class="two"><label>描画解像度<select id="dpr"><option value="1">1×</option><option value="2">2×</option></select></label>
+      <label class="check"><input id="rotate" type="checkbox" checked> 自動回転</label></div>
+      <button id="reset" class="secondary wide">視点をリセット</button>
+    </section>
+  </aside>
+  <div class="workspace">
+    <div class="viewport" id="viewport">
+      <div class="viewlabel"><span id="viewName">3D WORKSPACE</span><small>ドラッグ：回転 / ホイール：拡大縮小 / 右ドラッグ：移動</small></div>
+      <div id="empty"><span>▦</span><h1>格子の細かさを、<br>実際の描画で確かめる。</h1><p>STEPを読み込み、粒度を変えて比較してください。</p></div>
+      <div class="live"><b id="liveFps">—</b><span>FPS（参考値）</span><div id="liveCounts">モデル未読込</div></div>
+    </div>
+    <div class="statusbar"><span id="status" role="status" aria-live="polite">ローカルサーバーへ接続中…</span><button id="stop" disabled>停止</button></div>
+    <section class="bench">
+      <div class="benchhead"><div><div class="eyebrow">04 / BENCHMARK</div><h2>粒度を順番に変えて計測</h2></div><button id="export" class="secondary" disabled>CSVを書き出す</button></div>
+      <div class="benchcontrols"><label>辺長リスト <span>mm・入力順に実行</span><input id="pitches" value="2, 1, 0.5, 0.25"></label>
+        <button id="reverse" class="secondary">順序を反転</button><button id="measure" class="secondary" disabled>現在の表示を計測</button><button id="sweep" class="primary" disabled>連続生成・計測</button></div>
+      <p class="hint">各条件：ウォームアップ1秒＋自動回転3秒。計測中はタブを前面に置き、画面サイズを固定してください。非表示・リサイズ時の結果は無効として残します。</p>
+      <div class="tablewrap"><table><thead><tr><th>辺長 mm</th><th>表示条件</th><th>総セル / 材料セル</th><th>三角形 / Draw calls</th><th>C++生成 ms</th><th>JSメッシュ ms</th><th>FPS</th><th>フレーム p95 ms</th><th>CPU / GPU ms</th><th>状態</th></tr></thead><tbody id="results"><tr id="noResults"><td colspan="10">計測結果はここに蓄積されます。表面抽出と全セル描画の違いも比較できます。</td></tr></tbody></table></div>
+      <details><summary>計測値の読み方・現在の制限</summary><p>FPSは画面の更新周期で頭打ちになります。CPUはrenderer.render()呼出時間、GPUは対応ブラウザーでのみタイマークエリを使用し、非対応は「—」です。JSヒープ値は対応ブラウザーのみCSVへ記録し、GPU使用量は属性バッファの計算値（実VRAM使用量ではありません）。STEP表示は描画用の三角形近似、ボクセル判定は元CADのBRepを使用します。</p><p>同じ材料内の面は表面抽出で省略します。全セル方式は内部面も描画し、半透明時の前後ソートには制限があります。空気はID 0で常にVTIに保存され、表示設定で削除されません。現在は最大500万セル、表示面150万面または75万インスタンスまでです。</p></details>
+    </section>
+  </div>
+</main>
+<script type="module" src="/app.js"></script>
+</body></html>

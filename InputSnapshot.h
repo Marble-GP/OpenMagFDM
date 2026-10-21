@@ -60,6 +60,7 @@ inline void saveInputSnapshot(const std::string& output, std::string& configPath
         if (depth > 64 || ++visited > 50000) throw std::runtime_error("Configuration nesting limit exceeded");
         if (node.IsMap()) for (auto entry : node) {
             const auto key = entry.first.as<std::string>();
+            if (depth == 0 && key == "model_3d") continue; // preserved verbatim; inactive for the 2D solver
             if ((key == "initial_az_path" || key == "value_profile" || key == "gamma_profile") && entry.second.IsScalar()) {
                 const auto source = entry.second.as<std::string>();
                 if (!source.empty()) {
