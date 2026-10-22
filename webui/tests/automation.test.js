@@ -11,7 +11,7 @@ const {Workspace,noLinks}=require('../automation/workspace');
 const {AutomationRuntime}=require('../automation/runtime');
 const {execute}=require('../automation/tools');
 const {localRequest}=require('../automation/access');
-const Jimp=require('jimp');
+const {Jimp}=require('jimp');
 async function fixture(t) {
     const temp=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'omfdm-mcp-'));
     const base=path.join(temp,'workspace'),directory=path.join(temp,'private');
@@ -151,7 +151,7 @@ test('pairing is one-use and management requires CSRF',async t=>{
 test('job input snapshot, idempotency, output protection and OFF preserve running jobs',async t=>{
     const f=await fixture(t);
     const config=await f.wa.write('configs/model.yaml',Buffer.from('coordinate_system: cartesian'),null);
-    const img=await new Jimp(4,4,0xffffffff).getBufferAsync(Jimp.MIME_PNG);
+    const img=await new Jimp({width:4,height:4,color:0xffffffff}).getBuffer('image/png');
     const image=await f.wa.write('images/model.png',img,null,{permission:'images'});
     const input={config:{id:config.id,revision:config.revision},image:{id:image.id,revision:image.revision},idempotencyKey:'one'};
     const first=await f.runtime.jobs.start(f.actor,input);const second=await f.runtime.jobs.start(f.actor,input);
@@ -167,7 +167,7 @@ test('job input snapshot, idempotency, output protection and OFF preserve runnin
     await f.runtime.jobs.cancel(f.actor.user,first.jobId,()=>{});assert.equal(f.backend.jobs.get(first.jobId).process.running,false);
 });
 test('YAML references outside the workspace are rejected before solver spawn',async t=>{
-    const f=await fixture(t);const image=await f.wa.write('images/m.png',await new Jimp(2,2,0xffffffff).getBufferAsync(Jimp.MIME_PNG),null,{permission:'images'});
+    const f=await fixture(t);const image=await f.wa.write('images/m.png',await new Jimp({width:2,height:2,color:0xffffffff}).getBuffer('image/png'),null,{permission:'images'});
     for(const reference of ['../user_b/x.bin','C:/Windows/a.bin','results/../../secret']){
         const config=await f.wa.write(`configs/${Math.random().toString(36).slice(2)}.yaml`,Buffer.from(`nonlinear_solver:\n  initial_az_path: ${JSON.stringify(reference)}`),null);
         await assert.rejects(f.runtime.jobs.start(f.actor,{config:{id:config.id,revision:config.revision},image:{id:image.id,revision:image.revision},idempotencyKey:reference}));
@@ -208,7 +208,7 @@ test('archive roundtrip is scoped and bounded; uploads cannot be taken over by a
 test('stdio bridge uses the same server and exits without cancelling a running analysis',async t=>{
     const f=await fixture(t);f.runtime.access.state.port=0;await f.runtime.reconfigure();
     const config=await f.wa.write('configs/model.yaml',Buffer.from('coordinate_system: cartesian'),null);
-    const image=await f.wa.write('images/model.png',await new Jimp(2,2,0xffffffff).getBufferAsync(Jimp.MIME_PNG),null,{permission:'images'});
+    const image=await f.wa.write('images/model.png',await new Jimp({width:2,height:2,color:0xffffffff}).getBuffer('image/png'),null,{permission:'images'});
     const job=await f.runtime.jobs.start(f.actor,{config:{id:config.id,revision:config.revision},image:{id:image.id,revision:image.revision},idempotencyKey:'stdio-job'});
     f.runtime.access.state.port=f.runtime.listener.address().port;await f.runtime.access.change(()=>{});
     const bridge=require.resolve('../automation/bridge');
