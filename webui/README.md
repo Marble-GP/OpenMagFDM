@@ -56,7 +56,7 @@ package or in the configured development paths. Use `GET /api/health` and
 - Optional 30-day browser trust; Forget this browser revokes GUI management only.
 - Automatic solver detection, with GUI path settings applied at the next startup.
 - YAML assistance, safe reloads and explicit Results source/loading guidance.
-- See [release notes](../docs/RELEASE_NOTES_v1.7.0.md) for verification and limitations.
+- See [release notes](../docs/releases/RELEASE_NOTES_v1.7.0.md) for verification and limitations.
 
 ## Retained v1.6.2 behaviours
 

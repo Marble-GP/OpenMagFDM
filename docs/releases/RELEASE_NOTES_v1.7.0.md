@@ -13,7 +13,7 @@
 
 ## セットアップ
 
-[READMEのMCP手順](../README.md#mcp-setup)と[詳細仕様](MCP_INTEGRATION.md)を参照。
+[READMEのMCP手順](../../README.md#mcp-setup)と[詳細仕様](../MCP_INTEGRATION.md)を参照。
 初回はHelp & Integrationsでサーバーの確認コードを入力し、必要な権限だけを持つ接続を作成する。
 普段はサーバーの起動だけで既存の接続を再利用できる。stdioブリッジはサーバーを自動起動しない。
 保存したソルバー設定の変更は次回起動から適用される。
@@ -32,4 +32,4 @@
 - MCPのユーザー境界はOSサンドボックスやWebUI全体の多人数認証基盤ではない。
   共有PCではブラウザーを信頼せず、削除・置換権限は必要な接続にのみ与える。
 
-[OpenCode用の小モデル試験手順・ZIP生成方法](MCP_ACCEPTANCE_TEST.md)も利用できる。
+[OpenCode用の小モデル試験手順・ZIP生成方法](../MCP_ACCEPTANCE_TEST.md)も利用できる。

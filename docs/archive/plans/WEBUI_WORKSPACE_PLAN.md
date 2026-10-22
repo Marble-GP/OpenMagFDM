@@ -58,7 +58,7 @@ No solver rebuild, long benchmark, deployment or release in this work.
 ## MCP compatibility, not an unauthenticated MCP endpoint
 
 Update (2026-10-15): embedded MCP implementation and remaining acceptance checks
-are tracked separately in [MCP integration](MCP_INTEGRATION.md). The following
+are tracked separately in [MCP integration](../../MCP_INTEGRATION.md). The following
 paragraph records the original UI foundation scope.
 
 Existing user IDs are namespaces, not authentication credentials. Do not expose
@@ -94,7 +94,7 @@ working specialist tools with unfinished new views.
 - File search and name/date/size sorting preserve existing visible selection
   and batch controls. No preload or additional field-result cache introduced.
 - Shared `workspace-core.js` and read-only `/api/config/inspect` endpoint.
-  See [automation contract](AUTOMATION_CONTRACT.md). Existing solver/job process
+  See [automation contract](../../AUTOMATION_CONTRACT.md). Existing solver/job process
   management is retained, not replaced by a parallel implementation.
 - `npm --prefix webui test`: **49/49 passed** (12 lifecycle, 22 IntelliSense,
   15 workspace/API). JavaScript syntax checks and `git diff --check` passed.
@@ -114,7 +114,7 @@ is recorded rather than substituted with a claim of visual success.
 The refresh is not a completed full-app accessibility audit. At the original
 UI checkpoint MCP transport/authentication/write capabilities were future work;
 their subsequent implementation and remaining acceptance checks are described
-in [MCP integration](MCP_INTEGRATION.md). Result comparison and specialist modal
+in [MCP integration](../../MCP_INTEGRATION.md). Result comparison and specialist modal
 modernization remain follow-ups. On 2026-10-15 the combined source tests passed
 68/68 before recording the UI/MCP checkpoint; browser acceptance is still pending.
 The prior benchmark files and binaries were left intact.

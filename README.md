@@ -5,7 +5,7 @@ OpenMagFDM は、画像で定義された矩形一次メッシュ空間に対し
 
 > **Current version: v1.7.1** — 正規のYAML仕様は
 > [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)、変更点は
-> [`docs/RELEASE_NOTES_v1.7.1.md`](docs/RELEASE_NOTES_v1.7.1.md)、全体履歴は
+> [`docs/releases/RELEASE_NOTES_v1.7.1.md`](docs/releases/RELEASE_NOTES_v1.7.1.md)、全体履歴は
 > [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
 
 永続ジョブ・共有HTTPS・保存先移行の手順と未完了の検証項目は
@@ -162,7 +162,7 @@ v1.6.1では、v1.6.0のDD性能回帰を修正し、極座標の軸を含む
 - `slide_region_start: 0.05` — physical metres
 
 詳細な移行事項と検証状況は
-[`v1.6.1 release notes`](docs/RELEASE_NOTES_v1.6.1.md)を参照してください。
+[`v1.6.1 release notes`](docs/releases/RELEASE_NOTES_v1.6.1.md)を参照してください。
 
 ## v1.4 移行ガイド（出力フォーマット変更）
 
@@ -880,3 +880,5 @@ transient:
 ## 連絡先
 
 - X(Twitter): [@scalar_subby](https://twitter.com/scalar_subby)
+
+Documentation index: [docs/README.md](docs/README.md).

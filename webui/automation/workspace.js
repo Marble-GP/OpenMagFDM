@@ -161,7 +161,9 @@ class Workspace {
             authorize(permission); if (current) authorize('replace');
             if (this.busy(id)) fail('BUSY', 'An active analysis owns this output', 409);
             const category = id.split('/')[0];
-            if (!current && ['configs','images'].includes(category) && (await this.walk(category)).length >= 20) fail('QUOTA_EXCEEDED', 'File limit reached; no files were removed', 409);
+            const limits = require('./limits').effective(require('./storage').settings(this.base), this.user);
+            const limit = limits[category];
+            if (!current && Number.isInteger(limit) && (await this.walk(category)).length >= limit) fail('QUOTA_EXCEEDED', `${category} file limit (${limit}) reached; ask the administrator to adjust limits. No files were removed`, 409);
             await noLinks(path.dirname(p), { missing: true }); await fs.mkdir(path.dirname(p), { recursive: true });
             const temporary = path.join(path.dirname(p), `.write-${crypto.randomUUID()}`);
             try {

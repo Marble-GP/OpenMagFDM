@@ -39,6 +39,9 @@ async function main(){
         PATH:(process.env.PATH||'').split(path.delimiter).filter(p=>path.resolve(p)!==path.dirname(process.execPath)).join(path.delimiter),
         };
     delete env.SOLVER_PATH; // Exercise the actual distribution layout, not a development override.
+    assert.match(execFileSync(exe,['help'],{env,encoding:'utf8',timeout:5000,windowsHide:true}),/limits set-default/);
+    execFileSync(exe,['limits','set','smoke_user','configs','10'],{env,encoding:'utf8',timeout:10000,windowsHide:true});
+    assert.equal(JSON.parse(execFileSync(exe,['limits','show','smoke_user'],{env,encoding:'utf8',timeout:5000,windowsHide:true})).limits.configs,10);
     let output='';const child=spawn(exe,[],{cwd:base,env,windowsHide:true,stdio:['ignore','pipe','pipe']});
     let stderr='';
     child.stdout.on('data',b=>{output=(output+b).slice(-65536);});child.stderr.on('data',b=>{stderr=(stderr+b).slice(-65536);});
