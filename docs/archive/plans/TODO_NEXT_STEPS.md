@@ -46,7 +46,7 @@
 - [ ] AA採否・追加処理時間・反復数・総時間・波形・メモリをレビュー。有用な候補のみ全周／大変位へ。
   12点だけで周期EMFを合格としない。効果がなければDIRECT単独で今回の仮説検証を締める。
 - ソース差分・新規ヘッダー・ハッシュは元manifestに記録。生データ・固定バイナリは変更しない。
-  詳細は [研究報告](research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md)、[コマンド](../benchmarks/solver_speed/README.md)。
+  詳細は [研究報告](../../research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md)、[コマンド](../../../benchmarks/solver_speed/README.md)。
 
 ## 完了レビュー（2026-10-15）
 
@@ -55,7 +55,7 @@
 - 30°刻みは0.59%差にとどまり、外反復589→621。背景負荷にも差があるため高速化実績としない。
 - 全周の最大差は鎖交磁束RMS 0.001742%、EMF RMS 0.023169%、EMF高調波0.006172%。
   最大RSS約1.727 GiB。比較条件・限界・ハッシュは
-  [実験報告](research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md#completed-full-revolution-and-large-displacement-gate-2026-10-15)に保存。
+  [実験報告](../../research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md#completed-full-revolution-and-large-displacement-gate-2026-10-15)に保存。
 - ハーネス・証跡・報告は `f3ebdfa` にコミット済み。元データ・バイナリは変更せず保持する。
   完了済み出力先での再実行や集計上書きは不要。
 - この完了レビュー時点の次工程は **角度予測→安全策付きAnderson併用**（その後の着手状況は上記）。
@@ -128,8 +128,8 @@
 
 ハッシュ不一致や未完了の試行がある場合、既存ディレクトリを消して再開しない。
 原因を確認して記録し、必要なら別の新規出力先を準備する。
-詳細：[実験報告](research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md)、
-[実行手順](../benchmarks/solver_speed/README.md)。
+詳細：[実験報告](../../research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md)、
+[実行手順](../../../benchmarks/solver_speed/README.md)。
 
 ## YAML入力支援の強化（初回実装済み、以下は提案時の記録）
 
@@ -173,7 +173,7 @@ WebUIは既にAce Editor上で独自の補完・候補説明・スニペット�
 固定ユーザー領域、接続・権限管理、リビジョン付きファイル操作、入力固定・冪等ジョブ開始、
 ストリーミングバックアップ、GUIヘルプ・活動表示まで実装した。
 既存49件＋MCP関連19件の軽量回帰を実施。ソルバー本体・実験バイナリは変更していない。
-詳細・制限・再現コマンドは [MCP実装と受入チェック](MCP_INTEGRATION.md)。
+詳細・制限・再現コマンドは [MCP実装と受入チェック](../../MCP_INTEGRATION.md)。
 
 - [x] 長時間ベンチマーク終了と記録保存を確認。パッケージング・実解析試験を再開できる。
 - [ ] `webui/tools/build-mcp-package.cjs` で現行exeを再生成。

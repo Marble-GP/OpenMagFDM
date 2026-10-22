@@ -12,4 +12,5 @@ function root(base, category) {
     const settings = configurations.get(path.resolve(base)) || {};
     return category === 'outputs' && settings.resultsRoot ? path.resolve(settings.resultsRoot) : path.join(base, category);
 }
-module.exports = {configure, root, readSettings};
+function settings(base) { return configurations.get(path.resolve(base)) || readSettings(base); }
+module.exports = {configure, root, readSettings, settings};

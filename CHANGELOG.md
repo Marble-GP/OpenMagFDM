@@ -3,14 +3,17 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/research/`.
 
-## 1.7.1 — 2026-10-22 (release preparation)
+## 1.7.1 — 2026-10-23
 
 - Unify WebUI/MCP jobs with durable queues, reconnectable controls, idempotency and frozen inputs.
 - Add result descriptions, aspect locking, image-independent field lines and tracked asynchronous deletion.
 - Retain plots during step preparation and expose preload/cache diagnostics.
 - Add CLI storage migration and account/workspace management with explicit HTTPS sharing.
+- Add CLI help and configurable per-workspace config/image/material-library quotas without deleting existing files.
+- Pin packaged Node to security release 24.22.1 via SEA; update vulnerable image/upload dependencies.
+- Consolidate documentation under `docs/`, with release history and archived development plans.
 - Keep existing 2D YAML semantics; exclude experimental GPU and 3D features from release packages.
-- See `docs/RELEASE_NOTES_v1.7.1.md` for API migration and remaining release acceptance checks.
+- See `docs/releases/RELEASE_NOTES_v1.7.1.md` for API migration and remaining release acceptance checks.
 
 ## 1.7.0 — 2026-10-19
 
@@ -23,7 +26,7 @@ investigations remain under `docs/research/`.
   silently enabling every experimental option.
 - Validate native MCP packages on all three release platforms before publication.
 
-See `docs/RELEASE_NOTES_v1.7.0.md` for setup, verification and known limitations.
+See `docs/releases/RELEASE_NOTES_v1.7.0.md` for setup, verification and known limitations.
 
 ## 1.6.2 — 2026-08-07
 
@@ -35,7 +38,7 @@ See `docs/RELEASE_NOTES_v1.7.0.md` for setup, verification and known limitations
 - Synchronized solver, WebUI package, CMake, vcpkg and release-contract
   version metadata to 1.6.2.
 
-See `docs/RELEASE_NOTES_v1.6.2.md` for the release details.
+See `docs/releases/RELEASE_NOTES_v1.6.2.md` for the release details.
 
 ## 1.6.1 — release candidate
 
@@ -84,7 +87,7 @@ See `docs/RELEASE_NOTES_v1.6.2.md` for the release details.
   `export.async_queue_depth` to `1..16`, resetting per-run histories, and
   creating output directories without spawning command shells.
 
-See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
+See `docs/releases/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 
 ## 1.6.0 — 2026-07-06
 
@@ -107,4 +110,4 @@ See `docs/RELEASE_NOTES_v1.6.1.md` for the full release candidate notes.
 
 - Added OpenMP, permanent-magnet models, material libraries, force methods,
   nonlinear solvers, polar coordinates and the original WebUI/API foundation.
-- Historical notes are retained in `.doc/` and GitHub Releases.
+- Historical notes are retained in `docs/archive/`, `docs/releases/`, and GitHub Releases.

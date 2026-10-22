@@ -1,6 +1,34 @@
 # v1.7.1 Operations
 
-See [release notes](RELEASE_NOTES_v1.7.1.md) for release readiness and limitations.
+See [release notes](releases/RELEASE_NOTES_v1.7.1.md) for release readiness and limitations.
+
+## CLI help and file count limits
+
+Packaged: `webui-server.exe help` (also `--help`, `-h`, `limits --help`).
+Source: `node webui/launcher.js help`. Help exits without starting the server.
+
+Stop the server before changing limits; start it again after saving settings.
+For example, using the packaged executable:
+
+```text
+webui-server.exe limits show
+webui-server.exe limits show user_example
+webui-server.exe limits set-default configs 100
+webui-server.exe limits set user_example images 200
+webui-server.exe limits set user_example libraries unlimited
+webui-server.exe limits set user_example images default
+```
+
+Categories are `configs` (YAML), `images`, and `libraries` (material YAML).
+Defaults remain 20, 20, and unlimited respectively. `unlimited` removes the
+quota, `0` blocks creation, and `default` removes a workspace override.
+These are **per workspace**, the existing browser userId. An account assigned
+multiple workspaces has separate quotas for each workspace, not a combined quota.
+Nested files count too. Results, frozen analysis inputs, and transfer staging
+are not input-file quotas; their existing resource safeguards still apply.
+WebUI, MCP, and backup import use the same write check. Lowering a limit never
+deletes files and existing files can still be updated. OS filesystem access by
+the administrator is outside these application quotas.
 
 ## ソース版の起動
 

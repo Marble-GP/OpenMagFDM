@@ -524,7 +524,7 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v3
       with:
-        body_path: docs/RELEASE_NOTES_v1.7.1.md
+        body_path: docs/releases/RELEASE_NOTES_v1.7.1.md
         files: |
           artifacts/OpenMagFDM-Linux-x86_64/OpenMagFDM-Linux-x86_64.tar.gz
           artifacts/OpenMagFDM-Windows-x86_64/OpenMagFDM-Windows-x86_64.zip

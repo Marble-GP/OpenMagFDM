@@ -6,6 +6,33 @@ const {privateDirectory,atomicJSON,ensurePrivateDirectory} = require('./access')
 const {passwordHash} = require('./accounts');
 const {userKey,noLinks,digest,locked} = require('./workspace');
 const {readSettings,root,configure} = require('./storage');
+const HELP = `OpenMagFDM server CLI
+  help | --help | -h                 Show this help (also: <group> --help)
+  --runtime-info                    Print embedded Node runtime without starting the server
+  users list
+  users create <name> [--admin]      Set password through hidden interactive input
+  users disable|enable|reset-password <name>
+  workspaces list
+  workspaces assign <workspace> <account>
+  storage show
+  storage set-results-root <absolute-directory>
+  storage migrate-results <absolute-empty-directory>
+  network local
+  network shared --cert <path> --key <path> [--host address]
+  limits show [workspace]
+  limits set-default <configs|images|libraries> <count|unlimited>
+  limits set <workspace> <configs|images|libraries> <count|unlimited|default>
+
+With no arguments the WebUI server starts. For source installs, use:
+  node webui/launcher.js <command>
+For packaged installs, use: webui-server[.exe] <command>
+Storage, network and limit changes require the server to be stopped.
+Limits apply per workspace (the existing browser userId), across WebUI and MCP.
+Counts include nested files in each input category, not result artifacts.
+Defaults: configs 20, images 20, libraries unlimited. 0 blocks new files.
+Existing files are retained; replacement remains possible at/above the limit.
+Restart after changing settings. 'default' removes a workspace override.
+`;
 async function password(prompt) {
     if(!process.stdin.isTTY)throw Error('Password entry requires an interactive terminal');
     process.stdout.write(prompt); process.stdin.setRawMode(true); process.stdin.resume();
@@ -60,6 +87,22 @@ async function command(base,args) {
         await atomicJSON(filename,data);console.log('Saved. No workspace files were deleted.');
     });
     const settings=readSettings(base);configure(base,settings);
+    if(group==='limits') {
+        const limits=require('./limits');
+        if(command==='show') {console.log(JSON.stringify({workspace:value?userKey(value):null,limits:limits.effective(settings,value?userKey(value):undefined),overrides:settings.fileLimits||{}},null,2));return;}
+        settings.fileLimits ||= {defaults:{},workspaces:{}};
+        settings.fileLimits.defaults ||= {};settings.fileLimits.workspaces ||= {};
+        const category=command==='set-default'?value:rest[0];
+        if(!Object.hasOwn(limits.defaults,category))throw Error('Category must be configs, images or libraries');
+        if(command==='set-default')settings.fileLimits.defaults[category]=limits.value(rest[0]);
+        else if(command==='set') {
+            const workspace=userKey(value);
+            if(!Object.hasOwn(settings.fileLimits.workspaces,workspace))Object.defineProperty(settings.fileLimits.workspaces,workspace,{value:{},enumerable:true,writable:true,configurable:true});
+            if(rest[1]==='default')delete settings.fileLimits.workspaces[workspace][category];
+            else settings.fileLimits.workspaces[workspace][category]=limits.value(rest[1]);
+        } else throw Error('Use limits show, set-default or set');
+        await atomicJSON(settingsFile,settings);console.log('Saved. Restart the server. Existing files were retained.');return;
+    }
     if(group==='storage') {
         if(command==='show'){console.log(JSON.stringify({resultsRoot:root(base,'outputs')},null,2));return;}
         if(!value||!path.isAbsolute(value))throw Error('An absolute directory is required');
@@ -91,8 +134,9 @@ async function command(base,args) {
     throw Error('Commands: users, workspaces, storage, network');
 }
 async function run(base,args) {
+    if(args.some(a=>['help','--help','-h'].includes(a))) {console.log(HELP);return;}
     const directory=privateDirectory(base);await ensurePrivateDirectory(directory);
-    const maintenance=args[0]==='network'||(args[0]==='storage'&&args[1]!=='show');
+    const maintenance=args[0]==='network'||(['storage','limits'].includes(args[0])&&args[1]!=='show');
     if(!maintenance)return command(base,args);
     // Share the server's exclusive startup lock throughout copy, verification
     // and settings replacement. A second process cannot start during migration.
