@@ -7,7 +7,7 @@ const fs=require('node:fs/promises');
 const path=require('node:path');
 const os=require('node:os');
 const net=require('node:net');
-const {spawn}=require('node:child_process');
+const {spawn,execFileSync}=require('node:child_process');
 const {once}=require('node:events');
 const {Client,StreamableHTTPClientTransport}=require('@modelcontextprotocol/client');
 const {StdioClientTransport}=require('@modelcontextprotocol/client/stdio');
@@ -17,6 +17,10 @@ const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function freePort(){const server=net.createServer();server.listen(0,'127.0.0.1');await once(server,'listening');const port=server.address().port;await new Promise(resolve=>server.close(resolve));return port;}
 async function main(){
     const original=argument('--exe');if(!original)throw Error('--exe is required');
+    const expectedNode=(await fs.readFile(path.join(__dirname,'../../.node-version'),'utf8')).trim();
+    const runtime=JSON.parse(execFileSync(path.resolve(original),['--runtime-info'],{encoding:'utf8',windowsHide:true,timeout:15000}));
+    assert.equal(runtime.node,expectedNode,'Packaged Node must match the reviewed security release');
+    assert.equal(runtime.packaged,true);
     const solver=argument('--solver');
     const temp=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'omfdm-packaged-mcp-'));
     const base=path.join(temp,'app');await fs.mkdir(base);
@@ -99,7 +103,7 @@ async function main(){
             if(solver) {
                 const finished=async job=>{
                     let state;const deadline=Date.now()+60000;
-                    do {state=await tool('analysis_get',{jobId:job.jobId});if(!['preparing','running','cancelling'].includes(state.status))return state;await delay(100);}while(Date.now()<deadline);
+                    do {state=await tool('analysis_get',{jobId:job.jobId});if(!['queued','preparing','running','cancelling'].includes(state.status))return state;await delay(100);}while(Date.now()<deadline);
                     throw Error(`Real solver timed out (${index===0?'HTTP':'stdio'})`);
                 };
                 const input={config:{id:config.id,revision:config.revision},image:{id:image.id,revision:image.revision},idempotencyKey:`smoke-${index}`};

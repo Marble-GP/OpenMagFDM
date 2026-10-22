@@ -52,6 +52,7 @@ jobs:
         cp CHANGELOG.md release/OpenMagFDM-Linux/
         cp -r docs release/OpenMagFDM-Linux/
         cp -r webui release/OpenMagFDM-Linux/
+        cp .node-version release/OpenMagFDM-Linux/
         cp -r sample_config.yaml release/OpenMagFDM-Linux/
         cp general_materials.yaml release/OpenMagFDM-Linux/
         python3 tools/stage-release.py release/OpenMagFDM-Linux
@@ -127,6 +128,7 @@ jobs:
         Copy-Item CHANGELOG.md release/OpenMagFDM-Windows/
         Copy-Item -Recurse docs release/OpenMagFDM-Windows/
         Copy-Item -Recurse webui release/OpenMagFDM-Windows/
+        Copy-Item .node-version release/OpenMagFDM-Windows/
         Copy-Item sample_config.yaml release/OpenMagFDM-Windows/
         Copy-Item general_materials.yaml release/OpenMagFDM-Windows/
         python tools/stage-release.py release/OpenMagFDM-Windows
@@ -309,6 +311,7 @@ jobs:
         cp CHANGELOG.md release/OpenMagFDM-macOS/
         cp -r docs release/OpenMagFDM-macOS/
         cp -r webui release/OpenMagFDM-macOS/
+        cp .node-version release/OpenMagFDM-macOS/
         cp sample_config.yaml release/OpenMagFDM-macOS/
         cp general_materials.yaml release/OpenMagFDM-macOS/
         python3 tools/stage-release.py release/OpenMagFDM-macOS
@@ -330,7 +333,7 @@ jobs:
     - name: Setup Node.js
       uses: actions/setup-node@v6
       with:
-        node-version: '24'
+        node-version-file: '.node-version'
 
     - name: Install dependencies and create standalone package
       run: |
@@ -340,9 +343,9 @@ jobs:
         mkdir -p ../release
 
         # Create standalone executables for each platform
-        npx --no-install pkg package.json --targets node24-linux-x64 --output ../release/webui-server-linux
-        npx --no-install pkg package.json --targets node24-win-x64 --output ../release/webui-server-win.exe
-        npx --no-install pkg package.json --targets node24-macos-x64 --output ../release/webui-server-macos
+        node tools/build-mcp-package.cjs --target linux-x64 --output ../release/webui-server-linux
+        node tools/build-mcp-package.cjs --target win-x64 --output ../release/webui-server-win.exe
+        node tools/build-mcp-package.cjs --target macos-x64 --output ../release/webui-server-macos
 
     - name: Create WebUI packages
       run: |
@@ -351,6 +354,7 @@ jobs:
         # Linux
         mkdir -p OpenMagFDM-WebUI-Linux
         cp webui-server-linux OpenMagFDM-WebUI-Linux/webui-server
+        cp webui-server-linux.runtime.json OpenMagFDM-WebUI-Linux/runtime.json
         chmod +x OpenMagFDM-WebUI-Linux/webui-server
         cp -r ../webui/public OpenMagFDM-WebUI-Linux/
         cp -r ../webui/icon OpenMagFDM-WebUI-Linux/
@@ -365,6 +369,7 @@ jobs:
         # Windows
         mkdir -p OpenMagFDM-WebUI-Windows
         cp webui-server-win.exe OpenMagFDM-WebUI-Windows/webui-server.exe
+        cp webui-server-win.exe.runtime.json OpenMagFDM-WebUI-Windows/runtime.json
         cp -r ../webui/public OpenMagFDM-WebUI-Windows/
         cp -r ../webui/icon OpenMagFDM-WebUI-Windows/
         cp -r ../docs OpenMagFDM-WebUI-Windows/
@@ -378,6 +383,7 @@ jobs:
         # macOS
         mkdir -p OpenMagFDM-WebUI-macOS
         cp webui-server-macos OpenMagFDM-WebUI-macOS/webui-server
+        cp webui-server-macos.runtime.json OpenMagFDM-WebUI-macOS/runtime.json
         chmod +x OpenMagFDM-WebUI-macOS/webui-server
         cp -r ../webui/public OpenMagFDM-WebUI-macOS/
         cp -r ../webui/icon OpenMagFDM-WebUI-macOS/

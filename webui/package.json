@@ -5,13 +5,13 @@
   "main": "server.js",
   "bin": "launcher.js",
   "engines": {
-    "node": ">=24 <25"
+    "node": ">=24.22.1 <25"
   },
   "scripts": {
     "start": "node launcher.js",
     "dev": "node launcher.js",
     "test": "node --test tests/*.test.js",
-    "package": "pkg package.json"
+    "package": "node tools/build-mcp-package.cjs"
   },
   "keywords": [
     "magnetic-field",
@@ -21,17 +21,17 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/server": "2.3.1",
     "@modelcontextprotocol/client": "2.3.1",
     "@modelcontextprotocol/node": "2.1.1",
-    "zod": "4.6.7",
+    "@modelcontextprotocol/server": "2.3.1",
+    "express": "^4.21.2",
     "image-size": "2.0.4",
+    "jimp": "1.6.1",
+    "js-yaml": "^4.1.0",
+    "multer": "2.5.0",
     "yauzl": "3.4.0",
     "yazl": "3.3.1",
-    "express": "^4.21.2",
-    "jimp": "^0.22.12",
-    "js-yaml": "^4.1.0",
-    "multer": "^1.4.5-lts.1"
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@yao-pkg/pkg": "6.23.0"
@@ -43,7 +43,8 @@
       "public/workspace-core.js",
       "public/yaml-intellisense.js",
       "node_modules/@modelcontextprotocol/server/dist/**/*.cjs",
-      "node_modules/@modelcontextprotocol/client/dist/**/*.cjs"
+      "node_modules/@modelcontextprotocol/client/dist/**/*.cjs",
+      "node_modules/@jimp/**/*.js"
     ],
     "assets": [
       "public/yaml-schema.json"

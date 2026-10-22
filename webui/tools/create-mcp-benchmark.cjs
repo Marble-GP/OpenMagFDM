@@ -5,7 +5,7 @@ const path = require('node:path');
 const {pipeline} = require('node:stream/promises');
 const crypto = require('node:crypto');
 const yaml = require('js-yaml');
-const Jimp = require('jimp');
+const { Jimp } = require('jimp');
 const yazl = require('yazl');
 
 async function fixture() {
@@ -20,10 +20,10 @@ async function fixture() {
     const warning = structuredClone(model);
     warning.materials.body = {rgb:[128,128,128],'B-H':'mu0 * (1000 / (1 + ($H/1000)^2)) * $H',jz:0};
     warning.nonlinear_solver = {enabled:true,solver_type:'newton-krylov',max_iterations:2,tolerance:0,anderson:{enabled:false}};
-    const bitmap = new Jimp(32,32,0xffffffff);
+    const bitmap = new Jimp({width:32,height:32,color:0xffffffff});
     for(let y=12;y<20;y++)for(let x=12;x<20;x++)bitmap.setPixelColor(0xff0000ff,x,y);
     for(let y=10;y<22;y++)for(let x=8;x<11;x++)bitmap.setPixelColor(0x808080ff,x,y);
-    return {model,warning,png:await bitmap.getBufferAsync(Jimp.MIME_PNG)};
+    return {model,warning,png:await bitmap.getBuffer('image/png')};
 }
 
 async function main() {

@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('node:fs/promises');
 const crypto = require('node:crypto');
-const Jimp = require('jimp');
+const { Jimp } = require('jimp');
 const { imageSize } = require('image-size');
 const { fail, locked } = require('./workspace');
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -16,6 +16,12 @@ function inspectImage(buffer) {
     const dimensions = imageSize(buffer);
     if (!dimensions.width || !dimensions.height || dimensions.width * dimensions.height > MAX_PIXELS) fail('LIMIT_EXCEEDED', 'Image exceeds the 16-megapixel limit');
     return dimensions;
+}
+async function readImageFile(filename) {
+    if ((await fs.stat(filename)).size > MAX_IMAGE_BYTES) fail('LIMIT_EXCEEDED', 'Image limit is 10 MiB');
+    const buffer = await fs.readFile(filename);
+    inspectImage(buffer);
+    return Jimp.fromBuffer(buffer);
 }
 class Images {
     constructor(backend) {
@@ -36,10 +42,7 @@ class Images {
     async close() { clearInterval(this.timer); await this.cleanup(true); }
     async load(ws, id) {
         if (!id.startsWith('images/')) fail('INVALID_INPUT', 'Expected an image ID');
-        const p = await ws.resolve(id); const stat = await fs.stat(p);
-        if (stat.size > MAX_IMAGE_BYTES) fail('LIMIT_EXCEEDED', 'Image limit is 10 MiB');
-        const buffer = await fs.readFile(p); inspectImage(buffer);
-        return Jimp.read(buffer);
+        return readImageFile(await ws.resolve(id));
     }
     async info(ws, id) {
         return locked('mcp-image-operation', async () => {
@@ -72,7 +75,7 @@ class Images {
             }
             const id = input.outputId || `images/preview_${crypto.randomUUID()}.png`;
             if (!/^images\/[^/]+\.png$/.test(id)) fail('INVALID_INPUT','Output must be a PNG file in images');
-            const buffer = await result.getBufferAsync(Jimp.MIME_PNG);
+            const buffer = await result.getBuffer('image/png');
             inspectImage(buffer);
             const file = await ws.write(id,buffer,input.expectedRevision ?? null,{permission:'images'});
             const expires = Date.now()+10*60000;
@@ -81,4 +84,4 @@ class Images {
         });
     }
 }
-module.exports = {Images, inspectImage, MAX_IMAGE_BYTES};
+module.exports = {Images, inspectImage, readImageFile, MAX_IMAGE_BYTES};

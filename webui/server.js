@@ -902,6 +902,11 @@ function getUserDir(userId) {
 }
 
 // Helper: Get user uploads directory
+async function readWorkspaceImage(userId, filename) {
+    const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
+    return require('./automation/images').readImageFile(await ws.resolve(`images/${filename}`));
+}
+
 function getUserUploadsDir(userId) {
     return path.join(UPLOAD_DIR, normalizeUserId(userId));
 }
@@ -1248,6 +1253,8 @@ app.post('/api/upload-image', upload.single('image'), async (req, res) => {
             success: false,
             error: error.message
         });
+    } finally {
+        if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
     }
 });
 
@@ -1311,8 +1318,7 @@ app.post('/api/materials/detect', upload.single('image'), async (req, res) => {
             return Math.max(0, Math.min(1, t));
         }
 
-        const Jimp = require('jimp');
-        const image = await Jimp.read(tmpPath);
+        const image = await require('./automation/images').readImageFile(tmpPath);
         const totalPixels = image.bitmap.width * image.bitmap.height;
 
         // Count occurrences of each unique RGB color (ignore fully transparent pixels)
@@ -2402,7 +2408,7 @@ function detectPolarGeometry(jimpImage, hint, colorGroups) {
 //   r_orientation == "vertical"   -> (rows=nr,     cols=ntheta)
 // Pixels falling outside the source remain alpha=0 (transparent).
 function warpPolar(srcJimp, opts) {
-    const Jimp = require('jimp');
+    const { Jimp } = require('jimp');
     const {
         center_x, center_y,
         r_start_px, r_end_px,
@@ -2417,7 +2423,7 @@ function warpPolar(srcJimp, opts) {
     const outW = horizontal ? nr     : ntheta;
     const outH = horizontal ? ntheta : nr;
 
-    const out = new Jimp(outW, outH, 0x00000000);
+    const out = new Jimp({width:outW,height:outH,color:0x00000000});
     const src = srcJimp.bitmap.data;
     const srcW = srcJimp.bitmap.width;
     const srcH = srcJimp.bitmap.height;
@@ -2470,14 +2476,13 @@ async function chooseOutputFilename(uploadsDir, originalFilename, requested) {
 //   Body (JSON): { userId, filename, hint?: { shape: "auto"|"circular"|"rectangular" } }
 app.post('/api/preprocess-polar/detect', async (req, res) => {
     try {
-        const Jimp = require('jimp');
         const { userId = 'default', filename } = req.body || {};
         if (!filename) {
             return res.status(400).json({ success: false, error: 'filename is required' });
         }
         const uploadsDir = getUserUploadsDir(userId);
         const filePath = path.join(uploadsDir, filename);
-        const img = await Jimp.read(filePath);
+        const img = await readWorkspaceImage(userId, filename);
         const hint = (req.body && req.body.hint) || {};
         // Optional colour groupings drive the new periodicity.grouped
         // field. Shape: [{id: 'A', colors: [[r,g,b], ...]}, ...]. Anything
@@ -2497,7 +2502,6 @@ app.post('/api/preprocess-polar/detect', async (req, res) => {
 //   Returns the filename and a ready-to-insert polar_domain block.
 app.post('/api/preprocess-polar/warp', async (req, res) => {
     try {
-        const Jimp = require('jimp');
         const {
             userId = 'default', filename,
             center_x, center_y,
@@ -2516,13 +2520,14 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
                 return res.status(400).json({ success: false, error: `Missing or invalid: ${k}` });
             }
         }
-        if (nr < 2 || ntheta < 2) {
-            return res.status(400).json({ success: false, error: 'nr and ntheta must be >= 2' });
+        if (!Number.isSafeInteger(nr) || !Number.isSafeInteger(ntheta) || nr < 2 || ntheta < 2 || nr * ntheta > 16 * 1024 * 1024 ||
+            ![center_x, center_y, r_start_px, r_end_px, theta_start, theta_end].every(Number.isFinite) || r_end_px <= r_start_px || theta_end <= theta_start) {
+            return res.status(400).json({ success: false, error: 'Invalid polar grid: finite bounds and integer dimensions within 16 megapixels required' });
         }
 
         const uploadsDir = getUserUploadsDir(userId);
         const srcPath = path.join(uploadsDir, filename);
-        const src = await Jimp.read(srcPath);
+        const src = await readWorkspaceImage(userId, filename);
 
         const warped = warpPolar(src, {
             center_x, center_y, r_start_px, r_end_px,
@@ -2542,7 +2547,7 @@ app.post('/api/preprocess-polar/warp', async (req, res) => {
         }
         const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
         const previous = preview ? await ws.describe(`images/${outName}`).catch(e => { if(e.code!=='ENOENT') throw e; return null; }) : null;
-        await ws.write(`images/${outName}`, await warped.getBufferAsync(Jimp.MIME_PNG), previous?.revision ?? null, {permission:'images'});
+        await ws.write(`images/${outName}`, await warped.getBuffer('image/png'), previous?.revision ?? null, {permission:'images'});
 
         // Best-effort: enforce per-user image cap only for permanent saves;
         // the preview file is overwritten so it doesn't contribute to the cap.
@@ -2704,14 +2709,13 @@ function applyBilateralFilterRGB(data, W, H, sigmaSpatial, sigmaColor) {
 
 app.post('/api/preprocess-filter/quick-stats', async (req, res) => {
     try {
-        const Jimp = require('jimp');
         const { userId = 'default', filename } = req.body || {};
         if (!filename) {
             return res.status(400).json({ success: false, error: 'filename required' });
         }
         const uploadsDir = getUserUploadsDir(userId);
         const srcPath = path.join(uploadsDir, filename);
-        const src = await Jimp.read(srcPath);
+        const src = await readWorkspaceImage(userId, filename);
         const W = src.bitmap.width;
         const H = src.bitmap.height;
         const data = src.bitmap.data;
@@ -3024,7 +3028,6 @@ function nelderMead(fn, x0, bounds, maxEvals = 60) {
 
 app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
     try {
-        const Jimp = require('jimp');
         const {
             userId = 'default', filename,
             nTargets = 8,
@@ -3039,7 +3042,7 @@ app.post('/api/preprocess-filter/auto-tune', async (req, res) => {
 
         const uploadsDir = getUserUploadsDir(userId);
         const srcPath = path.join(uploadsDir, filename);
-        const src = await Jimp.read(srcPath);
+        const src = await readWorkspaceImage(userId, filename);
         const fullW = src.bitmap.width;
         const fullH = src.bitmap.height;
         // Downsample to keep per-eval cost ~50-150 ms even for 4 MP sources.
@@ -3292,7 +3295,6 @@ function quantizeImage(src, params = {}) {
 
 app.post('/api/preprocess-filter/quantize', async (req, res) => {
     try {
-        const Jimp = require('jimp');
         const {
             userId = 'default', filename,
             rareThreshold = 0.005,
@@ -3310,7 +3312,7 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
             return res.status(400).json({ success: false, error: 'filename required' });
         }
         const uploadsDir = getUserUploadsDir(userId);
-        const src = await Jimp.read(path.join(uploadsDir, filename));
+        const src = await readWorkspaceImage(userId, filename);
         const result = quantizeImage(src, req.body || {});
         const out = result.image;
         const K = result.n_targets_used;
@@ -3328,7 +3330,7 @@ app.post('/api/preprocess-filter/quantize', async (req, res) => {
         }
         const ws = new AutomationWorkspace(BASE_DIR, normalizeUserId(userId));
         const previous = preview ? await ws.describe(`images/${outName}`).catch(e => { if(e.code!=='ENOENT') throw e; return null; }) : null;
-        await ws.write(`images/${outName}`, await out.getBufferAsync(Jimp.MIME_PNG), previous?.revision ?? null, {permission:'images'});
+        await ws.write(`images/${outName}`, await out.getBuffer('image/png'), previous?.revision ?? null, {permission:'images'});
 
         if (!preview && typeof enforceImageLimit === 'function') {
             try { await enforceImageLimit(userId); } catch { /* ignore */ }
