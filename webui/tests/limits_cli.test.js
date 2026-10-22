@@ -18,6 +18,9 @@ test('CLI persists defaults and workspace overrides; quotas serialize creation a
     await run(base,['limits','set-default','configs','1']);
     await run(base,['limits','set','alice','images','0']);
     await run(base,['limits','set','bob','configs','2']);
+    await run(base,['limits','set','__proto__','configs','3']);
+    assert.equal(Object.prototype.configs,undefined);
+    assert.equal(storage.readSettings(base).fileLimits.workspaces.__proto__.configs,3);
     storage.configure(base);
     const alice=new Workspace(base,'alice'),bob=new Workspace(base,'bob');await alice.init();await bob.init();
     const writes=await Promise.allSettled(['a','b'].map(n=>alice.write(`configs/${n}.yaml`,'x',null)));

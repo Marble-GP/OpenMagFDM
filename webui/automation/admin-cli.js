@@ -96,7 +96,8 @@ async function command(base,args) {
         if(!Object.hasOwn(limits.defaults,category))throw Error('Category must be configs, images or libraries');
         if(command==='set-default')settings.fileLimits.defaults[category]=limits.value(rest[0]);
         else if(command==='set') {
-            const workspace=userKey(value);settings.fileLimits.workspaces[workspace] ||= {};
+            const workspace=userKey(value);
+            if(!Object.hasOwn(settings.fileLimits.workspaces,workspace))Object.defineProperty(settings.fileLimits.workspaces,workspace,{value:{},enumerable:true,writable:true,configurable:true});
             if(rest[1]==='default')delete settings.fileLimits.workspaces[workspace][category];
             else settings.fileLimits.workspaces[workspace][category]=limits.value(rest[1]);
         } else throw Error('Use limits show, set-default or set');

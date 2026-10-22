@@ -6,7 +6,8 @@ function value(text) {
     return Number(text);
 }
 function effective(settings, workspace) {
-    const result={...defaults,...settings.fileLimits?.defaults,...settings.fileLimits?.workspaces?.[workspace]};
+    const overrides=settings.fileLimits?.workspaces;
+    const result={...defaults,...settings.fileLimits?.defaults,...(overrides && Object.hasOwn(overrides,workspace) ? overrides[workspace] : {})};
     for(const [key,count] of Object.entries(result)) if(!Object.hasOwn(defaults,key) || (count!==null && (!Number.isSafeInteger(count)||count<0))) throw Error('Invalid file limit settings');
     return result;
 }
