@@ -18,6 +18,11 @@ Public interfaces and current manuals use English. User-authored filenames,
 descriptions and configurations may use other languages. Historical records
 retain their original language.
 
+## Current evaluation
+
+- [v1.7.2 MCP practical trial — 2026-10-24](development/V1_7_2_MCP_TRIAL_20261024.md):
+  connected baseline, release/source distinction and pending practical checks.
+
 ## Release and development history
 
 - [v1.7.2 release notes](releases/RELEASE_NOTES_v1.7.2.md)
