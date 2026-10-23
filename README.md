@@ -378,7 +378,7 @@ bash run_test.sh ../../build/MagFDMsolver
 
 - **Linux** (x86_64): `OpenMagFDM-Linux-x86_64.tar.gz`
 - **Windows** (x86_64): `OpenMagFDM-Windows-x86_64.zip` または `OpenMagFDM-Installer-Windows-x86_64.exe`（インストーラ）
-- **macOS** (x86_64): `OpenMagFDM-macOS-x86_64.tar.gz`
+- **macOS** (Apple Silicon / arm64): `OpenMagFDM-macOS-arm64.tar.gz`
 - **WebUI Standalone**: Node.js不要の単体実行可能ファイル（全プラットフォーム対応）
 
 ### 依存関係
