@@ -1,23 +1,31 @@
-# OpenMagFDM v1.7.2 ドキュメント
+# OpenMagFDM documentation
 
-## 利用・運用マニュアル
+Latest published release: **v1.7.2**. Current-source additions are marked
+unreleased in the manuals and [Changelog](../CHANGELOG.md).
 
-| 目的 | マニュアル |
+## User and administrator manuals
+
+| Topic | Manual |
 |---|---|
-| インストール・最初の解析 | [README](../README.md) |
-| YAML、材料、式、境界条件、出力 | [CONFIGURATION](CONFIGURATION.md) |
-| 常駐コンソール・起動引数・単体ソルバー | [CLI](CLI.md) |
-| 認証、ファイル、ジョブ、結果、画像、ZIPのHTTP操作 | [REST API](REST_API.md) |
-| 共有HTTPS、アカウント・所有者、保存先、更新・バックアップ | [OPERATIONS](OPERATIONS.md) |
-| ローカルHTTP／stdioのエージェント接続 | [MCP](MCP_INTEGRATION.md) |
+| Installation and first analysis | [README](../README.md) |
+| YAML, materials, expressions, boundaries and output | [Configuration](CONFIGURATION.md) |
+| Resident console, administration, startup flags and standalone solver | [CLI](CLI.md) |
+| HTTP authentication, files, jobs, fields, images and ZIP backups | [REST API](REST_API.md) |
+| Shared HTTPS, ownership, storage, metadata and upgrades | [Operations](OPERATIONS.md) |
+| Local agent connections over HTTP/stdio | [MCP](MCP_INTEGRATION.md) |
 
-## 履歴・開発記録
+Public interfaces and current manuals use English. User-authored filenames,
+descriptions and configurations may use other languages. Historical records
+retain their original language.
 
-- [v1.7.2 release notes (English)](releases/RELEASE_NOTES_v1.7.2.md)
-- [リリース履歴](releases/README.md)
+## Release and development history
+
+- [v1.7.2 release notes](releases/RELEASE_NOTES_v1.7.2.md)
+- [Release history](releases/README.md)
 - [Changelog](../CHANGELOG.md)
-- [過去の検討・測定・診断・旧手順](archive/README.md)
+- [Historical plans, investigations, measurements and old instructions](archive/README.md)
 
-現在の利用手順は上表を使用してください。旧`docs/research/`、版別運用説明、
-導入時の契約・検証記録、整理前READMEは`archive/`へ移しました。
-同梱依存ライブラリの文書は`amgcl/`、`tinyexpr/`、`webui/public/vendor/`にあります。
+Use the manuals above for current procedures. Historical research, version-specific
+operations, introduction contracts/acceptance records and the old README are
+under `archive/`. Dependency documentation stays with `amgcl/`, `tinyexpr/` and
+`webui/public/vendor/`.

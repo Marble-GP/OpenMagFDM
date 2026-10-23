@@ -1,105 +1,108 @@
-# CLIコマンドマニュアル — v1.7.2
+# CLI command manual
 
-サーバーの常駐コンソール、起動引数、単体2Dソルバーの操作を説明する。
-保存先・アカウント・共有HTTPSの運用は[運用マニュアル](OPERATIONS.md)、
-HTTPからの操作は[REST APIマニュアル](REST_API.md)を参照。
+This manual covers the resident server console, startup flags and standalone 2D
+solver. See [Operations](OPERATIONS.md) for deployment and [REST API](REST_API.md)
+for HTTP automation. The published baseline is v1.7.2. Whole-workspace storage
+commands and `jobs list --all` are **unreleased source additions**.
 
-## 1. 起動
+## 1. Startup
 
-| 配布形態 | 起動コマンド |
+| Installation | Command |
 |---|---|
-| WindowsのNode同梱版 | `webui-server.exe` |
-| Linux/macOSのNode同梱版 | `./webui-server` |
-| ソース版（リポジトリ直下） | `npm --prefix webui ci`の後、`node webui/launcher.js` |
-| ソース版（webui内） | `npm ci`の後、`npm start` |
+| Packaged Windows | `webui-server.exe` |
+| Packaged Linux/macOS | `./webui-server` |
+| Source, repository root | `npm --prefix webui ci`, then `node webui/launcher.js` |
+| Source, webui directory | `npm ci`, then `npm start` |
 
-端末が接続されていればサーバー起動後に`OpenMagFDM>`が表示される。
-以降の例は、このプロンプトへ入力するコマンド。プロンプト文字自体は入力しない。
-WebUIは既定で`http://localhost:3000`。
+With a terminal attached, the server starts and opens `OpenMagFDM>`. Commands
+below are entered at this prompt; do not type the prompt itself. The default
+WebUI address is `http://localhost:3000`.
 
 ```text
-OpenMagFDM> help
-OpenMagFDM> status
-OpenMagFDM> menu
-OpenMagFDM> configure
+help
+status
+menu
+configure
 ```
 
-`menu`は矢印キーによる操作選択、`configure`はファイル数制限の設定フォーム。
-Tabはコマンド補完、上下キーは今回の起動中の履歴。履歴はメモリ内で100件まで保持する。
-空白を含むパスは`"D:\Analysis Results"`のように引用符で囲む。
-フォームのCtrl+Cは入力取消、コマンド入力途中のCtrl+Cは行の消去。
-空行でのCtrl+Cは通常終了を要求する。Ctrl+D／標準入力EOFは解析を含め終了する。
-パスワードは伏字の専用入力と確認入力を使用し、コマンド履歴に入れない。
+`menu` offers arrow-key actions; `configure` guides file-limit settings.
+Tab completes commands; Up/Down recalls up to 100 commands from this session.
+History stays in memory. Quote paths containing spaces, for example `"D:\Analysis Results"`.
+Ctrl+C cancels a form, clears a partial command, or requests normal exit on an
+empty command line. Ctrl+D/EOF closes the console and terminates active analyses.
+Passwords use separate masked prompts and are excluded from command history.
 
-## 2. 共通操作とサーバー制御
+## 2. Server control
 
-| コマンド | 動作・条件 |
+| Command | Effect |
 |---|---|
-| `help` / `/help` / `?` | 常駐コンソールのコマンド一覧。`--help`、`-h`も使用可 |
-| `menu` | 選択メニュー |
-| `configure` | 既定または指定作業領域のファイル数制限を対話設定 |
-| `status` | PID、アドレス、初期化状態、実行状況、ジョブをJSON表示。停止中は停止状態を表示 |
-| `start` | 停止中のサーバーを起動 |
-| `stop [--force]` | サーバーを停止し、コンソールを残す |
-| `restart [--force]` | 停止して起動 |
-| `exit [--force]` / `quit [--force]` | サーバーを停止してコンソールを終了 |
-| `<group> --help` | 管理コマンドの引数一覧。例：`limits --help` |
+| `help`, `/help`, `?`, `--help`, `-h` | Show console help |
+| `menu` | Choose an action |
+| `configure` | Configure default or per-workspace file limits |
+| `status` | Show PID, address, readiness, activity and unfinished jobs as JSON |
+| `start` | Start the stopped server |
+| `stop [--force]` | Stop the server, keeping the console open |
+| `restart [--force]` | Stop and start the server |
+| `exit [--force]`, `quit [--force]` | Stop the server and close the console |
+| `<group> --help` | Show administration arguments, e.g. `limits --help` |
 
-`stop`、`restart`、`exit`は解析・入力準備中には拒否する。
-`--force`は実行中の解析を終了する指定。取消はプロセスの終了を確認して確定する。
-待機ジョブはサーバー再起動後に保留となる。再開には`jobs resume`を使用する。
-起動に失敗してもコンソールは残るため、設定やポート競合を修正して`start`できる。
+Normal stop/restart/exit refuses active analyses or input preparation.
+`--force` explicitly terminates analyses. Queued jobs are held after a restart;
+use `jobs resume`. Startup failure leaves the console open to correct settings
+and retry `start`.
 
-## 3. ジョブ（稼働中のみ）
+## 3. Jobs (running server)
 
-| コマンド | 内容 |
+| Command | Effect |
 |---|---|
-| `jobs` / `jobs list` | 全作業領域の最近100件までを表示 |
-| `jobs list <workspace>` | 作業領域を絞って表示 |
-| `jobs cancel <workspace> <jobId>` | 指定ジョブの取消を要求 |
-| `jobs resume <workspace>` | サーバー再起動後の保留ジョブを再開 |
+| `jobs`, `jobs list` | Show up to 100 unfinished jobs across workspaces |
+| `jobs list <workspace>` | Filter unfinished jobs by workspace |
+| `jobs list [workspace] --all` | Include finished history (unreleased) |
+| `jobs cancel <workspace> <jobId>` | Request cancellation |
+| `jobs resume <workspace>` | Release jobs held after restart |
+
+Published v1.7.2 lists recent jobs including finished ones by default. Current
+source lists unfinished jobs by default. Held jobs remain visible for resumption;
+completed, failed, cancelled and interrupted jobs require `--all`.
 
 ```text
 jobs list user_example
+jobs list user_example --all
 jobs cancel user_example 01234567-89ab-cdef-0123-456789abcdef
 jobs resume user_example
 ```
 
-ジョブIDと作業領域は一覧から取得する。解析の新規受付はWebUI、REST API、MCPを使用する。
-常駐コンソールはOS端末を使用するサーバー管理者の操作経路で、全体のジョブを管理できる。
+Submit new analyses through WebUI, REST or MCP. The local server console is an
+administrator interface and can manage jobs across workspaces.
 
-## 4. アカウント（稼働中に反映）
+## 4. Accounts (live changes)
 
-| コマンド | 内容 |
+| Command | Effect |
 |---|---|
-| `users list` | アカウント名、役割、無効化状態を表示 |
-| `users create <name> [--admin]` | 通常ユーザー、または管理者を作成 |
-| `users disable <name>` | 新規操作と待機ジョブの開始を停止 |
-| `users enable <name>` | アカウントを有効化 |
-| `users reset-password <name>` | 新しいパスワードと確認入力を要求 |
+| `users list` | List names, roles and disabled state |
+| `users create <name> [--admin]` | Create an account with private password prompts |
+| `users disable <name>` | Stop new operations and queued job starts |
+| `users enable <name>` | Enable an account |
+| `users reset-password <name>` | Set a new password with confirmation |
 
-パスワードは12文字以上・UTF-8で1,024バイト以下。salt付きscryptで保存する。
-最後の有効な管理者は無効化できない。無効化してもデータは残り、既に実行中の解析は継続する。
-パスワード変更・無効化はそのアカウントのWebセッションを失効する。
+Passwords require at least 12 characters and at most 1,024 UTF-8 bytes, and use
+salted scrypt. The last enabled administrator cannot be disabled. Disabling an
+account retains its data and running analyses. Password changes and disabling
+invalidate its Web sessions.
 
-## 5. 作業領域（稼働中に反映）
+## 5. Workspaces (live changes)
 
-| コマンド | 内容 |
+| Command | Effect |
 |---|---|
-| `workspaces list` | 既存領域と所有者を表示。未割当は`(unassigned)` |
-| `workspaces assign <workspace> <account>` | 有効なアカウントへ所有者を割り当てる |
+| `workspaces list` | Scan storage directories and list workspace owners; unassigned is `(unassigned)` |
+| `workspaces assign <workspace> <account>` | Assign an enabled account |
 
-```text
-users create alice
-workspaces list
-workspaces assign user_example alice
-```
+Workspace IDs correspond to existing browser `userId` directories and use letters,
+digits, `_` and `-`. This list contains workspaces, not one entry per job; it does
+not use `jobs.json` to discover directories. Shared-mode users cannot access
+unassigned workspaces. Assignment and disabling do not delete or move files.
 
-作業領域IDは既存のブラウザー別`userId`に対応する。名前は英数字、`_`、`-`を用いる。
-共有モードでは所有者を割り当てるまで一般ユーザーへ公開しない。
-作業領域の割当変更やアカウント無効化で、ファイルを削除・移動することはない。
-
-## 6. ファイル数制限（稼働中に反映）
+## 6. File limits (live changes)
 
 ```text
 limits show [workspace]
@@ -107,14 +110,12 @@ limits set-default <configs|images|libraries> <count|unlimited>
 limits set <workspace> <configs|images|libraries> <count|unlimited|default>
 ```
 
-| 分類 | 対象 | 既定 |
-|---|---|---|
-| `configs` | 設定YAML | 20件 |
-| `images` | 入力画像 | 20件 |
-| `libraries` | 材料ライブラリYAML | 無制限 |
-
-`count`は0以上の整数、`unlimited`は無制限、`default`は領域別の上書きを解除する。
-`default`は`limits set`だけで使用できる。
+Defaults are 20 configuration files, 20 input images and unlimited material
+libraries per workspace. Counts include nested files in that input category,
+not generated results or frozen run inputs. Limits apply to WebUI, MCP and
+backup imports. A count is a nonnegative integer; `0` blocks creation.
+`unlimited` removes the cap; `default` removes a workspace override and is only
+accepted by `limits set`. Existing files remain and can be replaced at the cap.
 
 ```text
 limits set-default configs 100
@@ -124,96 +125,97 @@ limits set user_example images default
 limits show user_example
 ```
 
-制限は作業領域ごとで、サブフォルダーも数える。複数領域を持つアカウント全体の合算ではない。
-WebUI・MCP・バックアップ復元に共通で適用する。
-`0`は新規作成を禁止する。制限を減らしても既存ファイルは残り、上書きできる。
-結果と保存済み解析入力は、この入力ファイル数の対象外。
-
-## 7. 保存先（stop後に変更）
+## 7. Storage (stop before changes)
 
 ```text
 storage show
+storage set-workspace-root <absolute-directory>
+storage migrate-workspaces <absolute-empty-directory>
 storage set-results-root <absolute-directory>
 storage migrate-results <absolute-empty-directory>
 ```
 
+The two workspace commands are unreleased. `storage show` in current source
+prints the workspace root, each resolved category path and any results override.
+The default workspace root is the application directory, with `configs`,
+`uploads`, `user-libs` and `outputs` beneath it.
+
 ```text
 stop
-storage migrate-results "E:\OpenMagFDM Results"
+storage migrate-workspaces "E:\OpenMagFDM Data"
 start
 ```
 
-`set-results-root`は保存先設定だけを切り替える。`migrate-results`はコピーし、
-ファイル数とハッシュを検証してから設定を切り替える。元データは自動削除しない。
-移行元と重ならない空ディレクトリを指定する。失敗途中のコピーは残るため、
-原因を解決して別の空ディレクトリへ再試行する。設定は次の`start`で有効になる。
-詳細は[更新・移行手順](OPERATIONS.md#更新と移設)を参照。
+`set-workspace-root` changes settings only. It does not move existing data, and
+preserves a separate results override. `migrate-workspaces` copies all four
+categories from their currently resolved locations, including separately stored
+results, verifies file counts/hashes, then switches to the new common root and
+clears the results override. Original data is retained.
 
-## 8. ネットワーク（stop後に変更）
+The two results commands affect only results. `set-results-root` changes settings
+only; `migrate-results` copies and verifies before switching. A migration needs
+an empty destination that does not overlap any source. Private server state and
+public web assets cannot be used as data destinations. On failure, settings stay
+unchanged and partial copies remain for inspection. Retry with another empty
+destination after resolving the problem. Changes take effect at the next `start`.
+See [Operations](OPERATIONS.md#upgrades-and-relocation).
+
+## 8. Network (stop before changes)
 
 ```text
 network local
 network shared --cert <path> --key <path> [--host address]
 ```
 
-```text
-users create admin --admin
-stop
-network shared --cert "C:\certs\server.pem" --key "C:\certs\server-key.pem" --host 0.0.0.0
-start
-```
+Create an enabled administrator before enabling sharing. Provide a readable TLS
+certificate/key and configure client trust. Shared mode defaults to `0.0.0.0`,
+requires HTTPS and requires login even from localhost. `network local` restores
+loopback-only HTTP. Set the WebUI port through `PORT` before server startup.
 
-共有モードの有効化には有効な管理者、読み取り可能な証明書・秘密鍵が必要。
-証明書の発行・クライアント端末への信頼設定は運用側で行う。
-`--host`の既定は`0.0.0.0`。共有時はHTTPSで、localhostからもログインが必要。
-`network local`はループバック限定のHTTPへ戻す。ポートは起動環境の`PORT`で指定する。
+## 9. Startup flags and automation
 
-## 9. 起動引数と自動運用
+These are OS-shell arguments, not console commands:
 
-次は`OpenMagFDM>`ではなく、OSのシェルから指定する。
-
-| 引数 | 内容 |
+| Argument | Effect |
 |---|---|
-| 引数なし | TTYがあれば常駐コンソール、なければサーバーのみ起動 |
-| `--no-console` | 対話端末があってもサーバーのみ起動。サービス用 |
-| `--console` | パイプ等でもコンソールを明示起動。フォームにはTTYが必要 |
-| `help` / `--help` / `-h` | 管理コマンドのhelpを表示して終了 |
-| `--runtime-info` | Nodeバージョン・OS・CPU・同梱実行の有無をJSON表示して終了 |
-| `--mcp-admin-code` | 同じ配置の稼働サーバーのペアリングコードを表示 |
-| `--mcp-stdio --connection <id>` | 既存サーバーへのMCPブリッジ。GUIで表示された引数を使用 |
-| `users ...` / `workspaces ...` / `limits ...` / `storage ...` / `network ...` | 従来の単発管理コマンド |
+| None | Resident console with a TTY; server only otherwise |
+| `--no-console` | Server only, including with a TTY |
+| `--console` | Explicit console, including through pipes; forms still need a TTY |
+| `help`, `--help`, `-h` | Print administration help and exit |
+| `--runtime-info` | Print embedded Node version, OS, architecture and packaging information |
+| `--mcp-admin-code` | Print the running installation's pairing code |
+| `--mcp-stdio --connection <id>` | Bridge to an existing MCP server |
+| `users`, `workspaces`, `limits`, `storage`, `network` | One-shot administration |
 
-単発の保存先・ネットワーク・制限変更は、別プロセスのサーバーを停止してから実行する。
-稼働中の管理には常駐コンソールを使用する。`status`、`menu`、`jobs`、`stop`等は常駐コンソール専用。
-単発コマンドは正常時0、エラー時は非0で終了する。
+One-shot storage/network/limit mutations require the server to be stopped.
+Use the resident console for live administration. `status`, `menu`, `jobs`,
+`start` and `stop` are console commands. One-shot success exits 0; errors exit nonzero.
 
 ```powershell
-# OSシェルでの例
 .\webui-server.exe --runtime-info
 .\webui-server.exe limits show
 $env:PORT = '3100'
 .\webui-server.exe --no-console
 ```
 
-主な起動環境変数は[運用マニュアル](OPERATIONS.md#起動環境とリソース設定)を参照。
-MCPのOFF・切断・ログアウトは解析取消ではない。サーバー自体の終了は子ソルバーも終了する。
+Environment variables are documented in [Operations](OPERATIONS.md#environment-and-resources).
+MCP disconnection/OFF and WebUI logout do not cancel analyses. Server shutdown
+terminates child solvers.
 
-## 10. 単体2Dソルバー
+## 10. Standalone 2D solver
 
 ```text
 MagFDMsolver[.exe] <config.yaml> <image.png> [output_folder]
 MagFDMsolver[.exe] --version
 ```
 
-Windowsの例：
-
 ```powershell
 .\MagFDMsolver.exe .\sample_config.yaml .\model.png .\output_example
 .\MagFDMsolver.exe --version
 ```
 
-Linux/macOSは`./MagFDMsolver sample_config.yaml model.png output_example`。
-出力先省略時はタイムスタンプ付きフォルダーを使用する。
-引数不足時は使用方法を表示して非0で終了する。`--version`の出力は`OpenMagFDM 1.7.2`。
-画像はRGB材料配置、設定仕様は[CONFIGURATION.md](CONFIGURATION.md)を参照する。
-WebUI/MCPジョブ台帳と単体ソルバーの直接実行は別の起動経路である。
+Linux/macOS use `./MagFDMsolver sample_config.yaml model.png output_example`.
+Omitting the output directory creates a timestamped directory. Missing arguments
+print usage and exit nonzero. Version output is `OpenMagFDM 1.7.2`.
+The image defines RGB material regions; see [Configuration](CONFIGURATION.md).
+Direct standalone runs do not enter the WebUI/MCP job ledger.

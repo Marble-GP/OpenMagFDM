@@ -3,6 +3,22 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/archive/research/`.
 
+## Unreleased
+
+- Fix metadata/deletion of result directories exceeding 10,000 entries without
+  relaxing backup transfer limits; avoid repeated ancestor/tree inspections.
+- Retain deletion errors after refresh, report per-target filesystem failure
+  reasons, preserve failed selections and batch selections of more than 100 items.
+- Keep deletion progress in memory; write its durable journal only at acceptance
+  and completion, with explicit uncertainty after a server restart.
+- Add `storage set-workspace-root` and verified `storage migrate-workspaces` for
+  configurations, images, material libraries and results, preserving original data.
+- Show unfinished jobs in console status/list by default; expose finished
+  history explicitly with `jobs list --all`. Retain the server's durable JSON
+  ledger for queue recovery, idempotency and recorded convergence.
+- Use English for application-owned UI, README and current manuals. Add a
+  regression check for Japanese text in first-party public UI source.
+
 ## 1.7.2 — 2026-10-23
 
 - Open a resident `OpenMagFDM>` console on terminal startup, with completion,

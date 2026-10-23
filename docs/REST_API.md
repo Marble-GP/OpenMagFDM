@@ -1,54 +1,40 @@
-# REST APIマニュアル — v1.7.2
+# REST API manual
 
-対象はWebUIと同じサーバーのHTTP API。既定ベースURLは`http://localhost:3000`、
-共有モードでは設定したHTTPSアドレスとなる。CLI操作は[CLI.md](CLI.md)、
-アカウント・保存先・更新は[OPERATIONS.md](OPERATIONS.md)を参照。
+The API shares the WebUI server: `http://localhost:3000` locally, or the configured
+HTTPS address in shared mode. Baseline: v1.7.2. See [CLI](CLI.md) and [Operations](OPERATIONS.md).
 
-## 1. 共通規則
+## 1. Conventions
 
-- JSON更新は`Content-Type: application/json`。アップロードは`multipart/form-data`。
-- `userId`は作業領域ID。省略時に`default`を使うAPIもあるが、クライアントは明示する。
-- 共有モードの所有権はログインセッションから判定する。送信した`userId`は権限を与えない。
-- `configs/<name>`、`images/<name>`、`libraries/<name>`、`results/<folder>`は領域内の論理ファイルID。
-- 結果取得の`result`は一覧APIが返す`outputs/<workspace>/<folder>`。OS絶対パスを渡さない。
-- `file`は結果内の相対パス（例：`Az/step_0001`）。URLのパラメータはエンコードする。
-- ファイルの`revision`はSHA-256の64桁16進文字列。更新・削除前に取得する。
-- レスポンスはJSON、YAMLテキスト、画像、TIFF、ZIPなどAPIごとに異なる。
-- 多くのJSON APIは`success`を返す。一部の旧取得APIはエラーでもHTTP 200と
-  `success:false`を返すため、ステータスと本文・Content-Typeの両方を確認する。
+- Send JSON mutations with `Content-Type: application/json`; uploads use multipart.
+- `userId` is a workspace ID, not authorization. Shared access is checked against the login session. Explicitly send the workspace, even where `default` is accepted.
+- Logical file IDs are `configs/<name>`, `images/<name>`, `libraries/<name>` and `results/<folder>`.
+- A result query uses the returned `outputs/<workspace>/<folder>` identifier, never an OS path. `file` is relative to that result, e.g. `Az/step_0001`. URL-encode parameters.
+- Revisions are opaque 64-character SHA-256 hexadecimal values. Retrieve before updating/deleting.
+- Responses may be JSON, YAML text, images, TIFF or ZIP. Some legacy getters return HTTP 200 with `success:false` on error: inspect status, body and Content-Type.
+- MCP Bearer tokens are MCP-specific. Ordinary shared REST calls use Web sessions. Local calls must pass loopback, Host and Origin checks. If sending Origin, match the destination.
 
-MCPのBearerトークンはMCP専用。一般REST APIでは共有Webセッションを使用する。
-ローカルモードはループバック・Host・Originを検証する。
-外部クライアントも接続先と一致するHostを使い、Originを送る場合は接続先と一致させる。
+## 2. Authentication and CSRF
 
-## 2. 認証とCSRF
+Local mode requires no Web login; `/api/auth/me` returns `{success:true,mode:"local"}`.
+MCP administration pairing is separate. In shared mode:
 
-### ローカルモード
+1. POST `{name,password,remember?}` to `/api/auth/login`, with a matching Origin.
+2. Retain the HttpOnly/Secure/SameSite `omfdm_session` Cookie.
+3. GET `/api/auth/me` for `name,role,workspaces,csrf`.
+4. Mutations send Cookie, matching `Origin` and `X-CSRF-Token: <csrf>`.
 
-WebUIログインは不要。`GET /api/auth/me`は`{"success":true,"mode":"local"}`を返す。
-MCP管理ペアリングは別のセッションである（後述）。
-
-### 共有HTTPSモード
-
-1. `POST /api/auth/login`に`{name,password,remember?}`を送る。
-2. 返されたHttpOnly/Secure/SameSite Cookie（`omfdm_session`）を保存する。
-3. `GET /api/auth/me`で`name`、`role`、`workspaces`、`csrf`を取得する。
-4. 更新リクエストにはCookie、接続先と一致する`Origin`、`X-CSRF-Token: <csrf>`を送る。
-
-ログインにも一致する`Origin`が必要。ログイン成功の本文は`{success:true}`で、
-CSRFは`/api/auth/me`から取得する。ログイン試行制限に達した場合は429。
-TLS証明書を信頼したクライアントで接続する。
-
-| Method / path | リクエスト | 応答・効果 |
+| Method / path | Request | Effect |
 |---|---|---|
-| `POST /api/auth/login` | JSON `name`, `password`, 任意の`remember:boolean` | セッションCookieを発行。共有モードのみ |
-| `GET /api/auth/me` | Cookie | 利用者、役割、割当領域、CSRF。ローカル時は`mode`のみ |
-| `POST /api/auth/logout` | Cookie、Origin、CSRF | 当該セッションを失効 |
-| `POST /api/auth/password` | JSON `currentPassword`, `password`、Cookie、Origin、CSRF | 12文字以上の新パスワードへ変更。既存セッションを失効 |
+| `POST /api/auth/login` | JSON `name,password,remember?:boolean` | Shared login; `{success:true}` and session Cookie |
+| `GET /api/auth/me` | Cookie in shared mode | Identity/workspaces/CSRF; mode only locally |
+| `POST /api/auth/logout` | Cookie, Origin, CSRF | Invalidate this session |
+| `POST /api/auth/password` | JSON `currentPassword,password`, Cookie, Origin, CSRF | Change password; invalidate sessions |
 
-通常は無操作8時間・最長24時間、`remember:true`は最長30日。
-以下のcurl例はHTTPSの準備済みサーバーと専用アカウントを想定する。
-Windows PowerShellではOS標準のcurlを`curl.exe`で呼ぶ。
+Passwords require 12+ characters. Login throttling returns 429. Normal sessions
+expire after eight idle hours or 24 total; explicit remember allows up to 30 days.
+Use a client that trusts the TLS certificate. Regular users access assigned
+workspaces; administrators access all. Health, solver info and MCP administration
+require an administrator in shared mode.
 
 ```bash
 # login.json: {"name":"alice","password":"<your password>","remember":false}
@@ -56,40 +42,29 @@ curl --fail-with-body -c cookies.txt \
   -H 'Origin: https://server.example:3000' -H 'Content-Type: application/json' \
   --data-binary @login.json https://server.example:3000/api/auth/login
 curl --fail-with-body -b cookies.txt https://server.example:3000/api/auth/me
-# 更新では下記に加え、OriginとX-CSRF-Tokenを付ける。
 ```
 
-`login.json`とCookieはローカルの認証情報として扱い、公開・コミットしない。
-一般ユーザーは割当領域、管理者は全領域を操作できる。
-`/api/health`、`/api/solver/info`、MCP管理APIは共有時に管理者が必要。
+Use `curl.exe` in Windows PowerShell. Keep login/Cookie files private. Subsequent
+shared mutations also need Origin and `X-CSRF-Token`.
 
-## 3. 最小の解析ワークフロー
+## 3. Minimal analysis workflow
 
-以下はローカルモードのcurl例。共有モードでは前節のCookie・Origin・CSRFを追加する。
+These examples use local mode; add session/Origin/CSRF for shared mode.
 
 ```bash
-# 1. 画像を新規保存する。同名の既存画像は置換しない。
 curl --fail-with-body -F 'userId=demo' -F 'image=@model.png' \
   http://localhost:3000/api/upload-image
-
-# 2. 設定を取得する。本文はYAML、X-File-Revisionに現在のリビジョン。
 curl --fail-with-body -D config-headers.txt -o model.yaml \
   'http://localhost:3000/api/config?userId=demo&file=model.yaml'
-
-# 3. 保存する。config-save.jsonは後述のJSON形式。
 curl --fail-with-body -H 'Content-Type: application/json' \
   --data-binary @config-save.json http://localhost:3000/api/config
-
-# 4. ジョブを受付する。冪等キーは新しい解析ごとに生成し、再試行では同じ値を使う。
 curl --fail-with-body -H 'Content-Type: application/json' \
   --data '{"userId":"demo","configFile":"model.yaml","imageFile":"model.png","idempotencyKey":"demo-run-001"}' \
   http://localhost:3000/api/jobs
-
-# 5. 応答のjobIdで進捗・ログを取得する。
 curl --fail-with-body 'http://localhost:3000/api/jobs/JOB_ID?userId=demo'
 ```
 
-新規保存の`config-save.json`：
+Example `config-save.json` for a new white-only material image:
 
 ```json
 {
@@ -100,85 +75,82 @@ curl --fail-with-body 'http://localhost:3000/api/jobs/JOB_ID?userId=demo'
 }
 ```
 
-実際の画像に含まれる材料色を全て定義する。上記は白色だけの最小設定例。
-既存ファイルの更新時は`expectedRevision`を取得済みの値に置き換える。
+Define every image material color. Updating an existing file requires its
+retrieved revision. Use a fresh idempotency key per new analysis, reuse on retry.
 
-## 4. 設定・入力・材料ライブラリ
+## 4. Configuration, images and material libraries
 
-| Method / path | 主な入力 | 応答 |
+| Method / path | Input | Response |
 |---|---|---|
-| `GET /api/config/list` | query `userId` | `{success,files:[名前]}` |
-| `GET /api/config` | query `userId`, `file`（既定`sample_config.yaml`） | YAMLテキスト、`X-File-Revision` |
+| `GET /api/config/list` | query `userId` | `{success,files:[name]}` |
+| `GET /api/config` | query `userId,file?` (default `sample_config.yaml`) | YAML, `X-File-Revision` |
 | `POST /api/config` | JSON `userId,file,content,expectedRevision` | `{success,revision}` |
-| `POST /api/config/inspect` | JSON `content`（1 MiBまで） | `{version:1,valid,diagnostics,summary,scope}` |
-| `POST /api/validate-config` | JSON `config`（YAML文字列） | 旧互換の`{valid,errors}` |
-| `POST /api/upload-image` | multipart `userId`, `image` | `{success,filename,path,originalName}` |
-| `GET /api/images` | query `userId` | `{success,images:[名前]}` |
-| `GET /uploads/:user/:filename` | URLの作業領域と画像名 | 所有権を確認した画像バイナリ |
+| `POST /api/config/inspect` | JSON `content`, up to 1 MiB | `{version:1,valid,diagnostics,summary,scope}` |
+| `POST /api/validate-config` | JSON `config` (YAML string) | Legacy `{valid,errors}` |
+| `POST /api/upload-image` | multipart `userId,image` | `{success,filename,path,originalName}` |
+| `GET /api/images` | query `userId` | `{success,images:[name]}` |
+| `GET /uploads/:user/:filename` | Workspace/image in URL | Authorized image bytes |
 | `GET /api/material-libraries` | query `userId` | `{success,libraries:[{filename,size,modified}]}` |
-| `POST /api/material-libraries` | multipart `userId`, `library` | 新規YAMLの`filename,revision` |
-| `GET /api/material-libraries/:filename` | query `userId` | YAMLテキスト、`X-File-Revision` |
+| `POST /api/material-libraries` | multipart `userId,library` | New YAML `filename,revision` |
+| `GET /api/material-libraries/:filename` | query `userId` | YAML, `X-File-Revision` |
 | `PUT /api/material-libraries/:filename` | JSON `userId,content,expectedRevision` | `{success,filename,revision}` |
-| `GET /api/user-files` | query `userId` | 全分類の`{success,files}`。分類、名前、サイズ、更新日時等 |
-| `GET /api/workspace/file` | query `userId,id` | `{success,file}`。存在しなければ`file:null` |
+| `GET /api/user-files` | query `userId` | `{success,files}` across categories |
+| `GET /api/workspace/file` | query `userId,id` | `{success,file}`; absent target is `file:null` |
 
-設定取得時、指定ファイルがない場合はサーバー既定YAMLを返し、リビジョンは空となる。
-実在確認が必要なら`/api/workspace/file`を使用する。
-新規作成は`expectedRevision:null`、既存置換は現在のSHA-256リビジョンを指定する。
-欠落値を新規扱いにする旧経路でも、既存ファイルへの無条件上書きにはならない。
-設定・材料YAML保存は100 KiBまで。画像はPNG/JPEG/BMP、10 MiBまでで、デコード・画素数の制限も適用する。
-ファイル数制限はCLIの`limits`と共通。
+A missing config GET returns server-default YAML with an empty revision; use
+workspace metadata to check existence. Creation uses `expectedRevision:null`;
+replacement uses the current revision. Missing revision never grants unconditional
+overwrite. Config/material YAML saving is limited to 100 KiB. Images are PNG,
+JPEG or BMP, up to 10 MiB, with additional decoded-pixel guards. CLI quotas apply.
+Inspection positions use zero-based `row,column`. Editor validity does not
+establish physical validity, evaluated expressions, file resolution or convergence.
 
-`inspect`の診断位置は0始まりの`row,column`。`valid`はエディター検査でエラーがない意味で、
-物理的妥当性・外部ファイルの解決・式の実評価・収束を保証しない。
+## 5. Persistent jobs
 
-## 5. 永続ジョブ
-
-| Method / path | 主な入力 | 応答 |
+| Method / path | Input | Response |
 |---|---|---|
-| `POST /api/jobs` | JSON `userId,configFile,imageFile,idempotencyKey`、任意`materialLibraryFile` | 初回202、再送200。`jobId,status,resultId`等 |
-| `GET /api/jobs` | query `userId` | `{success,jobs}`。新しい順 |
-| `GET /api/jobs/:jobId` | query `userId` | 状態、進捗、完了・収束・警告、`logTail`等 |
-| `DELETE /api/jobs/:jobId` | query `userId` | 202。取消要求後の状態 |
-| `POST /api/jobs/resume` | JSON `userId` | 保留解除後の`{success,jobs}` |
+| `POST /api/jobs` | JSON `userId,configFile,imageFile,idempotencyKey`, optional `materialLibraryFile` | 202 initially, 200 on retry; `jobId,status,resultId,...` |
+| `GET /api/jobs` | query `userId` | `{success,jobs}`, newest first, including history |
+| `GET /api/jobs/:jobId` | query `userId` | State, progress, completion/convergence/warning, `logTail` |
+| `DELETE /api/jobs/:jobId` | query `userId` | 202; state after cancellation request |
+| `POST /api/jobs/resume` | JSON `userId` | `{success,jobs}` after releasing held jobs |
 
-冪等キーは空でない128文字以下。同じ領域・キー・入力名を再送すると同じジョブを返す。
-同じキーを異なる入力名に使うと409。入力ファイル名は領域内の保存名を指定する。
-YAML内の参照ファイルも`configs/...`等の領域内論理IDを使用する。
-受付時の画像・実効設定・材料・参照ファイルをスナップショットし、その入力で実行する。
+Keys must be nonempty and at most 128 characters. The same workspace/key/input
+names return the original job; reusing the key for different names returns 409.
+Use saved workspace filenames. YAML file references use logical IDs such as
+`configs/...`. Inputs, effective configuration, materials and references are
+frozen at acceptance. This server stores its durable job ledger in local private
+JSON; it is not a result-directory index. Result listings scan actual storage.
 
-状態は`preparing`、`queued`、`held`、`running`、`cancelling`、
-`completed`、`failed`、`cancelled`、`interrupted`。
-`completed`と`converged`は区別する。未収束警告を伴う完了もあるため、
-`warning`、`exitCode`、`message`、ログを合わせて確認する。
-結果の論理IDは`resultId`、結果取得API用の識別子は`resultPath`（未準備時はnullの場合あり）。
+States: `preparing,queued,held,running,cancelling,completed,failed,cancelled,interrupted`.
+Completion and convergence differ: check `converged,warning,exitCode,message`
+and logs. `resultId` is a logical file ID; `resultPath` is for retrieval APIs and
+may be null before preparation. Disconnect does not stop jobs. Poll after
+reconnection/cancellation until final state. Restart interrupts running jobs
+and holds queued jobs; calculations do not automatically resume midway.
 
-接続を切っても解析は継続する。画面復帰時は一覧を再取得し、必要なジョブをポーリングする。
-実行中取消は即時の終了成功を意味せず、プロセス終了後の状態まで追跡する。
-サーバー再起動後、実行途中は`interrupted`、待機中は`held`。自動の途中再開は行わない。
-新しい解析としてやり直す場合は新しいキーを使う。
+## 6. Results, fields and images
 
-## 6. 結果・分布データ・画像
+Inputs below are query parameters unless specified in the URL.
 
-| Method / path | 入力 | 応答・注意 |
+| Method / path | Input | Response / behavior |
 |---|---|---|
-| `GET /api/results` | `userId` | `{success,results}`。`name,path,steps`等 |
-| `GET /api/user-outputs` | `userId` | `{success,outputs}`。結果サイズ等の詳細一覧 |
-| `GET /api/detect-steps` | `result` | `{success,steps,hasTiff,hasCsv}`。CSV/TIFF同一ステップを重複計数しない |
-| `GET /api/load-field` | `result,file,prefer?` | TIFFバイナリ、またはCSVをデコードしたJSON |
-| `GET /api/load-csv-raw` | `result,file` | 生のCSVテキスト。時系列のヘッダーを保持 |
-| `GET /api/load-conditions` | `result` | 条件JSON |
-| `GET /api/get-conditions` | `result` | 条件JSONの別名経路 |
-| `GET /api/get-log` | `result` | `log.txt`テキスト |
+| `GET /api/results` | `userId` | `{success,results}` with `name,path,steps` |
+| `GET /api/user-outputs` | `userId` | `{success,outputs}` including sizes |
+| `GET /api/detect-steps` | `result` | `{success,steps,hasTiff,hasCsv}`; deduplicates CSV/TIFF steps |
+| `GET /api/load-field` | `result,file,prefer?` | Raw TIFF or decoded CSV JSON |
+| `GET /api/load-csv-raw` | `result,file` | CSV text, preserving time-series headers |
+| `GET /api/load-conditions` | `result` | Conditions JSON |
+| `GET /api/get-conditions` | `result` | Alias for conditions |
+| `GET /api/get-log` | `result` | `log.txt` text |
 | `GET /api/get-flux-linkage` | `result` | `{success,steps,series,step_column}` |
-| `GET /api/get-original-input` | `result` | 受付時の保存入力画像。旧結果等でなければ404 |
-| `GET /api/get-step-input-image` | `result,step`（既定0） | 当該ステップの`InputImg`。未出力時は404 |
-| `GET /api/get-boundary-image` | `result,step`（既定0） | `BoundaryImg`のPNG |
-| `GET /api/get-coarsening-mask` | `result,step`（省略または0は1） | 旧粗大化マスク。未出力時は404 |
-| `GET /api/results/:resultFolder/field-at-point` | `userId,x,y,step?` | 点の磁場値。直交はx/y[m]、極座標はx=r[m]、y=θ[rad]。既定step=0 |
+| `GET /api/get-original-input` | `result` | Accepted initial image, or 404 if absent |
+| `GET /api/get-step-input-image` | `result,step?` (default 0) | Step `InputImg`, or 404 |
+| `GET /api/get-boundary-image` | `result,step?` (default 0) | `BoundaryImg` PNG |
+| `GET /api/get-coarsening-mask` | `result,step?` (missing/0 means 1) | Legacy mask, or 404 |
+| `GET /api/results/:resultFolder/field-at-point` | `userId,x,y,step?` | Point values; Cartesian x/y [m], polar x=r [m], y=theta [rad]; default step 0 |
 
-表の入力はquery。`resultFolder`には結果フォルダー名だけを指定する。
-旧結果や任意出力でデータが存在しない場合を扱う。
+`resultFolder` is a folder name. Handle missing optional output and legacy data.
 
 ```bash
 curl --get --data-urlencode 'result=outputs/demo/output_example' \
@@ -186,137 +158,136 @@ curl --get --data-urlencode 'result=outputs/demo/output_example' \
   --output field.tiff http://localhost:3000/api/load-field
 ```
 
-`load-field`は拡張子省略可で、既定はTIFF優先・CSVへフォールバック。
-`prefer=csv`はCSV優先。TIFFは`Content-Type: image/tiff`と`X-Field-Format: tiff`、
-CSVは`{success:true,data:[[...]],format:"csv",precision:"double"}`。
-CSV JSONの行は上下反転され、欠損値はnull。TIFFは元バイナリのため同じ行変換は行わない。
-拡張子だけで形式を決めず、Content-Typeでデコードを選ぶ。
+`load-field` accepts an omitted extension. Default preference is TIFF then CSV;
+`prefer=csv` reverses it. TIFF returns `image/tiff` and `X-Field-Format: tiff`.
+CSV returns `{success:true,data:[[...]],format:"csv",precision:"double"}` with
+vertically reversed rows and null missing values. Raw TIFF has no such row
+conversion. Decode according to Content-Type, not the requested extension.
+Az field lines do not require an image. An initial image is not a substitute
+for moved/rotated step material geometry.
 
-元入力と移動・回転後のステップ画像は別物。磁力線表示にはAzがあればよく、
-画像がない場合に元入力を現在の材料配置とみなすことはない。
+## 7. Descriptions, rename and deletion
 
-## 7. description・名前変更・削除
-
-| Method / path | JSON入力（GETはquery） | 応答 |
+| Method / path | JSON input (GET uses query) | Response |
 |---|---|---|
-| `GET /api/user-outputs/:folderName/description` | `userId` | `{success,description,revision}`。未作成は空文字・null |
-| `PUT /api/user-outputs/:folderName/description` | `userId,description,expectedRevision` | 保存後のファイルメタデータ。descriptionは32 KiBまで |
+| `GET /api/user-outputs/:folderName/description` | `userId` | `{success,description,revision}`; absent description is empty/null |
+| `PUT /api/user-outputs/:folderName/description` | `userId,description,expectedRevision` | Saved metadata; description up to 32 KiB |
 | `PUT /api/user-outputs/:folderName/rename` | `userId,newName,revision` | `{success,newName,revision}` |
-| `POST /api/file-operations` | `userId,files:[{id,revision}]` | 200、`{success,operation}`。非同期削除を受付 |
-| `GET /api/file-operations` | `userId` | 最近100件までの`operations` |
-| `GET /api/file-operations/:id` | `userId` | `operation`の現在状態 |
+| `POST /api/file-operations` | `userId,files:[{id,revision}]` | 200 `{success,operation}`; accepts asynchronous deletion |
+| `GET /api/file-operations` | `userId` | Latest 100 `operations` |
+| `GET /api/file-operations/:id` | `userId` | Current `operation` |
 
-削除は`/api/workspace/file`で各対象の現在のリビジョンを取得してから要求する。
-1操作あたり1〜100対象。同じ作業領域の重複実行は409。
+Retrieve each target's current revision first. One operation accepts 1..100
+targets; concurrent workspace deletion returns 409. Current-source WebUI splits
+larger selections into operations automatically.
 
 ```json
-{
-  "userId": "demo",
-  "files": [{"id": "results/output_example", "revision": "<current 64-character SHA-256>"}]
-}
+{"userId":"demo","files":[{"id":"results/output_example","revision":"<current 64-character SHA-256>"}]}
 ```
 
-`operation`は`id,status,total,current,results,created,finished?`等を持つ。
-`status`は`running`、`complete`、`interrupted`。
-成功・失敗件数は`results`各項目の`success`から集計する。
-`complete`は処理終了であり、全対象の削除成功とは限らない。
-再接続後も操作IDから確認できる。サーバー再起動で中断した対象は、現状とリビジョンを再取得してから再要求する。
-通信タイムアウトだけで失敗と判断しない。実行中・待機中の結果は削除・名前変更から保護する。
+Operation fields include `id,status,total,current,results,created,finished?`.
+States are `running,complete,interrupted`. **`complete` does not mean deletion
+succeeded**: count each result's `success` and inspect `error,code`. Reconnect
+using the operation ID. Refresh state/revisions before retrying interrupted
+targets. A timeout is not proof of failure. Active/queued results are protected.
+Current source keeps failed selections and displays target-specific errors after
+list refresh; large-result inspection/deletion no longer uses the transfer-entry cap.
+Progress remains in server memory; current-source journals are written at
+acceptance and completion only. After a server restart, an interrupted operation
+may have removed targets without a persisted outcome: refresh actual files.
 
-旧互換の同期削除経路は、`DELETE /api/config/:filename`、`/api/images/:filename`、
-`/api/material-libraries/:filename`、`/api/user-outputs/:folderName`。
-bodyに`userId,revision`、またはqueryの`userId`と`If-Match`ヘッダーで対象を指定する。
-`DELETE /api/user-files`はbodyに`userId,category,name,revision`、
-`DELETE /api/user-outputs/bulk`は`userId,files:[{name,revision}]`。
-大きな結果の一括削除には非同期の`/api/file-operations`を使用する。
+Legacy synchronous DELETE paths: `/api/config/:filename`, `/api/images/:filename`,
+`/api/material-libraries/:filename`, `/api/user-outputs/:folderName`. Send
+`userId,revision` in the body, or query `userId` and the `If-Match` header.
+`DELETE /api/user-files` takes `userId,category,name,revision`;
+`DELETE /api/user-outputs/bulk` takes `userId,files:[{name,revision}]`.
+Use asynchronous operations for large results.
 
-## 8. ZIPバックアップ
+## 8. ZIP backups
 
-| Method / path | 入力 | 応答 |
+| Method / path | Input | Response |
 |---|---|---|
 | `GET /api/backup-manifest` | query `userId` | `categories,totalSize` |
-| `GET /api/export` | query `userId,include?` | ZIP。include既定は`configs,images,libraries` |
-| `POST /api/export` | JSON `userId,entries:[論理ファイルID]` | 選択した1〜10,000ファイルのZIP |
-| `POST /api/import` | multipart `userId,backup` | 検査結果、`transferId,files:[{id,size,expectedRevision}]`等 |
+| `GET /api/export` | query `userId,include?` | ZIP; default include `configs,images,libraries` |
+| `POST /api/export` | JSON `userId,entries:[logical ID]` | ZIP of selected 1..10000 files |
+| `POST /api/import` | multipart `userId,backup` | Preview `transferId,files:[{id,size,expectedRevision}],...` |
 | `POST /api/import/commit` | JSON `userId,transferId,files:[{id,revision}]` | `success,written,skipped` |
-| `DELETE /api/import/:transferId` | query `userId` | 検査用一時データを解放 |
+| `DELETE /api/import/:transferId` | query `userId` | Release preview data |
 
-`include`は分類名のカンマ区切り。結果も含める場合は`results`を明示する。
-インポートの最初のPOSTは検査と一時保存のみで、既存ファイルを書き換えない。
-検査で返された全対象をcommitする。各項目の`expectedRevision`を、commitでは
-`revision`というキーに入れる（新規対象はnull）。対象の部分選択はこの経路では行わない。
-競合時は409。途中で失敗した場合は`applied`に適用済みIDが返ることがある。
-ZIPアップロード上限1 GiB、展開後サイズ等の追加制限あり。
-旧JSONバックアップは16 MiBまで。リンク・暗号化・領域外パスを拒否する。
+`include` is comma-separated; request `results` explicitly. Initial import only
+inspects/stages data. Commit all preview targets using the preview's
+`expectedRevision` as `revision` (null for new targets). This adapter does not
+commit subsets. Conflicts return 409; partial failures may include `applied`
+IDs. ZIP upload limit is 1 GiB, with additional expanded-size/resource guards.
+Legacy JSON backups are limited to 16 MiB. Links, encryption and foreign paths
+are rejected. Backup transfer-entry limits still apply to large directories.
 
-## 9. 画像前処理
+## 9. Image preprocessing
 
-保存済みの画像を使う経路はJSON `userId,filename`を共通入力にする。
+Saved-image operations share JSON `userId,filename`.
 
-| Method / path | 追加の主な入力 | 内容 |
+| Method / path | Additional input | Effect |
 |---|---|---|
-| `POST /api/materials/detect` | multipart `image`。query `rareThreshold,blendTolerance,minColorDist,blendBaseMinRatio`は任意 | 色、AA候補、材料YAML生成 |
-| `POST /api/preprocess-polar/detect` | 任意`hint,color_groups` | 中心、半径、周期性等を推定 |
-| `POST /api/preprocess-polar/warp` | `center_x,center_y,r_start_px,r_end_px,theta_start,theta_end,nr,ntheta`、任意`r_orientation,output_filename,r_outer_physical,preview` | 極座標画像と`polar_domain`を生成 |
-| `POST /api/preprocess-polar/cleanup-preview` | 共通入力 | 対象画像の一時warpプレビューを削除 |
-| `POST /api/preprocess-filter/quick-stats` | 共通入力 | `unique_colors,image_width,image_height,looks_noisy` |
-| `POST /api/preprocess-filter/auto-tune` | 任意`nTargets,maxEvals,subsampleSize,initial,rareThreshold` | 量子化のノイズ抑制設定を探索 |
-| `POST /api/preprocess-filter/quantize` | 任意`rareThreshold,nTargets,minTargetDist,despeckleRadius,bilateralSigmaSpatial,bilateralSigmaColor,minIslandSize,preview,output_filename` | 均一色画像を生成 |
+| `POST /api/materials/detect` | multipart `image`; optional query `rareThreshold,blendTolerance,minColorDist,blendBaseMinRatio` | Colors, anti-alias candidates and material YAML |
+| `POST /api/preprocess-polar/detect` | optional `hint,color_groups` | Estimate center, radii and periodicity |
+| `POST /api/preprocess-polar/warp` | `center_x,center_y,r_start_px,r_end_px,theta_start,theta_end,nr,ntheta`; optional `r_orientation,output_filename,r_outer_physical,preview` | Polar image and domain |
+| `POST /api/preprocess-polar/cleanup-preview` | Common input | Remove this image's warp preview |
+| `POST /api/preprocess-filter/quick-stats` | Common input | `unique_colors,image_width,image_height,looks_noisy` |
+| `POST /api/preprocess-filter/auto-tune` | optional `nTargets,maxEvals,subsampleSize,initial,rareThreshold` | Search quantization settings |
+| `POST /api/preprocess-filter/quantize` | optional `rareThreshold,nTargets,minTargetDist,despeckleRadius,bilateralSigmaSpatial,bilateralSigmaColor,minIslandSize,preview,output_filename` | Quantized image |
 
-warpの角度はrad、画像上の中心・半径はpixel、`r_outer_physical`はm。
-`nr`と`ntheta`は2以上の整数で積は16×1,024×1,024以下。
-`r_orientation`は`horizontal`（既定）または`vertical`。
-出力は`filename,path`等を返す。`preview:true`は元画像ごとの固定プレビュー名を使う。
-画像出力も共通の作業領域・ファイル数制限で管理する。
-これらはWebUIの前処理機能に対応する補助APIで、形状・材料の検出結果は解析前に確認する。
+Warp angles use radians; image center/radii use pixels; `r_outer_physical` uses
+metres. `nr,ntheta` are integers >=2 with product <=16*1024*1024.
+Orientation is `horizontal` (default) or `vertical`. Outputs include `filename,path`.
+`preview:true` uses a fixed per-input preview name. Output images share workspace
+quotas. Review inferred geometry/materials before analysis.
 
-## 10. 診断・MCP管理・旧API
+## 10. Diagnostics, MCP administration and retired APIs
 
-| Method / path | 入力・用途 |
+| Method / path | Purpose |
 |---|---|
-| `GET /api/health` | ソルバーの存在とデータディレクトリの書込可否。200 `ok`、503 `degraded` |
-| `GET /api/solver/info` | ソルバーバージョン、検出パス、機能、Node/OS情報 |
-| `GET /api/get-transient-config` | サーバー既定YAMLの移動設定。結果固有の条件には`load-conditions`を使用 |
-| `GET /api/automation/activity?userId=...` | ループバック用のジョブ・操作履歴 |
-| `POST /api/automation/jobs/:id/cancel` | 旧ローカル管理用取消。新規クライアントは`DELETE /api/jobs/:jobId` |
+| `GET /api/health` | Solver availability and storage writability; 200 `ok`, 503 `degraded` |
+| `GET /api/solver/info` | Solver version/path/features and Node/OS |
+| `GET /api/get-transient-config` | Server-default motion settings; use conditions for result-specific settings |
+| `GET /api/automation/activity?userId=...` | Local job/operation activity |
+| `POST /api/automation/jobs/:id/cancel` | Legacy local cancellation; prefer common jobs API |
 
-MCP管理APIは一般REST認証に加え、ループバック検証・ブラウザーペアリングを行う。
-`POST /api/mcp/pair`へ`{code,remember?}`を送ると`omfdm_admin` Cookieと`csrf`が返る。
-変更には`X-OMFDM-CSRF`を使用する（共有Webセッションの`X-CSRF-Token`とは別）。
+MCP management adds loopback checks/browser pairing to ordinary REST auth.
+POST `{code,remember?}` to `/api/mcp/pair` for an `omfdm_admin` Cookie and `csrf`.
+Management mutations use `X-OMFDM-CSRF`, separate from Web-session CSRF.
 
-| Method / path | 入力・内容 |
+| Method / path | Input / effect |
 |---|---|
-| `GET /api/mcp/status` | 待受・接続状態と管理CSRF |
-| `POST /api/mcp/forget-browser` | 管理ブラウザーの信頼を解除 |
-| `GET /api/mcp/solver` | 保存済みソルバーパスと検出状態 |
-| `PUT /api/mcp/solver` | `{path}`。絶対パスまたは自動検出へ戻す空文字。再起動が必要 |
+| `GET /api/mcp/status` | Listener/connections and administration CSRF |
+| `POST /api/mcp/forget-browser` | Remove trusted-browser state |
+| `GET /api/mcp/solver` | Saved solver path/detection |
+| `PUT /api/mcp/solver` | `{path}`; absolute, or empty for detection; restart required |
 | `PUT /api/mcp/settings` | `{enabled:boolean,port:1024..65535}` |
-| `POST /api/mcp/connections` | `{name,user,permissions}`。トークンは作成時だけ表示 |
-| `PATCH /api/mcp/connections/:id` | 接続の権限・失効等を更新。詳細はMCPマニュアル |
-| `POST /api/mcp/connections/:id/test` | サーバー側の接続試験 |
-| `GET /api/mcp/setup/:id` | HTTP URLとstdioのcommand/args。トークン本体は返さない |
+| `POST /api/mcp/connections` | `{name,user,permissions}`; raw token shown once |
+| `PATCH /api/mcp/connections/:id` | Update permissions/revocation |
+| `POST /api/mcp/connections/:id/test` | Server-side connection check |
+| `GET /api/mcp/setup/:id` | HTTP URL and stdio arguments, without raw token |
 
-共有HTTPSでのMCP管理UIには制約がある。[MCP接続手順](MCP_INTEGRATION.md)を参照。
-MCPのJSON-RPCツール呼出し先は別待受の`/mcp`で、上記RESTとは別プロトコル。
+See [MCP](MCP_INTEGRATION.md) for the shared HTTPS limitation. MCP JSON-RPC tools
+use the separate `/mcp` listener. Old POST `/api/solve`, `/api/solve-stream`,
+`/api/stop-solver` and `/data` return 410. `/api/load-csv` is deprecated CSV-only
+compatibility; prefer `load-field`. `/api/get-material-image` returns 410 in
+shared mode; use workspace-scoped image routes.
 
-旧`POST /api/solve`、`/api/solve-stream`、`/api/stop-solver`と`/data`は410。
-`GET /api/load-csv`はCSV限定の非推奨互換経路。新規取得は`load-field`を使用する。
-旧`GET /api/get-material-image`は共有モードでは410。新規クライアントは領域付き画像経路を使用する。
+## 11. Errors and retries
 
-## 11. エラー時の扱い
-
-| HTTP | 代表的な意味 | クライアントの処理 |
+| HTTP | Typical meaning | Action |
 |---|---|---|
-| 400 | 入力・パス・形式の不正 | 本文を確認して修正 |
-| 401 | ログインなし／セッション失効 | 再ログインして領域・CSRFを再取得 |
-| 403 | 領域権限、Origin、CSRF | 割当と送信元・Cookie・ヘッダーを確認 |
-| 404 | 対象・出力がない | 任意出力・旧結果・削除を区別 |
-| 409 | 更新競合、冪等キー不一致、制限、処理中 | メッセージに応じ再取得／既存操作の照会 |
-| 410 | 廃止経路 | 共通ジョブ・領域付きAPIへ移行 |
-| 413 | サイズ上限 | 送信サイズ・API別上限を確認 |
-| 428 | 削除・更新の前提リビジョンなし | 先にメタデータを取得 |
-| 429 | 試行・リソース制限 | 待機して再試行 |
-| 500 / 503 | サーバーエラー／初期化・容量等 | 状態とログを確認。受付済み操作を照会して重複を防ぐ |
+| 400 | Invalid input/path/format | Correct from response details |
+| 401 | Login absent/expired | Log in; retrieve workspace and CSRF again |
+| 403 | Ownership, Origin or CSRF | Check assignment, Cookie and headers |
+| 404 | Target/output absent | Distinguish optional, legacy and deleted output |
+| 409 | Revision/idempotency/quota/busy conflict | Refresh or inspect existing operation |
+| 410 | Retired route | Use common jobs/scoped routes |
+| 413 | Resource/size limit | Check endpoint-specific limits |
+| 428 | Required revision absent | Retrieve metadata first |
+| 429 | Attempt/resource throttling | Wait before retry |
+| 500 / 503 | Server/readiness/capacity issue | Inspect logs/status; query accepted operations |
 
-エラー本文は経路により`{success:false,error,code?}`、`{error,code}`、テキスト等となる。
-通信断時、ジョブは同じ冪等キーで再照会・再送し、削除は操作IDで追跡する。
+Errors vary by adapter: `{success:false,error,code?}`, `{error,code}`, or text.
+After disconnection, retry jobs with the same key and query deletions by operation ID.
