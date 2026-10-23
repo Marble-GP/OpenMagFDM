@@ -316,13 +316,13 @@ jobs:
         cp general_materials.yaml release/OpenMagFDM-macOS/
         python3 tools/stage-release.py release/OpenMagFDM-macOS
         cd release
-        tar -czf OpenMagFDM-macOS-x86_64.tar.gz OpenMagFDM-macOS
+        tar -czf OpenMagFDM-macOS-arm64.tar.gz OpenMagFDM-macOS
 
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
-        name: OpenMagFDM-macOS-x86_64
-        path: release/OpenMagFDM-macOS-x86_64.tar.gz
+        name: OpenMagFDM-macOS-arm64
+        path: release/OpenMagFDM-macOS-arm64.tar.gz
 
   build-webui-standalone:
     runs-on: ubuntu-latest
@@ -528,7 +528,7 @@ jobs:
         files: |
           artifacts/OpenMagFDM-Linux-x86_64/OpenMagFDM-Linux-x86_64.tar.gz
           artifacts/OpenMagFDM-Windows-x86_64/OpenMagFDM-Windows-x86_64.zip
-          artifacts/OpenMagFDM-macOS-x86_64/OpenMagFDM-macOS-x86_64.tar.gz
+          artifacts/OpenMagFDM-macOS-arm64/OpenMagFDM-macOS-arm64.tar.gz
           artifacts/OpenMagFDM-WebUI-Standalone/OpenMagFDM-WebUI-Linux.tar.gz
           artifacts/OpenMagFDM-WebUI-Standalone/OpenMagFDM-WebUI-Windows.zip
           artifacts/OpenMagFDM-WebUI-Standalone/OpenMagFDM-WebUI-macOS.tar.gz
