@@ -1,4 +1,4 @@
-"""Remove experimental GPU assets from an already copied v1.7.1 package.
+"""Remove experimental GPU assets from an already copied maintenance package.
 
 Never run against the source tree. The 3D targets/tools are not copied by release.yml.
 """
@@ -28,7 +28,7 @@ def stage(destination):
         gpu.unlink()
     if 'field-gpu.js' in content or 'value="gpu"' in content:
         raise ValueError('Experimental renderer is still referenced')
-    print(f'Staged v1.7.1 legacy-renderer package: {root}')
+    print(f'Staged maintenance legacy-renderer package: {root}')
 
 
 if __name__ == '__main__':

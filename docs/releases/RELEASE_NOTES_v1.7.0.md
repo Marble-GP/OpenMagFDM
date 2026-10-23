@@ -32,4 +32,4 @@
 - MCPのユーザー境界はOSサンドボックスやWebUI全体の多人数認証基盤ではない。
   共有PCではブラウザーを信頼せず、削除・置換権限は必要な接続にのみ与える。
 
-[OpenCode用の小モデル試験手順・ZIP生成方法](../MCP_ACCEPTANCE_TEST.md)も利用できる。
+[OpenCode用の小モデル試験手順・ZIP生成方法](../archive/acceptance/MCP_ACCEPTANCE_TEST.md)も利用できる。

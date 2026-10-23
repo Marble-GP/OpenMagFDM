@@ -1,7 +1,7 @@
 # Workspace and embedded MCP contracts
 
 The text-inspection contract below remains v1. As of 2026-10-15 an embedded MCP
-implementation is under acceptance testing; see [MCP setup and status](MCP_INTEGRATION.md).
+implementation is under acceptance testing; see [MCP setup and status](../../MCP_INTEGRATION.md).
 The GUI user ID separates data directories but is not authentication. Do not expose
 the legacy WebUI to untrusted networks or treat it as an authenticated multi-user API.
 

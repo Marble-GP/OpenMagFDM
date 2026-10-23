@@ -1,28 +1,10 @@
-# OpenMagFDM WebUI v1.7.1
+# OpenMagFDM WebUI v1.7.2
 
-This checkout contains v2 development changes. See the
-[v2 implementation and operations notes](../docs/V1_7_1_OPERATIONS.md) for
-persistent jobs, shared HTTPS accounts, storage migration and experimental GPU
-rendering, including uncompleted acceptance tests and retired API endpoints.
-
-The WebUI is the browser-based editor, preprocessor, solver launcher and result
-viewer for OpenMagFDM. It runs on Node.js/Express and is also distributed as a
-standalone executable built with `pkg`.
-
-## Agent / MCP setup
-
-See the [MCP connection manual in the main README](../README.md#mcp-setup) for
-GUI pairing, workspace assignment, permissions, Codex HTTP/stdio examples,
-read-only acceptance prompts and troubleshooting. Embedded MCP is available
-in v1.7.0 and is initially OFF; local connections are scoped to an assigned user.
-The [MCP integration notes](../docs/MCP_INTEGRATION.md) track tested behavior
-and remaining limitations. Existing client settings are never edited automatically.
+The browser editor, image preprocessor, analysis manager and result viewer for
+the OpenMagFDM 2D solver. The packaged executable embeds Node.js 24.22.1.
+For a source checkout, use the version in [`.node-version`](../.node-version).
 
 ## Start
-
-Use Node.js **24.x** for the source distribution, or the packaged executable
-which includes its own runtime. Keep the WebUI server running when using MCP;
-`--mcp-stdio` only bridges to that existing server.
 
 ```bash
 cd webui
@@ -30,117 +12,46 @@ npm ci
 npm start
 ```
 
-Open `http://localhost:3000`. The server locates `MagFDMsolver` beside the
-package or in the configured development paths. Use `GET /api/health` and
-`GET /api/solver/info` to diagnose the runtime.
+Open `http://localhost:3000`. With a terminal attached, the server opens the
+resident `OpenMagFDM>` console. Enter `help`, `menu`, `configure` or `status`.
+Use `--no-console` for service operation. The standalone package starts with
+`webui-server.exe` on Windows or `./webui-server` on Linux/macOS.
+Install the C++ solver and its native dependencies separately when using the
+WebUI-only archive.
 
-## Main workflows
+## Manuals
 
-- Edit and validate YAML with Ace completion from `public/yaml-schema.json`.
-- Upload an image, inspect physical/image properties and detect material RGBs.
-- Uniformise anti-aliased CAD screenshots before analysis.
-- Detect and interactively correct polar geometry, then warp and insert YAML.
-- Generate a Cartesian/Linear template directly from an existing strip image.
-- Preview permanent-magnet directions, including polar coordinate conversion.
-- Queue/cancel persistent analyses and reconnect to their progress and logs.
-- View TIFF or CSV fields, flux linkage, energy, force and torque timelines.
-- Manage configurations, uploaded analysis images, material libraries and
-  result folders together from the File Manager tab, including select-all and
-  bulk deletion across file categories.
-- Export/import selected user content as a standard ZIP backup from File
-  Manager; the YAML editor remains focused on editing configuration content.
+- [CLI commands and startup arguments](../docs/CLI.md)
+- [REST API: authentication, revisions, jobs, results, images and backups](../docs/REST_API.md)
+- [Server operation, sharing, storage and upgrades](../docs/OPERATIONS.md)
+- [MCP HTTP/stdio setup](../docs/MCP_INTEGRATION.md)
+- [YAML configuration](../docs/CONFIGURATION.md)
+- [Documentation index](../docs/README.md)
+- [Historical investigations and acceptance records](../docs/archive/README.md)
 
-## v1.7.0 additions
+Account, owner and file-limit changes entered in the resident console apply
+while the server runs. Storage and network changes use `stop`, settings, `start`.
+Browser reloads and MCP disconnects do not cancel durable analysis jobs.
+Existing one-shot administration commands remain available.
 
-- Local HTTP/stdio MCP, permission management and warning-aware analysis results.
-- Optional 30-day browser trust; Forget this browser revokes GUI management only.
-- Automatic solver detection, with GUI path settings applied at the next startup.
-- YAML assistance, safe reloads and explicit Results source/loading guidance.
-- See [release notes](../docs/releases/RELEASE_NOTES_v1.7.0.md) for verification and limitations.
-
-## Retained v1.6.2 behaviours
-
-- Fixed the Input Image preview feedback loop: ruler canvases and the zoom
-  stage now stay inside a bounded viewport instead of expanding the image
-  plot area on every layout pass.
-
-## v1.6.1 behaviours
-
-- Polar `r_start/r_end` are physical metres; `r_start: 0` represents a full
-  disc and requires a Dirichlet inner boundary.
-- Decimal slide-region bounds are metres; integers are legacy pixel indices.
-- Generated nonlinear templates enable Eisenstat-Walker and use
-  `max_iterations: 100`, `tolerance: 1.0e-3`.
-- Detected air-gap sliding is enabled by default when an air-gap candidate is
-  available.
-- Input Image and Magnetisation Preview support wheel zoom, middle-drag pan,
-  reset and image-pixel rulers.
-- Decoded field data uses a 256 MiB byte-budgeted LRU cache. Memory-heavy field
-  fetch/decode work is serialized and cache, staging payloads and decode
-  headroom share an estimated 384 MiB field-data working budget. In-flight
-  loads are leased per viewer and the physical request is cancelled when its
-  final viewer leaves. Preload stops at the budget instead of retaining every
-  transient step.
-- Coarsening masks use compact byte arrays and retain at most four completed
-  result/step entries within a 32 MiB cache budget. Dashboard and File Manager
-  consumers use independent cancellation, and deleted/redrawn plots release
-  their Plotly state.
-- Solver children are tracked until their `close` event and are stopped on an
-  interrupted stream or server shutdown. The default process limits are two
-  solver processes globally and one active solve per user.
-
-Long-running server retention is bounded by default: at most 200 completed job
-records are kept for 24 hours, with 256 KiB of log text per job. The principal
-deployment overrides are `MAX_SOLVER_PROCESSES`, `MAX_CONCURRENT_JOBS`,
-`MAX_CONCURRENT_JOBS_PER_USER`, `MAX_SOLVER_START_OPERATIONS`,
-`MAX_SOLVER_START_OPERATIONS_PER_USER`, `MAX_JOB_RECORDS`,
-`MAX_JOB_LOG_CHARS`, and `JOB_TTL_MS`. Solver preparation is reserved before
-asynchronous YAML/file work begins. Legacy non-streaming responses retain at
-most `LEGACY_RESPONSE_LOG_CHARS` characters per returned stream and are bounded
-by `MAX_LEGACY_RESPONSES` until the response finishes or closes. Raise process
-limits only after measuring solver peak memory on the target model.
-
-Windows `Cached`/standby memory and the paged/nonpaged kernel pools are managed
-by Windows, not by the WebUI cache. OpenMagFDM deliberately does not call
-working-set or system-cache purge APIs: those counters may remain high while
-their pages are reclaimable, and forced trimming causes avoidable rereads and
-page faults. Diagnose application retention with each process's Private Bytes,
-the number of live `MagFDMsolver` children, and whether those values return
-after the run; the limits and lifecycle cleanup above address those owned
-resources.
-
-The authoritative YAML contract is in `../docs/CONFIGURATION.md`.
-
-## Development rules
-
-- Keep `public/yaml-schema.json`, generated templates in `public/app.js`,
-  `sample_config.yaml`, and `docs/CONFIGURATION.md` synchronized.
-- Add no server dependency without checking Node 24 / `@yao-pkg/pkg` compatibility.
-  ESM-only transitive dependencies have broken standalone builds before.
-- After JavaScript edits run:
+## Development checks
 
 ```bash
-node --check server.js
-node --check public/app.js
-node -e "JSON.parse(require('fs').readFileSync('public/yaml-schema.json','utf8'))"
-node --test tests/process_lifecycle.test.js
+npm test
+npm audit --audit-level=moderate
+node tests/image_api_smoke.cjs
+node tests/server_console_smoke.cjs
+node tests/server_console_pty.cjs
+node tools/build-mcp-package.cjs
 ```
 
-- Prefer browser-side decoding for TIFF; `public/lib/geotiff.js` is the shipped
-  UMD bundle.
-- User data lives under `configs/`, `uploads/`, `user-libs/` and `outputs/` and
-  must never be committed or included unintentionally in packages.
+The CI additionally tests packaged HTTP, MCP stdio, image handling and actual
+terminal input on Windows, Linux and macOS. The PTY harness uses the development
+dependency `node-pty`; on Linux it requires a native build toolchain.
+Runtime prompt widgets use Inquirer; command editing uses Node's `readline`.
 
-## API groups
-
-- Configuration: `/api/config*`, `/api/validate-config`
-- Images/preprocess: `/api/images*`, `/api/materials/detect`,
-  `/api/preprocess-filter/*`, `/api/preprocess-polar/*`
-- Solver/jobs: `/api/jobs*` (legacy solve/stop routes return HTTP 410)
-- Results/files: `/api/results*`, `/api/user-files`, `/api/user-outputs*`, `/api/load-field`,
-  `/api/get-flux-linkage`
-- Libraries/backups: `/api/material-libraries*`, `/api/backup-manifest`,
-  `/api/export`, `/api/import`
-
-All user-supplied paths must stay basename/path-normalized and constrained to
-the current user's server directories.
+Keep `public/yaml-schema.json`, templates, sample YAML and the configuration
+manual synchronized. Preserve workspace ownership, revision preconditions,
+frozen job inputs and active-result protection when changing an API.
+User data under `configs/`, `uploads/`, `user-libs/` and results directories must
+not be committed or unintentionally packaged.

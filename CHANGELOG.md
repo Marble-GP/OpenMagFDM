@@ -1,9 +1,9 @@
 # Changelog
 
 All notable user-facing changes are summarized here. Detailed technical
-investigations remain under `docs/research/`.
+investigations remain under `docs/archive/research/`.
 
-## Unreleased
+## 1.7.2 — 2026-10-23
 
 - Open a resident `OpenMagFDM>` console on terminal startup, with completion,
   session history, Inquirer menus/settings forms and private password input.
@@ -12,7 +12,10 @@ investigations remain under `docs/research/`.
 - Guard active analyses during normal shutdown; close the child server on EOF
   or supervisor loss. Preserve headless startup and MCP stdio behavior.
 - Add source/packaged PTY acceptance tests alongside HTTP, lifecycle and MCP checks.
-- See `docs/SERVER_CONSOLE.md` for usage, library selection and validation.
+- Refresh the README and add CLI, REST API and operations manuals. Archive
+  historical plans, implementation records, numerical investigations and measurements.
+- See `docs/CLI.md` and `docs/REST_API.md` for current usage;
+  UI selection and earlier validation records are under `docs/archive/`.
 
 ## 1.7.1 — 2026-10-23
 

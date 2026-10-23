@@ -1,16 +1,23 @@
-# OpenMagFDM documentation
+# OpenMagFDM v1.7.2 ドキュメント
 
-- [v1.7.1 release notes](releases/RELEASE_NOTES_v1.7.1.md)
-- [Server operation, accounts, file limits and storage](V1_7_1_OPERATIONS.md)
-- [Resident server console (after v1.7.1): usage, UI selection and tests](SERVER_CONSOLE.md)
-- [YAML configuration](CONFIGURATION.md)
-- [MCP setup](MCP_INTEGRATION.md)
-- [Automation API contract](AUTOMATION_CONTRACT.md)
-- [MCP acceptance procedure](MCP_ACCEPTANCE_TEST.md)
-- [Node security review](NODE_SECURITY_REVIEW_20261023.md)
+## 利用・運用マニュアル
 
-Release history is in [releases](releases/README.md). Superseded plans and
-checklists are in [archive/plans](archive/plans/README.md). Numerical investigations
-and performance reports remain in `research/`. The former `.doc/` files have
-been moved here without deleting their contents. Dependency documentation stays
-with its library (`amgcl/`, `tinyexpr/`).
+| 目的 | マニュアル |
+|---|---|
+| インストール・最初の解析 | [README](../README.md) |
+| YAML、材料、式、境界条件、出力 | [CONFIGURATION](CONFIGURATION.md) |
+| 常駐コンソール・起動引数・単体ソルバー | [CLI](CLI.md) |
+| 認証、ファイル、ジョブ、結果、画像、ZIPのHTTP操作 | [REST API](REST_API.md) |
+| 共有HTTPS、アカウント・所有者、保存先、更新・バックアップ | [OPERATIONS](OPERATIONS.md) |
+| ローカルHTTP／stdioのエージェント接続 | [MCP](MCP_INTEGRATION.md) |
+
+## 履歴・開発記録
+
+- [v1.7.2 release notes (English)](releases/RELEASE_NOTES_v1.7.2.md)
+- [リリース履歴](releases/README.md)
+- [Changelog](../CHANGELOG.md)
+- [過去の検討・測定・診断・旧手順](archive/README.md)
+
+現在の利用手順は上表を使用してください。旧`docs/research/`、版別運用説明、
+導入時の契約・検証記録、整理前READMEは`archive/`へ移しました。
+同梱依存ライブラリの文書は`amgcl/`、`tinyexpr/`、`webui/public/vendor/`にあります。

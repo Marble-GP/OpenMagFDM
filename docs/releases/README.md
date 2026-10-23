@@ -1,5 +1,6 @@
 # Release history
 
+- [v1.7.2 (English)](RELEASE_NOTES_v1.7.2.md)
 - [v1.7.1](RELEASE_NOTES_v1.7.1.md)
 - [v1.7.0](RELEASE_NOTES_v1.7.0.md)
 - [v1.6.2](RELEASE_NOTES_v1.6.2.md)

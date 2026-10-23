@@ -3,7 +3,7 @@
 Run from the repository root. Keep baseline and trial builds separate and do
 not benchmark concurrently with compilation, another solver or intensive work.
 The full protocol and negative historical results are in
-[`docs/research/SOLVER_SPEED_CONVERGENCE.md`](../../docs/research/SOLVER_SPEED_CONVERGENCE.md).
+[`docs/archive/research/SOLVER_SPEED_CONVERGENCE.md`](../../docs/archive/research/SOLVER_SPEED_CONVERGENCE.md).
 
 ## Small numerical cases
 
@@ -178,7 +178,7 @@ Completed on 2026-10-15: all eight runs and 568 steps converged, with all four
 quality/memory gates passing. The full-period pair took 10,940.629 / 6,657.868
 seconds (39.15% reduction). At 30 degrees per step there was no meaningful
 timing gain and outer iterations increased; this gate is not an unconditional
-speed/adoption decision. See the [review and archived evidence](../../docs/research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md#completed-full-revolution-and-large-displacement-gate-2026-10-15).
+speed/adoption decision. See the [review and archived evidence](../../docs/archive/research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md#completed-full-revolution-and-large-displacement-gate-2026-10-15).
 The original evidence directory is complete: do not reuse it for a new trial
 or run `--resume` merely to inspect results, since resume rewrites aggregates.
 
@@ -224,5 +224,5 @@ Both stages require strict convergence, repeatable within-mode histories and
 fields, unchanged archived OFF/control results, aligned flux RMS <=0.1%, actual
 initializer/AA use and paired memory limits. Background CPU load is retained.
 Total time includes prediction probes and output drain. These 12 points do not
-validate periodic EMF/harmonics. See the [research report](../../docs/research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md)
+validate periodic EMF/harmonics. See the [research report](../../docs/archive/research/NONLINEAR_INITIALIZATION_EXPERIMENTS.md)
 for supported motion, safeguards and remaining full-revolution gates.

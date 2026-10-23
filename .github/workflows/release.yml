@@ -361,6 +361,7 @@ jobs:
         cp -r ../docs OpenMagFDM-WebUI-Linux/
         cp ../README.md OpenMagFDM-WebUI-Linux/
         cp ../CHANGELOG.md OpenMagFDM-WebUI-Linux/
+        cp ../.node-version OpenMagFDM-WebUI-Linux/
         cp ../sample_config.yaml OpenMagFDM-WebUI-Linux/   # default config the server loads on startup
         cp ../general_materials.yaml OpenMagFDM-WebUI-Linux/
         python3 ../tools/stage-release.py OpenMagFDM-WebUI-Linux
@@ -375,6 +376,7 @@ jobs:
         cp -r ../docs OpenMagFDM-WebUI-Windows/
         cp ../README.md OpenMagFDM-WebUI-Windows/
         cp ../CHANGELOG.md OpenMagFDM-WebUI-Windows/
+        cp ../.node-version OpenMagFDM-WebUI-Windows/
         cp ../sample_config.yaml OpenMagFDM-WebUI-Windows/   # default config the server loads on startup
         cp ../general_materials.yaml OpenMagFDM-WebUI-Windows/
         python3 ../tools/stage-release.py OpenMagFDM-WebUI-Windows
@@ -390,6 +392,7 @@ jobs:
         cp -r ../docs OpenMagFDM-WebUI-macOS/
         cp ../README.md OpenMagFDM-WebUI-macOS/
         cp ../CHANGELOG.md OpenMagFDM-WebUI-macOS/
+        cp ../.node-version OpenMagFDM-WebUI-macOS/
         cp ../sample_config.yaml OpenMagFDM-WebUI-macOS/   # default config the server loads on startup
         cp ../general_materials.yaml OpenMagFDM-WebUI-macOS/
         python3 ../tools/stage-release.py OpenMagFDM-WebUI-macOS
@@ -434,14 +437,14 @@ jobs:
 
     - name: Create NSIS installer script
       env:
-        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.7.1")
+        # GitHub Actions sets GITHUB_REF_NAME = the pushed tag (e.g. "v1.7.2")
         # for tag-triggered runs and the branch name for manual dispatch.
-        # We extract the numeric "1.7.1" form, with a hardcoded fallback so
+        # We extract the numeric "1.7.2" form, with a hardcoded fallback so
         # a workflow_dispatch from a feature branch still produces a
         # reasonable installer label.
         TAG_NAME: ${{ github.ref_name }}
       run: |
-        $version = "1.7.1"
+        $version = "1.7.2"
         if ($env:TAG_NAME -match '^v?(\d+\.\d+\.\d+)') {
             $version = $matches[1]
         }
@@ -524,7 +527,8 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v3
       with:
-        body_path: docs/releases/RELEASE_NOTES_v1.7.1.md
+        body_path: docs/releases/RELEASE_NOTES_v1.7.2.md
+        draft: true
         files: |
           artifacts/OpenMagFDM-Linux-x86_64/OpenMagFDM-Linux-x86_64.tar.gz
           artifacts/OpenMagFDM-Windows-x86_64/OpenMagFDM-Windows-x86_64.zip

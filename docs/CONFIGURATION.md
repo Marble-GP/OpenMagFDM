@@ -1,6 +1,6 @@
-# OpenMagFDM v1.7.0 configuration reference
+# OpenMagFDM v1.7.2 configuration reference
 
-This document is the normative reference for analysis YAML in v1.7.0. The
+This document is the normative reference for analysis YAML in v1.7.2. The
 WebUI autocomplete file `webui/public/yaml-schema.json` must describe the same
 contract. Historical research knobs may remain parseable for reproducibility,
 but only the keys documented here are supported for production use.

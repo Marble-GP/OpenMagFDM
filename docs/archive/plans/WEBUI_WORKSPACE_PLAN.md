@@ -94,7 +94,7 @@ working specialist tools with unfinished new views.
 - File search and name/date/size sorting preserve existing visible selection
   and batch controls. No preload or additional field-result cache introduced.
 - Shared `workspace-core.js` and read-only `/api/config/inspect` endpoint.
-  See [automation contract](../../AUTOMATION_CONTRACT.md). Existing solver/job process
+  See [automation contract](../contracts/AUTOMATION_CONTRACT_20261015.md). Existing solver/job process
   management is retained, not replaced by a parallel implementation.
 - `npm --prefix webui test`: **49/49 passed** (12 lifecycle, 22 IntelliSense,
   15 workspace/API). JavaScript syntax checks and `git diff --check` passed.
