@@ -20,3 +20,5 @@ describe their historical context, not current supported defaults.
 [Release history](../releases/README.md) is separate. The v1.7.2 reorganization
 moved records without deleting measurements. Historical paths and working-tree
 state inside provenance JSON remain unchanged.
+
+Recent follow-up: [workspace storage and file-management verification](acceptance/WORKSPACE_STORAGE_20261023.md).
