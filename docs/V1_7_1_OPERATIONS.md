@@ -2,6 +2,11 @@
 
 See [release notes](releases/RELEASE_NOTES_v1.7.1.md) for release readiness and limitations.
 
+The published v1.7.1 commands below are one-shot startup arguments. The resident
+interactive console added after that release is documented in
+[Server console](SERVER_CONSOLE.md); its account and file-limit changes apply
+while the server runs.
+
 ## CLI help and file count limits
 
 Packaged: `webui-server.exe help` (also `--help`, `-h`, `limits --help`).

@@ -3,6 +3,17 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/research/`.
 
+## Unreleased
+
+- Open a resident `OpenMagFDM>` console on terminal startup, with completion,
+  session history, Inquirer menus/settings forms and private password input.
+- Apply account, workspace and file-limit changes to the running server; add
+  job inspection/cancellation and stop/settings/start without closing the console.
+- Guard active analyses during normal shutdown; close the child server on EOF
+  or supervisor loss. Preserve headless startup and MCP stdio behavior.
+- Add source/packaged PTY acceptance tests alongside HTTP, lifecycle and MCP checks.
+- See `docs/SERVER_CONSOLE.md` for usage, library selection and validation.
+
 ## 1.7.1 — 2026-10-23
 
 - Unify WebUI/MCP jobs with durable queues, reconnectable controls, idempotency and frozen inputs.

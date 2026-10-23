@@ -14,4 +14,8 @@ if(process.argv[2]==='--runtime-info') {
     const fs=require('node:fs/promises');
     const filename=path.join(privateDirectory(base),'pairing.json');
     noLinks(filename).then(()=>fs.readFile(filename,'utf8')).then(text=>console.log(JSON.parse(text).code)).catch(()=>{console.error('Start the WebUI server first.');process.exitCode=1;});
+} else if(process.argv.includes('--server-child')) {
+    require('./automation/console-child').start(base).catch(error=>{console.error(error.message);process.exitCode=1;});
+} else if(!process.argv.includes('--no-console')&&(process.argv.includes('--console')||(process.stdin.isTTY&&process.stdout.isTTY))) {
+    new (require('./automation/server-console').ServerConsole)(base).run().catch(error=>{console.error(error.message);process.exitCode=1;});
 } else require('./server');

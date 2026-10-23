@@ -4809,6 +4809,7 @@ automation.install(app);
 if (process.env.OPENMAGFDM_NO_LISTEN !== '1') startServer();
 
 module.exports = {
+    consoleActivity: () => ({analyses:activeJobs().length,preparing:activeSolverStartOperations.size,processes:trackedSolverProcesses.size}),
     app,
     startServer,
     shutdownServer,

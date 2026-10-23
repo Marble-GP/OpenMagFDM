@@ -23,15 +23,19 @@ const HELP = `OpenMagFDM server CLI
   limits set-default <configs|images|libraries> <count|unlimited>
   limits set <workspace> <configs|images|libraries> <count|unlimited|default>
 
-With no arguments the WebUI server starts. For source installs, use:
+With a terminal attached, starting the server opens an interactive console.
+Type help at OpenMagFDM> for commands, or use --no-console for service mode.
+For source installs, one-shot commands remain available with:
   node webui/launcher.js <command>
 For packaged installs, use: webui-server[.exe] <command>
-Storage, network and limit changes require the server to be stopped.
+One-shot storage/network/limit changes require the server to be stopped.
+In the interactive console, account/owner/limit changes apply while running;
+storage/network changes use stop, change settings, then start in that console.
 Limits apply per workspace (the existing browser userId), across WebUI and MCP.
 Counts include nested files in each input category, not result artifacts.
 Defaults: configs 20, images 20, libraries unlimited. 0 blocks new files.
 Existing files are retained; replacement remains possible at/above the limit.
-Restart after changing settings. 'default' removes a workspace override.
+Start again after offline changes. 'default' removes a workspace override.
 `;
 async function password(prompt) {
     if(!process.stdin.isTTY)throw Error('Password entry requires an interactive terminal');
@@ -52,7 +56,7 @@ async function files(directory) {
     async function walk(dir) {await noLinks(dir);for(const entry of await fs.readdir(dir,{withFileTypes:true})){const item=path.join(dir,entry.name);await noLinks(item);if(entry.isDirectory())await walk(item);else if(entry.isFile())result.push({relative:path.relative(directory,item),hash:await digest(item)});else throw Error('Non-regular entry');}}
     await walk(directory);return result;
 }
-async function command(base,args) {
+async function command(base,args,{password:askPassword=password,live=false}={}) {
     const [group,command,value,...rest]=args;
     const directory=privateDirectory(base);
     const filename=path.join(directory,'accounts.json');
@@ -64,13 +68,13 @@ async function command(base,args) {
             const name=userKey(value);let account=data.users.find(u=>u.name===name);
             if(command==='create') {
                 if(account)throw Error('Account exists');
-                const first=await password('Password (12+ characters): '),second=await password('Repeat password: ');if(first!==second)throw Error('Passwords differ');
+                const first=await askPassword('Password (12+ characters): '),second=await askPassword('Repeat password: ');if(first!==second)throw Error('Passwords differ');
                 account={name,role:rest.includes('--admin')?'admin':'user',disabled:false,password:await passwordHash(first),revision:crypto.randomUUID()};data.users.push(account);
             }else{
                 if(!account)throw Error('Unknown account');
                 if(command==='disable') {if(account.role==='admin'&&data.users.filter(u=>u.role==='admin'&&!u.disabled).length<=1)throw Error('Cannot disable the last administrator');account.disabled=true;}
                 else if(command==='enable')account.disabled=false;
-                else if(command==='reset-password'){const first=await password('New password: '),second=await password('Repeat password: ');if(first!==second)throw Error('Passwords differ');account.password=await passwordHash(first);}
+                else if(command==='reset-password'){const first=await askPassword('New password: '),second=await askPassword('Repeat password: ');if(first!==second)throw Error('Passwords differ');account.password=await passwordHash(first);}
                 else throw Error('Unknown users command');
                 account.revision=crypto.randomUUID();
             }
@@ -86,7 +90,8 @@ async function command(base,args) {
         }
         await atomicJSON(filename,data);console.log('Saved. No workspace files were deleted.');
     });
-    const settings=readSettings(base);configure(base,settings);
+    const settings=readSettings(base);
+    if(group!=='limits')configure(base,settings);
     if(group==='limits') {
         const limits=require('./limits');
         if(command==='show') {console.log(JSON.stringify({workspace:value?userKey(value):null,limits:limits.effective(settings,value?userKey(value):undefined),overrides:settings.fileLimits||{}},null,2));return;}
@@ -101,7 +106,8 @@ async function command(base,args) {
             if(rest[1]==='default')delete settings.fileLimits.workspaces[workspace][category];
             else settings.fileLimits.workspaces[workspace][category]=limits.value(rest[1]);
         } else throw Error('Use limits show, set-default or set');
-        await atomicJSON(settingsFile,settings);console.log('Saved. Restart the server. Existing files were retained.');return;
+        await atomicJSON(settingsFile,settings);configure(base,settings);
+        console.log(live?'Saved and applied to the running server. Existing files were retained.':'Saved. Restart the server. Existing files were retained.');return;
     }
     if(group==='storage') {
         if(command==='show'){console.log(JSON.stringify({resultsRoot:root(base,'outputs')},null,2));return;}
@@ -133,18 +139,24 @@ async function command(base,args) {
     }
     throw Error('Commands: users, workspaces, storage, network');
 }
-async function run(base,args) {
+async function run(base,args,options={}) {
     if(args.some(a=>['help','--help','-h'].includes(a))) {console.log(HELP);return;}
     const directory=privateDirectory(base);await ensurePrivateDirectory(directory);
     const maintenance=args[0]==='network'||(['storage','limits'].includes(args[0])&&args[1]!=='show');
-    if(!maintenance)return command(base,args);
+    if(options.live) {
+        const lock=JSON.parse(await fs.readFile(path.join(directory,'server-lock.json'),'utf8'));
+        if(lock.pid!==process.pid)throw Error('Live commands must run inside the owning server');
+        if(maintenance && args[0]!=='limits')throw Error('Use stop, change settings here, then start. Running analyses must finish first.');
+        return command(base,args,options);
+    }
+    if(!maintenance)return command(base,args,options);
     // Share the server's exclusive startup lock throughout copy, verification
     // and settings replacement. A second process cannot start during migration.
     const stale=await stopped(directory);
     const lock=path.join(directory,'server-lock.json');await noLinks(lock,{missing:true});
     if(stale)try{await fs.unlink(lock);}catch(error){if(error.code!=='ENOENT')throw error;}
     await fs.writeFile(lock,JSON.stringify({pid:process.pid,maintenance:true}),{flag:'wx',mode:0o600});
-    try{return await command(base,args);}
+    try{return await command(base,args,options);}
     finally{if(JSON.parse(await fs.readFile(lock,'utf8')).pid===process.pid)await fs.unlink(lock);}
 }
 module.exports={run};
