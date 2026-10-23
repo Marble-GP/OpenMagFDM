@@ -107,6 +107,9 @@ node webui/tests/server_console_pty.cjs --exe build_mcp/webui-server.exe --artif
 macOS/LinuxはEXEのパスを`build_mcp/webui-server`へ置き換える。
 Linuxで端末テスト用ネイティブモジュールが未構築の場合は、
 C++ビルド環境を用意して`npm --prefix webui rebuild node-pty --ignore-scripts=false`を実行する。
+macOSでは`node-pty` 1.1.0の配布アーカイブ内の補助プログラムが0644のため、
+テストが使用前に実行権限を復元する。npmのインストールスクリプト許可は
+`node-pty@1.1.0`とビルド用`esbuild@0.28.2`だけを版固定で記録する。
 `server_console_smoke.cjs`に`--solver <絶対パス>`を追加すると、実解析中の停止拒否と強制取消も確認する。
 
 Windowsローカルでは103件のNode回帰試験、依存監査（指摘0件）、

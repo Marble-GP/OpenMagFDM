@@ -6,6 +6,12 @@ const {createFixture}=require('./console_fixture.cjs');
 const arg=key=>{const i=process.argv.indexOf(key);return i<0?null:process.argv[i+1];};
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 async function main(){
+    // node-pty 1.1.0's published macOS tarball gives spawn-helper mode 0644.
+    // Restore the executable bit on this development-only helper before use.
+    if(process.platform==='darwin'){
+        const helper=path.join(path.dirname(require.resolve('node-pty/package.json')),'prebuilds',`darwin-${process.arch}`,'spawn-helper');
+        try{await fs.chmod(helper,0o755);}catch(error){if(error.code!=='ENOENT')throw error;}
+    }
     const fixture=await createFixture({exe:arg('--exe')});const {root,base,port,env,executable,args,privateDir}=fixture;
     // The test runner itself may use TERM=dumb; the PTY emulates a real terminal.
     env.TERM='xterm-256color';
