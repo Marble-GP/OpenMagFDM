@@ -72,12 +72,41 @@ test('async deletion reports partial failures, persists outcomes and protects bu
     const restored=new FileOperations(base,path.join(base,'private'),()=>false);await restored.ready;
     assert.equal(restored.get('wa',record.id).results.length,3);
 });
+
+test('deletion progress stays in memory; only acceptance and completion write a journal',async t=>{
+    const base=await temp(t),ws=new Workspace(base,'wa');await ws.init();const files=[];
+    for(const name of ['a','b','c']){const id=`configs/${name}.yaml`;await ws.write(id,'data',null);files.push({id,revision:(await ws.describe(id)).revision});}
+    const ops=new FileOperations(base,path.join(base,'private'),()=>false);await ops.ready;
+    const save=ops.save.bind(ops),writes=[],pending=[];ops.save=record=>{writes.push({status:record.status,results:record.results.length});const saved=save(record);pending.push(saved);return saved;};
+    const record=await ops.start('wa',files);
+    while(record.status==='running')await new Promise(resolve=>setTimeout(resolve,10));
+    await Promise.all(pending);
+    assert.deepEqual(writes,[{status:'running',results:0},{status:'complete',results:3}]);
+    const interrupted={...record,id:require('node:crypto').randomUUID(),status:'running',results:[]};await save(interrupted);
+    const restored=new FileOperations(base,path.join(base,'private'),()=>false);await restored.ready;
+    const recovered=restored.get('wa',interrupted.id);
+    assert.equal(recovered.status,'interrupted');assert.deepEqual(recovered.targets,files.map(file=>file.id));
+    assert.match(recovered.message,/Some targets may already be removed/);
+});
 test('external results root is used consistently by workspace reads and listings',async t=>{
     const base=await temp(t),root=path.join(base,'external');storage.configure(base,{resultsRoot:root});
     const ws=new Workspace(base,'wa');await ws.init();const filename=await ws.resolve('results/run/file.txt',{create:true});
     assert.equal(filename,path.join(root,'wa','run','file.txt'));await fs.mkdir(path.dirname(filename));await fs.writeFile(filename,'retained');
     assert.equal((await ws.read('results/run/file.txt',{text:true})).content,'retained');
     assert.ok((await ws.list({category:'results'})).items.some(f=>f.name==='run'));
+});
+
+test('large result deletion is independent of the bounded archive walk limit',async t=>{
+    const base=await temp(t),ws=new Workspace(base,'wa');await ws.init();
+    const dir=await ws.resolve('results/large/Az',{create:true});await fs.mkdir(dir,{recursive:true});
+    for(let start=0;start<10001;start+=100)await Promise.all(Array.from({length:Math.min(100,10001-start)},(_,i)=>fs.writeFile(path.join(dir,`step_${start+i}.csv`),'1')));
+    await assert.rejects(ws.walk('results/large'),{code:'LIMIT_EXCEEDED'});
+    const meta=await ws.describe('results/large');assert.equal(meta.count,10001);
+    const ops=new FileOperations(base,path.join(base,'private'),()=>false);await ops.ready;
+    const record=await ops.start('wa',[{id:'results/large',revision:meta.revision}]);
+    while(record.status==='running')await new Promise(resolve=>setTimeout(resolve,10));
+    assert.equal(record.status,'complete');assert.equal(record.results[0].success,true,JSON.stringify(record));
+    await assert.rejects(ws.resolve('results/large'),{code:'ENOENT'});
 });
 
 test('queue rotates across three workspaces and retries after an account is enabled',async t=>{

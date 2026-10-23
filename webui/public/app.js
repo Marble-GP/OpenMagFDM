@@ -12321,6 +12321,7 @@ function updateUserFileSelectionControls() {
     }
     const deleteButton = document.getElementById('deleteSelectedUserFilesBtn');
     if (deleteButton) deleteButton.disabled = totalSelected === 0 || !!AppState.fileDeleteBusy;
+    document.querySelectorAll('.user-file-actions .btn-delete').forEach(button => { button.disabled = !!AppState.fileDeleteBusy; });
     const count = document.getElementById('userFileSelectedCount');
     if (count) count.textContent = `${totalSelected} selected`;
 }
@@ -12349,7 +12350,7 @@ function toggleAllUserFiles(checked) {
 function userFileHtml(file) {
     const category = fileManagerEscape(file.category);
     const name = fileManagerEscape(file.name);
-    const date = file.modified ? new Date(file.modified).toLocaleString('ja-JP') : '';
+    const date = file.modified ? new Date(file.modified).toLocaleString('en-US') : '';
     const size = fmtBytes(Number(file.size) || 0);
     const detail = file.category === 'results'
         ? `${file.steps || 0} step(s) · ${size} · ${date}`
@@ -12396,7 +12397,7 @@ function renderUserFiles() {
     updateUserFileSelectionControls();
 }
 
-async function refreshUserFiles() {
+async function refreshUserFiles({ preserveStatus = false } = {}) {
     const list = document.getElementById('userFilesList');
     if (!list) return;
     list.innerHTML = '<p style="color:#666;">Loading…</p>';
@@ -12410,10 +12411,11 @@ async function refreshUserFiles() {
             [...AppState.userFileSelection].filter(key => availableKeys.has(key))
         );
         renderUserFiles();
-        fileManagerStatus(`${AppState.userFiles.length} file(s) available.`, 'info');
+        if (!preserveStatus) fileManagerStatus(`${AppState.userFiles.length} file(s) available.`, 'info');
     } catch (error) {
         list.innerHTML = `<p style="color:#dc3545;">Error: ${fileManagerEscape(error.message)}</p>`;
-        fileManagerStatus(error.message, 'error');
+        const previous = preserveStatus ? document.getElementById('fileManagerStatus')?.textContent : '';
+        fileManagerStatus(previous ? `${previous}\nList refresh failed: ${error.message}` : error.message, 'error');
     }
 }
 
@@ -12497,6 +12499,7 @@ async function deleteUserFiles(selected) {
     selected.forEach(file=>AppState.userFileSelection.add(userFileKey(file)));
     AppState.fileDeleteBusy = true;
     updateUserFileSelectionControls();
+    let submitted = false, operationId = null;
     try {
         const files = [], metadataStarted=performance.now();
         for (const file of selected) {
@@ -12507,16 +12510,27 @@ async function deleteUserFiles(selected) {
             files.push({id:`${file.category}/${file.name}`, revision:data.file.revision});
         }
         if(typeof FieldMetrics!=='undefined')FieldMetrics.record('delete-metadata',performance.now()-metadataStarted,{count:files.length});
-        const response = await fetch('/api/file-operations', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({userId:AppState.userId, files}), signal:AbortSignal.timeout(30000)});
-        const data = await response.json();
-        if (!response.ok || !data.success) throw Error(data.error || 'Delete request failed');
-        await watchFileOperation(data.operation);
+        const outcomes = []; let interruptionMessage = '';
+        // The server accepts at most 100 targets per durable operation. Keep
+        // Select all usable for larger lists without losing earlier outcomes.
+        for (let offset = 0; offset < files.length; offset += 100) {
+            submitted = true; operationId = null;
+            const response = await fetch('/api/file-operations', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({userId:AppState.userId, files:files.slice(offset,offset+100)}), signal:AbortSignal.timeout(30000)});
+            const data = await response.json();
+            if (!response.ok || !data.success) throw Error(data.error || 'Delete request failed');
+            operationId = data.operation.id;
+            const operation = await watchFileOperation(data.operation);
+            if (!operation) return;
+            outcomes.push(...operation.results);
+            if (operation.status !== 'complete') { interruptionMessage = operation.message || 'Refresh files before retrying.'; break; }
+        }
+        showFileOperationOutcome(outcomes, outcomes.length === files.length ? 'complete' : 'interrupted', interruptionMessage);
     } catch (error) {
-        fileManagerStatus(`${error.message}. Check operation status before retrying.`, 'error');
+        fileManagerStatus(submitted ? `${error.message}. Check ${operationId ? `operation ${operationId}` : 'operation status'} before retrying.` : `Deletion was not submitted: ${error.message}`, 'error');
     } finally {
         AppState.fileDeleteBusy = false;
         const refreshStarted=performance.now();
-        try {await refreshUserFiles();}
+        try {await refreshUserFiles({preserveStatus:true});}
         finally {updateUserFileSelectionControls();if(typeof FieldMetrics!=='undefined')FieldMetrics.record('delete-list-refresh',performance.now()-refreshStarted);}
     }
 }
@@ -12537,10 +12551,18 @@ async function watchFileOperation(operation) {
         if (file) AppState.userFileSelection.delete(userFileKey(file));
     }
     if(typeof FieldMetrics!=='undefined')for(const result of operation.results)FieldMetrics.record('delete-server',result.elapsedMs||0,{operation:operation.id,id:result.id,success:result.success});
-    const failures = operation.results.filter(r => !r.success);
-    fileManagerStatus(`${operation.status}: ${operation.results.filter(r=>r.success).length} deleted, ${failures.length} failed. ${failures[0]?.error || operation.message || ''}`, failures.length || operation.status !== 'complete' ? 'error' : 'success');
+    showFileOperationOutcome(operation.results, operation.status, operation.message);
     await Promise.allSettled([refreshResultsList(), refreshConfigList(), refreshImageList()]);
     clearFilePreview({hide:true});
+    return operation;
+}
+
+function showFileOperationOutcome(results, status, message = '') {
+    const succeeded = results.filter(result => result.success).length;
+    const failures = results.filter(result => !result.success);
+    const details = failures.map(result => `${result.id}: ${result.error || 'Deletion failed'}${result.code ? ` (${result.code})` : ''}`).join('\n');
+    const title = status !== 'complete' ? 'Deletion interrupted' : failures.length ? 'Deletion failed for some items' : 'Deletion succeeded';
+    fileManagerStatus(`${title}: ${succeeded} ${status === 'complete' ? 'deleted' : 'confirmed deleted'}, ${failures.length} failed.${details ? '\n'+details : ''}${message ? '\n'+message : ''}`, failures.length || status !== 'complete' ? 'error' : 'success');
 }
 
 /**
@@ -12597,7 +12619,7 @@ async function refreshOutputsList() {
 // future re-render share the same markup).
 const FILE_MANAGER_BATCH = 60;
 function fileManagerOutputHtml(output) {
-    const date = new Date(output.created).toLocaleString('ja-JP');
+    const date = new Date(output.created).toLocaleString('en-US');
     const escapedName = output.name.replace(/'/g, "\\'");
     return `
         <div class="output-item" data-folder="${escapedName}" onclick="selectOutput('${escapedName}', event)">

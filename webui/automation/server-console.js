@@ -2,13 +2,13 @@
 const readline=require('node:readline');
 const {spawn}=require('node:child_process');
 const {PassThrough}=require('node:stream');
-const commands=['help','menu','configure','status','start','stop','restart','exit','jobs list','jobs cancel','jobs resume','users list','users create','users disable','users enable','users reset-password','workspaces list','workspaces assign','limits show','limits set-default','limits set','storage show','storage set-results-root','storage migrate-results','network local','network shared'];
+const commands=['help','menu','configure','status','start','stop','restart','exit','jobs list','jobs cancel','jobs resume','users list','users create','users disable','users enable','users reset-password','workspaces list','workspaces assign','limits show','limits set-default','limits set','storage show','storage set-workspace-root','storage migrate-workspaces','storage set-results-root','storage migrate-results','network local','network shared'];
 const help=`OpenMagFDM interactive server console
   help / /help / ?                Show commands
   menu                           Choose an action with arrow keys
   configure                      Guided file-limit settings
   status                         Server address, running work and job status
-  jobs [list [workspace]]         Show up to 100 recent jobs
+  jobs [list [workspace] [--all]]  Show active jobs; --all includes completed history
   jobs cancel <workspace> <id>    Request cancellation of a job
   jobs resume <workspace>         Resume jobs held after a restart
   users list|create|disable|enable|reset-password ...
@@ -17,7 +17,10 @@ const help=`OpenMagFDM interactive server console
   limits set-default <configs|images|libraries> <count|unlimited>
   limits set <workspace> <category> <count|unlimited|default>
                                  Apply file limits immediately, without restarting
-  storage show|set-results-root|migrate-results ...
+  storage show                    Inspect all workspace storage paths
+  storage set-workspace-root <absolute-directory>
+  storage migrate-workspaces <absolute-empty-directory>
+  storage set-results-root|migrate-results ...
   network local|shared ...        Change storage/network after stop, then start
   start / stop / restart         Keep this console open while controlling the server
   exit / quit                    Shut down the server and leave the console

@@ -25,6 +25,7 @@ async function main(){
         await command('unknown-command','Unknown command');
         const before=await command('storage set-results-root "'+path.join(root,'new results')+'"','Use stop');assert.match(before,/Error:/);
         await command('jobs','OpenMagFDM>');
+        let submittedJob;
         if(arg('--solver')) {
             const fixture=await require('../tools/create-mcp-benchmark.cjs').fixture();
             fixture.model.transient={enabled:true,enable_sliding:false,total_steps:10000,parallel_chunks:1,export_fields:['Az']};
@@ -32,14 +33,24 @@ async function main(){
             await fs.writeFile(path.join(base,'uploads','console_test','model.png'),fixture.png);
             await fs.writeFile(path.join(base,'configs','console_test','run.yaml'),require('js-yaml').dump(fixture.model));
             const response=await request('/api/jobs',{userId:'console_test',configFile:'run.yaml',imageFile:'model.png',idempotencyKey:'console-active-stop'});
-            assert.equal(response.status,202);const job=await response.json();
+            assert.equal(response.status,202);const job=await response.json();submittedJob=job.jobId;
             await until(async()=>{const j=await (await request(`/api/jobs/${job.jobId}?userId=console_test`)).json();return j.status==='running';},'running native solver');
             await command('stop','Analyses are active');assert.equal((await request('/api/auth/me')).status,200);
             await command('stop --force','Server stopped');
         } else await command('stop','Server stopped');
         await assert.rejects(request('/api/auth/me'));assert.throws(()=>process.kill(pid,0));
         await command('storage set-results-root "'+path.join(root,'new results')+'"','Original data was retained');
+        const workspaceRoot=path.join(root,'all workspaces');
+        await command('storage migrate-workspaces "'+workspaceRoot+'"','Original data was retained');
+        await command('storage show','"workspaceRoot"');
         await command('start','Server ready:');assert.equal((await request('/api/auth/me')).status,200);
+        assert.equal(await fs.readFile(path.join(workspaceRoot,'configs','console_test','a.yaml'),'utf8'),'variables: {}');
+        const legacyRead=await request('/api/config?userId=console_test&file=a.yaml');
+        assert.equal(legacyRead.status,200,'Legacy GUI reads must use the workspace root');
+        const relocated=await request('/api/config',{userId:'console_test',file:'a.yaml',content:'variables: {after_move: true}',expectedRevision:legacyRead.headers.get('X-File-Revision')});
+        assert.equal(relocated.status,200);assert.equal(await fs.readFile(path.join(workspaceRoot,'configs','console_test','a.yaml'),'utf8'),'variables: {after_move: true}');
+        await command('jobs','No active jobs');
+        if(submittedJob)assert.ok((await command('jobs list --all',submittedJob)).includes(submittedJob));
         await command('limits show console_test','"configs": 2');
         await command('restart','Server ready:');assert.equal((await request('/api/auth/me')).status,200);
         const closed=once(child,'exit');child.stdin.write('exit\n');const [code]=await closed;assert.equal(code,0);

@@ -75,38 +75,48 @@ class Workspace {
         const p = await this.resolve(id); const stat = await fs.lstat(p);
         if (!stat.isFile() && !stat.isDirectory()) fail('UNSAFE_PATH', 'Only regular files and directories are supported');
         if (stat.isFile()) return { id, name: path.basename(p), kind: 'file', size: stat.size, modified: stat.mtime.toISOString(), revision: await digest(p) };
-        const entries = await this.walk(id);
         const hash = crypto.createHash('sha256');
         hash.update(JSON.stringify([stat.mtimeMs, stat.ctimeMs]));
-        let size = 0;
-        for (const e of entries) { hash.update(JSON.stringify([e.id, e.size, e.modified, e.changed])); size += e.size; }
-        return { id, name: path.basename(p), kind: 'directory', size, modified: stat.mtime.toISOString(), revision: hash.digest('hex'), count: entries.length };
+        let size = 0, count = 0;
+        // Stream metadata: a large result must remain inspectable/deletable even
+        // when it exceeds the bounded transfer/listing operation budget.
+        await this.scan(id, e => {
+            hash.update(JSON.stringify([e.id, e.size, e.modified, e.changed])); size += e.size; count++;
+        });
+        return { id, name: path.basename(p), kind: 'directory', size, modified: stat.mtime.toISOString(), revision: hash.digest('hex'), count };
     }
-    async walk(prefix) {
-        const entries = []; let visited = 0;
+    async scan(prefix, accept, limit = Infinity) {
+        let visited = 0;
         const visit = async (dir, id, depth = 0, hidden = false) => {
             if (depth > 64) fail('LIMIT_EXCEEDED', 'Directory nesting exceeds 64 levels', 413);
             await noLinks(dir);
             const children = (await fs.readdir(dir, { withFileTypes: true })).sort((a,b) => a.name.localeCompare(b.name));
             for (const e of children) {
-                if (++visited > 10000) fail('LIMIT_EXCEEDED', 'Directory exceeds the 10000-entry operation limit', 413);
+                if (++visited > limit) fail('LIMIT_EXCEEDED', `Directory exceeds the ${limit}-entry operation limit`, 413);
                 const nextId = `${id}/${e.name}`;
                 const snapshot = /^results\/[^/]+$/.test(id) && e.name === '.inputs';
                 const isHidden = hidden || (e.name.startsWith('.') && !snapshot);
-                const p = await this.resolve(nextId, {internal: isHidden});
+                segments(nextId, isHidden);
+                // Ancestors were checked on entering this directory. Inspect
+                // each child once instead of re-statting all its ancestors.
+                const p = path.join(dir, e.name);
                 const st = await fs.lstat(p);
+                if (st.isSymbolicLink() || (st.isFile() && st.nlink > 1)) fail('UNSAFE_PATH', 'Links, junctions and hard-linked files are not allowed');
                 if (st.isDirectory()) await visit(p, nextId, depth + 1, isHidden);
                 else if (st.isFile()) {
-                    if (!isHidden) entries.push({ id: nextId, name: e.name, size: st.size, modified: st.mtime.toISOString(), changed: st.ctimeMs, kind: 'file' });
+                    if (!isHidden) accept({ id: nextId, name: e.name, size: st.size, modified: st.mtime.toISOString(), changed: st.ctimeMs, kind: 'file' });
                 }
                 else fail('UNSAFE_PATH', 'Non-regular workspace entry');
-                if (entries.length > 10000) fail('LIMIT_EXCEEDED', 'Directory exceeds the 10000-entry operation limit', 413);
             }
         };
         if (Object.hasOwn(roots, prefix)) {
             const root = path.join(require('./storage').root(this.base, roots[prefix]), this.user);
             try { await visit(root, prefix); } catch (e) { if (e.code !== 'ENOENT') throw e; }
         } else await visit(await this.resolve(prefix), prefix);
+    }
+    async walk(prefix) {
+        const entries = [];
+        await this.scan(prefix, entry => entries.push(entry), 10000);
         return entries;
     }
     async list({ category, prefix, offset = 0, limit = 50 } = {}) {
@@ -188,11 +198,13 @@ class Workspace {
     }
     async remove(id, expectedRevision) {
         return locked(this.lockKey, async () => {
+            if (this.busy(id)) fail('BUSY', 'An active analysis owns this output', 409);
             const meta = await this.checkRevision(id, expectedRevision);
             if (!meta) fail('NOT_FOUND', 'Target not found', 404);
             if (this.busy(id)) fail('BUSY', 'An active analysis owns this output', 409);
             const p = await this.resolve(id);
-            if (meta.kind === 'directory') await this.walk(id); // Reject links anywhere in recursive target.
+            // checkRevision already scanned the complete tree, including hidden
+            // entries, and rejected unsafe links. Do not repeat that scan here.
             this.guard('delete');
             await fs.rm(p, { recursive: meta.kind === 'directory', force: false });
             return { deleted: id, permanent: true, bytes: meta.size };

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -1423,10 +1423,10 @@
                 <p id="resultSelectionHint">Selecting a result does not change the plots until you load it.</p>
                 <p id="resultLoadStatus" role="status" aria-live="polite"></p>
                 <section id="resultMemoEditor" hidden><p><a id="resultOriginalInput" target="_blank" rel="noopener">Original input image (initial state)</a></p>
-                    <label for="resultMemoText">Description / メモ — <span id="resultMemoTitle"></span></label>
+                    <label for="resultMemoText">Description — <span id="resultMemoTitle"></span></label>
                     <textarea id="resultMemoText" rows="4" style="display:block;width:100%;box-sizing:border-box" disabled></textarea>
-                    <button id="resultMemoSave" class="btn-primary" onclick="ResultImprovements.save()" disabled>保存</button>
-                    <button class="btn-secondary" onclick="ResultImprovements.description(document.getElementById('resultMemoTitle').textContent)">再読込</button>
+                    <button id="resultMemoSave" class="btn-primary" onclick="ResultImprovements.save()" disabled>Save</button>
+                    <button class="btn-secondary" onclick="ResultImprovements.description(document.getElementById('resultMemoTitle').textContent)">Reload</button>
                     <span id="resultMemoStatus" role="status"></span>
                 </section>
                 <dl class="results-current">
@@ -1439,7 +1439,7 @@
                     <summary>Display options &amp; data format</summary>
                     <div id="resultMetaBadge"></div>
                     <div id="polarControls" style="display: none;">
-                        <label><input type="checkbox" id="polarAspectLocked" checked onchange="ResultImprovements.aspect(this.checked)"> 縦横比を固定 (XY)</label>
+                        <label><input type="checkbox" id="polarAspectLocked" checked onchange="ResultImprovements.aspect(this.checked)"> Lock aspect ratio (XY)</label>
                         <label><input type="checkbox" id="polarCartesianTransform" onchange="toggleCartesianTransform()"> Cartesian Transform (Arc/Donut view)</label>
                         <label><input type="checkbox" id="polarFullModel" onchange="toggleFullModel()"> Full Model (×<span id="fullModelMultiplier">N</span>)</label>
                         <div id="polarInfo"></div>
@@ -1612,7 +1612,7 @@
                             <option value="modified">Recently modified</option><option value="name">Name A–Z</option><option value="size">Largest first</option>
                         </select>
                     </div>
-                    <div id="fileManagerStatus" style="margin-bottom: 10px;"></div>
+                    <div id="fileManagerStatus" role="status" aria-live="polite" style="margin-bottom: 10px; white-space: pre-line;"></div>
                     <div id="userFilesList">
                         <p style="color: #666;">Loading…</p>
                     </div>

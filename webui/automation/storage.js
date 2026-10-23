@@ -10,7 +10,8 @@ function readSettings(base) {
 function configure(base, settings = readSettings(base)) { configurations.set(path.resolve(base), settings); return settings; }
 function root(base, category) {
     const settings = configurations.get(path.resolve(base)) || {};
-    return category === 'outputs' && settings.resultsRoot ? path.resolve(settings.resultsRoot) : path.join(base, category);
+    return category === 'outputs' && settings.resultsRoot ? path.resolve(settings.resultsRoot)
+        : path.join(settings.workspaceRoot ? path.resolve(settings.workspaceRoot) : base, category);
 }
 function settings(base) { return configurations.get(path.resolve(base)) || readSettings(base); }
 module.exports = {configure, root, readSettings, settings};

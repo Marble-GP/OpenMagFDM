@@ -23,8 +23,10 @@ async function start(base) {
         try {process.kill(supervisor,0);}catch(error){if(error.code==='ESRCH')void shutdown().catch(()=>process.exit(1));}
     },1000);
     parentCheck.unref();
+    const recentJobs=()=>server.automation.jobs.records.map(j=>({workspace:j.user,...server.automation.jobs.public(j)}));
+    const active=job=>!['completed','failed','cancelled','interrupted'].includes(job.status);
     const status=()=>({pid:process.pid,mode:require('./storage').settings(base).mode,url,ready:server.automation.ready,error:server.automation.error,
-        activity:server.consoleActivity(),jobs:server.automation.jobs.records.map(j=>({workspace:j.user,...server.automation.jobs.public(j)}))});
+        activity:server.consoleActivity(),jobs:recentJobs().filter(active)});
     let chain=Promise.resolve(),url;
     process.on('message',message=>{
         if(message?.type==='password-result') {
@@ -47,8 +49,14 @@ async function start(base) {
                     if(!server.automation.ready)throw Error('Job service is not ready');
                     if(args[1]==='cancel'&&args.length===4)console.log(JSON.stringify(await jobs.cancel(require('./workspace').userKey(args[2]),args[3],()=>{}),null,2));
                     else if(args[1]==='resume'&&args.length===3)console.log(JSON.stringify(await jobs.resume(require('./workspace').userKey(args[2])),null,2));
-                    else if(args.length===1||(args[1]==='list'&&args.length<=3))console.table(status().jobs.filter(j=>!args[2]||j.workspace===args[2]).slice(-100).map(({workspace,jobId,status,progress})=>({workspace,jobId,status,progress})));
-                    else throw Error('Use jobs [list [workspace]], jobs cancel <workspace> <jobId>, or jobs resume <workspace>');
+                    else if(args.length===1||(args[1]==='list'&&args.length<=4&&args.slice(2).filter(a=>a!=='--all').length<=1)) {
+                        const workspace=args.slice(2).find(a=>a!=='--all');
+                        if(workspace)require('./workspace').userKey(workspace);
+                        const records=recentJobs().filter(j=>(args.includes('--all')||active(j))&&(!workspace||j.workspace===workspace)).slice(-100);
+                        if(records.length)console.table(records.map(({workspace,jobId,status,progress})=>({workspace,jobId,status,progress})));
+                        else console.log(args.includes('--all')?'No jobs found.':'No active jobs. Use jobs list --all to include history.');
+                    }
+                    else throw Error('Use jobs [list [workspace] [--all]], jobs cancel <workspace> <jobId>, or jobs resume <workspace>');
                 } else {
                     if(!['users','workspaces','limits','storage','network'].includes(args[0]))throw Error('Unknown command. Type help.');
                     await require('./admin-cli').run(base,args,{live:true,password:readPassword});

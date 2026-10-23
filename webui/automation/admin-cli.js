@@ -15,6 +15,8 @@ const HELP = `OpenMagFDM server CLI
   workspaces list
   workspaces assign <workspace> <account>
   storage show
+  storage set-workspace-root <absolute-directory>
+  storage migrate-workspaces <absolute-empty-directory>
   storage set-results-root <absolute-directory>
   storage migrate-results <absolute-empty-directory>
   network local
@@ -31,6 +33,9 @@ For packaged installs, use: webui-server[.exe] <command>
 One-shot storage/network/limit changes require the server to be stopped.
 In the interactive console, account/owner/limit changes apply while running;
 storage/network changes use stop, change settings, then start in that console.
+Workspace-root settings cover configs/uploads/user-libs/outputs; a separate
+results-root override takes precedence. migrate-workspaces consolidates all
+four categories and clears that override after verified copying. Originals stay.
 Limits apply per workspace (the existing browser userId), across WebUI and MCP.
 Counts include nested files in each input category, not result artifacts.
 Defaults: configs 20, images 20, libraries unlimited. 0 blocks new files.
@@ -55,6 +60,22 @@ async function files(directory) {
     const result=[];
     async function walk(dir) {await noLinks(dir);for(const entry of await fs.readdir(dir,{withFileTypes:true})){const item=path.join(dir,entry.name);await noLinks(item);if(entry.isDirectory())await walk(item);else if(entry.isFile())result.push({relative:path.relative(directory,item),hash:await digest(item)});else throw Error('Non-regular entry');}}
     await walk(directory);return result;
+}
+const within=(parent,child)=>{const relative=path.relative(parent,child);return !relative||(!relative.startsWith(`..${path.sep}`)&&relative!=='..'&&!path.isAbsolute(relative));};
+async function copyVerified(source,target) {
+    await noLinks(source,{missing:true});
+    const exists=await fs.stat(source).then(()=>true,error=>{if(error.code==='ENOENT')return false;throw error;});
+    const manifest=exists?await files(source):[];
+    await fs.mkdir(target,{recursive:true});
+    if((await fs.readdir(target)).length)throw Error('Migration destination must be empty');
+    if(exists) {
+        for(const name of await fs.readdir(source))await fs.cp(path.join(source,name),path.join(target,name),{recursive:true,force:false,errorOnExist:true});
+    }
+    const key=items=>JSON.stringify(items.sort((a,b)=>a.relative.localeCompare(b.relative)));
+    if(key(await files(target))!==key(manifest))throw Error('Copy verification failed; settings were not changed');
+    // External tools may still modify data while the server is stopped.
+    const after=await fs.stat(source).then(()=>files(source),error=>{if(error.code==='ENOENT')return [];throw error;});
+    if(key(after)!==key(manifest))throw Error('Source changed during migration; settings were not changed');
 }
 async function command(base,args,{password:askPassword=password,live=false}={}) {
     const [group,command,value,...rest]=args;
@@ -110,20 +131,32 @@ async function command(base,args,{password:askPassword=password,live=false}={}) 
         console.log(live?'Saved and applied to the running server. Existing files were retained.':'Saved. Restart the server. Existing files were retained.');return;
     }
     if(group==='storage') {
-        if(command==='show'){console.log(JSON.stringify({resultsRoot:root(base,'outputs')},null,2));return;}
+        const workspaceRoot=settings.workspaceRoot?path.resolve(settings.workspaceRoot):path.resolve(base);
+        if(command==='show'){console.log(JSON.stringify({workspaceRoot,configsRoot:root(base,'configs'),imagesRoot:root(base,'uploads'),librariesRoot:root(base,'user-libs'),resultsRoot:root(base,'outputs'),resultsRootOverride:settings.resultsRoot||null},null,2));return;}
+        if(!['set-workspace-root','migrate-workspaces','set-results-root','migrate-results'].includes(command))throw Error('Unknown storage command');
         if(!value||!path.isAbsolute(value))throw Error('An absolute directory is required');
         const target=path.resolve(value),source=root(base,'outputs');await noLinks(target,{missing:true});
-        if(command==='migrate-results'){
-            const within=(a,b)=>{const rel=path.relative(a,b);return !rel||(!rel.startsWith('..')&&!path.isAbsolute(rel));};
-            if(within(source,target)||within(target,source))throw Error('Source and destination must not overlap');
+        if(within(target,directory)||within(directory,target))throw Error('Workspace storage must not overlap private server state');
+        const targets=command.endsWith('workspaces')||command==='set-workspace-root'?['configs','uploads','user-libs','outputs'].map(folder=>path.join(target,folder)):[target];
+        for(const location of targets)for(const publicDir of [path.join(base,'public'),path.join(base,'webui','public'),path.join(base,'icon'),path.join(base,'webui','icon')]) {
+            if(within(location,publicDir)||within(publicDir,location))throw Error('Workspace storage must not overlap public web assets');
+        }
+        if(command==='migrate-workspaces') {
+            const folders=['configs','uploads','user-libs','outputs'];
+            for(const folder of folders){const original=root(base,folder);if(within(original,target)||within(target,original))throw Error('Source and destination must not overlap');}
             await fs.mkdir(target,{recursive:true});if((await fs.readdir(target)).length)throw Error('Migration destination must be empty');
-            const manifest=await files(source);
-            for(const name of await fs.readdir(source))await fs.cp(path.join(source,name),path.join(target,name),{recursive:true,force:false,errorOnExist:true});
-            for(const file of manifest)if(await digest(path.join(target,file.relative))!==file.hash)throw Error('Copy verification failed; settings were not changed');
-            if((await files(target)).length!==manifest.length)throw Error('Copy file count differs');
-        } else if(command!=='set-results-root')throw Error('Unknown storage command');
+            for(const folder of folders)await copyVerified(root(base,folder),path.join(target,folder));
+            settings.workspaceRoot=target;delete settings.resultsRoot;
+        } else if(command==='migrate-results') {
+            if(within(source,target)||within(target,source))throw Error('Source and destination must not overlap');
+            await copyVerified(source,target);settings.resultsRoot=target;
+        } else if(command==='set-workspace-root')settings.workspaceRoot=target;
+        else settings.resultsRoot=target;
         await fs.mkdir(target,{recursive:true});await fs.access(target,fs.constants.W_OK);
-        settings.resultsRoot=target;await atomicJSON(settingsFile,settings);console.log('Saved. Restart the server. Original data was retained.');return;
+        await atomicJSON(settingsFile,settings);configure(base,settings);
+        console.log('Saved. Restart the server. Original data was retained.');
+        if(command==='set-workspace-root'&&settings.resultsRoot)console.log('The separate results-root override is still active; use storage show to inspect all paths.');
+        return;
     }
     if(group==='network') {
         if(command==='local')settings.mode='local';

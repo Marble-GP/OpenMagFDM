@@ -4,6 +4,15 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const {Workspace, userKey, segments, fail, noLinks} = require('./workspace');
 const {atomicJSON} = require('./access');
+function deletionError(error) {
+    if (error.statusCode) return error.message;
+    return ({EACCES:'Permission denied. Check filesystem permissions and retry.',
+        EPERM:'Permission denied or file in use. Close programs using these files and check permissions.',
+        EBUSY:'File is in use. Close programs using it and retry.',
+        ENOTEMPTY:'Directory changed or a file is in use. Refresh and retry.',
+        ENOENT:'File no longer exists. Refresh the list.',
+        EROFS:'Storage is read-only. Check the workspace storage mount.'})[error.code] || 'Deletion failed. Check the server log and filesystem permissions.';
+}
 
 class FileOperations {
     constructor(base, directory, busy) {
@@ -20,7 +29,7 @@ class FileOperations {
             const record = JSON.parse(await fs.readFile(path.join(this.directory, name), 'utf8'));
             if (record.status === 'running') {
                 record.status = 'interrupted'; record.current = null;
-                record.message = 'Server restarted; inspect remaining files before retrying.';
+                record.message = 'Server restarted during deletion. Some targets may already be removed; refresh files before retrying.';
                 await this.save(record);
             }
             this.records.set(record.id, record);
@@ -42,7 +51,7 @@ class FileOperations {
         }
         if (this.pending.has(user)) fail('BUSY', 'A deletion is already running for this workspace', 409);
         this.pending.add(user);
-        const record = {id:crypto.randomUUID(), user, status:'running', created:new Date().toISOString(), total:files.length, current:null, results:[]};
+        const record = {id:crypto.randomUUID(), user, status:'running', created:new Date().toISOString(), total:files.length, targets:files.map(file=>file.id), current:null, results:[]};
         try { await this.save(record); this.records.set(record.id, record); }
         catch (error) { this.pending.delete(user); throw error; }
         void this.run(record, files);
@@ -52,22 +61,23 @@ class FileOperations {
         const ws = new Workspace(this.base, record.user, {busy:id => this.busy(record.user, id)});
         try {
             for (const file of files) {
-                record.current = file.id; await this.save(record);
+                // Polling reads progress from memory. Persist only acceptance
+                // and completion, not two full JSON rewrites per target.
+                record.current = file.id;
                 const started = performance.now();
                 try {
                     await ws.remove(file.id, file.revision);
                     record.results.push({id:file.id, success:true, elapsedMs:performance.now()-started});
                 } catch (error) {
-                    record.results.push({id:file.id, success:false, error:error.statusCode ? error.message : 'Deletion failed', code:error.code, elapsedMs:performance.now()-started});
+                    record.results.push({id:file.id, success:false, error:deletionError(error), code:error.code, elapsedMs:performance.now()-started});
                 }
-                await this.save(record);
             }
             record.status = 'complete';
-        } catch { record.status = 'interrupted'; record.message = 'Operation journal could not be updated; inspect files before retrying.'; }
+        } catch { record.status = 'interrupted'; record.message = 'Deletion was interrupted; inspect remaining files before retrying.'; }
         finally {
             record.current = null; record.finished = new Date().toISOString(); this.pending.delete(record.user);
             await this.save(record).catch(() => {});
         }
     }
 }
-module.exports = {FileOperations};
+module.exports = {FileOperations, deletionError};

@@ -1,12 +1,12 @@
-// ===== 材質画像表示とスライド領域描画 =====
+// ===== Material image and sliding-region preview =====
 
 let materialImage = null;
 let transientConfig = null;
 
-// 材質画像を読み込んでスライド領域を描画
+// Load the material image and draw the sliding region.
 async function loadAndDisplayMaterialImage() {
     try {
-        // 過渡解析設定を取得
+        // Read transient settings.
         const configResponse = await fetch('/api/get-transient-config');
         const configData = await configResponse.json();
 
@@ -14,7 +14,7 @@ async function loadAndDisplayMaterialImage() {
             transientConfig = configData;
         }
 
-        // 材質画像を取得
+        // Read the material image.
         const img = new Image();
         img.onload = function() {
             materialImage = img;
@@ -24,24 +24,24 @@ async function loadAndDisplayMaterialImage() {
         img.onerror = function() {
             console.error('Failed to load material image');
         };
-        img.src = '/api/get-material-image?' + Date.now(); // キャッシュ回避
+        img.src = '/api/get-material-image?' + Date.now(); // Bypass the cache.
     } catch (error) {
         console.error('Error loading material image:', error);
     }
 }
 
-// Canvasに材質画像とスライド領域を描画
+// Draw the material image and sliding region on the canvas.
 function drawMaterialImage() {
     if (!materialImage) return;
 
     const canvas = document.getElementById('materialImageCanvas');
     const ctx = canvas.getContext('2d');
 
-    // 画像サイズを取得
+    // Read the image dimensions.
     const imgWidth = materialImage.width;
     const imgHeight = materialImage.height;
 
-    // ブラウザウィンドウに収まるようにスケーリング
+    // Scale to fit the preview.
     const maxWidth = 800;
     const maxHeight = 600;
     let scale = 1.0;
@@ -53,24 +53,24 @@ function drawMaterialImage() {
     const displayWidth = imgWidth * scale;
     const displayHeight = imgHeight * scale;
 
-    // Canvasサイズを設定
+    // Set canvas dimensions.
     canvas.width = displayWidth;
     canvas.height = displayHeight;
 
-    // 画像を描画
+    // Draw the image.
     ctx.drawImage(materialImage, 0, 0, displayWidth, displayHeight);
 
-    // スライド領域を点線で描画
+    // Mark the sliding region with dashed lines.
     if (transientConfig && transientConfig.enable_sliding) {
-        ctx.strokeStyle = '#FF0000';  // 赤色
-        ctx.setLineDash([5, 5]);  // 点線
+        ctx.strokeStyle = '#FF0000';
+        ctx.setLineDash([5, 5]);
         ctx.lineWidth = 2;
 
         const start = transientConfig.slide_region_start * scale;
         const end = transientConfig.slide_region_end * scale;
 
         if (transientConfig.slide_direction === 'vertical') {
-            // vertical: x範囲をy方向にスライド
+            // Vertical motion: slide the selected x range along y.
             ctx.beginPath();
             ctx.moveTo(start, 0);
             ctx.lineTo(start, displayHeight);
@@ -81,7 +81,7 @@ function drawMaterialImage() {
             ctx.lineTo(end, displayHeight);
             ctx.stroke();
         } else {
-            // horizontal: y範囲をx方向にスライド
+            // Horizontal motion: slide the selected y range along x.
             ctx.beginPath();
             ctx.moveTo(0, start);
             ctx.lineTo(displayWidth, start);
@@ -93,13 +93,13 @@ function drawMaterialImage() {
             ctx.stroke();
         }
 
-        ctx.setLineDash([]);  // 点線解除
+        ctx.setLineDash([]);
     }
 
-    // 画像情報を表示
+    // Display image dimensions and scale.
     const scalePercent = (scale * 100).toFixed(1);
     const roundedWidth = Math.round(displayWidth);
     const roundedHeight = Math.round(displayHeight);
     document.getElementById('imageInfo').textContent =
-        `原寸: ${imgWidth}×${imgHeight} px, 表示: ${scalePercent}% (${roundedWidth}×${roundedHeight} px)`;
+        `Original: ${imgWidth}×${imgHeight} px, display: ${scalePercent}% (${roundedWidth}×${roundedHeight} px)`;
 }

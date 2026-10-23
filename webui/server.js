@@ -42,17 +42,17 @@ const PORT = process.env.PORT || 3000;
 const isPkg = typeof process.pkg !== 'undefined';
 const BASE_DIR = isPkg ? path.dirname(process.execPath) : path.join(__dirname, '..');
 
-// アップロードディレクトリの設定
-const UPLOAD_DIR = path.join(BASE_DIR, 'uploads');
+const dataStorage = require('./automation/storage');
+const serverSettings = dataStorage.configure(BASE_DIR);
+const UPLOAD_DIR = dataStorage.root(BASE_DIR, 'uploads');
 // Explicit environment override > saved administrator setting > standard layouts.
 const solverLocation = require('./automation/solver-location');
 let SOLVER_PATH = solverLocation.locate(BASE_DIR).path;
 const CONFIG_PATH = path.join(BASE_DIR, 'sample_config.yaml');
-const USER_CONFIGS_DIR = path.join(BASE_DIR, 'configs');
-const serverSettings = require('./automation/storage').configure(BASE_DIR);
+const USER_CONFIGS_DIR = dataStorage.root(BASE_DIR, 'configs');
 const accounts = new (require('./automation/accounts').Accounts)(BASE_DIR,serverSettings);
-const OUTPUTS_DIR = require('./automation/storage').root(BASE_DIR, 'outputs');
-const USER_LIBS_DIR = path.join(BASE_DIR, 'user-libs');
+const OUTPUTS_DIR = dataStorage.root(BASE_DIR, 'outputs');
+const USER_LIBS_DIR = dataStorage.root(BASE_DIR, 'user-libs');
 
 // 基本ディレクトリを同期的に作成（Multerが使用する前に必要）
 try {
