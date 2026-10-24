@@ -4,6 +4,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$projectFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'CMakeLists.txt'
+$projectVersion = [regex]::Match((Get-Content -Raw -LiteralPath $projectFile), 'project\(MagFDMsolver VERSION ([0-9]+\.[0-9]+\.[0-9]+)')
+if (-not $projectVersion.Success) { throw 'Unable to read release version from CMakeLists.txt' }
+$expectedVersion = $projectVersion.Groups[1].Value
 $package = (Resolve-Path -LiteralPath $PackageDir).Path
 $solver = Join-Path $package 'MagFDMsolver.exe'
 if (-not (Test-Path -LiteralPath $solver)) {
@@ -14,7 +18,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $package 'general_materials.yaml')))
 }
 
 $version = (& $solver --version | Out-String).Trim()
-if ($LASTEXITCODE -ne 0 -or $version -ne 'OpenMagFDM 1.7.2') {
+if ($LASTEXITCODE -ne 0 -or $version -ne "OpenMagFDM $expectedVersion") {
     throw "Unexpected --version result: '$version'"
 }
 
@@ -181,7 +185,7 @@ try {
     & $solver $metreConfig $imagePath 'contract_metres_out'
     if ($LASTEXITCODE -ne 0) { throw 'Metre metadata run failed' }
     $metreJson = Get-Content -Raw -LiteralPath 'contract_metres_out\conditions.json' | ConvertFrom-Json
-    if ($metreJson.openmagfdm_version -ne '1.7.2' -or
+    if ($metreJson.openmagfdm_version -ne $expectedVersion -or
         $metreJson.transient.slide_region_units -ne 'm' -or
         [math]::Abs([double]$metreJson.transient.slide_region_start - 0.05) -gt 1e-12) {
         throw 'Decimal slide bounds were not preserved as metres in conditions.json'
@@ -200,4 +204,4 @@ try {
     Pop-Location
 }
 
-Write-Host 'OpenMagFDM v1.7.2 release-contract smoke tests passed.'
+Write-Host "OpenMagFDM v$expectedVersion release-contract smoke tests passed."
