@@ -41,21 +41,22 @@ function findButton(node, text) {
     if (node.tag === 'button' && node.textContent === text) return node;
     for (const child of node.children || []) { const match = findButton(child, text); if (match) return match; }
 }
-test('MCP activity Open Results keeps picker label and actual requested result in sync', async () => {
+test('MCP activity summarizes finished jobs and routes to the dedicated manager', async () => {
     const f = fixture();
     await f.context.panel.activity();
-    const button = findButton(f.ids.mcpActivity, 'Open Results');
+    const button = findButton(f.ids.mcpActivity, 'Open job manager');
     assert.ok(button);
     await button.events.click();
-    assert.deepEqual(f.calls, ['refresh', 'display', 'dashboard', 'load']);
+    assert.deepEqual(f.calls, ['jobs']);
+    assert.equal(findButton(f.ids.mcpActivity, 'Open Results'), undefined);
     assert.equal(f.ids.mcpMessage.textContent, '');
     assert.equal(button.disabled, false);
 });
-test('MCP activity explains that first output is not ready instead of loading a stale selection', async () => {
+test('MCP activity keeps file events collapsed and leaves the current result untouched', async () => {
     const f = fixture(false);
     await f.context.panel.activity();
-    await findButton(f.ids.mcpActivity, 'Open Results').events.click();
-    assert.deepEqual(f.calls, ['refresh']);
-    assert.match(f.ids.mcpMessage.textContent, /Refresh after the first output/);
+    const details=f.ids.mcpActivity.children.find(n=>n.tag==='details');
+    assert.ok(details);assert.ok(!details.open);
+    assert.deepEqual(f.calls, []);
     assert.equal(f.ids.resultSelect.value, 'outputs/user_A/old-result');
 });

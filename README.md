@@ -6,15 +6,19 @@ provides configuration editing, image preprocessing and result visualization.
 It supports Cartesian and polar coordinates, nonlinear B-H materials,
 permanent magnets, and transient analyses with prescribed motion.
 
-**Latest published release: v1.7.2** · [Release notes](docs/releases/RELEASE_NOTES_v1.7.2.md) ·
+**Latest release: v1.7.3** · [Release notes](docs/releases/RELEASE_NOTES_v1.7.3.md) ·
 [Changelog](CHANGELOG.md) · [Documentation](docs/README.md)
 
-## Development changes (unreleased)
+## v1.7.3
 
 The current source adds whole-workspace storage configuration and verified
 migration, clearer deletion failures, large-result deletion fixes, active-only
 console job lists with optional history, and English public interfaces and manuals.
-These changes are not included in the published v1.7.2 binaries.
+It also adds a paged Jobs screen, compact workspace activity, automatic result
+discovery after job completion, guided storage migration in the console menu,
+and per-workspace result-count/storage admission limits. Completed results stay
+editable/deletable while another job runs; active result protection remains.
+See the [v1.7.3 release notes](docs/releases/RELEASE_NOTES_v1.7.3.md) for upgrade and validation details.
 
 ## v1.7.2
 
@@ -64,6 +68,10 @@ explicitly terminates them. Use `--no-console` for service deployments.
 3. Review dimensions, materials, current sources, magnetization and boundary conditions; submit from Run.
 4. Inspect progress and logs, then view fields, field lines and time series in Results.
 5. Save a description and export the required inputs/results as a ZIP backup.
+
+In current source, Jobs separates the active queue from paged finished history.
+Completed WebUI/MCP jobs refresh the result picker automatically, preserving
+the currently loaded plots. Open a job's results explicitly from its row.
 
 Jobs continue on the server after a browser reload, tab close or logout.
 Reconnect to restore controls. Stopping the server also stops its solver processes.

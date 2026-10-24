@@ -24,13 +24,23 @@ async function main(){
     const request=(body)=>fetch(`http://127.0.0.1:${port}/api/config`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(3000)});
     try{
         await until(()=>text().includes('Server ready:')&&text().includes('OpenMagFDM>'),'default interactive startup');
-        await send('he\t\r','Guided file-limit settings'); // Tab completes help.
-        await send('\x1b[A\r','Guided file-limit settings'); // Up recalls help.
+        await send('he\t\r','Guided input/result'); // Tab completes help.
+        await send('\x1b[A\r','Guided input/result'); // Up recalls help.
         console.log('PTY: default startup, Tab and history passed');
-        await send('menu\r','Server action');await send('\x1b[B\r','File-limit scope');
-        await send('\r','Files to limit');await send('\r','Maximum files');await send('4\r','Saved and applied');
+        await send('menu\r','Server action');await send('\x1b[B\r','Limit scope');
+        await send('\r','Resource to limit');await send('\r','Maximum count');await send('4\r','Saved and applied');
         const settings=JSON.parse(await fs.readFile(path.join(privateDir,'server-settings.json'),'utf8'));assert.equal(settings.fileLimits.defaults.configs,4);
         console.log('PTY: Inquirer menu and settings passed');
+        await send('configure\r','Limit scope');await send('\x1b[B\r','Workspace ID');await send('quota_demo\r','Resource to limit');
+        await send('\x1b[B\x1b[B\x1b[B\r','Maximum count');await send('2\r','Saved and applied');
+        assert.equal(JSON.parse(await fs.readFile(path.join(privateDir,'server-settings.json'),'utf8')).fileLimits.workspaces.quota_demo.results,2);
+        await send('configure\r','Limit scope');await send('\r','Resource to limit');
+        await send('\x1b[B\x1b[B\x1b[B\x1b[B\r','Maximum MiB');await send('64\r','Saved and applied');
+        assert.equal(JSON.parse(await fs.readFile(path.join(privateDir,'server-settings.json'),'utf8')).fileLimits.defaults['result-mib'],64);
+        const moved=path.join(root,'relocated workspace');
+        await send('storage\r','Storage action');await send('\x1b[B\r','Absolute destination');await send(moved+'\r','Stop the idle server');await send('y\r','Server ready:');
+        assert.equal(JSON.parse(await fs.readFile(path.join(privateDir,'server-settings.json'),'utf8')).workspaceRoot,moved);
+        console.log('PTY: result quotas and guided verified workspace migration passed');
         const password='Disposable-console-secret-413!';
         await send('users create console_admin --admin\r','Password (12+ characters)');
         await send(password+'\r','Repeat password');await send(password+'\r','Saved. No workspace files were deleted');
@@ -47,7 +57,7 @@ async function main(){
         terminal.write('sta');await delay(100);
         assert.equal((await request({userId:'log_test',file:'x.yaml',content:'variables: {}',expectedRevision:null})).status,200);
         await delay(100);await send('tus\r','"activity"'); // Async logs preserve the partially typed command.
-        await send('configure\r','File-limit scope');await send('\x04','Console closed');await Promise.race([closed,delay(15000).then(()=>{throw Error('Console process did not exit after closing');})]);assert.equal(exitResult.exitCode,0);
+        await send('configure\r','Limit scope');await send('\x04','Console closed');await Promise.race([closed,delay(15000).then(()=>{throw Error('Console process did not exit after closing');})]);assert.equal(exitResult.exitCode,0);
         await assert.rejects(fetch(`http://127.0.0.1:${port}/api/auth/me`,{signal:AbortSignal.timeout(1000)}));
         assert.equal(output.includes(password),false);
         if(arg('--artifacts')){

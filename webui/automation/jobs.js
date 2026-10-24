@@ -30,7 +30,9 @@ class AnalysisJobs {
     save() { return locked(this.filename, () => atomicJSON(this.filename, this.records)); }
     busy(user, id) {
         user = userKey(user);
-        if (id.startsWith('results/') && this.backend.userHasActiveSolver?.(user)) return true;
+        // A connected MCP client (or a different running job) owns no handles
+        // to this result. Keep the broad guard only for unscoped legacy solves.
+        if (id.startsWith('results/') && this.backend.legacySolverActive?.(user)) return true;
         return this.records.some(j => j.user === user && ['preparing','queued','held','running','cancelling'].includes(this.current(j).status) && (id === j.resultId || id.startsWith(`${j.resultId}/`)));
     }
     current(record) {
@@ -39,11 +41,21 @@ class AnalysisJobs {
     }
     public(record) {
         const j = this.current(record);
-        return { jobId: j.jobId, source: j.source, resultId: j.resultId, status: j.status, progress: j.progress || 0,
+        return { jobId: j.jobId, workspace:j.user, source: j.source, configName:j.configName||null, imageName:j.imageName||null, resultId: j.resultId, status: j.status, progress: j.progress || 0,
             completed: !!j.completed, converged: !!j.converged, warning: !!j.warning, exitCode: j.exitCode ?? null,
             resultPath: j.resultPath || null, created: j.created, finished: j.finished || null, message: j.message || null };
     }
     list(user) { return this.records.filter(j => j.user === user).map(j => this.public(j)).reverse(); }
+    page(user,{view='active',offset=0,limit=20}={}) {
+        if(!['active','history','overview','all'].includes(view)||!Number.isInteger(offset)||offset<0||!Number.isInteger(limit)||limit<1||limit>100)fail('INVALID_INPUT','Expected job view and offset/limit (1..100)');
+        const all=this.list(user),active=j=>['preparing','queued','held','running','cancelling'].includes(j.status);
+        const running=all.filter(active),history=all.filter(j=>!active(j));
+        // A held job may finish after many newer submissions. Include recent
+        // completions in the overview so clients notice that transition.
+        const recent=history.slice().sort((a,b)=>(b.finished||b.created||'').localeCompare(a.finished||a.created||''));
+        const selected=view==='overview'?[...running.slice(0,50),...recent.slice(0,20)]:view==='active'?running:view==='history'?recent:all;
+        return {jobs:view==='overview'?selected:selected.slice(offset,offset+limit),counts:{active:running.length,history:history.length},total:selected.length,offset,limit,nextOffset:view!=='overview'&&offset+limit<selected.length?offset+limit:null};
+    }
     get(user, jobId) {
         const record = this.records.find(j => j.user === user && j.jobId === jobId);
         if (!record) fail('NOT_FOUND', 'Job not found', 404);
@@ -95,6 +107,8 @@ class AnalysisJobs {
             // Resolve again after restart/storage migration; never trust persisted absolute paths.
             let out;
             try {out=await ws.resolve(record.resultId);}catch(error){record.status='failed';record.message='Saved input directory unavailable';record.finished=new Date().toISOString();await this.save();continue;}
+            try {await require('./limits').checkResults(this.base,record.user,{starting:true});}
+            catch(error){if(error.code!=='QUOTA_EXCEEDED')throw error;record.status='held';record.message=error.message+' Adjust limits, then resume the queue.';await this.save();continue;}
             const prepared = {outputPath:out, configPath:path.join(out,'.inputs','config.yaml'), imagePath:path.join(out,'.inputs',path.basename(record.prepared.imagePath))};
             try {
                 record.status = 'preparing'; await this.save();
@@ -131,7 +145,7 @@ class AnalysisJobs {
             await ws.init();
             const jobId = crypto.randomUUID(); const resultId = `results/output_mcp_${jobId}`;
             const out = await ws.resolve(resultId, { create: true });
-            const record = { key, requestHash, jobId, user: actor.user, source: actor.name, resultId, status: 'preparing', created: new Date().toISOString(), browserRequestHash: input.browserRequestHash };
+            const record = { key, requestHash, jobId, user: actor.user, source: actor.name, configName:input.config.id.split('/').pop(), imageName:input.image.id.split('/').pop(), resultId, status: 'preparing', created: new Date().toISOString(), browserRequestHash: input.browserRequestHash };
             // Record BEFORE spawning. An uncertain/restarted request never launches twice.
             this.records.push(record); await this.save();
             try {
@@ -152,17 +166,19 @@ class AnalysisJobs {
                     }
                     const parsed = yaml.load(content);
                     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail('INVALID_CONFIG', 'Expected a configuration mapping');
-                    await fs.mkdir(out, { recursive: false });
-                    const snapshot = path.join(out, '.inputs'); await fs.mkdir(snapshot);
-                    const manifest = [];
-                    const copy = async (id, dest) => {
+                    const snapshot = path.join(out, '.inputs');
+                    const manifest = [], copies=[];
+                    const planCopy = async (id, dest) => {
                         const from = await ws.resolve(id); const stat = await fs.stat(from);
                         if (!stat.isFile() || stat.size > 512 * 1024 * 1024) fail('LIMIT_EXCEEDED', 'Input must be a regular file of at most 512 MiB');
-                        await fs.copyFile(from, dest, fs.constants.COPYFILE_EXCL);
-                        manifest.push({ id, path:path.relative(out,dest).replace(/\\/g,'/'), sha256: await digest(dest), size: stat.size });
+                        const sha256=await digest(from);
+                        const after=await fs.stat(from);
+                        if(after.size!==stat.size||after.mtimeMs!==stat.mtimeMs||after.ctimeMs!==stat.ctimeMs)fail('REVISION_CONFLICT','Input changed while planning its snapshot',409);
+                        copies.push({id,dest,sha256});
+                        manifest.push({ id, path:path.relative(out,dest).replace(/\\/g,'/'), sha256, size: stat.size });
                     };
-                    await copy(input.config.id,path.join(snapshot,'source-config.yaml'));
-                    if(input.library)await copy(input.library.id,path.join(snapshot,'materials.yaml'));
+                    await planCopy(input.config.id,path.join(snapshot,'source-config.yaml'));
+                    if(input.library)await planCopy(input.library.id,path.join(snapshot,'materials.yaml'));
                     let visited = 0; const seen = new WeakSet();
                     const visit = async obj => {
                         if (!obj || typeof obj !== 'object') return;
@@ -174,16 +190,31 @@ class AnalysisJobs {
                                 if (typeof v !== 'string') fail('INVALID_PATH', 'File references must be workspace IDs');
                                 // Require explicit category IDs; do not interpret paths relative to process cwd.
                                 const dest = path.join(snapshot, `reference-${manifest.length}.bin`);
-                                await copy(v, dest); obj[k] = path.relative(out,dest).replace(/\\/g,'/');
+                                await planCopy(v, dest); obj[k] = path.relative(out,dest).replace(/\\/g,'/');
                             } else if (v && typeof v === 'object') await visit(v);
                         }
                     };
                     await visit(parsed);
                     const imagePath = path.join(snapshot, 'model' + path.extname(input.image.id));
-                    await copy(input.image.id, imagePath);
+                    await planCopy(input.image.id, imagePath);
                     const configPath = path.join(snapshot, 'config.yaml');
-                    await fs.writeFile(configPath, yaml.dump(parsed, { lineWidth: -1 }), { flag: 'wx' });
-                    await atomicJSON(path.join(out, 'run-inputs.json'), { version: 1, inputs: input, files: manifest, effectiveConfigHash: await digest(configPath), solverVersion: await this.backend.getSolverVersion?.() || 'unknown' });
+                    const effectiveConfig=yaml.dump(parsed, { lineWidth: -1 });
+                    const metadata={ version: 1, inputs: input, files: manifest, effectiveConfigHash: hash(effectiveConfig), solverVersion: await this.backend.getSolverVersion?.() || 'unknown' };
+                    const bytes=manifest.reduce((sum,file)=>sum+file.size,0)+Buffer.byteLength(effectiveConfig)+Buffer.byteLength(JSON.stringify(metadata,null,2));
+                    await require('./limits').checkResults(this.base,actor.user,{newResults:1,bytes,starting:true});
+                    await fs.mkdir(out, { recursive: false });
+                    try {
+                        await fs.mkdir(snapshot);
+                        for(const file of copies) {
+                            await fs.copyFile(await ws.resolve(file.id),file.dest,fs.constants.COPYFILE_EXCL);
+                            if(await digest(file.dest)!==file.sha256)fail('REVISION_CONFLICT','Input changed while creating its snapshot',409);
+                        }
+                        await fs.writeFile(configPath,effectiveConfig,{flag:'wx'});
+                        await atomicJSON(path.join(out,'run-inputs.json'),metadata);
+                        actor.guard('run');
+                    } catch(error) {
+                        await noLinks(out);await fs.rm(out,{recursive:true,force:true});throw error;
+                    }
                     actor.guard('run');
                     record.prepared = {configPath, imagePath, outputPath:out};
                     record.resultPath = `outputs/${record.user}/${path.basename(out)}`;

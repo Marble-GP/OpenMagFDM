@@ -1,7 +1,6 @@
 # Server operations
 
-The published baseline is v1.7.2. Whole-workspace storage commands, active-only
-console job lists and deletion fixes in current source are **unreleased**.
+The release baseline is v1.7.3.
 See [CLI](CLI.md), [REST API](REST_API.md) and [MCP](MCP_INTEGRATION.md).
 
 ## Installation and startup
@@ -55,8 +54,8 @@ shared mode. Ownership and enabled-account checks still apply.
 | Results | `<workspaceRoot>/outputs/<workspace>/`, unless separately overridden |
 | Accounts, ownership, sessions, settings, job ledger and MCP profiles | OS-private directory keyed by application installation path |
 
-The workspace root defaults to the application directory. Published v1.7.2 can
-change results storage only; current source can configure/migrate all categories.
+The workspace root defaults to the application directory. v1.7.3 can
+configure or migrate all workspace categories.
 `storage show` reports resolved paths. Private server state is stored under
 `%LOCALAPPDATA%/OpenMagFDM/automation/<installation-path-hash>/` on Windows, or
 `~/.local/share/OpenMagFDM/automation/<installation-path-hash>/` on Linux/macOS.
@@ -119,7 +118,7 @@ console for live administration. To change settings without moving data, use
 `stop`, `storage set-workspace-root <absolute-path>`, then `start`.
 For verified copying use `storage migrate-workspaces <absolute-empty-path>`.
 It includes separately stored results, then clears that override. Originals
-remain. These workspace commands are unreleased. Published v1.7.2 provides
+remain. v1.7.2 provides
 `set-results-root` and `migrate-results` for results only. Migration rejects
 overlap/nonempty targets. Verification failure retains settings and source data;
 partial destination copies remain for inspection.

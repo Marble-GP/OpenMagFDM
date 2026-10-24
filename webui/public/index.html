@@ -1162,9 +1162,10 @@
         <div class="tabs" role="tablist" aria-label="Analysis workflow">
             <button class="tab active" role="tab" id="nav-config" aria-controls="tab-config" aria-selected="true" data-tab="config">01 · Configuration<small>YAML, materials & validation</small></button>
             <button class="tab" role="tab" id="nav-run" aria-controls="tab-run" aria-selected="false" data-tab="run">02 · Model & Run<small>Prepare inputs & calculate</small></button>
-            <button class="tab" role="tab" id="nav-dashboard" aria-controls="tab-dashboard" aria-selected="false" data-tab="dashboard">03 · Results<small>Fields, waveforms & inspection</small></button>
-            <button class="tab" role="tab" id="nav-files" aria-controls="tab-files" aria-selected="false" data-tab="files">04 · Files<small>Manage, import & export</small></button>
-            <button class="tab" role="tab" id="nav-integrations" aria-controls="tab-integrations" aria-selected="false" data-tab="integrations">05 · Help &amp; Integrations<small>Local MCP connections &amp; activity</small></button>
+            <button class="tab" role="tab" id="nav-jobs" aria-controls="tab-jobs" aria-selected="false" data-tab="jobs">03 · Jobs<small>Queue, progress &amp; history</small></button>
+            <button class="tab" role="tab" id="nav-dashboard" aria-controls="tab-dashboard" aria-selected="false" data-tab="dashboard">04 · Results<small>Fields, waveforms & inspection</small></button>
+            <button class="tab" role="tab" id="nav-files" aria-controls="tab-files" aria-selected="false" data-tab="files">05 · Files<small>Manage, import & export</small></button>
+            <button class="tab" role="tab" id="nav-integrations" aria-controls="tab-integrations" aria-selected="false" data-tab="integrations">06 · Help &amp; Integrations<small>Local MCP connections &amp; activity</small></button>
         </div>
         <div class="workspace-context" aria-label="Current workspace context">
             <strong id="workspaceConfig">Loading configuration…</strong>
@@ -1218,16 +1219,41 @@
             </div>
             <section class="workspace-card"><h3>Workspace activity</h3><p>Saved-file changes are reported here. Your editor draft and current image are never replaced automatically. Reload a changed file explicitly; a stale save is rejected.</p><button id="mcpRefreshActivity" class="btn-secondary">Refresh activity</button><div id="mcpActivity" aria-live="polite"></div></section>
         </div>
+        <div class="tab-content" id="tab-jobs">
+            <section class="workspace-card">
+                <h2>Analysis jobs</h2>
+                <p>Jobs belong to workspace <strong id="jobsWorkspace"></strong>. Browser and MCP submissions share this queue. Closing a page does not stop an analysis.</p>
+                <div class="button-group">
+                    <label for="jobsFilter">Show</label><select id="jobsFilter"><option value="active">Active queue</option><option value="history">Finished history</option></select>
+                    <button class="btn-secondary" onclick="JobsPanel.refresh()">Refresh jobs</button>
+                    <span id="jobsConnection" role="status"></span>
+                </div>
+                <p id="jobsCounts"></p>
+                <div class="jobs-table-wrap"><table class="jobs-table"><thead><tr><th>Job / configuration</th><th>Submitted by</th><th>Status</th><th>Progress</th><th>Created</th><th>Actions</th></tr></thead><tbody id="analysisJobs"></tbody></table></div>
+                <p id="jobsEmpty" hidden>No active jobs. Finished jobs are available in history.</p>
+                <div class="button-group"><button class="btn-secondary" id="jobsPrevious">Previous</button><span id="jobsPage" role="status"></span><button class="btn-secondary" id="jobsNext">Next</button></div>
+            </section>
+            <section class="workspace-card">
+                <h3>Job details</h3><p id="jobDetails">Select a job to inspect its status and log.</p>
+                <details id="jobLogDetails"><summary>Solver log</summary><pre id="solverOutput" class="job-log"></pre></details>
+            </section>
+        </div>
         <div class="tab-content active" id="tab-config">
             <div class="config-section">
                 <h2>YAML Configuration</h2>
                 <p class="page-intro">Define the model, review inline diagnostics, then prepare the image in Model &amp; Run. Ctrl/Cmd + S saves your changes.</p>
                 <div class="button-group">
-                    <label>Config File:
-                        <select id="configFileSelect" onchange="loadSelectedConfig()" style="width: 300px; padding: 8px; margin-left: 10px; border: 1px solid #dee2e6; border-radius: 3px;">
-                            <option value="sample_config.yaml">sample_config.yaml</option>
-                        </select>
-                    </label>
+                    <span id="configPickerLabel">Config File:</span>
+                    <div id="configSelectContainer" class="custom-select file-picker">
+                        <button type="button" class="custom-select-trigger" id="configSelectTrigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="configSelectOptions" aria-labelledby="configPickerLabel configSelectDisplay">
+                            <span id="configSelectDisplay">sample_config.yaml</span>
+                            <span class="custom-select-arrow" aria-hidden="true">▼</span>
+                        </button>
+                        <div class="custom-select-options" id="configSelectOptions" role="listbox" aria-labelledby="configPickerLabel"></div>
+                    </div>
+                    <select id="configFileSelect" onchange="loadSelectedConfig()" hidden aria-label="Config File">
+                        <option value="sample_config.yaml">sample_config.yaml</option>
+                    </select>
                     <button class="btn-danger" onclick="deleteConfig()">Delete</button>
                     <button class="btn-primary" onclick="saveConfig()">Save</button>
                     <button class="btn-secondary" onclick="saveConfigAs()">Save As...</button>
@@ -1375,8 +1401,9 @@
                             <div id="solverProgressBar" style="background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); height: 100%; width: 0%; transition: width 0.3s ease;"></div>
                         </div>
                     </div>
-                    <section><h4>Analysis jobs</h4><div id="jobsConnection" role="status"></div><div id="analysisJobs"></div></section>
-<div id="solverOutput" style="background: #f8f9fa; padding: 10px; margin-top: 15px; border-radius: 5px; font-family: monospace; font-size: 0.85rem; max-height: 300px; overflow-y: auto; white-space: pre-wrap;"></div>
+                    <p id="jobsOverview" role="status">Connecting to the job service…</p>
+                    <button class="btn-secondary" onclick="switchTab('jobs')">Open job manager</button>
+                    <p id="jobsResultNotice" role="status"></p>
                 </div>
 
                 <!-- Results Preview (Full Width) -->
@@ -1405,7 +1432,7 @@
                 <div class="results-loader">
                     <div class="results-picker">
                         <label id="resultPickerLabel">Result to load</label>
-                        <div id="resultSelectContainer" class="custom-select">
+                        <div id="resultSelectContainer" class="custom-select file-picker">
                             <button type="button" class="custom-select-trigger" id="resultSelectTrigger" aria-haspopup="listbox" aria-expanded="false" aria-controls="resultSelectOptions" aria-labelledby="resultPickerLabel resultSelectDisplay">
                                 <span id="resultSelectDisplay">Select result...</span>
                                 <span class="custom-select-arrow" aria-hidden="true">▼</span>
@@ -1596,7 +1623,7 @@
                         <button class="btn-delete" id="deleteSelectedUserFilesBtn"
                                 onclick="deleteSelectedUserFiles()" disabled>Delete selected...</button>
                         <button class="btn-secondary" onclick="openBackupModal()">Export selected…</button>
-                        <button class="btn-secondary" onclick="document.getElementById('importDataInput').click()">Import backup</button>
+                        <button class="btn-secondary" id="importBackupButton" onclick="document.getElementById('importDataInput').click()">Import backup</button>
                         <input type="file" id="importDataInput" accept=".zip,application/zip,application/json,.json"
                                style="display:none" onchange="importUserData(this)">
                         <select id="fileManagerFilter" onchange="renderUserFiles()" style="padding: 7px; border:1px solid #dee2e6; border-radius:4px;">
@@ -1613,6 +1640,10 @@
                         </select>
                     </div>
                     <div id="fileManagerStatus" role="status" aria-live="polite" style="margin-bottom: 10px; white-space: pre-line;"></div>
+                    <div id="fileOperationProgress" class="file-operation-progress" hidden aria-live="polite">
+                        <strong id="fileOperationLabel"></strong>
+                        <progress id="fileOperationBar" aria-label="File operation progress"></progress>
+                    </div>
                     <div id="userFilesList">
                         <p style="color: #666;">Loading…</p>
                     </div>

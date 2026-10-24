@@ -6,7 +6,7 @@ const commands=['help','menu','configure','status','start','stop','restart','exi
 const help=`OpenMagFDM interactive server console
   help / /help / ?                Show commands
   menu                           Choose an action with arrow keys
-  configure                      Guided file-limit settings
+  configure                      Guided input/result count and storage limits
   status                         Server address, running work and job status
   jobs [list [workspace] [--all]]  Show active jobs; --all includes completed history
   jobs cancel <workspace> <id>    Request cancellation of a job
@@ -14,9 +14,10 @@ const help=`OpenMagFDM interactive server console
   users list|create|disable|enable|reset-password ...
   workspaces list|assign ...      List workspaces or assign an owner
   limits show [workspace]
-  limits set-default <configs|images|libraries> <count|unlimited>
+  limits set-default <configs|images|libraries|results|result-mib> <value|unlimited>
   limits set <workspace> <category> <count|unlimited|default>
                                  Apply file limits immediately, without restarting
+  storage                         Guided storage location / verified migration
   storage show                    Inspect all workspace storage paths
   storage set-workspace-root <absolute-directory>
   storage migrate-workspaces <absolute-empty-directory>
@@ -152,15 +153,28 @@ class ServerConsole {
         try {
             if(['help','?','--help','-h'].includes(args[0]))return this.print(help);
             if(args[0]==='menu') {
-                const action=await this.ask('select',{message:'Server action',choices:['status','configure','users list','workspaces list','jobs list',this.child?'stop':'start','exit'].map(value=>({name:value,value}))});
+                const action=await this.ask('select',{message:'Server action',choices:['status','configure','users list','workspaces list','jobs list','jobs list --all','limits show','storage',this.child?'stop':'start','exit'].map(value=>({name:value,value}))});
                 return await this.execute(action);
             }
             if(args[0]==='configure') {
-                const scope=await this.ask('select',{message:'File-limit scope',choices:[{name:'Default for all workspaces',value:'default'},{name:'One workspace',value:'workspace'}]});
+                const scope=await this.ask('select',{message:'Limit scope',choices:[{name:'Default for all workspaces',value:'default'},{name:'One workspace',value:'workspace'}]});
                 const workspace=scope==='workspace'?await this.ask('input',{message:'Workspace ID',validate:value=>/^[A-Za-z0-9_-]{1,128}$/.test(value)||'Enter a workspace ID'}):null;
-                const category=await this.ask('select',{message:'Files to limit',choices:[{name:'Configuration YAML',value:'configs'},{name:'Images',value:'images'},{name:'Material libraries',value:'libraries'}]});
-                const count=await this.ask('input',{message:'Maximum files (0, a count, unlimited, or default for an override)',validate:value=>{if(workspace&&value==='default')return true;try{require('./limits').value(value);return true;}catch{return 'Enter a nonnegative integer or unlimited';}}});
+                const category=await this.ask('select',{message:'Resource to limit',choices:[{name:'Configuration YAML files',value:'configs'},{name:'Input images',value:'images'},{name:'Material library files',value:'libraries'},{name:'Result folders (includes queued analyses)',value:'results'},{name:'Stored results (MiB; checked before new work)',value:'result-mib'}]});
+                const count=await this.ask('input',{message:`Maximum ${category==='result-mib'?'MiB':'count'} (0, unlimited${workspace?', or default':''})`,validate:value=>{if(workspace&&value==='default')return true;try{require('./limits').value(value);return true;}catch{return 'Enter a nonnegative integer or unlimited';}}});
                 return await this.execute(workspace?`limits set ${workspace} ${category} ${count}`:`limits set-default ${category} ${count}`);
+            }
+            if(args[0]==='storage'&&args.length===1) {
+                await this.execute('storage show');
+                const action=await this.ask('select',{message:'Storage action',choices:[{name:'Back',value:'back'},{name:'Move all workspace data by verified copy (retain originals)',value:'migrate-workspaces'},{name:'Set workspace root for configs, images, libraries and results',value:'set-workspace-root'},{name:'Move results only by verified copy (retain originals)',value:'migrate-results'},{name:'Set results location only',value:'set-results-root'}]});
+                if(action==='back')return;
+                const target=await this.ask('input',{message:'Absolute destination directory (empty for migration)',validate:value=>require('node:path').isAbsolute(value)&&!/["\r\n]/.test(value)||'Enter an absolute directory without double quotes'});
+                const wasRunning=!!this.child;
+                const proceed=await this.ask('confirm',{message:`${wasRunning?'Stop the idle server, apply and restart?':'Apply this storage setting?'} ${action.startsWith('set-')?'Existing files will not be moved.':'Original files will be retained.'}`,default:false});
+                if(!proceed)return;
+                if(wasRunning)await this.stop();
+                try {await this.execute(`storage ${action} "${target}"`);}
+                finally {if(wasRunning)await this.start();}
+                return;
             }
             if(args[0]==='status') {
                 if(!this.child)return this.print('Server stopped. Use start.');

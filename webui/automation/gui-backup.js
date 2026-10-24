@@ -49,6 +49,13 @@ function installBackupRoutes(app, base, runtime, upload) {
         } finally {record.busy=false;await transfers.release(actor,download.transferId);}
     });
     app.get('/api/export',exportBackup);app.post('/api/export',exportBackup);
+    app.post('/api/import/check',wrap(async(req,res,{ws,actor})=>{
+        actor.guard('edit');
+        const size=req.body?.size;
+        if(!Number.isSafeInteger(size)||size<1||size>1024*1024*1024)fail('LIMIT_EXCEEDED','Backup exceeds the 1 GiB upload limit');
+        await require('./limits').checkResults(ws.base,ws.user,{bytes:size});
+        res.json({success:true});
+    }));
     app.post('/api/import',upload.single('backup'),wrap(async(req,res,{ws,actor,transfers})=>{
         if(!req.file)fail('INVALID_INPUT','Select a backup file');
         let transfer;
@@ -84,7 +91,14 @@ function installBackupRoutes(app, base, runtime, upload) {
     }));
     app.post('/api/import/commit',wrap(async(req,res,{ws,actor,transfers})=>{
         if(!Array.isArray(req.body.files)||req.body.files.length>10000)fail('INVALID_INPUT','Expected inspected targets');
-        const result=await transfers.import(actor,ws,{transferId:req.body.transferId,files:req.body.files});
+        let result;
+        try {result=await transfers.import(actor,ws,{transferId:req.body.transferId,files:req.body.files});}
+        catch(error) {
+            // The GUI discards a failed preview; a new upload/inspection is
+            // required for retry. Preserve the original failure and applied IDs.
+            await transfers.release(actor,req.body.transferId).catch(()=>{});
+            throw error;
+        }
         await transfers.release(actor,req.body.transferId);
         const written={};for(const id of result.applied){const cat=id.split('/')[0];written[cat]=(written[cat]||0)+1;}
         res.json({success:true,written,skipped:[]});

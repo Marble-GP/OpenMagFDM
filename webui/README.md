@@ -1,4 +1,4 @@
-# OpenMagFDM WebUI v1.7.2
+# OpenMagFDM WebUI v1.7.3
 
 The browser editor, image preprocessor, analysis manager and result viewer for
 the OpenMagFDM 2D solver. The packaged executable embeds Node.js 24.22.1.

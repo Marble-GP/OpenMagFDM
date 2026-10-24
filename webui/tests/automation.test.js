@@ -260,6 +260,29 @@ test('GUI and MCP share revisions and block active-output deletion',async t=>{
     busy=true;assert.equal((await remove(updated.revision)).status,409);
     busy=false;assert.equal((await remove(updated.revision)).status,200);
 });
+test('connected MCP read and another running job do not prevent GUI deletion of a completed result',async t=>{
+    const f=await fixture(t),express=require('express'),app=express();app.use(express.json());
+    f.backend.userHasActiveSolver=()=>true;
+    f.runtime.jobs.records.push({jobId:'running',user:'user_a',status:'running',resultId:'results/live'});
+    await f.wa.write('results/done/Az/step.csv',Buffer.from('1,2'),null);
+    require('../automation/gui-files').installFileRoutes(app,f.base,(user,id)=>f.runtime.jobs.busy(user,id));
+    const server=await new Promise(resolve=>{const s=app.listen(0,'127.0.0.1',()=>resolve(s));});t.after(()=>new Promise(resolve=>server.close(resolve)));
+    f.runtime.access.state.port=0;await f.runtime.reconfigure();
+    const client=new Client({name:'connected-delete-test',version:'1'});
+    await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${f.runtime.listener.address().port}/mcp`),{requestInit:{headers:{Authorization:`Bearer ${f.a.token}`}}}));
+    try {
+        const read=await client.callTool({name:'files_read',arguments:{id:'results/done/Az/step.csv',text:true}});assert.notEqual(read.isError,true);
+        const result=await f.wa.describe('results/done');
+        const archive=await client.callTool({name:'backup_export',arguments:{files:[{id:result.id,revision:result.revision}]}});assert.notEqual(archive.isError,true);
+        const response=await fetch(`http://127.0.0.1:${server.address().port}/api/user-files`,{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:'user_a',category:'results',name:'done',revision:result.revision})});
+        assert.equal(response.status,200,await response.text());
+        await assert.rejects(f.wa.resolve('results/done'),{code:'ENOENT'});
+        assert.equal(f.runtime.jobs.busy('user_a','results/live/Az/step.csv'),true);
+        assert.notEqual((await client.callTool({name:'transfer_release',arguments:{transferId:archive.structuredContent.transferId}})).isError,true);
+        assert.notEqual((await client.callTool({name:'workspace_status',arguments:{}})).isError,true,'MCP stays connected after deletion');
+    }finally {await client.close();}
+});
+
 test('GUI ZIP inspection is non-mutating and stale import commits conflict',async t=>{
     const f=await fixture(t),express=require('express'),multer=require('multer');const app=express();app.use(express.json());
     require('../automation/gui-backup').installBackupRoutes(app,f.base,()=>f.runtime,multer({dest:f.temp,limits:{fileSize:1024*1024}}));
@@ -273,6 +296,10 @@ test('GUI ZIP inspection is non-mutating and stale import commits conflict',asyn
     await f.wa.write(old.id,Buffer.from('a: 2'),old.revision);
     const result=await fetch(url+'/api/import/commit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:'user_a',transferId:preview.transferId,files:preview.files.map(file=>({id:file.id,revision:file.expectedRevision}))})});
     assert.equal(result.status,409);assert.equal((await f.wa.read(old.id,{text:true})).content,'a: 2');
+    assert.equal(f.runtime.transfers.records.has(preview.transferId),false,'failed GUI commit releases its uploaded ZIP');
+    require('../automation/storage').configure(f.base,{fileLimits:{defaults:{'result-mib':0}}});
+    const denied=await fetch(url+'/api/import/check',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:'user_a',size:100})});
+    assert.equal(denied.status,409);assert.equal((await denied.json()).code,'QUOTA_EXCEEDED');
 });
 test('durable records mark interrupted jobs without spawning on restart',async t=>{
     const f=await fixture(t);f.runtime.jobs.records.push({jobId:'test',user:'user_a',status:'running'});await f.runtime.jobs.save();

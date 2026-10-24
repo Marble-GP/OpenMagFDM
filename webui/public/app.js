@@ -122,6 +122,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     await initializeConfigEditor();
     initializeDashboard();
     initCustomSelect();
+    initCustomSelect('config');
     ResultsWorkspace.refresh();
     await refreshConfigList();
     await loadConfig();
@@ -189,6 +190,7 @@ function switchTab(tabName) {
         initializeFileManager();
     }
     if (tabName === 'integrations') MCPPanel.refresh();
+    if (tabName === 'jobs') void JobsPanel.refresh();
 }
 
 // ===== User Management =====
@@ -691,6 +693,38 @@ async function refreshConfigList() {
         }
     } catch (error) {
         showStatus('configStatus', `Error loading file list: ${error.message}`, 'error');
+    } finally {
+        syncConfigPicker(true);
+    }
+}
+
+// Keep the existing native select as the source of truth for save/import/run.
+function syncConfigPicker(rebuild = false) {
+    const select = document.getElementById('configFileSelect');
+    const options = document.getElementById('configSelectOptions');
+    const display = document.getElementById('configSelectDisplay');
+    if (rebuild) {
+        options.replaceChildren();
+        for (const entry of select.options) {
+            const option = document.createElement('div');
+            option.className = 'custom-select-option';
+            option.setAttribute('data-value', entry.value);
+            option.setAttribute('role', 'option');
+            option.tabIndex = -1;
+            option.title = entry.textContent;
+            const name = document.createElement('div');
+            name.className = 'custom-select-option-main';
+            name.textContent = entry.textContent;
+            option.appendChild(name);
+            options.appendChild(option);
+        }
+    }
+    display.textContent = select.selectedOptions[0]?.textContent || 'No configurations';
+    display.title = display.textContent;
+    for (const option of options.querySelectorAll('.custom-select-option')) {
+        const selected = option.getAttribute('data-value') === select.value;
+        option.classList.toggle('selected', selected);
+        option.setAttribute('aria-selected', String(selected));
     }
 }
 
@@ -704,6 +738,7 @@ async function loadConfig() {
     const fileName = select.value || 'sample_config.yaml';
     if (AppState.configSaving || (Workbench.dirty() && !confirm('Discard unsaved configuration changes and load another file?'))) {
         select.value = AppState.loadedConfigFile || fileName;
+        syncConfigPicker();
         return false;
     }
     const generation = ++AppState.configLoadGeneration;
@@ -730,6 +765,7 @@ async function loadConfig() {
         return false;
     } finally {
         if (generation === AppState.configLoadGeneration) AppState.configLoadPending = false;
+        syncConfigPicker();
         Workbench.refresh();
     }
 }
@@ -809,6 +845,7 @@ async function saveConfigAs() {
         showStatus('configStatus', `Error saving config: ${error.message}`, 'error');
     } finally {
         AppState.configSaving = false;
+        syncConfigPicker();
         Workbench.refresh();
     }
 }
@@ -4997,29 +5034,68 @@ async function downloadBackup() {
     }
 }
 
+async function uploadBackupWithProgress(file, userId) {
+    const session = await ApiSession.ready;
+    return new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open('POST', '/api/import');
+        if (session.mode === 'shared') request.setRequestHeader('X-CSRF-Token', session.csrf);
+        request.upload.onprogress = event => {
+            if (event.lengthComputable) {
+                fileOperationProgress(`Uploading backup: ${Math.round(event.loaded / event.total * 100)}%`, event.loaded, event.total);
+                if (event.loaded === event.total) fileOperationProgress('Upload complete; inspecting ZIP…');
+            }
+        };
+        request.onload = () => {
+            let data;
+            try { data = JSON.parse(request.responseText); }
+            catch { reject(Error('Backup inspection returned an invalid response')); return; }
+            if (request.status === 401 && session.mode === 'shared') location.replace('/login.html');
+            resolve(data);
+        };
+        request.onerror = () => reject(Error('Backup upload failed; check the connection'));
+        request.onabort = () => reject(Error('Backup upload was interrupted'));
+        const body = new FormData();
+        body.append('backup', file, file.name);
+        body.append('userId', userId);
+        request.send(body);
+    });
+}
+
 async function importUserData(input) {
+    if (AppState.fileImportBusy || AppState.fileDeleteBusy) return;
     const file = input && input.files && input.files[0];
     input.value = '';   // reset so re-selecting the same file fires change again
     if (!file) return;
     if (!AppState.userId) { fileManagerStatus('No user session yet', 'error'); return; }
+    AppState.fileImportBusy = true;
+    updateUserFileSelectionControls();
     try {
-        const fd = new FormData();
-        fd.append('backup', file, file.name);
-        fd.append('userId', AppState.userId);
-        const preview = await fetch('/api/import', { method: 'POST', body: fd }).then(r => r.json());
+        fileOperationProgress('Checking available storage…');
+        const admission = await fetch('/api/import/check', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:AppState.userId,size:file.size})}).then(r=>r.json());
+        if (!admission.success) throw new Error(admission.error || 'Backup exceeds available storage');
+        fileOperationProgress('Uploading backup…');
+        const preview = await uploadBackupWithProgress(file, AppState.userId);
         if (!preview.success) throw new Error(preview.error || 'Backup inspection failed');
         const replacements = preview.files.filter(f => f.expectedRevision !== null).length;
+        fileOperationProgress('Waiting for import confirmation…');
         if (!preview.files.length || !confirm(`Import ${preview.files.length} file(s)?\n${replacements} existing file(s) will be permanently replaced.\n\nUnsaved editor contents will not be changed.`)) {
             await fetch(`/api/import/${preview.transferId}?userId=${encodeURIComponent(AppState.userId)}`, {method:'DELETE'});
             return;
         }
+        fileOperationProgress(`Importing ${preview.files.length} file(s)…`);
         const res = await fetch('/api/import/commit', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:AppState.userId,transferId:preview.transferId,files:preview.files.map(f=>({id:f.id,revision:f.expectedRevision}))})}).then(r=>r.json());
-        if (!res.success) throw new Error(`${res.error || 'Import failed'} (${res.applied?.length || 0} file(s) applied)`);
+        if (!res.success) {
+            const error = new Error(`${res.error || 'Import failed'} (${res.applied?.length || 0} file(s) applied)`);
+            error.applied = res.applied || [];
+            throw error;
+        }
         const w = res.written || {};
         const nSkip = (res.skipped || []).filter(Boolean).length;
         // Refresh the lists so the restored content shows up immediately.
         try { await refreshConfigList(); } catch (_) {}
         try { await refreshImageList(); } catch (_) {}
+        try { await refreshResultsList(); } catch (_) {}
         try { await refreshUserFiles(); } catch (_) {}
         fileManagerStatus(
             `Imported ${w.configs || 0} config(s), ${w.images || 0} image(s), ` +
@@ -5028,7 +5104,12 @@ async function importUserData(input) {
             `. Material libraries appear in the Library Manager.`,
             'success');
     } catch (err) {
+        if (err.applied?.length) await Promise.allSettled([refreshConfigList(),refreshImageList(),refreshResultsList(),refreshUserFiles({preserveStatus:true})]);
         fileManagerStatus(`Import failed: ${err.message}`, 'error');
+    } finally {
+        AppState.fileImportBusy = false;
+        fileOperationProgress();
+        updateUserFileSelectionControls();
     }
 }
 
@@ -5172,11 +5253,11 @@ async function deleteConfig() {
 
 // ===== Result Management =====
 let resultListGeneration = 0;
-async function refreshResultsList() {
+async function refreshResultsList({throwOnError=false}={}) {
     const generation = ++resultListGeneration;
     if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.listLoading();
     try {
-        const response = await fetch(`/api/results?userId=${AppState.userId}`);
+        const response = await fetch(`/api/results?userId=${AppState.userId}`,{signal:AbortSignal.timeout(30000)});
         if (!response.ok) throw new Error('Failed to load results');
 
         const result = await response.json();
@@ -5187,7 +5268,7 @@ async function refreshResultsList() {
             result.results.map(async (res) => {
                 try {
                     const folderName = res.path.split('/').pop();
-                    const descResponse = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`);
+                    const descResponse = await fetch(`/api/user-outputs/${encodeURIComponent(folderName)}/description?userId=${AppState.userId}`,{signal:AbortSignal.timeout(30000)});
                     const descData = await descResponse.json();
                     return {
                         ...res,
@@ -5236,6 +5317,7 @@ async function refreshResultsList() {
             const mainText = document.createElement('div');
             mainText.className = 'custom-select-option-main';
             mainText.textContent = `${res.name} (${res.steps} steps)`;
+            mainText.title = mainText.textContent;
 
             customOption.appendChild(mainText);
 
@@ -5272,6 +5354,7 @@ async function refreshResultsList() {
     } catch (error) {
         console.error('Error loading results list:', error);
         if (generation === resultListGeneration && typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.listFailed(error);
+        if(throwOnError)throw error;
         return [];
     }
 }
@@ -5290,6 +5373,7 @@ function updateCustomSelectDisplay(value) {
 
     if (!value) {
         display.textContent = 'Select result...';
+        display.title = display.textContent;
         if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
         return;
     }
@@ -5302,59 +5386,88 @@ function updateCustomSelectDisplay(value) {
         const mainText = selectedOption.querySelector('.custom-select-option-main');
         display.textContent = mainText ? mainText.textContent : 'Select result...';
     }
+    display.title = display.textContent;
     if (typeof ResultsWorkspace !== 'undefined') ResultsWorkspace.refresh();
 }
 
 // Initialize custom select event handlers
-function initCustomSelect() {
-    const container = document.getElementById('resultSelectContainer');
-    const trigger = document.getElementById('resultSelectTrigger');
-    const options = document.getElementById('resultSelectOptions');
-    const nativeSelect = document.getElementById('resultSelect');
+function initCustomSelect(kind = 'result') {
+    const container = document.getElementById(`${kind}SelectContainer`);
+    const trigger = document.getElementById(`${kind}SelectTrigger`);
+    const options = document.getElementById(`${kind}SelectOptions`);
+    const nativeSelect = document.getElementById(kind === 'config' ? 'configFileSelect' : 'resultSelect');
+    const sync = () => kind === 'config' ? syncConfigPicker() : updateCustomSelectDisplay(nativeSelect.value);
+    const entries = () => Array.from(options.querySelectorAll('.custom-select-option'));
+    const selected = () => entries().find(entry => entry.getAttribute('data-value') === nativeSelect.value) || entries()[0];
+    const focusOption = option => {
+        option?.focus({preventScroll:true});
+        option?.scrollIntoView({block:'nearest'});
+    };
+    // Fixed positioning avoids clipping by the scrolling workspace panel.
+    // Prefer opening upward when there is insufficient space below the trigger.
+    const positionOptions = () => {
+        const rect = trigger.getBoundingClientRect();
+        const {clientWidth: width, clientHeight: height} = document.documentElement;
+        const gap = 4, margin = 8;
+        const below = Math.max(0, height - rect.bottom - gap - margin);
+        const above = Math.max(0, rect.top - gap - margin);
+        const upward = below < Math.min(300, options.scrollHeight) && above > below;
+        options.style.left = `${Math.max(margin, Math.min(rect.left, width - rect.width - margin))}px`;
+        options.style.width = `${Math.max(0, Math.min(rect.width, width - 2 * margin))}px`;
+        options.style.maxHeight = `${Math.min(300, upward ? above : below)}px`;
+        options.style.top = upward ? 'auto' : `${rect.bottom + gap}px`;
+        options.style.bottom = upward ? `${height - rect.top + gap}px` : 'auto';
+    };
     const setOpen = open => {
+        if (open) sync();
         container.classList.toggle('open', open);
         trigger.setAttribute('aria-expanded', String(open));
+        if (open) { positionOptions(); selected()?.scrollIntoView({block:'nearest'}); }
     };
-    const choose = option => {
+    const choose = async option => {
         nativeSelect.value = option.getAttribute('data-value');
-        updateCustomSelectDisplay(nativeSelect.value);
+        sync();
         setOpen(false);
-        trigger.focus();
-        nativeSelect.dispatchEvent(new Event('change'));
+        trigger.focus({preventScroll:true});
+        if (kind === 'config') {
+            // Loading may be cancelled by the unsaved-editor guard or fail.
+            try { await loadSelectedConfig(); } finally { sync(); }
+        } else {
+            nativeSelect.dispatchEvent(new Event('change'));
+        }
     };
 
     // Toggle dropdown on trigger click
-    trigger.addEventListener('click', (e) => {
-        e.stopPropagation();
-        setOpen(!container.classList.contains('open'));
+    trigger.addEventListener('click', () => {
+        const open = !container.classList.contains('open');
+        setOpen(open);
+        if (open) focusOption(selected());
     });
     trigger.addEventListener('keydown', e => {
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
             e.preventDefault();
             setOpen(true);
-            const entries = Array.from(options.querySelectorAll('.custom-select-option'));
-            const selected = entries.find(entry => entry.getAttribute('data-value') === nativeSelect.value);
-            (selected || entries[0])?.focus();
+            focusOption(selected());
         }
     });
     options.addEventListener('keydown', e => {
-        const entries = Array.from(options.querySelectorAll('.custom-select-option'));
-        const index = entries.indexOf(e.target.closest('.custom-select-option'));
+        const items = entries();
+        const index = items.indexOf(e.target.closest('.custom-select-option'));
         if (index < 0) return;
-        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); choose(entries[index]); }
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void choose(items[index]); }
         else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(e.key)) {
             e.preventDefault();
-            const next = e.key === 'Home' ? 0 : e.key === 'End' ? entries.length - 1
-                : (index + (e.key === 'ArrowDown' ? 1 : -1) + entries.length) % entries.length;
-            entries[next].focus();
+            const next = e.key === 'Home' ? 0 : e.key === 'End' ? items.length - 1
+                : (index + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+            focusOption(items[next]);
         }
     });
-    nativeSelect.addEventListener('change', () => updateCustomSelectDisplay(nativeSelect.value));
+    nativeSelect.addEventListener('change', sync);
 
     // Handle option selection
     options.addEventListener('click', (e) => {
         const option = e.target.closest('.custom-select-option');
-        if (option) choose(option);
+        if (option) void choose(option);
     });
 
     // Close dropdown when clicking outside
@@ -5374,6 +5487,13 @@ function initCustomSelect() {
     container.addEventListener('focusout', e => {
         if (!container.contains(e.relatedTarget)) setOpen(false);
     });
+    // Scrolling the list itself stays local; moving its parent closes it so
+    // the floating menu cannot become detached from its trigger.
+    document.addEventListener('scroll', e => {
+        if (!options.contains(e.target)) setOpen(false);
+    }, true);
+    window.addEventListener('resize', () => setOpen(false));
+    if (kind === 'config') syncConfigPicker(true);
 }
 
 function createAbortError(message) {
@@ -12285,6 +12405,19 @@ function fileManagerStatus(message, type = 'info') {
     }
 }
 
+function fileOperationProgress(label, completed, total) {
+    const panel = document.getElementById('fileOperationProgress');
+    if (!panel) return;
+    panel.hidden = !label;
+    if (!label) return;
+    document.getElementById('fileOperationLabel').textContent = label;
+    const bar = document.getElementById('fileOperationBar');
+    if (Number.isFinite(total) && total > 0) {
+        bar.max = total;
+        bar.value = Math.min(total, Math.max(0, completed || 0));
+    } else bar.removeAttribute('value');
+}
+
 const USER_FILE_CATEGORY_LABEL = {
     configs: 'YAML configs',
     images: 'Input images',
@@ -12320,8 +12453,10 @@ function updateUserFileSelectionControls() {
         selectAll.disabled = visible.length === 0;
     }
     const deleteButton = document.getElementById('deleteSelectedUserFilesBtn');
-    if (deleteButton) deleteButton.disabled = totalSelected === 0 || !!AppState.fileDeleteBusy;
-    document.querySelectorAll('.user-file-actions .btn-delete').forEach(button => { button.disabled = !!AppState.fileDeleteBusy; });
+    if (deleteButton) deleteButton.disabled = totalSelected === 0 || !!AppState.fileDeleteBusy || !!AppState.fileImportBusy;
+    document.querySelectorAll('.user-file-actions .btn-delete').forEach(button => { button.disabled = !!AppState.fileDeleteBusy || !!AppState.fileImportBusy; });
+    const importButton = document.getElementById('importBackupButton');
+    if (importButton) importButton.disabled = !!AppState.fileDeleteBusy || !!AppState.fileImportBusy;
     const count = document.getElementById('userFileSelectedCount');
     if (count) count.textContent = `${totalSelected} selected`;
 }
@@ -12489,27 +12624,30 @@ async function fileManagerDelete(button) {
 }
 
 async function deleteSelectedUserFiles() {
-    if (AppState.fileDeleteBusy) return;
+    if (AppState.fileDeleteBusy || AppState.fileImportBusy) return;
     const selected = (AppState.userFiles || []).filter(file => AppState.userFileSelection.has(userFileKey(file)));
     return deleteUserFiles(selected);
 }
 
 async function deleteUserFiles(selected) {
-    if (AppState.fileDeleteBusy || !selected.length || !confirm(`Delete ${selected.length} selected item(s)? This action cannot be undone.`)) return;
+    if (AppState.fileDeleteBusy || AppState.fileImportBusy || !selected.length || !confirm(`Delete ${selected.length} selected item(s)? This action cannot be undone.`)) return;
     selected.forEach(file=>AppState.userFileSelection.add(userFileKey(file)));
     AppState.fileDeleteBusy = true;
     updateUserFileSelectionControls();
     let submitted = false, operationId = null;
     try {
         const files = [], metadataStarted=performance.now();
+        fileOperationProgress(`Checking 0/${selected.length} item(s)…`, 0, selected.length);
         for (const file of selected) {
             fileManagerStatus(`Checking ${files.length + 1}/${selected.length}: ${file.name}`, 'info');
+            fileOperationProgress(`Checking ${files.length + 1}/${selected.length}: ${file.name}`, files.length, selected.length);
             const response = await fetch(`/api/workspace/file?userId=${encodeURIComponent(AppState.userId)}&id=${encodeURIComponent(`${file.category}/${file.name}`)}`, {signal:AbortSignal.timeout(30000)});
             const data = await response.json();
             if (!response.ok || !data.file) throw Error(data.error || 'File metadata unavailable');
             files.push({id:`${file.category}/${file.name}`, revision:data.file.revision});
         }
         if(typeof FieldMetrics!=='undefined')FieldMetrics.record('delete-metadata',performance.now()-metadataStarted,{count:files.length});
+        fileOperationProgress(`Deleting 0/${files.length} item(s)…`, 0, files.length);
         const outcomes = []; let interruptionMessage = '';
         // The server accepts at most 100 targets per durable operation. Keep
         // Select all usable for larger lists without losing earlier outcomes.
@@ -12519,7 +12657,7 @@ async function deleteUserFiles(selected) {
             const data = await response.json();
             if (!response.ok || !data.success) throw Error(data.error || 'Delete request failed');
             operationId = data.operation.id;
-            const operation = await watchFileOperation(data.operation);
+            const operation = await watchFileOperation(data.operation, offset, files.length);
             if (!operation) return;
             outcomes.push(...operation.results);
             if (operation.status !== 'complete') { interruptionMessage = operation.message || 'Refresh files before retrying.'; break; }
@@ -12531,14 +12669,15 @@ async function deleteUserFiles(selected) {
         AppState.fileDeleteBusy = false;
         const refreshStarted=performance.now();
         try {await refreshUserFiles({preserveStatus:true});}
-        finally {updateUserFileSelectionControls();if(typeof FieldMetrics!=='undefined')FieldMetrics.record('delete-list-refresh',performance.now()-refreshStarted);}
+        finally {fileOperationProgress();updateUserFileSelectionControls();if(typeof FieldMetrics!=='undefined')FieldMetrics.record('delete-list-refresh',performance.now()-refreshStarted);}
     }
 }
 
-async function watchFileOperation(operation) {
+async function watchFileOperation(operation, offset = 0, total = operation.total) {
     const user = AppState.userId;
     while (operation.status === 'running') {
         fileManagerStatus(`${operation.id}: ${operation.results.length}/${operation.total} ${operation.current || ''}`, 'info');
+        fileOperationProgress(`Deleting ${offset + operation.results.length}/${total}: ${operation.current || 'Preparing…'}`, offset + operation.results.length, total);
         await new Promise(resolve => setTimeout(resolve, 750));
         if (AppState.userId !== user) return;
         const response = await fetch(`/api/file-operations/${operation.id}?userId=${encodeURIComponent(user)}`, {signal:AbortSignal.timeout(30000)});
@@ -12546,6 +12685,7 @@ async function watchFileOperation(operation) {
         if (!response.ok || !data.success) throw Error(data.error || 'Operation status unavailable');
         operation = data.operation;
     }
+    fileOperationProgress(`Deleted ${offset + operation.results.length}/${total} item(s)`, offset + operation.results.length, total);
     for (const result of operation.results) if (result.success) {
         const file = (AppState.userFiles || []).find(f => `${f.category}/${f.name}` === result.id);
         if (file) AppState.userFileSelection.delete(userFileKey(file));
@@ -14638,5 +14778,5 @@ async function restoreFileOperations() {
         AppState.fileDeleteBusy = !!pending; updateUserFileSelectionControls();
         await watchFileOperation(last);
     } catch(error) { fileManagerStatus(error.message,'error'); }
-    finally {AppState.fileDeleteBusy=false;updateUserFileSelectionControls();}
+    finally {AppState.fileDeleteBusy=false;fileOperationProgress();updateUserFileSelectionControls();}
 }

@@ -124,7 +124,7 @@ class AutomationRuntime {
                 note:'The WebUI server must already be running with MCP enabled. No credentials are included in command-line arguments.'};
         }));
         app.get('/api/automation/activity',async(req,res)=>{
-            try{localRequest(req);const ws=new Workspace(this.base,req.query.userId);res.set('Cache-Control','no-store').json({jobs:this.jobs.list(ws.user),events:this.access.events.filter(e=>e.user===ws.user).slice(-50)});}
+            try{localRequest(req);const ws=new Workspace(this.base,req.query.userId);res.set('Cache-Control','no-store').json({...this.jobs.page(ws.user,{view:'overview'}),events:this.access.events.filter(e=>e.user===ws.user).slice(-50)});}
             catch(e){res.status(e.statusCode||500).json({error:'Activity unavailable'});}
         });
         app.post('/api/automation/jobs/:id/cancel',async(req,res)=>{

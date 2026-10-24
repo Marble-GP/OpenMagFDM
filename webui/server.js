@@ -4071,7 +4071,8 @@ app.post('/api/jobs/resume', async (req,res) => {
     catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
 });
 app.get('/api/jobs', async (req,res) => {
-    try { res.json({success:true,jobs:(await browserJobsReady()).list(normalizeUserId(req.query.userId))}); }
+    try { const service=await browserJobsReady(),user=normalizeUserId(req.query.userId);
+        res.json({success:true,...(req.query.view?service.page(user,{view:req.query.view,offset:Number(req.query.offset||0),limit:Number(req.query.limit||20)}):{jobs:service.list(user)})}); }
     catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
 });
 app.get('/api/jobs/:jobId', async (req,res) => {
@@ -4802,6 +4803,7 @@ const automation = new AutomationRuntime(BASE_DIR, {
     configureSolver: saved => { SOLVER_PATH = solverLocation.locate(BASE_DIR,saved).path; },
     solverStatus: () => ({...solverLocation.locate(BASE_DIR,automation.access.state.solverPath),activePath:SOLVER_PATH}),
     jobs, submitAnalysisJob, mergeLibraryIntoConfig, isChildRunning, terminateChildProcess, userHasActiveSolver, getSolverVersion, maxConcurrentJobs: MAX_CONCURRENT_JOBS, workspaceEnabled: user=>accounts.workspaceEnabled(user),
+    legacySolverActive:user=>runningProcesses.has(user),
     detectPolarGeometry, warpPolar, quantizeImage
 });
 automation.install(app);

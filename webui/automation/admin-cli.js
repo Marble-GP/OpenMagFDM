@@ -22,8 +22,8 @@ const HELP = `OpenMagFDM server CLI
   network local
   network shared --cert <path> --key <path> [--host address]
   limits show [workspace]
-  limits set-default <configs|images|libraries> <count|unlimited>
-  limits set <workspace> <configs|images|libraries> <count|unlimited|default>
+  limits set-default <configs|images|libraries|results|result-mib> <value|unlimited>
+  limits set <workspace> <category> <value|unlimited|default>
 
 With a terminal attached, starting the server opens an interactive console.
 Type help at OpenMagFDM> for commands, or use --no-console for service mode.
@@ -37,7 +37,10 @@ Workspace-root settings cover configs/uploads/user-libs/outputs; a separate
 results-root override takes precedence. migrate-workspaces consolidates all
 four categories and clears that override after verified copying. Originals stay.
 Limits apply per workspace (the existing browser userId), across WebUI and MCP.
-Counts include nested files in each input category, not result artifacts.
+Input counts include nested files. results counts result folders; result-mib
+limits stored result bytes in MiB. Result limits default to unlimited.
+Result storage is checked before admission/import/write and queued starts;
+a running solver can exceed it. No result is automatically deleted or cancelled.
 Defaults: configs 20, images 20, libraries unlimited. 0 blocks new files.
 Existing files are retained; replacement remains possible at/above the limit.
 Start again after offline changes. 'default' removes a workspace override.
@@ -119,7 +122,7 @@ async function command(base,args,{password:askPassword=password,live=false}={}) 
         settings.fileLimits ||= {defaults:{},workspaces:{}};
         settings.fileLimits.defaults ||= {};settings.fileLimits.workspaces ||= {};
         const category=command==='set-default'?value:rest[0];
-        if(!Object.hasOwn(limits.defaults,category))throw Error('Category must be configs, images or libraries');
+        if(!Object.hasOwn(limits.defaults,category))throw Error('Category must be configs, images, libraries, results or result-mib');
         if(command==='set-default')settings.fileLimits.defaults[category]=limits.value(rest[0]);
         else if(command==='set') {
             const workspace=userKey(value);

@@ -11,6 +11,18 @@ function fixture(files) {
     return {context,state,elements};
 }
 const response=data=>({ok:true,json:async()=>data});
+test('successful ZIP import discovers results immediately and restores operation controls',async()=>{
+    let refreshes=0;
+    const state={userId:'alice'};
+    const context=vm.createContext({AppState:state,console,confirm:()=>true,fileOperationProgress(){},updateUserFileSelectionControls(){},fileManagerStatus(){},
+        uploadBackupWithProgress:async()=>({success:true,transferId:'one',files:[{id:'results/run/data.txt',expectedRevision:null}]}),
+        fetch:async()=>response({success:true,written:{results:1}}),
+        refreshConfigList:async()=>{},refreshImageList:async()=>{},refreshUserFiles:async()=>{},refreshResultsList:async()=>{refreshes++;}});
+    vm.runInContext(source.slice(source.indexOf('async function importUserData('),source.indexOf('async function insertPolarYaml(')),context);
+    await context.importUserData({files:[{name:'backup.zip',size:100}],value:'backup.zip'});
+    assert.equal(refreshes,1);
+    assert.equal(state.fileImportBusy,false);
+});
 test('application-owned public UI source uses English',()=>{
     const path=require('node:path'),root=path.dirname(require.resolve('../public/index.html'));
     for(const name of fs.readdirSync(root))if(/\.(html|js)$/.test(name)) {
@@ -39,6 +51,31 @@ test('failed metadata fetch preserves the actual error after refresh and permits
     await f.context.deleteUserFiles(files);
     assert.match(f.elements.fileManagerStatus.textContent,/Storage unavailable/);
     assert.equal(f.state.fileDeleteBusy,false);assert.equal(f.elements.deleteSelectedUserFilesBtn.disabled,false);
+});
+test('deletion exposes a progress bar during work and clears it after completion',async()=>{
+    const files=[{category:'configs',name:'old.yaml'}],f=fixture(files);
+    f.elements.fileOperationProgress={hidden:true};f.elements.fileOperationLabel={};
+    f.elements.fileOperationBar={removeAttribute(name){delete this[name];}};
+    let visibleDuringDelete=false;
+    f.context.fetch=async url=>{
+        if(url.startsWith('/api/workspace/file'))return response({file:{revision:'a'.repeat(64)}});
+        if(url==='/api/file-operations') {
+            visibleDuringDelete=!f.elements.fileOperationProgress.hidden&&/Deleting/.test(f.elements.fileOperationLabel.textContent);
+            return response({success:true,operation:{status:'complete',results:[{id:'configs/old.yaml',success:true}]}});
+        }
+        return response({success:true,files:[]});
+    };
+    await f.context.deleteUserFiles(files);
+    assert.equal(visibleDuringDelete,true);
+    assert.equal(f.elements.fileOperationProgress.hidden,true);
+});
+test('an active import prevents deletion from replacing its progress',async()=>{
+    const files=[{category:'configs',name:'old.yaml'}],f=fixture(files);
+    f.state.fileImportBusy=true;
+    let requested=false;f.context.fetch=async()=>{requested=true;throw Error('unexpected request');};
+    await f.context.deleteUserFiles(files);
+    assert.equal(requested,false);
+    assert.equal(f.state.fileDeleteBusy,undefined);
 });
 test('selecting over 100 files uses multiple durable operations',async()=>{
     const files=Array.from({length:101},(_,i)=>({category:'configs',name:`${i}.yaml`})),f=fixture(files),counts=[];

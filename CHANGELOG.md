@@ -3,7 +3,7 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/archive/research/`.
 
-## Unreleased
+## 1.7.3 — 2026-10-24
 
 - Fix metadata/deletion of result directories exceeding 10,000 entries without
   relaxing backup transfer limits; avoid repeated ancestor/tree inspections.
@@ -18,6 +18,12 @@ investigations remain under `docs/archive/research/`.
   ledger for queue recovery, idempotency and recorded convergence.
 - Use English for application-owned UI, README and current manuals. Add a
   regression check for Japanese text in first-party public UI source.
+- Add a paged Jobs screen, compact workspace activity, and automatic result
+  discovery after job completion.
+- Add per-workspace result-count and storage admission limits; report upload,
+  import and deletion progress in the file manager.
+- Preserve input snapshots and enforce quota checks during job preparation;
+  improve concurrent import and deletion recovery.
 
 ## 1.7.2 — 2026-10-23
 

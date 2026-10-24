@@ -56,18 +56,11 @@ const MCPPanel=(()=>{
         try{
             const data=await api(`/api/automation/activity?userId=${encodeURIComponent(AppState.userId)}`);
             const container=el('mcpActivity');container.replaceChildren();
-            for(const j of data.jobs.slice(0,20)) {
-                const row=node('article');row.className='mcp-job';row.append(node('strong',`${j.source} · ${j.status} · ${j.progress}%`),node('p',j.resultId),node('p',j.message||''));
-                if(['running','cancelling'].includes(j.status))row.append(button('Stop analysis',async()=>{await api(`/api/automation/jobs/${j.jobId}/cancel`,'POST',{userId:AppState.userId});await activity();},'btn-danger'));
-                row.append(button('Open Results',async()=>{
-                    await refreshResultsList();
-                    const select=el('resultSelect'),folder=j.resultId.split('/')[1];
-                    const option=Array.from(select.options).find(o=>o.value.split('/').pop()===folder);
-                    if(!option){message('Result is not available yet. Refresh after the first output is written.');return;}
-                    select.value=option.value;updateCustomSelectDisplay(option.value);switchTab('dashboard');await loadSelectedResult();
-                }));container.append(row);
-            }
-            const list=node('ul');for(const e of data.events.slice(-20).reverse())list.append(node('li',`${e.at} · ${e.client} · ${e.operation} · ${e.target||''} · ${e.code}`));container.append(list);
+            const count=data.counts||{active:data.jobs.filter(j=>['queued','held','preparing','running','cancelling'].includes(j.status)).length,history:data.jobs.filter(j=>!['queued','held','preparing','running','cancelling'].includes(j.status)).length};
+            container.append(node('p',`${count.active} active jobs · ${count.history} finished. Manage jobs and open their results in Jobs.`),button('Open job manager',()=>switchTab('jobs')));
+            // Job history has its own paged screen. Keep file audit events compact.
+            const details=node('details'),summary=node('summary',`Recent file activity (${Math.min(20,data.events.length)})`),list=node('ul');list.className='activity-events';
+            for(const e of data.events.slice(-20).reverse())list.append(node('li',`${e.at} · ${e.client} · ${e.operation} · ${e.target||''} · ${e.code}`));details.append(summary,list);container.append(details);
             if(!data.jobs.length&&!data.events.length)container.append(node('p','No agent activity in this workspace.'));
             await observeChanges(data.events);
         }catch(e){el('mcpActivity').textContent=e.message;}finally{activityBusy=false;}

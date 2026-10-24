@@ -173,7 +173,8 @@ class Workspace {
             const category = id.split('/')[0];
             const limits = require('./limits').effective(require('./storage').settings(this.base), this.user);
             const limit = limits[category];
-            if (!current && Number.isInteger(limit) && (await this.walk(category)).length >= limit) fail('QUOTA_EXCEEDED', `${category} file limit (${limit}) reached; ask the administrator to adjust limits. No files were removed`, 409);
+            if (category==='results') await require('./limits').checkResultWrite(this,id,buffer.length,current);
+            else if (!current && Number.isInteger(limit) && (await this.walk(category)).length >= limit) fail('QUOTA_EXCEEDED', `${category} file limit (${limit}) reached; ask the administrator to adjust limits. No files were removed`, 409);
             await noLinks(path.dirname(p), { missing: true }); await fs.mkdir(path.dirname(p), { recursive: true });
             const temporary = path.join(path.dirname(p), `.write-${crypto.randomUUID()}`);
             try {
@@ -190,7 +191,11 @@ class Workspace {
             if (id.split('/')[0] !== targetId.split('/')[0]) fail('INVALID_PATH', 'Renaming must stay in the same category');
             const original = await this.checkRevision(id, expectedRevision); await this.checkRevision(targetId, null);
             if (!original) fail('NOT_FOUND', 'Target not found', 404);
-            if (this.busy(id)) fail('BUSY', 'An active analysis owns this output', 409);
+            if (this.busy(id) || this.busy(targetId)) fail('BUSY', 'An active analysis owns this output', 409);
+            if(id.startsWith('results/')&&original.kind==='directory') {
+                const increase=Number(targetId.split('/').length===2)-Number(id.split('/').length===2);
+                if(increase>0)await require('./limits').checkResults(this.base,this.user,{newResults:increase});
+            }
             const from = await this.resolve(id), to = await this.resolve(targetId, { create: true });
             await noLinks(path.dirname(to)); this.guard('edit');
             await fs.rename(from, to); return this.describe(targetId);
@@ -206,7 +211,7 @@ class Workspace {
             // checkRevision already scanned the complete tree, including hidden
             // entries, and rejected unsafe links. Do not repeat that scan here.
             this.guard('delete');
-            await fs.rm(p, { recursive: meta.kind === 'directory', force: false });
+            await fs.rm(p, { recursive: meta.kind === 'directory', force: false, maxRetries:3, retryDelay:100 });
             return { deleted: id, permanent: true, bytes: meta.size };
         });
     }

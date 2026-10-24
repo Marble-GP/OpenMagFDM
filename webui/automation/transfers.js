@@ -14,9 +14,12 @@ const MAX_ARCHIVE = 1024 * 1024 * 1024;
 class Transfers {
     constructor() {
         this.records = new Map();
+        this.unregisterReservations=require('./limits').registerReservations((base,user)=>[...this.records.values()]
+            .filter(r=>r.base===base&&r.user===user&&r.kind==='backup'&&Date.now()<=r.expires)
+            .reduce((sum,r)=>sum+Math.max(0,r.size-r.received),0));
         this.timer = setInterval(() => { void this.cleanup(); }, 60000); this.timer.unref();
     }
-    async close() { clearInterval(this.timer); await this.cleanup(true); }
+    async close() { clearInterval(this.timer); await this.cleanup(true); this.unregisterReservations(); }
     async cleanup(all = false) {
         for (const [id,r] of this.records) if (!r.busy && (all || Date.now() > r.expires))
             await locked(`transfer:${id}`,async()=>{
@@ -39,19 +42,26 @@ class Transfers {
         });
     }
     async begin(actor, ws, kind, size = 0) {
-        return locked('mcp-transfer-allocation',()=>this.allocate(actor,ws,kind,size));
+        return locked('mcp-transfer-allocation',async()=>{
+            await this.cleanup();
+            return locked(ws.lockKey,()=>this.allocate(actor,ws,kind,size));
+        });
     }
     async allocate(actor, ws, kind, size) {
-        await this.cleanup();
         if (this.records.size >= 32 || [...this.records.values()].filter(r=>r.user===actor.user).length >= 4) fail('LIMIT_EXCEEDED','Too many active transfers',429);
         actor.guard(kind === 'download' ? 'read' : kind === 'image' ? 'images' : 'edit');
         if (!Number.isSafeInteger(size) || size<0 || size>MAX_ARCHIVE || (kind==='image' && size>10*1024*1024)) fail('LIMIT_EXCEEDED','Transfer is too large');
+        if (kind === 'backup') {
+            // The archive occupies result storage before import. Reserve the
+            // unreceived bytes of concurrent uploads as well as this one.
+            await require('./limits').checkResults(ws.base, ws.user, { bytes: size });
+        }
         const id=crypto.randomUUID();
         const filename=await ws.resolve(`results/.mcp-transfers/${id}.bin`,{create:true,internal:true});
         await fs.mkdir(path.dirname(filename),{recursive:true});
         actor.guard(kind === 'download' ? 'read' : kind === 'image' ? 'images' : 'edit');
         await fs.writeFile(filename,Buffer.alloc(0),{flag:'wx',mode:0o600});
-        const r={id,filename,kind,size,received:0,actor:actor.id,user:actor.user,expires:Date.now()+3600000,ready:kind==='download',busy:false};
+        const r={id,base:ws.base,filename,kind,size,received:0,actor:actor.id,user:actor.user,expires:Date.now()+3600000,ready:kind==='download',busy:false};
         this.records.set(id,r); return {transferId:id,size,chunkBytes:256*1024,expires:new Date(r.expires).toISOString()};
     }
     async append(actor,input) {
@@ -147,8 +157,11 @@ class Transfers {
         } finally {r.busy=false;}
     }
     async preview(actor,ws,input) {
+        return locked(`transfer:${input.transferId}`,()=>this.previewUnlocked(actor,ws,input));
+    }
+    async previewUnlocked(actor,ws,input) {
         const files=[];
-        await this.entries(actor,input,async(name,entry)=>{
+        await this.readEntries(actor,input,async(name,entry)=>{
             if(name==='manifest.json')return;
             await ws.resolve(name,{create:true});
             const current=await ws.describe(name).catch(e=>{if(e.code!=='ENOENT')throw e;return null;});
@@ -157,16 +170,19 @@ class Transfers {
         return {files,permanentReplacement:true};
     }
     async import(actor,ws,input) {
+        return locked(`transfer:${input.transferId}`,()=>this.importUnlocked(actor,ws,input));
+    }
+    async importUnlocked(actor,ws,input) {
         actor.guard('edit');const applied=[];
         const expected=new Map(input.files.map(f=>[f.id,f.revision]));
         // Validate the complete manifest before writing the first file.
-        const preview=await this.preview(actor,ws,input);
+        const preview=await this.previewUnlocked(actor,ws,input);
         if(preview.files.length!==expected.size) fail('REVISION_CONFLICT','Import manifest does not match the archive',409);
         for(const f of preview.files) {
             if(!expected.has(f.id)||expected.get(f.id)!==f.expectedRevision)fail('REVISION_CONFLICT','Import target changed',409);
             if(f.expectedRevision!==null)actor.guard('replace');
         }
-        await this.entries(actor,input,async(name,entry,stream)=>{
+        const importEntry=async(name,entry,stream)=>{
             if(name==='manifest.json')return;
             const size=entry.uncompressedSize;
             // Small editable inputs are validated in memory. Result artifacts stream to staging.
@@ -178,19 +194,39 @@ class Transfers {
                 if(name.startsWith('images/')){actor.guard('images');inspectImage(buffer);}else yaml.load(buffer.toString('utf8'));
                 await ws.write(name,buffer,expected.get(name),{permission:name.startsWith('images/')?'images':'edit'});
             } else {
-                await locked(ws.lockKey,async()=>{
-                    await ws.checkRevision(name,expected.get(name)); if(ws.busy(name))fail('BUSY','Active result cannot be replaced',409);
-                    const p=await ws.resolve(name,{create:true});await fs.mkdir(path.dirname(p),{recursive:true});
-                    const tmp=path.join(path.dirname(p),`.import-${crypto.randomUUID()}`);
-                    try {
-                        await pipeline(await stream(),fsSync.createWriteStream(tmp,{flags:'wx'}));
-                        await ws.resolve(name,{create:true});actor.guard('edit');if(expected.get(name)!==null)actor.guard('replace');
-                        await fs.rename(tmp,p);
-                    } finally {await fs.rm(tmp,{force:true});}
-                });
+                const current=await ws.checkRevision(name,expected.get(name)); if(ws.busy(name))fail('BUSY','Active result cannot be replaced',409);
+                const p=await ws.resolve(name,{create:true});await fs.mkdir(path.dirname(p),{recursive:true});
+                const tmp=path.join(path.dirname(p),`.import-${crypto.randomUUID()}`);
+                try {
+                    await pipeline(await stream(),fsSync.createWriteStream(tmp,{flags:'wx'}));
+                    await ws.resolve(name,{create:true});actor.guard('edit');if(expected.get(name)!==null)actor.guard('replace');
+                    await fs.rename(tmp,p);
+                } finally {await fs.rm(tmp,{force:true});}
             }
             applied.push(name);
-        }).catch(e=>{e.applied=applied;throw e;});
+        };
+        try {
+            // Input writes take the workspace lock themselves. Keep the lock for
+            // the entire result batch so a single quota scan covers its growth.
+            await this.readEntries(actor,input,(name,entry,stream)=>name.startsWith('results/')?undefined:importEntry(name,entry,stream));
+            const results=preview.files.filter(f=>f.id.startsWith('results/'));
+            if(results.length)await locked(ws.lockKey,async()=>{
+                const parents=new Set(),newParents=new Set();let growth=0;
+                for(const file of results) {
+                    const current=await ws.checkRevision(file.id,expected.get(file.id));
+                    if(ws.busy(file.id))fail('BUSY','Active result cannot be replaced',409);
+                    growth+=Math.max(0,file.size-(current?.size||0));
+                    const parent=file.id.split('/').slice(0,2).join('/');
+                    if(!parents.has(parent)) {
+                        parents.add(parent);
+                        const exists=await fs.stat(await ws.resolve(parent,{create:true})).then(()=>true,e=>{if(e.code==='ENOENT')return false;throw e;});
+                        if(!exists)newParents.add(parent);
+                    }
+                }
+                if(growth||newParents.size)await require('./limits').checkResults(ws.base,ws.user,{newResults:newParents.size,bytes:growth});
+                await this.readEntries(actor,input,(name,entry,stream)=>name.startsWith('results/')?importEntry(name,entry,stream):undefined);
+            });
+        } catch(e) {e.applied=applied;throw e;}
         return {applied};
     }
 }

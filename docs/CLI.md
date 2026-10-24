@@ -2,8 +2,7 @@
 
 This manual covers the resident server console, startup flags and standalone 2D
 solver. See [Operations](OPERATIONS.md) for deployment and [REST API](REST_API.md)
-for HTTP automation. The published baseline is v1.7.2. Whole-workspace storage
-commands and `jobs list --all` are **unreleased source additions**.
+for HTTP automation. The release baseline is v1.7.3.
 
 ## 1. Startup
 
@@ -25,7 +24,12 @@ menu
 configure
 ```
 
-`menu` offers arrow-key actions; `configure` guides file-limit settings.
+`menu` offers arrow-key actions, including Storage and explicit job history;
+`configure` guides input-file, result-folder and result-storage limits.
+`storage` opens a guided storage menu. It can stop an idle
+server, copy/verify data to a new directory and restart after confirmation.
+It refuses to interrupt active analyses. Setting a path without migration
+does not copy data; the menu states this before applying the change.
 Tab completes commands; Up/Down recalls up to 100 commands from this session.
 History stays in memory. Quote paths containing spaces, for example `"D:\Analysis Results"`.
 Ctrl+C cancels a form, clears a partial command, or requests normal exit on an
@@ -38,7 +42,8 @@ Passwords use separate masked prompts and are excluded from command history.
 |---|---|
 | `help`, `/help`, `?`, `--help`, `-h` | Show console help |
 | `menu` | Choose an action |
-| `configure` | Configure default or per-workspace file limits |
+| `configure` | Configure default or per-workspace input/result limits |
+| `storage` | Guided storage location or verified migration |
 | `status` | Show PID, address, readiness, activity and unfinished jobs as JSON |
 | `start` | Start the stopped server |
 | `stop [--force]` | Stop the server, keeping the console open |
@@ -57,12 +62,11 @@ and retry `start`.
 |---|---|
 | `jobs`, `jobs list` | Show up to 100 unfinished jobs across workspaces |
 | `jobs list <workspace>` | Filter unfinished jobs by workspace |
-| `jobs list [workspace] --all` | Include finished history (unreleased) |
+| `jobs list [workspace] --all` | Include finished history |
 | `jobs cancel <workspace> <jobId>` | Request cancellation |
 | `jobs resume <workspace>` | Release jobs held after restart |
 
-Published v1.7.2 lists recent jobs including finished ones by default. Current
-source lists unfinished jobs by default. Held jobs remain visible for resumption;
+The console lists unfinished jobs by default. Held jobs remain visible for resumption;
 completed, failed, cancelled and interrupted jobs require `--all`.
 
 ```text
@@ -106,8 +110,8 @@ unassigned workspaces. Assignment and disabling do not delete or move files.
 
 ```text
 limits show [workspace]
-limits set-default <configs|images|libraries> <count|unlimited>
-limits set <workspace> <configs|images|libraries> <count|unlimited|default>
+limits set-default <configs|images|libraries|results|result-mib> <value|unlimited>
+limits set <workspace> <category> <value|unlimited|default>
 ```
 
 Defaults are 20 configuration files, 20 input images and unlimited material
@@ -117,12 +121,29 @@ backup imports. A count is a nonnegative integer; `0` blocks creation.
 `unlimited` removes the cap; `default` removes a workspace override and is only
 accepted by `limits set`. Existing files remain and can be replaced at the cap.
 
+Current source adds `results` (top-level result-folder count) and `result-mib`
+(stored result bytes in integer MiB), both unlimited by default. Queued input
+snapshots reserve a result folder. The byte budget includes snapshots and
+field outputs and is measured from actual directories, without a quota index.
+These limits apply to common WebUI/REST/MCP job acceptance, queued starts,
+result writes and backup imports. MCP backup uploads reserve their declared
+archive size against `result-mib` before any bytes are transferred; pending
+uploads share the same budget. A queue held by a lowered quota can be
+resumed after adjusting limits or removing unneeded results.
+
+The storage budget is an **admission limit**: a running native solver may
+grow beyond it, and is not automatically cancelled. Existing data is never
+removed to satisfy a quota. Smaller replacements and deletion remain possible
+above a lowered cap. A partially applied backup import reports applied IDs.
+
 ```text
 limits set-default configs 100
 limits set user_example images 200
 limits set user_example libraries unlimited
 limits set user_example images default
 limits show user_example
+limits set user_example results 100
+limits set user_example result-mib 10240
 ```
 
 ## 7. Storage (stop before changes)
@@ -135,8 +156,7 @@ storage set-results-root <absolute-directory>
 storage migrate-results <absolute-empty-directory>
 ```
 
-The two workspace commands are unreleased. `storage show` in current source
-prints the workspace root, each resolved category path and any results override.
+`storage show` prints the workspace root, each resolved category path and any results override.
 The default workspace root is the application directory, with `configs`,
 `uploads`, `user-libs` and `outputs` beneath it.
 
@@ -216,6 +236,6 @@ MagFDMsolver[.exe] --version
 
 Linux/macOS use `./MagFDMsolver sample_config.yaml model.png output_example`.
 Omitting the output directory creates a timestamped directory. Missing arguments
-print usage and exit nonzero. Version output is `OpenMagFDM 1.7.2`.
+print usage and exit nonzero. Version output is `OpenMagFDM 1.7.3`.
 The image defines RGB material regions; see [Configuration](CONFIGURATION.md).
 Direct standalone runs do not enter the WebUI/MCP job ledger.

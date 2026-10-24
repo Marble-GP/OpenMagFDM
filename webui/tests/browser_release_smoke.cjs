@@ -66,7 +66,12 @@ async function browser(exe, label, url, base, root) {
             const j=data.jobs?.[0]; if(j && ['failed','interrupted','cancelled'].includes(j.status))throw Error(JSON.stringify(j));return j?.status==='completed'?j:false;
         }, `${label} native job after reload`,60000);
         await cdp.evaluate('JobsPanel.refresh()');
-        assert.ok((await cdp.evaluate("document.getElementById('analysisJobs').textContent")).includes(job.jobId.slice(0,8)));
+        assert.equal(await cdp.evaluate("document.getElementById('analysisJobs').children.length"),0,'finished jobs stay out of the active queue');
+        await until(()=>cdp.evaluate(`Array.from(document.getElementById('resultSelect').options).some(o=>o.value===${JSON.stringify(job.resultPath)})`),`${label} automatic completed-result discovery`);
+        await cdp.evaluate("switchTab('jobs'); document.getElementById('jobsFilter').value='history'; document.getElementById('jobsFilter').dispatchEvent(new Event('change'))");
+        await until(()=>cdp.evaluate(`document.getElementById('analysisJobs').textContent.includes(${JSON.stringify(job.jobId.slice(0,8))})`),`${label} explicit finished history`);
+        const jobScreenshot=await cdp.send('Page.captureScreenshot',{format:'png'});
+        await fs.writeFile(path.join(root,`${label}-jobs.png`),Buffer.from(jobScreenshot.data,'base64'));
         const loadJobResult = async () => {
             await cdp.evaluate('refreshResultsList()');
             await until(()=>cdp.evaluate(`Array.from(document.getElementById('resultSelect').options).some(o=>o.value===${JSON.stringify(job.resultPath)})`),`${label} result option`);
@@ -92,7 +97,7 @@ async function browser(exe, label, url, base, root) {
         await fs.writeFile(path.join(root,`${label}.png`),Buffer.from(screenshot.data,'base64'));
         assert.deepEqual(cdp.errors,[],`${label} uncaught browser errors`);
         const info = await cdp.send('Browser.getVersion');
-        return {browser:info.product,passed:true,reconnectedJob:job.jobId,description:true,aspectPersistence:true,plotUpdates:timings.length,updateWallMilliseconds:timings};
+        return {browser:info.product,passed:true,reconnectedJob:job.jobId,jobsManager:true,automaticResultDiscovery:true,description:true,aspectPersistence:true,plotUpdates:timings.length,updateWallMilliseconds:timings};
     } catch(error) {
         if(cdp){
             const state=await cdp.evaluate("({url:location.href,user:typeof AppState==='undefined'?null:AppState.userId,result:typeof AppState==='undefined'?null:AppState.resultsData.currentResult,memo:document.getElementById('resultMemoStatus')?.textContent,status:document.getElementById('solverStatus')?.textContent,picker:document.getElementById('resultSelect')?.innerHTML})").catch(()=>null);

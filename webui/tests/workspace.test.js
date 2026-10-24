@@ -14,7 +14,7 @@ function fixture() {
         configSaving:false, configLoadPending:false, userId:'fixture',
         aceEditor:{getValue:() => content, setValue:v => { content = v; }}};
     const context = vm.createContext({AppState:state, document:{getElementById:() => select},
-        confirm:() => true, prompt:() => 'b.yaml', showStatus() {}, refreshConfigList:async () => {},
+        confirm:() => true, prompt:() => 'b.yaml', showStatus() {}, refreshConfigList:async () => {}, syncConfigPicker() {},
         Workbench:{refresh() {}, dirty:() => core.dirty(content, state.configData)},
         fetch:async () => ({ok:true, text:async () => 'loaded', json:async () => ({})})});
     vm.runInContext(source, context);

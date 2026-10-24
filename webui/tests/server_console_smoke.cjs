@@ -14,7 +14,7 @@ async function main(){
     try{
         await until(()=>output.includes('Server ready:')&&output.includes('OpenMagFDM>'),'console startup');
         assert.equal((await request('/api/auth/me')).status,200);
-        await command('help','Guided file-limit settings');
+        await command('help','Guided input/result');
         const status=await command('status','"pid"');const pid=JSON.parse(status.slice(status.indexOf('{'),status.lastIndexOf('}')+1)).pid;
         await command('limits set console_test configs 0','Saved and applied');
         const write=()=>request('/api/config',{userId:'console_test',file:'a.yaml',content:'variables: {}',expectedRevision:null});

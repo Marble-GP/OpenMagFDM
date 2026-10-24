@@ -22,6 +22,11 @@ class Element {
     getAttribute(k) { return this.attributes[k]; }
     appendChild(child) { this.children.push(child); return child; }
     get options() { return this.children; }
+    get selectedOptions() { return this.children.filter(c => c.value === this.value); }
+    get scrollHeight() { return this.children.length * 40; }
+    replaceChildren(...children) { this.children = children; }
+    contains(target) { return this === target || this.children.some(c => c.contains(target)); }
+    getBoundingClientRect() { return this.rect || {left:100, top:120, bottom:158, width:300}; }
     set innerHTML(value) { this._html = value; this.children = []; if (this.tag === 'select') this.value = ''; }
     get innerHTML() { return this._html || ''; }
     querySelector(selector) {
@@ -39,7 +44,7 @@ class Element {
 
 function fixture() {
     const nodes = {};
-    for (const match of html.matchAll(/\bid="([^"]+)"/g)) nodes[match[1]] = new Element(match[1] === 'resultSelect' ? 'select' : 'div');
+    for (const match of html.matchAll(/\bid="([^"]+)"/g)) nodes[match[1]] = new Element(['resultSelect','configFileSelect'].includes(match[1]) ? 'select' : 'div');
     const controls = new Element(); const palette = new Element();
     palette.dataset.plotType = 'b_magnitude';
     const plots = [];
@@ -49,6 +54,8 @@ function fixture() {
         containerRenderControllers: new Map(), containerRenderTokens: new Map(),
     };
     const document = {
+        documentElement: {clientWidth:1200, clientHeight:800},
+        addEventListener() {},
         getElementById: id => nodes[id] || null,
         createElement: tag => new Element(tag),
         querySelector: s => s === '.dashboard-controls' ? controls : s === '#dashboard-grid .grid-stack-item' ? plots[0] || null : null,
@@ -57,7 +64,7 @@ function fixture() {
     };
     const counters = { cacheClears: 0, renders: 0, purges: 0 };
     const context = vm.createContext({
-        AppState: state, document, console: { log() {}, warn() {}, error() {} }, AbortController, Event,
+        AppState: state, document, window: {addEventListener() {}}, console: { log() {}, warn() {}, error() {} }, AbortController, Event,
         Workbench: { schedule() {} }, switchTab: tab => { state.currentTab = tab; },
         updateCustomSelectDisplay() {}, pauseAnimation() {}, showStatus() {},
         invalidateDashboardRenders() { state.dashboardRenderGeneration++; },
@@ -219,6 +226,7 @@ test('real Plotly commit publishes provenance only after completion and cannot p
 
 test('list refresh preserves a mid-fetch choice and ignores stale responses; failures preserve options', async () => {
     const f = fixture();
+    f.context.AbortSignal=AbortSignal;
     vm.runInContext(slice('let resultListGeneration', '// Initialize custom select event handlers'), f.context);
     const response = rows => ({ ok: true, json: async () => ({ results: rows }) });
     const a = deferred(), b = deferred(); let calls = 0;
@@ -300,6 +308,105 @@ test('result picker keyboard navigation selects without implicitly loading and c
     for (const fn of listeners.keydown) fn({ key: 'Escape' });
     assert.equal(trigger.getAttribute('aria-expanded'), 'false');
     assert.equal(trigger.focused, true);
+});
+
+function pickerFixture(kind, count = 100) {
+    const f = fixture();
+    const prefix = `${kind}Select`;
+    const select = f.nodes[kind === 'config' ? 'configFileSelect' : 'resultSelect'];
+    const options = f.nodes[`${prefix}Options`], trigger = f.nodes[`${prefix}Trigger`];
+    const container = f.nodes[`${prefix}Container`];
+    container.appendChild(trigger); container.appendChild(options);
+    const listeners = {};
+    f.context.document.addEventListener = (type, fn) => { (listeners[type] ||= []).push(fn); };
+    f.context.window.addEventListener = (type, fn) => { (listeners[type] ||= []).push(fn); };
+    for (let i = 0; i < count; i++) {
+        const entry = new Element('option');
+        entry.value = `${'long_model_name_'.repeat(15)}${i}.yaml`;
+        entry.textContent = entry.value;
+        select.appendChild(entry);
+        if (kind === 'result') {
+            const option = new Element(); option.className = 'custom-select-option';
+            option.setAttribute('data-value', entry.value); option.closest = () => option;
+            options.appendChild(option);
+        }
+    }
+    select.value = select.children.at(-1)?.value || '';
+    vm.runInContext(slice('function syncConfigPicker', '// Load selected config from dropdown'), f.context);
+    vm.runInContext(slice('function initCustomSelect', 'function createAbortError'), f.context);
+    f.context.initCustomSelect(kind);
+    for (const option of options.children) option.closest = () => option;
+    const key = (name, target = options.children.at(-1)) => options.dispatchEvent({type:'keydown', key:name, target, preventDefault() {}});
+    const open = () => trigger.dispatchEvent({type:'click'});
+    return {...f, select, options, trigger, container, listeners, key, open};
+}
+
+test('both file pickers bound a large list to available viewport space and scroll to its selection', () => {
+    for (const kind of ['config', 'result']) {
+        const f = pickerFixture(kind);
+        f.open();
+        assert.equal(f.options.children.length, 100);
+        assert.equal(f.options.style.maxHeight, '300px');
+        assert.equal(f.options.children.at(-1).scrolled, true);
+        assert.equal(f.trigger.getAttribute('aria-expanded'), 'true');
+        // A low trigger opens upward. A narrow viewport clamps width/position.
+        f.open();
+        f.context.document.documentElement = {clientWidth:320, clientHeight:360};
+        f.trigger.rect = {left:20, top:280, bottom:318, width:600};
+        f.open();
+        assert.equal(f.options.style.maxHeight, '268px');
+        assert.equal(f.options.style.top, 'auto');
+        assert.equal(f.options.style.bottom, '84px');
+        assert.equal(f.options.style.width, '304px');
+        assert.equal(f.options.style.left, '8px');
+        // Scrolling the list stays open; moving the workspace closes it.
+        f.listeners.scroll[0]({target:f.options});
+        assert.equal(f.trigger.getAttribute('aria-expanded'), 'true');
+        f.listeners.scroll[0]({target:{}});
+        assert.equal(f.trigger.getAttribute('aria-expanded'), 'false');
+        f.open(); f.listeners.resize[0]();
+        assert.equal(f.trigger.getAttribute('aria-expanded'), 'false');
+    }
+});
+
+test('YAML picker preserves a dirty editor on cancellation and restores its filename and selection', async () => {
+    const f = pickerFixture('config', 30);
+    const loaded = f.select.value;
+    Object.assign(f.state, {loadedConfigFile:loaded, configData:'saved', configLoadGeneration:0,
+        aceEditor:{getValue:() => 'unsaved draft'}});
+    f.context.Workbench = {dirty:() => true, refresh() {}};
+    f.context.confirm = () => false;
+    f.context.fetch = () => { throw Error('must not load a discarded choice'); };
+    vm.runInContext(slice('async function loadSelectedConfig', 'async function saveConfig'), f.context);
+    f.open(); f.key('Home');
+    assert.equal(f.options.children[0].focused, true);
+    f.key('Enter', f.options.children[0]); await tick();
+    assert.equal(f.select.value, loaded);
+    assert.equal(f.nodes.configSelectDisplay.textContent, loaded);
+    assert.equal(f.options.children.at(-1).getAttribute('aria-selected'), 'true');
+    assert.equal(f.options.children[0].getAttribute('aria-selected'), 'false');
+    assert.equal(f.trigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(f.state.aceEditor.getValue(), 'unsaved draft');
+});
+
+test('YAML picker restores the displayed name after load failure and follows rebuilt file lists', async () => {
+    const f = pickerFixture('config', 3);
+    const loaded = f.select.value;
+    Object.assign(f.state, {loadedConfigFile:loaded, configData:'saved', configLoadGeneration:0,
+        aceEditor:{getValue:() => 'saved'}});
+    f.context.Workbench = {dirty:() => false, refresh() {}};
+    f.context.fetch = async () => ({ok:false});
+    vm.runInContext(slice('async function loadSelectedConfig', 'async function saveConfig'), f.context);
+    f.open(); f.key('Enter', f.options.children[0]); await tick();
+    assert.equal(f.select.value, loaded);
+    assert.equal(f.nodes.configSelectDisplay.textContent, loaded);
+    const added = new Element('option'); added.value = added.textContent = 'new_config.yaml';
+    f.select.replaceChildren(added); f.select.value = added.value;
+    f.context.syncConfigPicker(true);
+    assert.equal(f.options.children.length, 1);
+    assert.equal(f.options.children[0].title, added.value);
+    assert.equal(f.nodes.configSelectDisplay.textContent, added.value);
+    assert.equal(f.nodes.configSelectDisplay.title, added.value);
 });
 
 test('missing data uses the real message lifecycle and never remains labelled as plotted data', () => {

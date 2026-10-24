@@ -1,7 +1,7 @@
 # REST API manual
 
 The API shares the WebUI server: `http://localhost:3000` locally, or the configured
-HTTPS address in shared mode. Baseline: v1.7.2. See [CLI](CLI.md) and [Operations](OPERATIONS.md).
+HTTPS address in shared mode. Baseline: v1.7.3. See [CLI](CLI.md) and [Operations](OPERATIONS.md).
 
 ## 1. Conventions
 
@@ -111,9 +111,26 @@ establish physical validity, evaluated expressions, file resolution or convergen
 |---|---|---|
 | `POST /api/jobs` | JSON `userId,configFile,imageFile,idempotencyKey`, optional `materialLibraryFile` | 202 initially, 200 on retry; `jobId,status,resultId,...` |
 | `GET /api/jobs` | query `userId` | `{success,jobs}`, newest first, including history |
+| `GET /api/jobs` (current source) | query `userId,view,offset,limit` | Paged active/history view and counts; see below |
 | `GET /api/jobs/:jobId` | query `userId` | State, progress, completion/convergence/warning, `logTail` |
 | `DELETE /api/jobs/:jobId` | query `userId` | 202; state after cancellation request |
 | `POST /api/jobs/resume` | JSON `userId` | `{success,jobs}` after releasing held jobs |
+
+In current source, `view=active|history|all` requests a page (`offset=0`,
+`limit=20`, maximum 100), returning `total,nextOffset,counts:{active,history}`.
+`view=overview` returns at most 50 active and 20 recent finished records for
+background status/result discovery. Finished history is ordered by completion
+time, including jobs resumed after newer submissions. Omitting `view` preserves the previous
+response contract. MCP `analysis_list` is unchanged. Every view remains scoped
+to the authorized workspace. Finished records are hidden by default in the
+WebUI and resident console; they remain durable for idempotency, convergence
+and recovery, and can be inspected explicitly. Hiding history does not delete
+jobs or results.
+
+CLI result-folder and storage admission quotas apply to this common job
+service. A quota rejection returns `409 QUOTA_EXCEEDED`; new solver processes
+are not launched. See [CLI file/result limits](CLI.md#6-file-limits-live-changes)
+for queued starts and the running-solver storage limitation.
 
 Keys must be nonempty and at most 128 characters. The same workspace/key/input
 names return the original job; reusing the key for different names returns 409.
@@ -210,6 +227,7 @@ Use asynchronous operations for large results.
 | `GET /api/backup-manifest` | query `userId` | `categories,totalSize` |
 | `GET /api/export` | query `userId,include?` | ZIP; default include `configs,images,libraries` |
 | `POST /api/export` | JSON `userId,entries:[logical ID]` | ZIP of selected 1..10000 files |
+| `POST /api/import/check` | JSON `userId,size` (compressed bytes) | Early storage check; `409 QUOTA_EXCEEDED` if over limit |
 | `POST /api/import` | multipart `userId,backup` | Preview `transferId,files:[{id,size,expectedRevision}],...` |
 | `POST /api/import/commit` | JSON `userId,transferId,files:[{id,revision}]` | `success,written,skipped` |
 | `DELETE /api/import/:transferId` | query `userId` | Release preview data |
@@ -219,6 +237,14 @@ inspects/stages data. Commit all preview targets using the preview's
 `expectedRevision` as `revision` (null for new targets). This adapter does not
 commit subsets. Conflicts return 409; partial failures may include `applied`
 IDs. ZIP upload limit is 1 GiB, with additional expanded-size/resource guards.
+GUI commit failures discard the uploaded preview and release its transfer slot;
+upload and inspect again before retrying. Already applied files are reported in
+`applied` and are retained. Pending upload bytes also count toward result-write
+and job-admission checks. Reservations live only in server memory.
+The optional pre-upload check uses compressed bytes; commit separately checks
+the aggregate expanded result growth against the current stored results.
+MCP backup transfers are also rejected at admission if their declared size
+would exceed the workspace's `result-mib` budget, counting pending transfers.
 Legacy JSON backups are limited to 16 MiB. Links, encryption and foreign paths
 are rejected. Backup transfer-entry limits still apply to large directories.
 
