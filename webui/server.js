@@ -875,7 +875,8 @@ app.use(async(req,res,next)=>{
 // Register revision-aware GUI file adapters before legacy endpoints. Solver jobs
 // and MCP share the same active-output protection and per-workspace mutation lock.
 require('./automation/gui-files').installFileRoutes(app, BASE_DIR,
-    (user, id) => automation.jobs.busy(user, id));
+    (user, id) => automation.jobs.busy(user, id),
+    (user, from, to) => automation.jobs.renameResult(user, from, to));
 
 // 静的ファイルの提供 (use BASE_DIR for pkg compatibility)
 const PUBLIC_DIR = isPkg ? path.join(BASE_DIR, 'public') : path.join(__dirname, 'public');
@@ -4075,6 +4076,10 @@ app.get('/api/jobs', async (req,res) => {
         res.json({success:true,...(req.query.view?service.page(user,{view:req.query.view,offset:Number(req.query.offset||0),limit:Number(req.query.limit||20)}):{jobs:service.list(user)})}); }
     catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
 });
+app.post('/api/jobs/history/delete', async (req,res) => {
+    try { res.json({success:true,...await (await browserJobsReady()).deleteHistory(normalizeUserId(req.body.userId),req.body.period)}); }
+    catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
+});
 app.get('/api/jobs/:jobId', async (req,res) => {
     try { res.json({success:true,...(await browserJobsReady()).get(normalizeUserId(req.query.userId),req.params.jobId)}); }
     catch(error) { res.status(error.statusCode || 500).json({success:false,error:error.message}); }
@@ -4159,7 +4164,8 @@ app.post('/api/material-libraries', upload.single('library'), async (req, res) =
 app.get('/api/material-libraries/:filename', async (req, res) => {
     try {
         const userId = (req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
-        const filename = path.basename(req.params.filename);
+        const filename = req.params.filename;
+        if (/[\\/]/.test(filename)) return res.status(400).json({success:false,error:'Invalid filename'});
         const libDir = getUserLibsDir(userId);
         const filePath = path.join(libDir, filename);
 
@@ -4185,7 +4191,8 @@ app.get('/api/material-libraries/:filename', async (req, res) => {
 app.put('/api/material-libraries/:filename', async (req, res) => {
     try {
         const userId = (req.body.userId || req.query.userId || 'default').replace(/[^a-zA-Z0-9_-]/g, '');
-        const filename = path.basename(req.params.filename).replace(/[^a-zA-Z0-9_\-. ]/g, '_');
+        const filename = req.params.filename;
+        if (/[\\/]/.test(filename)) return res.status(400).json({success:false,error:'Invalid filename'});
 
         if (!filename.endsWith('.yaml') && !filename.endsWith('.yml')) {
             return res.status(400).json({ success: false, error: 'Only .yaml/.yml files are allowed' });

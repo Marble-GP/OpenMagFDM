@@ -44,3 +44,12 @@ test('opening job results updates the picker and reports missing fields without 
     assert.equal(f.ids.resultSelect.value,'outputs/wa/run');assert.deepEqual(f.calls,['outputs/wa/run','dashboard','loaded']);
     f.ids.resultSelect.options=[];await assert.rejects(f.context.panel.openResult(job()),/No field output/);assert.equal(f.calls.length,3);
 });
+test('clearing history sends the selected period and refreshes without deleting results',async()=>{
+    const f=fixture(),calls=[];f.ids.jobsHistoryPeriod=new Element();f.ids.jobsHistoryPeriod.value='week';f.ids.jobsHistoryPeriod.selectedOptions=[{textContent:'Last 7 days'}];
+    f.context.confirm=()=>true;
+    const original=f.context.fetch;
+    f.context.fetch=async(url,options)=>{if(url==='/api/jobs/history/delete'){calls.push(JSON.parse(options.body));return {ok:true,json:async()=>({success:true,deleted:3})};}return original(url,options);};
+    await f.context.panel.clearHistory();
+    assert.deepEqual(calls,[{userId:'wa',period:'week'}]);assert.match(f.ids.jobsHistoryStatus.textContent,/3 finished/);assert.equal(f.ids.jobsClearHistory.disabled,false);
+    f.context.confirm=()=>false;await f.context.panel.clearHistory();assert.equal(calls.length,1);
+});

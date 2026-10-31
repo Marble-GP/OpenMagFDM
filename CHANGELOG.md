@@ -3,6 +3,22 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/archive/research/`.
 
+## 1.7.4 — 2026-10-31
+
+- Add one Files Edit dialog for filenames and result descriptions, with revision
+  checks, inline errors, save progress and explicit discard confirmation.
+- Preserve unsaved result descriptions during data reloads and result switches;
+  keep Files previews independent of the loaded Results editor.
+- Keep renamed results, job paths and active material-library selections aligned.
+  Preserve supported special-character and Unicode library filenames on save.
+- Add workspace-scoped finished job history deletion by time range, preserving
+  active/held jobs and analysis results.
+- Name WebUI-created outputs with output_webui_ instead of output_mcp_.
+- Curate the plot color themes, display gradient previews, and remove the
+  Coarsening Mask palette item. Improve file-list and editor layout.
+- Update MCP SDK dependencies to 2.4.0 and its Node adapter to 2.1.2, resolving
+  reviewed Hono/qs advisories. Keep the packaged Node.js runtime at 24.22.1.
+
 ## 1.7.3 — 2026-10-24
 
 - Fix metadata/deletion of result directories exceeding 10,000 entries without

@@ -1,6 +1,6 @@
 {
   "name": "magfdm-visualizer",
-  "version": "1.7.3",
+  "version": "1.7.4",
   "description": "Web UI for MagFDMsolver visualization",
   "main": "server.js",
   "bin": "launcher.js",
@@ -22,9 +22,9 @@
   "license": "MIT",
   "dependencies": {
     "@inquirer/prompts": "8.7.4",
-    "@modelcontextprotocol/client": "2.3.1",
-    "@modelcontextprotocol/node": "2.1.1",
-    "@modelcontextprotocol/server": "2.3.1",
+    "@modelcontextprotocol/client": "2.4.0",
+    "@modelcontextprotocol/node": "2.1.2",
+    "@modelcontextprotocol/server": "2.4.0",
     "express": "^4.21.2",
     "image-size": "2.0.4",
     "jimp": "1.6.1",

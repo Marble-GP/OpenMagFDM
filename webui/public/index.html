@@ -1229,6 +1229,10 @@
                     <span id="jobsConnection" role="status"></span>
                 </div>
                 <p id="jobsCounts"></p>
+                <div class="button-group"><label for="jobsHistoryPeriod">Clear finished history:</label>
+                    <select id="jobsHistoryPeriod"><option value="hour">Last hour</option><option value="day">Last 24 hours</option><option value="week">Last 7 days</option><option value="month">Last 30 days</option><option value="older-month">Older than 30 days</option><option value="all">All time</option></select>
+                    <button class="btn-secondary" id="jobsClearHistory">Clear history…</button><span id="jobsHistoryStatus" role="status"></span>
+                </div>
                 <div class="jobs-table-wrap"><table class="jobs-table"><thead><tr><th>Job / configuration</th><th>Submitted by</th><th>Status</th><th>Progress</th><th>Created</th><th>Actions</th></tr></thead><tbody id="analysisJobs"></tbody></table></div>
                 <p id="jobsEmpty" hidden>No active jobs. Finished jobs are available in history.</p>
                 <div class="button-group"><button class="btn-secondary" id="jobsPrevious">Previous</button><span id="jobsPage" role="status"></span><button class="btn-secondary" id="jobsNext">Next</button></div>
@@ -1449,12 +1453,15 @@
                 </div>
                 <p id="resultSelectionHint">Selecting a result does not change the plots until you load it.</p>
                 <p id="resultLoadStatus" role="status" aria-live="polite"></p>
-                <section id="resultMemoEditor" hidden><p><a id="resultOriginalInput" target="_blank" rel="noopener">Original input image (initial state)</a></p>
-                    <label for="resultMemoText">Description — <span id="resultMemoTitle"></span></label>
-                    <textarea id="resultMemoText" rows="4" style="display:block;width:100%;box-sizing:border-box" disabled></textarea>
-                    <button id="resultMemoSave" class="btn-primary" onclick="ResultImprovements.save()" disabled>Save</button>
-                    <button class="btn-secondary" onclick="ResultImprovements.description(document.getElementById('resultMemoTitle').textContent)">Reload</button>
-                    <span id="resultMemoStatus" role="status"></span>
+                <section id="resultMemoEditor" class="result-notes" hidden aria-labelledby="resultMemoLabel">
+                    <div class="result-notes-heading"><div><label id="resultMemoLabel" for="resultMemoText">Description</label><p id="resultMemoTitle"></p></div><span class="result-notes-badge" id="resultMemoBadge">Loading</span></div>
+                    <textarea id="resultMemoText" rows="4" maxlength="32768" placeholder="Add context, observations, or notes about this result…" oninput="ResultImprovements.changed()" disabled></textarea>
+                    <div class="result-notes-footer"><span id="resultMemoStatus" role="status" aria-live="polite"></span><div class="button-group">
+                        <button id="resultMemoReload" class="btn-secondary" onclick="ResultImprovements.requestReload()">Reload description</button>
+                        <button id="resultMemoSave" class="btn-primary" onclick="ResultImprovements.save()" disabled>Save description</button>
+                    </div></div>
+                    <div id="resultMemoDiscard" class="file-edit-discard" hidden><p>Reload and discard your unsaved description?</p><div class="button-group"><button class="btn-secondary" onclick="ResultImprovements.keepEditing()">Keep editing</button><button class="btn-danger" onclick="ResultImprovements.requestReload(true)">Discard and reload</button></div></div>
+                    <div class="result-notes-source"><a id="resultOriginalInput" target="_blank" rel="noopener">Original input image (initial state)</a></div>
                 </section>
                 <dl class="results-current">
                     <div><dt>Loaded result</dt><dd id="loadedResultName">None</dd></div>
@@ -1511,9 +1518,6 @@
                         </div>
                         <div class="palette-item" draggable="true" data-plot-type="step_input_image">
                             <span class="palette-name">Input Image</span>
-                        </div>
-                        <div class="palette-item" draggable="true" data-plot-type="coarsening_mask">
-                            <span class="palette-name">Coarsening Mask</span>
                         </div>
                     </div>
 
@@ -1662,6 +1666,32 @@
         </div>
     </div>
 
+    <dialog id="fileEditDialog" class="file-edit-dialog" aria-labelledby="fileEditTitle" oncancel="event.preventDefault(); closeFileEditor()">
+        <form onsubmit="event.preventDefault(); saveFileEditor()">
+            <header class="file-edit-header">
+                <div><p class="file-edit-eyebrow">FILE DETAILS</p><h2 id="fileEditTitle">Edit file</h2></div>
+                <button id="fileEditClose" class="file-edit-close btn-secondary" type="button" aria-label="Close file editor" onclick="closeFileEditor()">&times;</button>
+            </header>
+            <div class="file-edit-body">
+                <div class="file-edit-target"><span id="fileEditCategory"></span><strong id="fileEditName"></strong></div>
+                <div id="fileEditRenameField" class="file-edit-field">
+                    <label for="fileEditNewName">Name</label>
+                    <input id="fileEditNewName" type="text" maxlength="100" autocomplete="off" spellcheck="false" aria-describedby="fileEditHelp fileEditStatus" oninput="fileEditorChanged()">
+                </div>
+                <p id="fileEditHelp" class="file-edit-help"></p>
+                <div id="fileEditDescriptionField" class="file-edit-field" hidden>
+                    <label for="fileEditDescription">Description</label>
+                    <textarea id="fileEditDescription" rows="5" maxlength="32768" placeholder="Add context, observations, or notes about this result…" aria-describedby="fileEditStatus" oninput="fileEditorChanged()"></textarea>
+                </div>
+                <p id="fileEditStatus" class="file-edit-status" role="status" aria-live="polite"></p>
+                <div id="fileEditDiscard" class="file-edit-discard" hidden>
+                    <p>Discard your unsaved changes?</p>
+                    <div class="button-group"><button class="btn-secondary" type="button" onclick="keepFileEditorChanges()">Keep editing</button><button class="btn-danger" type="button" onclick="closeFileEditor(true)">Discard changes</button></div>
+                </div>
+            </div>
+            <footer class="file-edit-footer"><button class="btn-secondary" id="fileEditCancel" type="button" onclick="closeFileEditor()">Cancel</button><button class="btn-primary" id="fileEditSave" type="submit" disabled>Save changes</button></footer>
+        </form>
+    </dialog>
     <!-- Plot Configure Modal -->
     <div id="plotConfigModal" class="modal" style="display: none;">
         <div class="modal-content" style="max-width: 800px; max-height: 80vh; overflow-y: auto;">
@@ -2219,6 +2249,7 @@
     <!-- Application JavaScript -->
     <script src="yaml-intellisense.js"></script>
     <script src="workspace-core.js"></script>
+    <script src="color-themes.js"></script>
     <script src="workspace.js"></script>
     <script src="results-workspace.js"></script>
     <script src="mcp-panel.js"></script>

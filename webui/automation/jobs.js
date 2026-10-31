@@ -21,6 +21,7 @@ class AnalysisJobs {
                 if (j.status === 'queued') j.status = 'held';
                 if (['preparing','running','cancelling'].includes(j.status)) {
                 j.status = 'interrupted'; j.completed = false; j.converged = false;
+                j.finished ||= new Date().toISOString();
                 j.message = 'The server restarted. This analysis was not automatically restarted.';
             }
             }
@@ -62,6 +63,49 @@ class AnalysisJobs {
         const live = this.backend.jobs.get(jobId);
         const scrub = line => String(line).split(this.base).join('[workspace]');
         return { ...this.public(record), logTail: (live?.log || record.logTail || []).slice(-50).map(scrub) };
+    }
+    async deleteHistory(user, period) {
+        user = userKey(user);
+        const durations = {hour:3600000, day:86400000, week:7*86400000, month:30*86400000};
+        if (!['hour','day','week','month','older-month','all'].includes(period)) fail('INVALID_INPUT', 'Invalid history period');
+        return locked(`${this.filename}:${user}`, async () => {
+            const now = Date.now(), cutoff = now - (durations[period] || durations.month);
+            const terminal = new Set(['completed','failed','cancelled','interrupted']);
+            const matches = j => {
+                if (j.user !== user || !terminal.has(j.status) || !terminal.has(this.current(j).status)) return false;
+                if (period === 'all') return true;
+                const time = Date.parse(j.finished || j.created);
+                if (!Number.isFinite(time) || time > now) return false;
+                return period === 'older-month' ? time < cutoff : time >= cutoff;
+            };
+            const removed = this.records.filter(matches);
+            if (!removed.length) return {deleted:0};
+            this.records = this.records.filter(j => !matches(j));
+            try { await this.save(); }
+            catch (error) { this.records.push(...removed); throw error; }
+            return {deleted:removed.length};
+        });
+    }
+    async renameResult(user, oldId, newId) {
+        user = userKey(user);
+        return locked(`${this.filename}:${user}`, async () => {
+            const changed = this.records.filter(j => j.user === user && j.resultId === oldId);
+            if (!changed.length) return;
+            const previous = changed.map(record => ({record, resultPath:record.resultPath}));
+            for (const record of changed) {
+                record.resultId = newId;
+                record.resultPath = `outputs/${user}/${newId.slice('results/'.length)}`;
+            }
+            try { await this.save(); }
+            catch (error) {
+                for (const {record, resultPath} of previous) {
+                    record.resultId = oldId;
+                    if (resultPath === undefined) delete record.resultPath;
+                    else record.resultPath = resultPath;
+                }
+                throw error;
+            }
+        });
     }
     async cancel(user, jobId, guard) {
         this.get(user, jobId); guard('cancel');
@@ -143,7 +187,7 @@ class AnalysisJobs {
             if (this.records.length >= 10000) fail('JOB_HISTORY_LIMIT', 'The durable job ledger is full; retain it and contact the application administrator', 409);
             const ws = new Workspace(this.base, actor.user, { guard: actor.guard });
             await ws.init();
-            const jobId = crypto.randomUUID(); const resultId = `results/output_mcp_${jobId}`;
+            const jobId = crypto.randomUUID(); const resultId = `results/output_${actor.id.startsWith('gui:') ? 'webui' : 'mcp'}_${jobId}`;
             const out = await ws.resolve(resultId, { create: true });
             const record = { key, requestHash, jobId, user: actor.user, source: actor.name, configName:input.config.id.split('/').pop(), imageName:input.image.id.split('/').pop(), resultId, status: 'preparing', created: new Date().toISOString(), browserRequestHash: input.browserRequestHash };
             // Record BEFORE spawning. An uncertain/restarted request never launches twice.

@@ -12505,7 +12505,7 @@ function userFileHtml(file) {
         <div class="user-file-actions">
             <button class="btn-secondary btn-small" onclick="fileManagerOpen(this)">${openLabel}</button>
             ${download}
-            ${file.category === 'results' ? `<button class="btn-secondary btn-small" onclick="editDescription(fileManagerRow(this).name)">Memo</button>` : ''}
+            <button class="btn-secondary btn-small" onclick="fileManagerEdit(this)">Edit</button>
             <button class="btn-delete btn-small" onclick="fileManagerDelete(this)">Delete</button>
         </div>
     </div>`;
@@ -12618,6 +12618,171 @@ async function workspaceFileMeta(id) {
     return data.file;
 }
 
+// One editor shell for both file names and result notes. A target captures the
+// workspace and revision at open time, so a stale dialog cannot overwrite edits.
+let fileEditorTarget = null, fileEditorGeneration = 0;
+function fileEditorDirty(target = fileEditorTarget) {
+    return !!target?.ready && (document.getElementById('fileEditNewName').value !== target.originalName ||
+        (target.category === 'results' && document.getElementById('fileEditDescription').value !== target.originalDescription));
+}
+function fileEditorStatus(message, error = false) {
+    const status = document.getElementById('fileEditStatus');
+    status.textContent = message; status.dataset.state = error ? 'error' : 'info';
+}
+function fileEditorChanged() {
+    const target = fileEditorTarget; if (!target || target.busy) return;
+    document.getElementById('fileEditNewName').setAttribute('aria-invalid', 'false');
+    fileEditorStatus(''); document.getElementById('fileEditDiscard').hidden = true;
+    document.getElementById('fileEditSave').disabled = !fileEditorDirty();
+}
+function keepFileEditorChanges() {
+    document.getElementById('fileEditDiscard').hidden = true;
+    document.getElementById('fileEditNewName').focus();
+}
+function closeFileEditor(discard = false) {
+    const target = fileEditorTarget; if (target?.busy) return;
+    if (!discard && fileEditorDirty()) {
+        document.getElementById('fileEditDiscard').hidden = false;
+        document.querySelector('#fileEditDiscard button').focus(); return;
+    }
+    ++fileEditorGeneration; fileEditorTarget = null;
+    document.getElementById('fileEditDialog').close();
+    if (target?.opener?.isConnected) target.opener.focus();
+    else document.getElementById('fileManagerSearch')?.focus();
+}
+async function fileManagerEdit(button) {
+    const file = fileManagerRow(button); if (!file) return;
+    const dialog = document.getElementById('fileEditDialog'); if (dialog.open) return;
+    if (file.category === 'configs' && file.name === AppState.loadedConfigFile && (AppState.configSaving || AppState.configLoadPending)) {
+        fileManagerStatus('Wait for the configuration operation to finish before editing.', 'error'); return;
+    }
+    const generation = ++fileEditorGeneration;
+    const target = fileEditorTarget = {...file, workspace:AppState.userId, opener:button, ready:false, busy:false};
+    const name = document.getElementById('fileEditNewName'), notes = document.getElementById('fileEditDescription');
+    document.getElementById('fileEditTitle').textContent = file.category === 'results' ? 'Edit result' : 'Edit file';
+    document.getElementById('fileEditCategory').textContent = USER_FILE_CATEGORY_LABEL[file.category] || file.category;
+    document.getElementById('fileEditName').textContent = file.name;
+    document.getElementById('fileEditDescriptionField').hidden = file.category !== 'results';
+    document.getElementById('fileEditHelp').textContent = 'References in YAML are not updated when you rename a file.' +
+        (file.category === 'images' ? ' Keep the original image extension.' : ['configs','libraries'].includes(file.category) ? ' Keep a .yaml or .yml extension.' : '');
+    document.getElementById('fileEditSave').textContent = 'Save changes';
+    document.getElementById('fileEditSave').disabled = true;
+    document.getElementById('fileEditCancel').disabled = false;
+    document.getElementById('fileEditClose').disabled = false;
+    document.getElementById('fileEditDiscard').hidden = true;
+    dialog.setAttribute('aria-busy', 'true');
+    name.value = file.name; notes.value = ''; name.disabled = notes.disabled = true; name.setAttribute('aria-invalid','false');
+    fileEditorStatus('Loading file details…'); dialog.showModal();
+    try {
+        const [meta, description] = await Promise.all([
+            workspaceFileMeta(file.category + '/' + file.name),
+            file.category === 'results' ? (async () => {
+                const response = await fetch('/api/user-outputs/' + encodeURIComponent(file.name) + '/description?userId=' + encodeURIComponent(target.workspace));
+                const data = await response.json(); if (!response.ok || !data.success) throw Error(data.error || 'Description load failed');
+                return data;
+            })() : null
+        ]);
+        if (generation !== fileEditorGeneration || !dialog.open) return;
+        if (target.workspace !== AppState.userId) throw Error('Workspace changed. Close this dialog and reopen the file.');
+        target.revision = meta.revision; target.descriptionRevision = description?.revision;
+        target.originalName = file.name; target.originalDescription = description?.description || ''; target.ready = true;
+        notes.value = target.originalDescription; name.disabled = notes.disabled = false; fileEditorStatus(''); name.focus();
+        name.setSelectionRange(0, file.category === 'results' ? name.value.length : (name.value.lastIndexOf('.') > 0 ? name.value.lastIndexOf('.') : name.value.length));
+    } catch(error) { if (generation === fileEditorGeneration) fileEditorStatus(error.message, true); }
+    finally { if (generation === fileEditorGeneration) dialog.setAttribute('aria-busy','false'); }
+}
+function fileRenameError(target, value) {
+    if (!value.trim()) return 'Enter a file name.';
+    if (value !== value.trim()) return 'Remove spaces at the beginning or end of the name.';
+    if (value.length > 100 || /[\\/<>:"|?*\x00-\x1f]/.test(value) || /[. ]$/.test(value)) return 'Use a name of up to 100 characters without path separators or reserved filename characters.';
+    if (['configs','libraries'].includes(target.category) && !/\.(yaml|yml)$/.test(value)) return 'Use a .yaml or .yml extension.';
+    if (target.category === 'images' && value.slice(value.lastIndexOf('.')).toLowerCase() !== target.name.slice(target.name.lastIndexOf('.')).toLowerCase()) return 'Keep the original image filename extension.';
+    return '';
+}
+async function saveFileEditor() {
+    const target = fileEditorTarget;
+    if (!target?.ready || target.busy || !fileEditorDirty()) return;
+    const name = document.getElementById('fileEditNewName'), notes = document.getElementById('fileEditDescription');
+    const newName = name.value, description = notes.value;
+    if (target.workspace !== AppState.userId) { fileEditorStatus('Workspace changed. Close this dialog and reopen the file.',true); return; }
+    const validation = newName !== target.originalName ? fileRenameError(target,newName) : '';
+    if (validation) { fileEditorStatus(validation,true); name.setAttribute('aria-invalid','true'); name.focus(); return; }
+    target.busy = true; name.disabled = notes.disabled = true;
+    const dialog = document.getElementById('fileEditDialog'), save = document.getElementById('fileEditSave');
+    save.disabled = true; save.textContent = 'Saving…';
+    document.getElementById('fileEditCancel').disabled = true; document.getElementById('fileEditClose').disabled = true;
+    document.getElementById('fileEditDiscard').hidden = true; dialog.setAttribute('aria-busy','true'); fileEditorStatus('Saving changes…');
+    let renamed = false, warning = '';
+    try {
+        if (newName !== target.originalName) {
+            warning = await renameWorkspaceFile(target,newName) || '';
+            renamed = true;
+            document.getElementById('fileEditName').textContent = newName;
+        }
+        if (target.category === 'results' && description !== target.originalDescription) {
+            const response = await fetch('/api/user-outputs/' + encodeURIComponent(target.name) + '/description', {method:'PUT',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({userId:target.workspace,description,expectedRevision:target.descriptionRevision})});
+            const data = await response.json(); if (!response.ok || !data.success) throw Error(data.error || 'Description save failed');
+            target.descriptionRevision = data.revision; target.originalDescription = description;
+            if (target.workspace === AppState.userId) {
+                if (typeof ResultImprovements !== 'undefined') ResultImprovements.syncDescription?.(target.name,description,data.revision);
+                await refreshResultsList().catch(()=>{ warning='Changes saved, but the results list could not be refreshed.'; });
+            }
+        }
+        target.busy = false; closeFileEditor(true);
+        if (target.workspace === AppState.userId) fileManagerStatus(warning || 'Changes saved for ' + target.name + '.',warning ? 'error' : 'success');
+    } catch(error) {
+        fileEditorStatus((renamed ? 'Name saved. Description was not saved. ' : '') + error.message + ' Your unsaved input has been kept.',true);
+    } finally {
+        target.busy = false;
+        if (fileEditorTarget === target) {
+            name.disabled = notes.disabled = false; save.disabled = !fileEditorDirty(); save.textContent = 'Save changes';
+            document.getElementById('fileEditCancel').disabled = false; document.getElementById('fileEditClose').disabled = false;
+            dialog.setAttribute('aria-busy','false'); (renamed ? notes : name).focus();
+        }
+    }
+}
+async function renameWorkspaceFile(target, newName) {
+    const file = {...target}, workspace = target.workspace;
+    const response = await fetch('/api/user-files/rename', {method:'PUT', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({userId:workspace,category:file.category,name:file.name,newName,revision:target.revision})});
+    const data = await response.json();
+    if (!response.ok || !data.success) throw Error(data.error || 'Rename failed');
+    target.name = newName; target.originalName = newName; target.revision = data.file?.revision || target.revision;
+    if (workspace !== AppState.userId) return;
+    const configActive = file.category === 'configs' && AppState.loadedConfigFile === file.name;
+    const imageActive = file.category === 'images' && AppState.uploadedImageFilename === file.name;
+    const resultPath = AppState.resultsData?.currentResult;
+    const resultActive = file.category === 'results' && resultPath && resultPath.split('/').pop() === file.name;
+    if (configActive) AppState.loadedConfigFile = newName;
+    if (imageActive) AppState.uploadedImageFilename = newName;
+    if (file.category === 'libraries') {
+        if (AppState.selectedLibrary === file.name) {
+            AppState.selectedLibrary = newName;
+            setCookie('magfdm_last_library', newName, 365);
+            document.getElementById('activeLibraryName').textContent = newName;
+        }
+        if (AppState.currentLibraryFile === file.name) {
+            AppState.currentLibraryFile = newName;
+            AppState.libraryLoadGeneration = (AppState.libraryLoadGeneration || 0) + 1;
+            document.getElementById('libEditFilename').textContent = newName;
+        }
+        if (AppState.detectLibraryName === file.name) AppState.detectLibraryName = newName;
+    }
+    if (resultActive) {
+        AppState.resultsData.currentResult = resultPath.slice(0, resultPath.lastIndexOf('/') + 1) + newName;
+        if (typeof ResultImprovements !== 'undefined') ResultImprovements.rename(file.name, newName);
+    }
+    if (AppState.userFileSelection.delete(userFileKey(file))) AppState.userFileSelection.add(userFileKey({...file,name:newName}));
+    await refreshUserFiles({preserveStatus:true});
+    const refreshed = await Promise.allSettled([refreshConfigList(), refreshImageList(), refreshResultsList()]);
+    if (configActive) { const select=document.getElementById('configFileSelect'); select.value=newName; syncConfigPicker(); }
+    if (imageActive) { const select=document.getElementById('imageSelect'); select.value=newName; loadSelectedImage(); }
+    if (resultActive) { const select=document.getElementById('resultSelect'); select.value=AppState.resultsData.currentResult; updateCustomSelectDisplay(select.value); }
+    if (typeof Workbench !== 'undefined') Workbench.refresh();
+    const warning = data.warning || (refreshed.some(r => r.status === 'rejected') ? 'The file was renamed, but a list could not be refreshed.' : '');
+    return warning;
+}
 async function fileManagerDelete(button) {
     const file = fileManagerRow(button);
     if (file) return deleteUserFiles([file]);
@@ -12887,7 +13052,6 @@ function clearFilePreview({
  */
 async function showOutputPreview(folderName) {
     console.log('showOutputPreview called:', folderName);
-    void ResultImprovements.description(folderName);
 
     const previewPanel = document.getElementById('filePreviewPanel');
     const descDiv = document.getElementById('previewDescription');
@@ -13271,6 +13435,24 @@ async function legacyEditDescription(folderName) {
 
 // ===== Plot Configure Functions =====
 
+const PLOT_THEME_CHOICES = ['Viridis','Cividis','Rainbow','Hot','Bluered','RdBu','Electric'];
+function plotColorPicker(plotId, selected) {
+    const value = selected || 'Viridis';
+    const names = PLOT_THEME_CHOICES.includes(value) ? PLOT_THEME_CHOICES : [value, ...PLOT_THEME_CHOICES];
+    const swatch = name => `<span class="plot-color-swatch" aria-hidden="true" style="background:${PlotColorThemes[name] || '#ddd'}"></span>`;
+    return `<details class="plot-color-picker"><summary><span class="plot-color-current">${fileManagerEscape(value)}</span>${swatch(value)}</summary>
+        <input type="hidden" id="colorscale_${plotId}" value="${fileManagerEscape(value)}">
+        <div class="plot-color-options">${names.map(name => `<button type="button" data-color-theme="${fileManagerEscape(name)}" onclick="selectPlotColor(this)">${fileManagerEscape(name)}${swatch(name)}</button>`).join('')}</div></details>`;
+}
+function selectPlotColor(button) {
+    const picker = button.closest('.plot-color-picker'), name = button.dataset.colorTheme;
+    picker.querySelector('input').value = name;
+    picker.querySelector('.plot-color-current').textContent = name;
+    picker.querySelector('summary .plot-color-swatch').style.background = PlotColorThemes[name] || '#ddd';
+    picker.open = false;
+    picker.querySelector('summary').focus();
+}
+
 /**
  * Open plot configuration modal
  */
@@ -13365,24 +13547,7 @@ function openPlotConfigModal() {
                 <!-- Colorscale theme -->
                 <div class="config-row">
                     <label>Color theme:</label>
-                    <select id="colorscale_${plotId}">
-                        <option value="Viridis" ${config.colorscale === 'Viridis' || !config.colorscale ? 'selected' : ''}>Viridis</option>
-                        <option value="Plasma" ${config.colorscale === 'Plasma' ? 'selected' : ''}>Plasma</option>
-                        <option value="Inferno" ${config.colorscale === 'Inferno' ? 'selected' : ''}>Inferno</option>
-                        <option value="Magma" ${config.colorscale === 'Magma' ? 'selected' : ''}>Magma</option>
-                        <option value="Cividis" ${config.colorscale === 'Cividis' ? 'selected' : ''}>Cividis</option>
-                        <option value="Turbo" ${config.colorscale === 'Turbo' ? 'selected' : ''}>Turbo</option>
-                        <option value="Rainbow" ${config.colorscale === 'Rainbow' ? 'selected' : ''}>Rainbow</option>
-                        <option value="Jet" ${config.colorscale === 'Jet' ? 'selected' : ''}>Jet</option>
-                        <option value="Hot" ${config.colorscale === 'Hot' ? 'selected' : ''}>Hot</option>
-                        <option value="Cool" ${config.colorscale === 'Cool' ? 'selected' : ''}>Cool</option>
-                        <option value="Bluered" ${config.colorscale === 'Bluered' ? 'selected' : ''}>Blue-Red</option>
-                        <option value="RdBu" ${config.colorscale === 'RdBu' ? 'selected' : ''}>RdBu</option>
-                        <option value="Portland" ${config.colorscale === 'Portland' ? 'selected' : ''}>Portland</option>
-                        <option value="Picnic" ${config.colorscale === 'Picnic' ? 'selected' : ''}>Picnic</option>
-                        <option value="Electric" ${config.colorscale === 'Electric' ? 'selected' : ''}>Electric</option>
-                        <option value="Blackbody" ${config.colorscale === 'Blackbody' ? 'selected' : ''}>Blackbody</option>
-                    </select>
+                    ${plotColorPicker(plotId, config.colorscale)}
                 </div>
             `;
         }

@@ -2,7 +2,7 @@
 // GUI adapters for the same revision-checked operations used by MCP.
 // The legacy GUI workspace selector is not an authentication mechanism.
 const {Workspace, fail} = require('./workspace');
-function installFileRoutes(app, base, busy) {
+function installFileRoutes(app, base, busy, renameResult = async () => {}) {
     const {FileOperations} = require('./operations');
     const {privateDirectory} = require('./access');
     let operations;
@@ -33,6 +33,27 @@ function installFileRoutes(app, base, busy) {
         catch (e) { if (e.code === 'ENOENT') return {file: null}; throw e; }
     }));
     app.delete('/api/user-files', route((req, ws) => ws.remove(`${req.body.category}/${req.body.name}`, revision(req))));
+    app.put('/api/user-files/rename', route(async (req, ws) => {
+        const {category, name, newName} = req.body;
+        if (!['configs','images','libraries','results'].includes(category) ||
+            typeof name !== 'string' || typeof newName !== 'string' ||
+            !name || !newName || /[\\/]/.test(name) || /[\\/]/.test(newName) || newName.length > 100)
+            fail('INVALID_INPUT', 'Invalid file name');
+        if (['configs','libraries'].includes(category) && !/\.(yaml|yml)$/.test(newName))
+            fail('INVALID_INPUT', 'YAML filenames must end in .yaml or .yml');
+        if (category === 'images') {
+            const oldExt = /\.(png|jpe?g|bmp)$/i.exec(name), newExt = /\.(png|jpe?g|bmp)$/i.exec(newName);
+            if (!oldExt || !newExt || oldExt[1].toLowerCase() !== newExt[1].toLowerCase())
+                fail('INVALID_INPUT', 'Keep the original image filename extension');
+        }
+        const file = await ws.rename(`${category}/${name}`, `${category}/${newName}`, revision(req));
+        let warning;
+        if (category === 'results') {
+            try { await renameResult(ws.user, `results/${name}`, `results/${newName}`); }
+            catch { warning = 'The folder was renamed, but job history could not be updated.'; }
+        }
+        return {file, warning};
+    }));
     app.delete('/api/user-outputs/bulk', route(async (req, ws) => {
         const files = req.body.files;
         if (!Array.isArray(files) || !files.length || files.length > 100)
@@ -54,7 +75,10 @@ function installFileRoutes(app, base, busy) {
         if (typeof req.body.newName !== 'string' || req.body.newName.includes('/') || req.body.newName.length > 100)
             fail('INVALID_INPUT', 'Invalid result folder name');
         const file = await ws.rename(`results/${req.params.folderName}`, `results/${req.body.newName}`, revision(req));
-        return {newName: file.name, revision: file.revision};
+        let warning;
+        try { await renameResult(ws.user, `results/${req.params.folderName}`, `results/${req.body.newName}`); }
+        catch { warning = 'The folder was renamed, but job history could not be updated.'; }
+        return {newName: file.name, revision: file.revision, warning};
     }));
     app.get('/api/user-outputs/:folderName/description', route(async (req, ws) => {
         const id = `results/${req.params.folderName}/description.txt`;

@@ -1,7 +1,7 @@
 # REST API manual
 
 The API shares the WebUI server: `http://localhost:3000` locally, or the configured
-HTTPS address in shared mode. Baseline: v1.7.3. See [CLI](CLI.md) and [Operations](OPERATIONS.md).
+HTTPS address in shared mode. Baseline: v1.7.4. See [CLI](CLI.md) and [Operations](OPERATIONS.md).
 
 ## 1. Conventions
 
@@ -96,6 +96,7 @@ retrieved revision. Use a fresh idempotency key per new analysis, reuse on retry
 | `PUT /api/material-libraries/:filename` | JSON `userId,content,expectedRevision` | `{success,filename,revision}` |
 | `GET /api/user-files` | query `userId` | `{success,files}` across categories |
 | `GET /api/workspace/file` | query `userId,id` | `{success,file}`; absent target is `file:null` |
+| `PUT /api/user-files/rename` | JSON `userId,category,name,newName,revision` | Rename within a category; `{success,file,warning?}` |
 
 A missing config GET returns server-default YAML with an empty revision; use
 workspace metadata to check existence. Creation uses `expectedRevision:null`;
@@ -115,6 +116,24 @@ establish physical validity, evaluated expressions, file resolution or convergen
 | `GET /api/jobs/:jobId` | query `userId` | State, progress, completion/convergence/warning, `logTail` |
 | `DELETE /api/jobs/:jobId` | query `userId` | 202; state after cancellation request |
 | `POST /api/jobs/resume` | JSON `userId` | `{success,jobs}` after releasing held jobs |
+| `POST /api/jobs/history/delete` | JSON `userId,period` | Delete matching finished history and return `{success,deleted}` |
+
+History periods are `hour`, `day`, `week`, `month`, `older-month`, and `all`,
+measured from completion time (or creation time when completion is unavailable).
+The operation is scoped to the authorized workspace and leaves active and held
+jobs and all result files intact. Deleting a job record also removes its
+idempotency record; a later retry with the same key can create a new job.
+Result names created by the WebUI use `output_webui_`; MCP submissions retain
+`output_mcp_`. Existing names remain valid.
+
+Rename requests use the current file revision and never overwrite a target.
+References in YAML are not rewritten. Renaming a completed result updates its
+job history `resultId` and retrieval `resultPath`; a `warning` reports a history
+update failure after the file
+has already been renamed. YAML names must retain a `.yaml` or `.yml` suffix;
+image names must retain their original suffix. Material-library reads and saves
+preserve the exact filename, including `+` and Unicode characters; unsafe path
+components are rejected rather than rewritten to another filename.
 
 In current source, `view=active|history|all` requests a page (`offset=0`,
 `limit=20`, maximum 100), returning `total,nextOffset,counts:{active,history}`.

@@ -6,8 +6,18 @@ provides configuration editing, image preprocessing and result visualization.
 It supports Cartesian and polar coordinates, nonlinear B-H materials,
 permanent magnets, and transient analyses with prescribed motion.
 
-**Latest release: v1.7.3** · [Release notes](docs/releases/RELEASE_NOTES_v1.7.3.md) ·
+**Latest release: v1.7.4** · [Release notes](docs/releases/RELEASE_NOTES_v1.7.4.md) ·
 [Changelog](CHANGELOG.md) · [Documentation](docs/README.md)
+
+## v1.7.4
+
+Files now has a unified Edit dialog for names and result descriptions. Results
+shows saved/unsaved notes and preserves drafts during data reloads and result
+switches. Finished job history can be cleared for a selected time range without
+removing result files or active jobs. WebUI runs use an output_webui_ prefix.
+Plot settings offer a shorter color-theme list with gradient previews, and MCP
+dependencies include the latest reviewed security fixes.
+See the [v1.7.4 release notes](docs/releases/RELEASE_NOTES_v1.7.4.md).
 
 ## v1.7.3
 

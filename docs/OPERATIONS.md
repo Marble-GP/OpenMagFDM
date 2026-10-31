@@ -1,6 +1,6 @@
 # Server operations
 
-The release baseline is v1.7.3.
+The release baseline is v1.7.4.
 See [CLI](CLI.md), [REST API](REST_API.md) and [MCP](MCP_INTEGRATION.md).
 
 ## Installation and startup

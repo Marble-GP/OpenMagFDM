@@ -72,6 +72,61 @@ input, select { max-width:100%; color:var(--ink); }
 .panel, .file-preview-panel { background:white; border:1px solid var(--line); border-radius:9px; box-shadow:none; }
 .run-section { gap:20px; }
 .user-files-toolbar { align-items:center; gap:9px; }
+.file-edit-dialog { margin:auto; padding:0; width:min(600px,calc(100vw - 32px)); max-height:calc(100dvh - 32px); overflow:auto; border:1px solid var(--line); border-radius:14px; color:var(--ink); box-shadow:0 24px 80px #10263240; }
+.file-edit-dialog::backdrop { background:#132e4070; }
+.file-edit-dialog [hidden] { display:none!important; }
+.file-edit-dialog .file-edit-header { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:22px 24px 18px; background:white; color:var(--ink); border-bottom:1px solid var(--line); }
+.file-edit-eyebrow { margin:0 0 6px; color:var(--muted); font-size:10px; font-weight:600; letter-spacing:1.5px; }
+.file-edit-dialog h2 { margin:0; font-size:21px; letter-spacing:-.3px; }
+.file-edit-close { padding:0; width:32px; height:32px; flex-shrink:0; font-size:22px; line-height:1; }
+.file-edit-body { padding:20px 24px; }
+.file-edit-target { display:grid; gap:5px; padding:12px 14px; margin-bottom:22px; background:#f3f7f9; border:1px solid var(--line); border-radius:7px; overflow-wrap:anywhere; }
+.file-edit-target span { color:var(--muted); font-size:11px; }
+.file-edit-target strong { font-size:13px; line-height:1.5; }
+.file-edit-field label { display:block; margin-bottom:8px; font-size:13px; font-weight:600; }
+.file-edit-field input,.file-edit-field textarea { width:100%; padding:11px 12px; border:1px solid #b6c8d2; border-radius:7px; background:white; color:var(--ink); font:inherit; font-size:14px; line-height:1.6; }
+.file-edit-field textarea { resize:vertical; min-height:130px; }
+.file-edit-field textarea:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
+.file-edit-field [aria-invalid=true] { border-color:#b33443; }
+.file-edit-help { margin:10px 0 0; color:var(--muted); font-size:12px; line-height:1.6; }
+#fileEditDescriptionField { margin-top:22px; }
+.file-edit-status { margin-top:12px; font-size:13px; line-height:1.6; overflow-wrap:anywhere; }
+.file-edit-status:empty { display:none; }
+.file-edit-status[data-state=error] { padding:10px 12px; border-radius:6px; background:#fff0f0; color:#9a2831; }
+.file-edit-discard { padding:12px; margin-top:14px; border:1px solid #e7caa0; border-radius:7px; background:#fffaef; }
+.file-edit-discard p { margin:0 0 10px; font-size:13px; }
+.file-edit-discard .button-group { display:flex; justify-content:flex-end; gap:8px; }
+.file-edit-footer { display:flex; justify-content:flex-end; gap:10px; padding:16px 24px; background:#f6f9fa; border-top:1px solid var(--line); }
+.result-notes { margin:18px 0; padding:18px; border:1px solid var(--line); border-radius:10px; background:#f8fafb; }
+.result-notes-heading { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:12px; }
+.result-notes-heading label { font-size:14px; font-weight:600; }
+.result-notes-heading p { margin:4px 0 0; font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
+.result-notes-heading > div { min-width:0; }
+.result-notes-badge { flex-shrink:0; font-size:11px; padding:4px 8px; border:1px solid var(--line); border-radius:20px; background:white; color:var(--muted); }
+.result-notes-badge[data-state=dirty] { background:#fff5df; border-color:#e9d39a; color:#785717; }
+.result-notes textarea { display:block; width:100%; min-height:112px; padding:12px; resize:vertical; border:1px solid #b6c8d2; border-radius:7px; background:white; color:var(--ink); font:inherit; font-size:14px; line-height:1.6; }
+.result-notes textarea:focus-visible { outline:3px solid var(--accent); outline-offset:3px; }
+.result-notes-footer { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; margin-top:12px; }
+.result-notes-footer .button-group { display:flex; gap:8px; margin-left:auto; }
+#resultMemoStatus { font-size:12px; color:var(--muted); overflow-wrap:anywhere; }
+#resultMemoStatus[data-state=error] { color:#9a2831; }
+.result-notes-source { margin-top:14px; padding-top:12px; border-top:1px solid var(--line); font-size:12px; }
+.result-notes-source a { color:#087481; text-underline-offset:3px; }
+.file-list-panel { flex:1 1 600px; max-width:none; min-width:0; }
+.file-preview-panel { min-width:0; }
+.file-manager-container:has(.file-preview-panel[style*="display: block"]) .file-list-panel { flex:0 1 600px; }
+.user-file-info { flex-basis:210px; }
+.user-file-actions { flex-shrink:0; }
+@media (max-width:1350px) { .user-file-item { flex-wrap:wrap; } .user-file-actions { width:100%; padding-left:48px; justify-content:flex-start; } }
+@media (max-width:600px) { .file-edit-dialog .file-edit-header,.file-edit-body { padding:16px; } .file-edit-footer { padding:14px 16px; } .user-file-actions { padding-left:0; } }
+.plot-color-picker { position:relative; min-width:220px; }
+.plot-color-picker summary, .plot-color-options button { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:7px 10px; border:1px solid #cbd7df; border-radius:5px; background:#fff; cursor:pointer; }
+.plot-color-picker summary::marker { content:''; }
+.plot-color-options { width:100%; max-height:250px; overflow:auto; padding:4px; background:white; border:1px solid #cbd7df; border-radius:5px; box-shadow:0 4px 10px #0002; }
+.config-row:has(.plot-color-picker[open]) { align-items:flex-start; }
+.plot-color-options button { width:100%; border:0; text-align:left; }
+.plot-color-options button:hover, .plot-color-options button:focus-visible { background:#e4f3f5; }
+.plot-color-swatch { display:inline-block; flex:0 0 100px; height:12px; border:1px solid #777; border-radius:2px; }
 .user-files-toolbar input[type=search],.user-files-toolbar select { padding:8px 10px; border:1px solid #cbd7df; border-radius:6px; background:white; }
 .user-files-toolbar input[type=search] { min-width:180px; flex:1; }
 .file-operation-progress { display:grid; gap:6px; margin:0 0 12px; padding:10px 12px; border:1px solid #b8d5dd; border-radius:6px; background:#edf8fa; color:#123f4b; overflow-wrap:anywhere; }

@@ -32,6 +32,22 @@ const JobsPanel = (() => {
         await request('/api/jobs/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:AppState.userId})});
         await refresh();
     }
+    async function clearHistory() {
+        const period=el('jobsHistoryPeriod').value, workspace=AppState.userId;
+        const label=el('jobsHistoryPeriod').selectedOptions[0].textContent;
+        if(!confirm(`Delete finished job history for ${label}? Results and active jobs are kept. Deleted records can no longer prevent a retry with the same request key.`))return;
+        const button=el('jobsClearHistory'); button.disabled=true;
+        text('jobsHistoryStatus','Deleting history…');
+        try {
+            const result=await request('/api/jobs/history/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:workspace,period})});
+            if(workspace!==AppState.userId)return;
+            selected=null;detailKey=null;offset=0;resultsFingerprint=null;
+            text('jobDetails','Select a job to inspect its status and log.');text('solverOutput','');
+            text('jobsHistoryStatus',`${result.deleted} finished job record(s) deleted.`);
+            await refresh();
+        } catch(error) { text('jobsHistoryStatus',`History deletion failed: ${error.message}`); }
+        finally { button.disabled=false; }
+    }
     function button(label,action) {
         const b=node('button',label);b.type='button';b.className='btn-secondary';
         b.onclick=async()=>{b.disabled=true;try{await action();}catch(e){showStatus('solverStatus',e.message,'error');text('jobsConnection',e.message);}finally{b.disabled=false;}};
@@ -119,9 +135,10 @@ const JobsPanel = (() => {
         el('jobsFilter').onchange=()=>{view=el('jobsFilter').value;offset=0;void refresh();};
         el('jobsPrevious').onclick=()=>{offset=Math.max(0,offset-20);void refresh();};
         el('jobsNext').onclick=()=>{if(next!==null){offset=next;void refresh();}};
+        el('jobsClearHistory').onclick=()=>void clearHistory();
         void poll();
     });
     window.addEventListener('pagehide',()=>{stopped=true;clearTimeout(timer);});
     window.addEventListener('pageshow',event=>{if(event.persisted){stopped=false;void poll();}});
-    return {submit,cancel,refresh,resume,openResult};
+    return {submit,cancel,refresh,resume,openResult,clearHistory};
 })();

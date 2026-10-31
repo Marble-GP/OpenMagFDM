@@ -78,7 +78,7 @@ async function browser(exe, label, url, base, root) {
             await cdp.evaluate(`document.getElementById('resultSelect').value=${JSON.stringify(job.resultPath)}; updateCustomSelectDisplay(${JSON.stringify(job.resultPath)}); loadSelectedResult()`);
         };
         await loadJobResult();
-        await until(()=>cdp.evaluate("Boolean(AppState.resultsData.currentResult) && !document.getElementById('resultMemoSave').disabled"),`${label} result loaded`);
+        await until(()=>cdp.evaluate("Boolean(AppState.resultsData.currentResult) && !document.getElementById('resultMemoText').disabled"),`${label} result loaded`);
         await cdp.evaluate("document.getElementById('resultMemoText').value='Browser acceptance description'; ResultImprovements.save()");
         await loadJobResult();
         await until(()=>cdp.evaluate("document.getElementById('resultMemoText').value==='Browser acceptance description'"),`${label} saved description`);
