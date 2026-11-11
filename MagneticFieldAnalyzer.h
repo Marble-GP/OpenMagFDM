@@ -288,38 +288,15 @@ public:
     void calculateForceShellIntegration(int step = -1, int shell_thickness = 3);
 
     /**
-     * @brief [DEFAULT] Calculate electromagnetic force using Distributed Amperian Force method
-     * @param step Step number for field caching (-1 for static analysis)
-     * @param sigma_smooth Gaussian smoothing sigma for magnetization (default: 0.0 = no smoothing)
-     *
-     * THIS IS THE RECOMMENDED AND DEFAULT FORCE CALCULATION METHOD.
-     *
-     * This method converts magnetization M to equivalent bound current and uses Lorentz force:
-     *   M = B/μ₀ - H (magnetization, exactly 0 in air where μ_r = 1)
-     *   J_b = ∇ × M (bound current from curl of magnetization)
-     *   F = ∫ J_b × B dV (Lorentz force on bound current)
-     *
-     * Key advantages over other methods:
-     * - NO ghost force: M = 0 exactly in air (μ_r = 1), so J_b = 0 in air
-     * - Surface magnetization current automatically captured via numerical curl
-     * - Optional Gaussian smoothing reduces numerical noise while preserving physics
-     * - Avoids jaggy boundary issues inherent to surface integral methods
-     * - Robust for complex geometries with multiple materials
-     * - Results closely match Virtual Work principle (energy-based) method
-     *
-     * For 2D (z-invariant): J_bz = ∂My/∂x - ∂Mx/∂y
-     *                       F = J × B where J = (0, 0, Jz), B = (Bx, By, 0)
-     *                       => Fx = -Jz·By, Fy = +Jz·Bx
-     *
-     * Physics note: For constant-current sources (Jz specified), the force is
-     * F = +∂W'/∂x|_I (co-energy derivative). For linear materials W' = W.
-     *
-     * Note on nonlinear materials: The Amperian method F = J × B is robust because
-     * it only depends on J and B, not on the B(H) constitutive relation. The code
-     * uses secant permeability μr := B/(H·μ0), so B = μr·μ0·H at each point.
-     * Virtual Work now computes true co-energy W' = ∫B dH for nonlinear materials.
-     *
-     * Results are stored in force_results_amperian member.
+     * Single-state, body-local Amperian force (per unit axial depth).
+     * Includes free current, prescribed permanent magnetization and induced
+     * magnetization using the field operator's face reluctivity/gradient.
+     * Each calc_force material owns its sources BEFORE differentiation.
+     * Summed touching-material loads are additive; individual contact loads
+     * are not certified mechanical interface tractions.
+     * Magnetized bodies must not touch a nonperiodic domain boundary.
+     * sigma_smooth is retained for source compatibility; only zero is supported.
+     * No neighbouring time steps, smoothing or additional field solves are used.
      */
     void calculateForceDistributedAmperian(int step = -1, double sigma_smooth = 0.0);
 
