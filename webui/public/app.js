@@ -11356,32 +11356,10 @@ async function loadFluxLinkageData(providedResultPath = null, signal = null) {
         const text = await response.text();
         if (!text || !text.trim()) return null;
 
-        const lines = text.trim().split(/\r?\n/);
-        if (lines.length < 2) return null;
-        const headers = lines[0].split(',').map(s => s.trim());
-        if (headers[0].toLowerCase() !== 'step' || headers.length < 2) return null;
-        const phiNames = headers.slice(1);
-        const steps = [];
-        const phiSeries = {};
-        phiNames.forEach(n => { phiSeries[n] = []; });
-        for (let i = 1; i < lines.length; i++) {
-            const parts = lines[i].split(',');
-            if (parts.length < 1) continue;
-            const step = Number(parts[0]);
-            if (!Number.isFinite(step)) continue;
-            steps.push(step);
-            for (let k = 0; k < phiNames.length; k++) {
-                const v = Number(parts[k + 1]);
-                phiSeries[phiNames[k]].push(Number.isFinite(v) ? v : null);
-            }
-        }
-        if (steps.length === 0) return null;
-
-        return { headers, phiNames, steps, phiSeries };
+        return FluxFilter.parseFlux(text);
     } catch (e) {
         if (e && e.name === 'AbortError') throw e;
-        console.error('loadFluxLinkageData failed:', e);
-        return null;
+        throw e;
     }
 }
 
@@ -11396,145 +11374,154 @@ function fluxPhaseColor(name) {
     return null;
 }
 
-async function renderFluxLinkageTime(containerId, step, renderContext = null) {
-    const container = document.getElementById(containerId);
-    if (!container) return;
-    renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
-    try {
-        const data = await loadFluxLinkageData(renderContext.resultPath, renderContext.controller.signal);
-        assertRenderContextCurrent(renderContext, container);
-        if (!data || data.steps.length === 0) {
-            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">'
-                + 'No flux_linkage.csv in this result.<br>'
-                + 'Define <code>flux_linkage:</code> in the YAML and rerun the transient analysis.'
-                + '</div>', renderContext);
-            return;
-        }
-
-        preparePlotlyContainer(container, renderContext);
-        const size = getContainerSize(container);
-
-        // CSV step column is 0-based to match the solver's `step 0:` print;
-        // display as 1-based so it lines up with "Step 1/N" elsewhere in the UI.
-        const xSteps = data.steps.map(s => s + 1);
-        const traces = data.phiNames.map(name => {
-            const color = fluxPhaseColor(name);
-            const trace = {
-                x: xSteps,
-                y: data.phiSeries[name],
-                type: 'scatter',
-                mode: 'lines+markers',
-                name,
-                line: { width: 2 },
-                marker: { size: 6 }
-            };
-            if (color) { trace.line.color = color; trace.marker.color = color; }
-            return trace;
-        });
-
-        const legendConfig = traces.length <= 3
-            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
-            : { x: 1.02, y: 1, xanchor: 'left' };
-
-        await newPlotForRender(container, traces, {
-            width: size.width,
-            height: size.height,
-            margin: { l: 60, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', zeroline: false },
-            yaxis: { title: 'Φ [Wb/m]', zeroline: true, tickformat: '.2e' },
-            legend: legendConfig,
-            showlegend: true,
-            hovermode: 'closest'
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
-    } catch (error) {
-        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
-            discardStaleRender(container, renderContext);
-            return;
-        }
-        console.error('Flux linkage time plot error:', error);
-        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
-    }
+function fluxFilterSettings(plotId, resultPath = getCurrentResultPath()) {
+    const saved = AppState.plotConfigs[plotId]?.fluxFilter;
+    // A period asserted for one result must never leak into another model.
+    return FluxFilter.options(saved && saved.resultPath === resultPath ? saved : {});
 }
 
-async function renderBackEMFTime(containerId, step, renderContext = null) {
+function fluxFilterControls(plotId) {
+    const settings = fluxFilterSettings(plotId);
+    return `<fieldset class="flux-filter-controls"><legend>Flux / EMF estimate</legend>
+        <div class="config-row"><label for="fluxMode_${plotId}">Processing:</label>
+        <select id="fluxMode_${plotId}" onchange="updateFluxFilterInputs('${plotId}')">
+            <option value="off" ${settings.mode === 'off' ? 'selected' : ''}>Off — raw data</option>
+            <option value="local" ${settings.mode === 'local' ? 'selected' : ''}>Robust local fit</option>
+            <option value="periodic" ${settings.mode === 'periodic' ? 'selected' : ''}>Repeating-state blend + local fit</option>
+        </select></div>
+        <div class="config-row"><label for="fluxWindow_${plotId}">Fit window:</label>
+            <input type="number" id="fluxWindow_${plotId}" min="5" max="51" step="2" value="${settings.window}" ${settings.mode === 'off' ? 'disabled' : ''}><span>samples (odd)</span></div>
+        <div class="config-row"><label for="fluxPeriod_${plotId}">Full-state period:</label>
+            <input type="number" id="fluxPeriod_${plotId}" min="6" step="1" value="${settings.period || ''}" ${settings.mode !== 'periodic' ? 'disabled' : ''}><span>steps</span></div>
+        <p class="flux-filter-help">Fit the flux first, then differentiate the fitted curve. Raw data stays visible; solver files are unchanged.
+        Adaptive weights reduce isolated deviations but may also change real harmonics.</p>
+        <p class="flux-filter-help">Repeating-state mode needs at least two periods. Specify a period in which <strong>geometry, excitation and boundary conditions all repeat</strong>.
+        Equal rotor angle or translated position alone is not enough. Non-converged points and gaps are not filled.</p>
+        <p id="fluxError_${plotId}" class="flux-filter-error" role="alert" tabindex="-1"></p>
+        </fieldset>`;
+}
+
+function updateFluxFilterInputs(plotId) {
+    const mode = document.getElementById('fluxMode_' + plotId).value;
+    document.getElementById('fluxWindow_' + plotId).disabled = mode === 'off';
+    document.getElementById('fluxPeriod_' + plotId).disabled = mode !== 'periodic';
+}
+
+async function loadFluxQuality(resultPath, signal) {
+    const response = await fetch(`/api/load-csv-raw?result=${encodeURIComponent(resultPath)}&file=FluxLinkage/flux_linkage_status.csv`, {cache: 'no-store', signal});
+    if (response.status === 404) return null; // Legacy result; quality is unknown.
+    if (!response.ok) throw Error('Quality metadata unavailable; estimate withheld.');
+    return FluxFilter.parseStatus(await response.text());
+}
+
+function calculateFluxEstimate(data, settings, status, signal) {
+    if (signal.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    if (settings.mode === 'off') return Promise.resolve(FluxFilter.analyze(data, settings, status));
+    if (typeof Worker === 'undefined') {
+        if (data.steps.length * data.phiNames.length > 5000) return Promise.reject(Error('A Web Worker is required to filter this many samples.'));
+        return Promise.resolve(FluxFilter.analyze(data, settings, status));
+    }
+    return new Promise((resolve, reject) => {
+        const worker = new Worker('flux-filter-worker.js');
+        const finish = (error, result) => {
+            signal.removeEventListener('abort', abort); worker.terminate();
+            if (error) reject(error); else resolve(result);
+        };
+        const abort = () => finish(new DOMException('Aborted', 'AbortError'));
+        signal.addEventListener('abort', abort, {once: true});
+        worker.onmessage = event => finish(event.data.error ? Error(event.data.error) : null, event.data.result);
+        worker.onerror = () => finish(Error('Flux estimate worker failed; raw results remain available with processing Off.'));
+        worker.postMessage({data, settings, status});
+    });
+}
+
+async function renderFluxTimeline(containerId, step, renderContext, derivative) {
     const container = document.getElementById(containerId);
     if (!container) return;
     renderContext = ensureDashboardRenderContext(containerId, step, renderContext);
+    const plotId = containerId.replace('container-', '');
+    const settings = fluxFilterSettings(plotId, renderContext.resultPath);
     try {
         const data = await loadFluxLinkageData(renderContext.resultPath, renderContext.controller.signal);
         assertRenderContextCurrent(renderContext, container);
-        if (!data || data.steps.length < 2) {
-            showPlotMessage(container, '<div style="padding: 20px; text-align: center; color: #999;">'
-                + 'Need at least 2 transient steps to compute dΦ/dstep.<br>'
-                + 'Define <code>flux_linkage:</code> and run a transient analysis (total_steps ≥ 2).'
-                + '</div>', renderContext);
+        if (!data || data.steps.length < (derivative ? 2 : 1)) {
+            showPlotMessage(container, '<div style="padding:20px">Flux linkage data is not available. Define flux_linkage in the YAML and run a transient analysis.</div>', renderContext);
             return;
         }
-
+        let quality = null, qualityError = '';
+        if (settings.mode !== 'off') {
+            try { quality = await loadFluxQuality(renderContext.resultPath, renderContext.controller.signal); }
+            catch (error) { if (error.name === 'AbortError') throw error; qualityError = error.message; }
+        }
+        let actualSettings = qualityError ? {...settings, mode: 'off'} : settings, analysis;
+        try { analysis = await calculateFluxEstimate(data, actualSettings, quality, renderContext.controller.signal); }
+        catch (error) {
+            if (error.name === 'AbortError') throw error;
+            qualityError = error.message;
+            actualSettings = {...settings, mode: 'off'};
+            analysis = FluxFilter.analyze(data, actualSettings, quality);
+        }
+        assertRenderContextCurrent(renderContext, container);
+        const traces = [], notes = new Set();
+        let excluded = 0, pooled = 0, maxDifference = 0;
+        const colors = ['#d62728', '#2ca02c', '#1f77b4', '#9467bd', '#8c564b', '#17becf'];
+        data.phiNames.forEach((name, index) => {
+            const result = analysis[name], color = fluxPhaseColor(name) || colors[index % colors.length];
+            const label = derivative ? name.replace(/^Phi/i, 'EMF').replace(/^Φ/i, 'EMF') : name;
+            const x = derivative ? result.x.map(v => v + 1) : data.steps.map(v => v + 1);
+            const raw = derivative ? result.raw : data.phiSeries[name];
+            const estimated = derivative ? result.estimated : result.smoothed;
+            const filtered = actualSettings.mode !== 'off';
+            traces.push({x, y: raw, type: 'scatter', mode: 'lines+markers', name: filtered ? `${label} (raw)` : label,
+                line: {width: filtered ? 1 : 2, color, dash: filtered ? 'dot' : 'solid'}, marker: {size: 4, color}, opacity: filtered ? .45 : 1, connectgaps: false});
+            if (filtered && estimated.some(Number.isFinite)) traces.push({x, y: estimated, type: 'scatter', mode: 'lines', name: `${label} (estimate)`,
+                line: {width: 2.5, color}, connectgaps: false, customdata: raw,
+                hovertemplate: 'Step %{x}<br>Estimate %{y:.6e}<br>Raw %{customdata:.6e}<extra>%{fullData.name}</extra>'});
+            excluded = Math.max(excluded, result.excluded); pooled = Math.max(pooled, result.pooled);
+            if (Number.isFinite(result.differenceRms)) maxDifference = Math.max(maxDifference, result.differenceRms);
+            if (filtered && result.note) notes.add(result.note);
+        });
+        let note = derivative ? 'Derivative per step — physical time is not stored; this is not voltage in V.' : '';
+        if (settings.mode !== 'off') {
+            note = qualityError || `${settings.mode === 'periodic' ? 'Repeating state' : 'Robust local fit'} · ${settings.window} samples · ${excluded} excluded${pooled ? ` · ${pooled} matched samples` : ''} · ${quality === null ? 'convergence metadata unavailable' : 'convergence metadata applied'}`;
+            note += '<br>' + (qualityError ? 'Raw data retained.' : Array.from(notes).join(' '));
+            if (derivative && !qualityError) note += `<br>Max RMS difference from raw derivative: ${maxDifference.toExponential(3)} (not an error bound).`;
+        }
         preparePlotlyContainer(container, renderContext);
-        const size = getContainerSize(container);
-
-        // Forward-difference EMF ∝ -ΔΦ/Δstep, plotted at the midpoint
-        // between adjacent steps. We don't divide by physical Δt here —
-        // the solver doesn't write it to the CSV — so this is "EMF in
-        // Wb/m per step". For a uniformly-rotating rotor (Δstep ↔
-        // constant electrical angle), the shape and amplitude of this
-        // curve is exactly the back-EMF up to a known (RPM, pole-pair)
-        // scale factor the user can apply downstream.
-        const xCenters = [];
-        const dPhi = {};
-        data.phiNames.forEach(n => { dPhi[n] = []; });
-        for (let i = 1; i < data.steps.length; i++) {
-            // midpoint, in 1-based display coords
-            xCenters.push(data.steps[i - 1] + 1.5);
-            for (const name of data.phiNames) {
-                const a = data.phiSeries[name][i - 1];
-                const b = data.phiSeries[name][i];
-                dPhi[name].push((a == null || b == null) ? null : -(b - a));
+        const size = getContainerSize(container), config = AppState.plotConfigs[plotId] || {};
+        const lineLength = Math.max(28, Math.floor((size.width - 90) / 5.3));
+        const noteLines = note ? note.split('<br>').flatMap(line => {
+            const lines = [''];
+            for (const word of line.split(' ')) {
+                if (lines[lines.length - 1].length + word.length > lineLength) lines.push('');
+                lines[lines.length - 1] += (lines[lines.length - 1] ? ' ' : '') + word;
             }
-        }
-
-        const traces = data.phiNames.map(name => {
-            const color = fluxPhaseColor(name);
-            // Rename Φ_* → EMF_* in the legend so the user can tell at a
-            // glance which palette item produced this trace.
-            const legendName = name.replace(/^Phi/i, 'EMF').replace(/^Φ/i, 'EMF');
-            const trace = {
-                x: xCenters,
-                y: dPhi[name],
-                type: 'scatter',
-                mode: 'lines+markers',
-                name: legendName,
-                line: { width: 2 },
-                marker: { size: 6 }
-            };
-            if (color) { trace.line.color = color; trace.marker.color = color; }
-            return trace;
-        });
-
-        const legendConfig = traces.length <= 3
-            ? { x: 0.02, y: 0.98, xanchor: 'left', yanchor: 'top' }
-            : { x: 1.02, y: 1, xanchor: 'left' };
-
-        await newPlotForRender(container, traces, {
-            width: size.width,
-            height: size.height,
-            margin: { l: 60, r: 10, t: 10, b: 35 },
-            xaxis: { title: 'Step', zeroline: false },
-            yaxis: { title: '-dΦ/dstep [Wb/m per step]', zeroline: true, tickformat: '.2e' },
-            legend: legendConfig,
-            showlegend: true,
-            hovermode: 'closest'
-        }, { responsive: true, displayModeBar: AppState.showPlotlyModeBar }, renderContext);
+            return lines;
+        }) : [];
+        const layout = {
+            width: size.width, height: size.height, margin: {l: 65, r: 20, t: note ? 25 + noteLines.length * 13 : 20, b: 60},
+            xaxis: {title: 'Step', zeroline: false},
+            yaxis: {title: derivative ? '-dΦ/dstep [Wb/m per step]' : 'Φ [Wb/m]', zeroline: true, tickformat: '.2e'},
+            legend: {orientation: 'h', x: 0, y: -.18}, showlegend: true, hovermode: 'closest',
+            annotations: note ? [{xref: 'paper', yref: 'paper', x: 0, y: 1.04, xanchor: 'left', yanchor: 'bottom', showarrow: false,
+                align: 'left', font: {size: 10, color: '#526477'}, text: noteLines.map(fileManagerEscape).join('<br>')}] : []
+        };
+        if (Array.isArray(config.xRange)) layout.xaxis.range = config.xRange;
+        if (Array.isArray(config.yRange)) layout.yaxis.range = config.yRange;
+        await newPlotForRender(container, traces, layout, {responsive: true, displayModeBar: AppState.showPlotlyModeBar}, renderContext);
     } catch (error) {
-        if ((error && error.name === 'AbortError') || !isRenderContextCurrent(renderContext, container)) {
-            discardStaleRender(container, renderContext);
-            return;
-        }
-        console.error('Back-EMF time plot error:', error);
-        showPlotMessage(container, `<div style="padding: 20px; text-align: center; color: red;">Error: ${error.message}</div>`, renderContext);
+        if (error.name === 'AbortError' || !isRenderContextCurrent(renderContext, container)) { discardStaleRender(container, renderContext); return; }
+        showPlotMessage(container, `<div style="padding:20px">${fileManagerEscape(error.message)}</div>`, renderContext);
     }
 }
+
+async function renderFluxLinkageTime(containerId, step, renderContext = null) {
+    return renderFluxTimeline(containerId, step, renderContext, false);
+}
+async function renderBackEMFTime(containerId, step, renderContext = null) {
+    return renderFluxTimeline(containerId, step, renderContext, true);
+}
+
 
 async function renderEnergyTime(containerId, step, renderContext = null) {
     const container = document.getElementById(containerId);
@@ -13526,6 +13513,10 @@ function openPlotConfigModal() {
                 </div>
         `;
 
+        if (['flux_linkage_time', 'back_emf_time'].includes(plotType)) {
+            html += fluxFilterControls(plotId);
+        }
+
         if (isHeatmap) {
             html += `
                 <!-- Z-axis (colorscale) range -->
@@ -13591,6 +13582,21 @@ function toggleRangeInputs(plotId, axis, mode) {
 function applyPlotConfigs() {
     const items = AppState.gridStack ? AppState.gridStack.getGridItems() : [];
 
+    const fluxFilters = new Map();
+    for (const item of items) {
+        const plotId = item.getAttribute('data-plot-id');
+        if (!document.getElementById('fluxMode_' + plotId)) continue;
+        const errorBox = document.getElementById('fluxError_' + plotId);
+        errorBox.textContent = '';
+        try {
+            fluxFilters.set(plotId, {...FluxFilter.options({
+                mode: document.getElementById('fluxMode_' + plotId).value,
+                window: document.getElementById('fluxWindow_' + plotId).value,
+                period: document.getElementById('fluxPeriod_' + plotId).value
+            }), resultPath: getCurrentResultPath()});
+        } catch (error) { errorBox.textContent = error.message; errorBox.focus(); return; }
+    }
+
     items.forEach(item => {
         const plotId = item.getAttribute('data-plot-id');
         const plotType = item.getAttribute('data-plot-type');
@@ -13639,6 +13645,8 @@ function applyPlotConfigs() {
             const colorscale = document.getElementById(`colorscale_${plotId}`)?.value;
             config.colorscale = colorscale || 'Viridis';
         }
+
+        if (fluxFilters.has(plotId)) config.fluxFilter = fluxFilters.get(plotId);
 
         // Save config
         AppState.plotConfigs[plotId] = config;
