@@ -15,6 +15,8 @@ class AutomationRuntime {
     constructor(base,backend,options={}) {
         this.base=base;this.backend=backend;this.access=new Access(base,options);this.jobs=new AnalysisJobs(base,this.access,backend);
         this.images=new Images(backend);this.transfers=new Transfers();this.listener=null;this.handler=null;this.error=null;this.ready=false;this.active=0;this.closed=false;
+        this.retryTimer=null;this.retryAt=null;this.retryAttempt=0;
+        this.retryBaseMs=options.listenerRetryBaseMs??1000;
     }
     async init() {
         this.initializing=(async()=>{
@@ -23,14 +25,28 @@ class AutomationRuntime {
         })();
         return this.initializing;
     }
-    status() {return {...this.access.summary(),ready:this.ready,listening:!!this.listener?.listening,error:this.error,url:`http://127.0.0.1:${this.access.state.port}/mcp`};}
+    status() {return {...this.access.summary(),ready:this.ready,listening:!!this.listener?.listening,error:this.error,retrying:!!this.retryTimer,retryAt:this.retryAt,url:`http://127.0.0.1:${this.access.state.port}/mcp`};}
+    cancelRetry(){clearTimeout(this.retryTimer);this.retryTimer=null;this.retryAt=null;}
+    scheduleRetry(){
+        if(this.closed||!this.ready||!this.access.state.enabled||this.retryTimer)return;
+        const delay=Math.min(30000,this.retryBaseMs*2**Math.min(this.retryAttempt++,5));
+        this.retryAt=new Date(Date.now()+delay).toISOString();
+        this.retryTimer=setTimeout(()=>{
+            this.retryTimer=null;this.retryAt=null;
+            void this.reconfigure(true).catch(()=>{
+                this.error='MCP listener recovery failed; automatic retry pending';this.scheduleRetry();
+            });
+        },delay);
+        this.retryTimer.unref();
+    }
     async stopListener() {
         const server=this.listener;this.listener=null;
         if(this.handler){await this.handler.close();this.handler=null;}
         if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
     }
-    async reconfigure() {
+    async reconfigure(retry=false) {
         return locked(`${this.access.filename}:listener`,async()=>{
+            this.cancelRetry();if(!retry)this.retryAttempt=0;
             await this.stopListener();this.error=null;
             if(this.closed||!this.ready||!this.access.state.enabled)return;
             this.handler=createMcpHandler(ctx=>serverFor(this.access.actor(ctx.authInfo.clientId),this),{legacy:'stateless',maxRequestBodySize:2*1024*1024,maxSubscriptions:8});
@@ -53,17 +69,24 @@ class AutomationRuntime {
             try {
                 await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(this.access.state.port,'127.0.0.1',()=>{server.removeListener('error',reject);resolve();});});
                 this.listener=server;
+                this.retryAttempt=0;
                 server.on('error',e=>{this.error=`MCP listener failed (${e.code||'IO_ERROR'})`;});
-            }catch(e){this.error=`MCP port ${this.access.state.port} unavailable (${e.code||'BIND_FAILED'}); WebUI remains available`;await this.handler.close();this.handler=null;}
+            }catch(e){
+                this.error=`MCP port ${this.access.state.port} unavailable (${e.code||'BIND_FAILED'}); WebUI remains available`;
+                await this.handler.close();this.handler=null;
+                if(['EADDRINUSE','EADDRNOTAVAIL'].includes(e.code))this.scheduleRetry();
+            }
         });
     }
     async close(){
         this.closed=true;this.jobs.stop();this.ready=false;this.access.ready=false;
+        this.cancelRetry();
         await this.initializing;
         await locked(`${this.access.filename}:listener`,()=>this.stopListener());
         await this.transfers.close();await this.images.close?.();await this.access.flush();
     }
     async testConnection(id) {
+        if(!this.listener?.listening)fail('MCP_UNAVAILABLE',this.error||'MCP is not listening; check enabled state and port.',503);
         const actor=this.access.actor(id);actor.guard('read');
         const filename=path.join(this.access.directory,`${id}.json`);await noLinks(filename);
         const {token}=JSON.parse(await fs.readFile(filename,'utf8'));

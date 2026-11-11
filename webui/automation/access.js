@@ -32,10 +32,22 @@ async function restrict(directory) {
         catch { fail('PRIVATE_STORAGE_ACL', 'Cannot protect private storage with Windows access permissions'); }
     } else await fs.chmod(directory, 0o700);
 }
-async function atomicJSON(filename, data) {
+async function atomicJSON(filename, data, { durable = false } = {}) {
     await noLinks(filename, { missing: true });
     const temp = `${filename}.${crypto.randomUUID()}.tmp`;
-    try { await fs.writeFile(temp, JSON.stringify(data, null, 2), { flag: 'wx', mode: 0o600 }); await fs.rename(temp, filename); }
+    try {
+        // Acknowledge credentials/settings only after their contents reach the
+        // filesystem. Atomic rename alone protects against process termination,
+        // but not dirty file-cache contents during an OS crash/power loss.
+        const handle = await fs.open(temp, 'wx', 0o600);
+        try { await handle.writeFile(JSON.stringify(data, null, 2)); if (durable) await handle.sync(); }
+        finally { await handle.close(); }
+        await fs.rename(temp, filename);
+        if (durable && process.platform !== 'win32') {
+            const directory = await fs.open(path.dirname(filename), 'r');
+            try { await directory.sync(); } finally { await directory.close(); }
+        }
+    }
     finally { await fs.rm(temp, { force: true }); }
 }
 function localRequest(req) {
@@ -81,7 +93,18 @@ class Access {
                 if (!/^[a-f0-9]{64}$/.test(entry.hash) || !/^[A-Za-z0-9_-]{43}$/.test(entry.csrf) || !Number.isFinite(entry.expires)) throw Error('Invalid browser session');
                 if (entry.expires > Date.now()) this.sessions.set(entry.hash, {csrf:entry.csrf,expires:entry.expires,remember:true});
             }
-        } catch (e) { if (e.code !== 'ENOENT') throw e; await atomicJSON(this.filename, this.state); }
+        } catch (e) {
+            if (e.code !== 'ENOENT') {
+                if (e instanceof SyntaxError || !e.code) fail('MCP_SETTINGS_INVALID', 'MCP settings are invalid; existing credentials were not replaced.', 503);
+                throw e;
+            }
+            // Do not silently reset authorization if only settings.json was
+            // lost. An older backup could also resurrect revoked credentials.
+            const files = await fs.readdir(this.directory);
+            if (files.some(name => /^[a-f0-9-]{36}\.json$/.test(name)))
+                fail('MCP_SETTINGS_MISSING', 'MCP settings are missing while credential profiles remain; restore the private settings directory.', 503);
+            await atomicJSON(this.filename, this.state, { durable: true });
+        }
         await atomicJSON(path.join(this.directory, 'pairing.json'), { code: this.pairingCode });
         this.ready = true;
     }
@@ -93,7 +116,7 @@ class Access {
         return locked(this.filename, async () => {
             const next = structuredClone(this.state);
             const result = await fn(next);
-            await atomicJSON(this.filename, next);
+            await atomicJSON(this.filename, next, { durable: true });
             this.state = next;
             return result;
         });
@@ -109,7 +132,7 @@ class Access {
         await this.change(async next => {
             if (next.connections.length >= 100) fail('LIMIT_EXCEEDED', 'At most 100 connection profiles are allowed');
             // The bridge reads this OS-private profile. It is never served over HTTP.
-            await atomicJSON(path.join(this.directory, `${connection.id}.json`), { token, id: connection.id });
+            await atomicJSON(path.join(this.directory, `${connection.id}.json`), { token, id: connection.id }, { durable: true });
             next.connections.push(connection);
         });
         return { id: connection.id, token };

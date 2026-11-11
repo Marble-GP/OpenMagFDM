@@ -29,7 +29,16 @@ Packaged stdio uses `webui-server[.exe] --mcp-stdio --connection <id>`.
 Source stdio uses Node, the absolute launcher path and remaining arguments.
 Copy the displayed settings. Stdio bridges to an already running server; it
 does not start the server or enable MCP. A raw HTTP token is shown only at
-creation; a connection ID is not a token. Restart client connections after changes.
+creation; a connection ID is not a token.
+
+Connections survive server restarts: HTTP clients keep the same URL and token,
+the stdio bridge re-reads the saved port on reconnect and waits up to 30 s for
+a server that starts later, and a listener that lost its port retries binding
+automatically. Calls interrupted by such an outage are reported as not
+completed and must be retried by the client; the bridge never replays them.
+Change the URL of a direct HTTP client when the saved MCP port changes.
+Authorization failures (401/403) always mean the token, revocation state or
+enabled state — not a restart.
 
 ## Workspaces and permissions
 
@@ -64,8 +73,9 @@ and MCP management pairing/CSRF are separate mechanisms.
 | Symptom | Check |
 |---|---|
 | GUI Test passes, client fails | Client URL/token or command/arguments; restart connection |
-| Connection refused | Server running, MCP enabled/listening, port conflict |
+| Connection refused | Server running, MCP enabled/listening, port conflict; the listener retries binding automatically once the port is free |
 | Stdio failure | Same OS account/install, absolute executable path and arguments |
+| "Authorization was refused" after a restart | Token, revocation state or MCP enabled state — restarts do not invalidate tokens |
 | Missing files | Assigned workspace, ownership, permissions and browser workspace ID |
 | 409 conflict | Retrieve revision and rebuild the operation |
 | Lost token | Revoke the old connection and create a replacement |
