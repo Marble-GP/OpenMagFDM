@@ -3,6 +3,18 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/archive/research/`.
 
+## Unreleased
+
+- Recover MCP connections across server restarts without re-issuing tokens:
+  retry the listener bind after a port conflict, reload the port in the stdio
+  bridge on reconnect, and wait a bounded time for a server that starts later.
+- Report MCP authorization refusals separately from transport outages in the
+  bridge and the connection test, and show the automatic bind retry state in
+  Help & Integrations.
+- Persist MCP credentials and settings with synchronous disk acknowledgement,
+  and fail loudly when private settings are corrupt or missing instead of
+  silently resetting authorization state.
+
 ## 1.7.4 — 2026-10-31
 
 - Add one Files Edit dialog for filenames and result descriptions, with revision

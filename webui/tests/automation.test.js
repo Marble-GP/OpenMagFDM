@@ -219,7 +219,8 @@ test('stdio bridge uses the same server and exits without cancelling a running a
     try {
         const result=await client.callTool({name:'workspace_status',arguments:{}});assert.equal(result.structuredContent.workspace,'user_a');
         await f.runtime.access.update(f.a.id,{revoked:true});
-        assert.equal((await client.callTool({name:'files_list',arguments:{}})).isError,true);
+        const refused=await client.callTool({name:'files_list',arguments:{}});assert.equal(refused.isError,true);
+        assert.match(refused.content?.[0]?.text,/authorization was refused/i,'revocation is not reported as a transport outage');
     }finally{await client.close();}
     assert.equal(f.runtime.listener.listening,true);
     assert.equal(f.starts(),1);assert.equal(f.backend.jobs.get(job.jobId).process.running,true);
@@ -325,4 +326,114 @@ test('hidden descendants cannot bypass recursive link rejection',async t=>{
     const f=await fixture(t);await fs.mkdir(await f.wa.resolve('results/a/.inputs',{create:true,internal:true}),{recursive:true});
     await fs.symlink(path.join(f.base,'configs','user_b'),path.join(f.base,'outputs','user_a','a','.inputs','escape'),'junction');
     await assert.rejects(f.wa.describe('results/a'),{code:'UNSAFE_PATH'});
+});
+
+test('connected HTTP clients recover after a runtime restart without a new token',async t=>{
+    const f=await fixture(t);f.runtime.access.state.port=0;await f.runtime.reconfigure();
+    const port=f.runtime.listener.address().port;await f.runtime.access.change(s=>{s.port=port;});
+    const url=new URL(`http://127.0.0.1:${port}/mcp`);
+    const client=new Client({name:'restart-client',version:'1'});
+    await client.connect(new StreamableHTTPClientTransport(url,{requestInit:{headers:{Authorization:`Bearer ${f.a.token}`}}}),{timeout:5000});
+    let restored;
+    try {
+        await client.callTool({name:'workspace_status',arguments:{}});
+        await f.runtime.close();
+        await assert.rejects(client.callTool({name:'workspace_status',arguments:{}}),undefined,'calls fail while the server is down');
+        restored=new AutomationRuntime(f.base,f.backend,{directory:f.runtime.access.directory});
+        await restored.init();
+        assert.equal(restored.status().listening,true);
+        assert.equal(restored.access.authenticate(`Bearer ${f.a.token}`).id,f.a.id,'the original token still authenticates');
+        const result=await client.callTool({name:'workspace_status',arguments:{}});
+        assert.equal(result.structuredContent.workspace,'user_a');
+    }finally{await client.close();await restored?.close();}
+});
+test('MCP listener retries binding and recovers automatically when the port is released',async t=>{
+    const f=await fixture(t);
+    const http=require('node:http');
+    const directory=path.join(f.temp,'private-retry');
+    const runtime=new AutomationRuntime(f.base,f.backend,{directory,listenerRetryBaseMs:25});
+    await runtime.init();
+    t.after(()=>runtime.close());
+    await runtime.access.change(s=>{s.enabled=true;});
+    const a=await runtime.access.create({name:'Retry probe',user:'user_a',permissions:['read']});
+    const occupied=await new Promise(resolve=>{const s=http.createServer().listen(0,'127.0.0.1',()=>resolve(s));});
+    t.after(()=>new Promise(resolve=>occupied.close(resolve)));
+    await runtime.access.change(s=>{s.port=occupied.address().port;});await runtime.reconfigure();
+    assert.equal(runtime.status().listening,false);assert.match(runtime.error,/EADDRINUSE/);
+    assert.equal(runtime.status().retrying,true,'a bounded automatic retry is scheduled');
+    await assert.rejects(runtime.testConnection(a.id),{code:'MCP_UNAVAILABLE'});
+    await new Promise(resolve=>occupied.close(resolve));
+    await new Promise((resolve,reject)=>{const started=Date.now();const poll=setInterval(()=>{
+        if(runtime.status().listening){clearInterval(poll);resolve();}
+        else if(Date.now()-started>5000){clearInterval(poll);reject(new Error(`listener did not recover: ${runtime.error}`));}
+    },20);});
+    assert.equal(runtime.status().retrying,false);
+    const client=new Client({name:'retry-client',version:'1'});
+    try {
+        await client.connect(new StreamableHTTPClientTransport(new URL(runtime.status().url),{requestInit:{headers:{Authorization:`Bearer ${a.token}`}}}),{timeout:5000});
+        const result=await client.callTool({name:'workspace_status',arguments:{}});assert.equal(result.structuredContent.workspace,'user_a');
+    }finally{await client.close();}
+});
+test('stdio bridge reconnects to a changed server port without restarting and reports the interrupted call',async t=>{
+    const f=await fixture(t);f.runtime.access.state.port=0;await f.runtime.reconfigure();
+    await f.runtime.access.change(s=>{s.port=f.runtime.listener.address().port;});
+    const bridge=require.resolve('../automation/bridge');
+    const script=`require(${JSON.stringify(bridge)}).start(${JSON.stringify(f.base)},['--connection',${JSON.stringify(f.a.id)}],{directory:${JSON.stringify(f.runtime.access.directory)}})`;
+    const client=new Client({name:'stdio-port-change',version:'1'});
+    await client.connect(new StdioClientTransport({command:process.execPath,args:['-e',script]}),{timeout:10000});
+    try {
+        assert.notEqual((await client.callTool({name:'workspace_status',arguments:{}})).isError,true);
+        f.runtime.access.state.port=0;await f.runtime.reconfigure();
+        await f.runtime.access.change(s=>{s.port=f.runtime.listener.address().port;});
+        const interrupted=await client.callTool({name:'workspace_status',arguments:{}});
+        assert.equal(interrupted.isError,true,'a call lost to the outage is not silently replayed');
+        assert.match(interrupted.content?.[0]?.text,/reconnected/i);
+        const recovered=await client.callTool({name:'workspace_status',arguments:{}});
+        assert.equal(recovered.isError,undefined);assert.equal(recovered.structuredContent.workspace,'user_a');
+    }finally{await client.close();}
+});
+test('stdio bridge waits for a server that starts after the bridge',async t=>{
+    const f=await fixture(t);
+    const http=require('node:http');
+    const {Access}=require('../automation/access');
+    const directory=path.join(f.temp,'private-late');
+    const blocker=await new Promise(resolve=>{const s=http.createServer().listen(0,'127.0.0.1',()=>resolve(s));});
+    t.after(()=>new Promise(resolve=>blocker.close(resolve)));
+    const seed=new Access(f.base,{directory});await seed.init();
+    await seed.change(s=>{s.enabled=true;s.port=blocker.address().port;});
+    const a=await seed.create({name:'Late server probe',user:'user_a',permissions:['read']});
+    const bridge=require.resolve('../automation/bridge');
+    const script=`require(${JSON.stringify(bridge)}).start(${JSON.stringify(f.base)},['--connection',${JSON.stringify(a.id)}],{directory:${JSON.stringify(directory)}})`;
+    const client=new Client({name:'stdio-late-server',version:'1'});
+    const connecting=client.connect(new StdioClientTransport({command:process.execPath,args:['-e',script]}),{timeout:20000}).catch(e=>({failure:e}));
+    const runtime=new AutomationRuntime(f.base,f.backend,{directory,listenerRetryBaseMs:25});
+    await runtime.init();t.after(()=>runtime.close());
+    assert.equal(runtime.status().listening,false,'startup while the port is occupied must not disable the runtime');
+    await new Promise(resolve=>setTimeout(resolve,300));
+    await new Promise(resolve=>blocker.close(resolve));
+    const outcome=await connecting;
+    if(outcome?.failure)throw outcome.failure;
+    try {
+        const result=await client.callTool({name:'workspace_status',arguments:{}},undefined,{timeout:10000});
+        assert.equal(result.structuredContent.workspace,'user_a');
+    }finally{await client.close();}
+});
+test('bridge transport errors are separated from authorization refusals',async t=>{
+    const {authorizationRefused,mcpDisabled,transportInterrupted}=require('../automation/bridge');
+    assert.equal(authorizationRefused(Object.assign(new Error('x'),{name:'UnauthorizedError'})),true);
+    assert.equal(authorizationRefused({status:401}),true);assert.equal(authorizationRefused({status:403}),true);
+    assert.equal(authorizationRefused({status:500}),false);
+    assert.equal(mcpDisabled({status:503}),true);assert.equal(mcpDisabled({code:'MCP_DISABLED'}),true);assert.equal(mcpDisabled({status:500}),false);
+    assert.equal(transportInterrupted({code:'NOT_CONNECTED'}),true);
+    assert.equal(transportInterrupted(Object.assign(new TypeError('fetch failed'),{cause:{code:'ECONNREFUSED'}})),true);
+    assert.equal(transportInterrupted({code:-32602,message:'Invalid params'}),false,'JSON-RPC protocol errors are surfaced, not treated as outages');
+});
+test('private settings corruption fails loudly instead of resetting credentials',async t=>{
+    const f=await fixture(t);
+    const {Access}=require('../automation/access');
+    const directory=f.runtime.access.directory,filename=path.join(directory,'settings.json');
+    await fs.writeFile(filename,'{"version":1,"enabled":',null);
+    await assert.rejects(new Access(f.base,{directory}).init(),{code:'MCP_SETTINGS_INVALID'});
+    await fs.rm(filename);
+    await assert.rejects(new Access(f.base,{directory}).init(),{code:'MCP_SETTINGS_MISSING'},'profiles without settings must not be silently reset');
 });

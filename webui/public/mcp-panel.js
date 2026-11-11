@@ -36,7 +36,8 @@ const MCPPanel=(()=>{
             const solver=await api('/api/mcp/solver');
             el('mcpSolverStatus').textContent=`Solver: ${solver.available?'Found':'Not found'} (${solver.source||'unavailable'}) — ${solver.path||''}${solver.activePath&&solver.activePath!==solver.path?' — restart required':''}`;
             if(document.activeElement!==el('mcpSolverPath'))el('mcpSolverPath').value=solver.savedPath||'';
-            el('mcpListenerStatus').textContent=status.error||`${status.listening?'Listening':'OFF'} · ${status.url}`;
+            const retryNote=status.retrying&&status.retryAt?` · Retrying automatically (next attempt ${new Date(status.retryAt).toLocaleTimeString()})`:'';
+            el('mcpListenerStatus').textContent=status.error?status.error+retryNote:`${status.listening?'Listening':'OFF'} · ${status.url}`;
             if(status.auditError||status.auditDropped)el('mcpListenerStatus').textContent+=` · Audit warning: ${status.auditError||''} ${status.auditDropped||0} records dropped`;
             const list=el('mcpConnections');list.replaceChildren();
             for(const c of status.connections) {
