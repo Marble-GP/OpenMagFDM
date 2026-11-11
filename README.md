@@ -6,8 +6,22 @@ provides configuration editing, image preprocessing and result visualization.
 It supports Cartesian and polar coordinates, nonlinear B-H materials,
 permanent magnets, and transient analyses with prescribed motion.
 
-**Latest release: v1.7.4** · [Release notes](docs/releases/RELEASE_NOTES_v1.7.4.md) ·
+**Latest release: v1.7.5** · [Release notes](docs/releases/RELEASE_NOTES_v1.7.5.md) ·
 [Changelog](CHANGELOG.md) · [Documentation](docs/README.md)
+
+## v1.7.5
+
+The electromagnetic force evaluator no longer produces ghost forces on
+non-magnetic bodies: source ownership prevents double counting, induced face
+currents match the magnetic-field operator, and polar signs, coordinates,
+storage orientation and the force basis are corrected. Flux-linkage and
+back-EMF plots gain optional residual-noise estimates (robust local fits and
+repeating-state blends, display-only and off by default). MCP connections now
+recover across server restarts: the listener retries after port conflicts,
+the stdio bridge re-reads the saved port and waits for a late server, and
+authorization refusals are reported separately from outages. Token and
+settings persistence is durable against power loss.
+See the [v1.7.5 release notes](docs/releases/RELEASE_NOTES_v1.7.5.md).
 
 ## v1.7.4
 

@@ -3,8 +3,17 @@
 All notable user-facing changes are summarized here. Detailed technical
 investigations remain under `docs/archive/research/`.
 
-## Unreleased
+## 1.7.5 — 2026-11-12
 
+- Estimate flux-linkage and back-EMF display curves through residual-driven
+  differentiation noise: robust local polynomial fits and repeating-state
+  blends, off by default, display-only, with convergence-metadata exclusion
+  and worker-based cancellation. Specifications and limits in `EMF_FILTER.md`.
+- Correct the single-state Amperian force evaluation: source ownership before
+  differentiation prevents overlapping material masks from double-counting,
+  induced face currents match the magnetic-field operator, and polar signs,
+  nodal coordinates, storage orientation and the force-vector basis are
+  corrected. Ghost forces on non-magnetic bodies are eliminated.
 - Recover MCP connections across server restarts without re-issuing tokens:
   retry the listener bind after a port conflict, reload the port in the stdio
   bridge on reconnect, and wait a bounded time for a server that starts later.

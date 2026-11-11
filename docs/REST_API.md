@@ -1,7 +1,7 @@
 # REST API manual
 
 The API shares the WebUI server: `http://localhost:3000` locally, or the configured
-HTTPS address in shared mode. Baseline: v1.7.4. See [CLI](CLI.md) and [Operations](OPERATIONS.md).
+HTTPS address in shared mode. Baseline: v1.7.5. See [CLI](CLI.md) and [Operations](OPERATIONS.md).
 
 ## 1. Conventions
 

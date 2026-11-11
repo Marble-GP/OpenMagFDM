@@ -444,7 +444,7 @@ jobs:
         # reasonable installer label.
         TAG_NAME: ${{ github.ref_name }}
       run: |
-        $version = "1.7.4"
+        $version = "1.7.5"
         if ($env:TAG_NAME -match '^v?(\d+\.\d+\.\d+)') {
             $version = $matches[1]
         }
@@ -527,7 +527,7 @@ jobs:
     - name: Create Release
       uses: softprops/action-gh-release@v3
       with:
-        body_path: docs/releases/RELEASE_NOTES_v1.7.4.md
+        body_path: docs/releases/RELEASE_NOTES_v1.7.5.md
         draft: true
         files: |
           artifacts/OpenMagFDM-Linux-x86_64/OpenMagFDM-Linux-x86_64.tar.gz

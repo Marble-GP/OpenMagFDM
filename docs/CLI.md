@@ -2,7 +2,7 @@
 
 This manual covers the resident server console, startup flags and standalone 2D
 solver. See [Operations](OPERATIONS.md) for deployment and [REST API](REST_API.md)
-for HTTP automation. The release baseline is v1.7.4.
+for HTTP automation. The release baseline is v1.7.5.
 
 ## 1. Startup
 
@@ -236,6 +236,6 @@ MagFDMsolver[.exe] --version
 
 Linux/macOS use `./MagFDMsolver sample_config.yaml model.png output_example`.
 Omitting the output directory creates a timestamped directory. Missing arguments
-print usage and exit nonzero. Version output is `OpenMagFDM 1.7.4`.
+print usage and exit nonzero. Version output is `OpenMagFDM 1.7.5`.
 The image defines RGB material regions; see [Configuration](CONFIGURATION.md).
 Direct standalone runs do not enter the WebUI/MCP job ledger.

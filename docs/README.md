@@ -1,6 +1,6 @@
 # OpenMagFDM documentation
 
-Latest release: **v1.7.4**. See the [Changelog](../CHANGELOG.md).
+Latest release: **v1.7.5**. See the [Changelog](../CHANGELOG.md).
 
 ## User and administrator manuals
 
@@ -30,6 +30,7 @@ retain their original language.
 
 ## Release and development history
 
+- [v1.7.5 release notes](releases/RELEASE_NOTES_v1.7.5.md)
 - [v1.7.4 release notes](releases/RELEASE_NOTES_v1.7.4.md)
 - [v1.7.3 release notes](releases/RELEASE_NOTES_v1.7.3.md)
 - [Release history](releases/README.md)
