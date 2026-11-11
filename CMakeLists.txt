@@ -111,6 +111,10 @@ add_executable(dd_bench dd_bench.cpp)
 target_link_libraries(dd_bench PRIVATE omfdm_core)
 
 if(BUILD_TESTING)
+    add_executable(amperian_force_test tests/amperian_force_test.cpp)
+    target_link_libraries(amperian_force_test PRIVATE omfdm_core)
+    add_test(NAME amperian_force COMMAND amperian_force_test
+        ${CMAKE_CURRENT_BINARY_DIR}/amperian_force_fixture)
     add_executable(chunk_threads_test tests/chunk_threads_test.cpp)
     target_link_libraries(chunk_threads_test PRIVATE omfdm_core)
     add_test(NAME chunk_threads COMMAND chunk_threads_test

@@ -1,3 +1,4 @@
+#include "AmperianForce.h"
 #include "MagneticFieldAnalyzer.h"
 #include "PolarMagnetizationCurl.h"
 #include "PolarGridAccess.h"
@@ -10098,571 +10099,75 @@ void MagneticFieldAnalyzer::calculateForceShellIntegration(int step, int shell_t
 
 
 void MagneticFieldAnalyzer::calculateForceDistributedAmperian(int step, double sigma_smooth) {
-    std::cout << "\n=== Calculating Force using Distributed Amperian Method ===" << std::endl;
-    std::cout << "  Method: M = B/μ₀ - H, J_b = ∇×M, F = ∫J_b × B dV" << std::endl;
-    std::cout << "  Coordinate system: " << coordinate_system << std::endl;
-    if (sigma_smooth > 0) {
-        std::cout << "  Gaussian smoothing sigma: " << sigma_smooth << " pixels" << std::endl;
-    }
-
-    // --- Calculate magnetic field if not already done for this step ---
-    if (current_field_step != step) {
-        if (coordinate_system == "polar") {
-            calculateMagneticFieldPolar();
-        } else {
-            calculateMagneticField();
-        }
-        current_field_step = step;
-    } else {
-        std::cout << "Magnetic field already calculated for step " << step << " (reusing)" << std::endl;
-    }
-
-    const double mu0 = MU_0;
-
-    // Clear previous results
+    if (sigma_smooth != 0.0)
+        throw std::invalid_argument("Amperian force no longer supports Gaussian smoothing; use mesh refinement instead");
     force_results_amperian.clear();
-
-    // ============================================================
-    // Branch: Polar vs Cartesian coordinate system
-    // ============================================================
-    if (coordinate_system == "polar") {
-        // ============================================================
-        // POLAR COORDINATE IMPLEMENTATION
-        // ============================================================
-        std::cout << "  Using polar coordinate formulation" << std::endl;
-        std::cout << "  r_orientation: " << r_orientation << std::endl;
-        std::cout << "  nr=" << nr << ", ntheta=" << ntheta << std::endl;
-
-        // Determine theta periodicity
-        bool theta_periodic = (bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic");
-        bool theta_antiperiodic = (bc_theta_min.type == "anti-periodic" || bc_theta_max.type == "anti-periodic");
-
-        // Grid dimensions for matrix storage (depends on r_orientation)
-        // r_orientation == "horizontal": rows=ntheta, cols=nr, indexing: mat(jt, ir)
-        // r_orientation == "vertical": rows=nr, cols=ntheta, indexing: mat(ir, jt)
-        int grid_rows, grid_cols;
-        if (r_orientation == "horizontal") {
-            grid_rows = ntheta;
-            grid_cols = nr;
-        } else {  // vertical
-            grid_rows = nr;
-            grid_cols = ntheta;
-        }
-        std::cout << "  Grid dimensions: " << grid_rows << " rows x " << grid_cols << " cols" << std::endl;
-
-        // Build r_coords array for physical r values
-        std::vector<double> r_coords(nr);
-        for (int ir = 0; ir < nr; ir++) {
-            r_coords[ir] = r_start + (ir + 0.5) * dr;
-        }
-
-        // ============================================================
-        // Step 1: Calculate magnetization in polar coordinates
-        // M_r = B_r(μ_r - 1)/(μ₀μ_r), M_θ = B_θ(μ_r - 1)/(μ₀μ_r)
-        // In air (μ_r = 1): M = 0 exactly (no ghost force)
-        // ============================================================
-        cv::Mat Mr_map(grid_rows, grid_cols, CV_64F, cv::Scalar(0.0));
-        cv::Mat Mt_map(grid_rows, grid_cols, CV_64F, cv::Scalar(0.0));  // M_theta
-
-        for (int j = 0; j < grid_rows; j++) {
-            for (int i = 0; i < grid_cols; i++) {
-                double mu = mu_map(j, i);
-                double mu_r_val = mu / mu0;
-                double chi = (mu_r_val - 1.0) / mu_r_val;
-
-                // Get Br, Btheta depending on r_orientation
-                // Matrix indexing is always (row, col) = (j, i)
-                // For both orientations, Br and Btheta are stored with consistent indexing
-                double br_val, bt_val;
-                int ir, jt;
-                if (r_orientation == "horizontal") {
-                    ir = i; jt = j;  // col=r, row=theta
-                    br_val = Br(jt, ir);
-                    bt_val = Btheta(jt, ir);
-                } else {
-                    ir = j; jt = i;  // row=r, col=theta
-                    br_val = Br(ir, jt);
-                    bt_val = Btheta(ir, jt);
-                }
-
-                Mr_map.at<double>(j, i) = br_val * chi / mu0;
-                Mt_map.at<double>(j, i) = bt_val * chi / mu0;
-            }
-        }
-
-        // ============================================================
-        // Step 2: Optional Gaussian smoothing of M
-        // ============================================================
-        if (sigma_smooth > 0) {
-            int ksize = static_cast<int>(std::ceil(sigma_smooth * 6)) | 1;
-            if (ksize < 3) ksize = 3;
-            cv::GaussianBlur(Mr_map, Mr_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
-            cv::GaussianBlur(Mt_map, Mt_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
-            std::cout << "  Applied Gaussian smoothing (kernel size: " << ksize << ")" << std::endl;
-        }
-
-        // ============================================================
-        // Step 3: Compute bound current in polar coordinates
-        // J_z = (1/r) ∂(r·M_θ)/∂r - (1/r) ∂M_r/∂θ
-        //     = M_θ/r + ∂M_θ/∂r - (1/r) ∂M_r/∂θ
-        // ============================================================
-        cv::Mat Jz_map(grid_rows, grid_cols, CV_64F, cv::Scalar(0.0));
-
-        // Lambda for wrapped index access with polar boundary handling
-        // Note: Mr_map and Mt_map are stored as cv::Mat with (row, col) = (j, i)
-        // For horizontal: j=theta, i=r → access as (jt, ir)
-        // For vertical: j=r, i=theta → access as (ir, jt)
-        auto getMr = [&](int jt, int ir) -> double {
-            // Handle r boundary (non-periodic)
-            ir = std::max(0, std::min(nr - 1, ir));
-            // Handle theta boundary
-            if (theta_periodic) {
-                jt = (jt + ntheta) % ntheta;
-            } else if (theta_antiperiodic) {
-                if (jt < 0) {
-                    jt = -jt - 1;
-                    if (r_orientation == "horizontal") {
-                        return -Mr_map.at<double>(jt, ir);
-                    } else {
-                        return -Mr_map.at<double>(ir, jt);
-                    }
-                }
-                if (jt >= ntheta) {
-                    jt = 2 * ntheta - jt - 1;
-                    if (r_orientation == "horizontal") {
-                        return -Mr_map.at<double>(jt, ir);
-                    } else {
-                        return -Mr_map.at<double>(ir, jt);
-                    }
-                }
-            } else {
-                jt = std::max(0, std::min(ntheta - 1, jt));
-            }
-            if (r_orientation == "horizontal") {
-                return Mr_map.at<double>(jt, ir);
-            } else {
-                return Mr_map.at<double>(ir, jt);
-            }
-        };
-        auto getMt = [&](int jt, int ir) -> double {
-            ir = std::max(0, std::min(nr - 1, ir));
-            if (theta_periodic) {
-                jt = (jt + ntheta) % ntheta;
-            } else if (theta_antiperiodic) {
-                if (jt < 0) {
-                    jt = -jt - 1;
-                    if (r_orientation == "horizontal") {
-                        return -Mt_map.at<double>(jt, ir);
-                    } else {
-                        return -Mt_map.at<double>(ir, jt);
-                    }
-                }
-                if (jt >= ntheta) {
-                    jt = 2 * ntheta - jt - 1;
-                    if (r_orientation == "horizontal") {
-                        return -Mt_map.at<double>(jt, ir);
-                    } else {
-                        return -Mt_map.at<double>(ir, jt);
-                    }
-                }
-            } else {
-                jt = std::max(0, std::min(ntheta - 1, jt));
-            }
-            if (r_orientation == "horizontal") {
-                return Mt_map.at<double>(jt, ir);
-            } else {
-                return Mt_map.at<double>(ir, jt);
-            }
-        };
-
-        for (int j = 0; j < grid_rows; j++) {
-            for (int i = 0; i < grid_cols; i++) {
-                int ir, jt;
-                if (r_orientation == "horizontal") {
-                    ir = i; jt = j;
-                } else {
-                    ir = j; jt = i;
-                }
-
-                double r = r_coords[ir];
-                if (r < 1e-10) {
-                    // At r=0, curl is undefined; skip or use limit
-                    Jz_map.at<double>(j, i) = 0.0;
-                    continue;
-                }
-
-                // Central differences for derivatives
-                // ∂(r·M_θ)/∂r using central difference
-                double rMt_plus = r_coords[std::min(ir + 1, nr - 1)] * getMt(jt, ir + 1);
-                double rMt_minus = r_coords[std::max(ir - 1, 0)] * getMt(jt, ir - 1);
-                double d_rMt_dr = (rMt_plus - rMt_minus) / (2.0 * dr);
-
-                // ∂M_r/∂θ using central difference
-                double dMr_dtheta = (getMr(jt + 1, ir) - getMr(jt - 1, ir)) / (2.0 * dtheta);
-
-                // J_z = (1/r) ∂(r·M_θ)/∂r - (1/r) ∂M_r/∂θ
-                double jz = (1.0 / r) * d_rMt_dr - (1.0 / r) * dMr_dtheta;
-                Jz_map.at<double>(j, i) = jz;
-            }
-        }
-
-        // ============================================================
-        // Step 4: For each material, integrate F = J_b × B
-        // ============================================================
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-        int dilation_size = 2;
-
-        for (const auto& material : config["materials"]) {
-            std::string name = material.first.as<std::string>();
-            const auto& props = material.second;
-            bool calc_force = props["calc_force"].as<bool>(false);
-            if (!calc_force) continue;
-
-            std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
-
-            // Build material mask
-            cv::Mat image_flipped;
-            cv::flip(image, image_flipped, 0);
-
-            // Debug: Check image dimensions
-            std::cout << "  Image size: " << image_flipped.cols << " x " << image_flipped.rows << std::endl;
-            std::cout << "  Creating mask with size: " << grid_cols << " x " << grid_rows << std::endl;
-
-            cv::Mat mat_mask(grid_rows, grid_cols, CV_8U, cv::Scalar(0));
-            int match_count = 0;
-            for (int jj = 0; jj < grid_rows; jj++) {
-                for (int ii = 0; ii < grid_cols; ii++) {
-                    cv::Vec3b px = image_flipped.at<cv::Vec3b>(jj, ii);
-                    if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
-                        mat_mask.at<uchar>(jj, ii) = 255;
-                        match_count++;
-                    }
-                }
-            }
-            std::cout << "  Material pixels found: " << match_count << std::endl;
-
-            // Dilate material mask with periodic handling for theta
-            // For polar: theta direction is periodic, r direction is not
-            cv::Mat mat_dilated;
-
-            // Check mat_mask validity
-            if (mat_mask.empty() || mat_mask.rows == 0 || mat_mask.cols == 0) {
-                std::cerr << "  ERROR: mat_mask is empty or invalid!" << std::endl;
-                mat_dilated = mat_mask.clone();
-            } else if (theta_periodic) {
-                int pad = dilation_size + 1;
-
-                // For theta-periodic boundary:
-                // r_orientation == "horizontal": rows=ntheta (periodic), cols=nr (non-periodic)
-                // r_orientation == "vertical": rows=nr (non-periodic), cols=ntheta (periodic)
-                cv::Mat mat_padded;
-                if (r_orientation == "horizontal") {
-                    // Rows are theta (periodic), cols are r (non-periodic)
-                    // Pad top/bottom for theta wrap
-                    cv::copyMakeBorder(mat_mask, mat_padded, pad, pad, 0, 0, cv::BORDER_WRAP);
-                    cv::Mat mat_padded_dilated;
-                    cv::dilate(mat_padded, mat_padded_dilated, kernel, cv::Point(-1, -1), dilation_size);
-                    mat_dilated = mat_padded_dilated(cv::Rect(0, pad, grid_cols, grid_rows)).clone();
-                } else {
-                    // Rows are r (non-periodic), cols are theta (periodic)
-                    // Pad left/right for theta wrap
-                    cv::copyMakeBorder(mat_mask, mat_padded, 0, 0, pad, pad, cv::BORDER_WRAP);
-                    cv::Mat mat_padded_dilated;
-                    cv::dilate(mat_padded, mat_padded_dilated, kernel, cv::Point(-1, -1), dilation_size);
-                    mat_dilated = mat_padded_dilated(cv::Rect(pad, 0, grid_cols, grid_rows)).clone();
-                }
-            } else {
-                cv::dilate(mat_mask, mat_dilated, kernel, cv::Point(-1, -1), dilation_size);
-            }
-
-            ForceResult result;
-            result.material_name = name;
-            result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
-            result.force_x = result.force_y = result.force_radial = 0.0;
-            result.torque = result.torque_origin = result.torque_center = 0.0;
-            result.pixel_count = 0;
-            result.magnetic_energy = 0.0;
-
-            std::cout << "\nCalculating force for material: " << name << " (Amperian, polar)" << std::endl;
-
-            // ============================================================
-            // Step 5: Integrate Lorentz force F = J × B in polar coords
-            // For J = (0, 0, Jz) and B = (Br, Bθ, 0) in cylindrical:
-            //   J × B = (-Jz·Bθ, +Jz·Br, 0) in (r, θ, z) components
-            //   => Fr = -Jz·Bθ, Fθ = +Jz·Br
-            //
-            // Physics note: For constant-current sources (Jz specified),
-            // the force is F = +∂W'/∂x where W' is magnetic co-energy.
-            // For linear materials, W = W' numerically, so F = +∂W/∂x.
-            // The Lorentz formula F = J × B is always valid.
-            // ============================================================
-            for (int j = 0; j < grid_rows; j++) {
-                for (int i = 0; i < grid_cols; i++) {
-                    if (mat_dilated.at<uchar>(j, i) == 0) continue;
-
-                    int ir, jt;
-                    if (r_orientation == "horizontal") {
-                        ir = i; jt = j;
-                    } else {
-                        ir = j; jt = i;
-                    }
-
-                    double r = r_coords[ir];
-                    double theta = jt * dtheta;  // Use rotor frame (no theta_offset)
-
-                    // Volume element in polar coordinates: r * dr * dθ
-                    double dV = r * dr * dtheta;
-
-                    double jz = Jz_map.at<double>(j, i);
-
-                    // Get Br, Btheta
-                    double br_val, bt_val;
-                    if (r_orientation == "horizontal") {
-                        br_val = Br(jt, ir);
-                        bt_val = Btheta(jt, ir);
-                    } else {
-                        br_val = Br(ir, jt);
-                        bt_val = Btheta(ir, jt);
-                    }
-
-                    // Force: F = J × B (Lorentz force in polar coordinates)
-                    // Fr = (J × B)_r = -Jz·Bθ
-                    // Fθ = (J × B)_θ = +Jz·Br
-                    double fr = -jz * bt_val * dV;
-                    double ft = +jz * br_val * dV;
-
-                    // Convert to Cartesian coordinates
-                    double cos_t = std::cos(theta);
-                    double sin_t = std::sin(theta);
-                    double fx = fr * cos_t - ft * sin_t;
-                    double fy = fr * sin_t + ft * cos_t;
-
-                    result.force_x += fx;
-                    result.force_y += fy;
-                    result.pixel_count++;
-
-                    // Torque: τ = r × F = r · F_θ (in 2D)
-                    // For polar centered at origin, torque = r * F_theta
-                    result.torque_origin += r * ft;
-
-                    // Physical coordinates for torque calculation
-                    double x_c = r * cos_t;
-                    double y_c = r * sin_t;
-                    result.torque_center += x_c * fy - y_c * fx;
-                }
-            }
-
-            // Calculate force magnitude
-            result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
-            result.torque = result.torque_origin;
-
-            // Output results
-            std::cout << "  Material: " << name << std::endl;
-            std::cout << "    Integration pixels: " << result.pixel_count << std::endl;
-            std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
-            std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
-            std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
-            std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
-
-            force_results_amperian.push_back(result);
-        }
-
-    } else {
-        // ============================================================
-        // CARTESIAN COORDINATE IMPLEMENTATION (original code)
-        // ============================================================
-
-        // Physical center for torque calculation
-        double cx_physical = (static_cast<double>(nx) * dx) / 2.0;
-        double cy_physical = (static_cast<double>(ny) * dy) / 2.0;
-
-        // ============================================================
-        // Step 1: Calculate magnetization M = B/μ₀ - H
-        // For linear material: H = B/(μ₀μ_r), so M = B/μ₀ - B/(μ₀μ_r) = B(μ_r - 1)/(μ₀μ_r)
-        // In air (μ_r = 1): M = 0 exactly (no ghost force)
-        // ============================================================
-        cv::Mat Mx_map(ny, nx, CV_64F, cv::Scalar(0.0));
-        cv::Mat My_map(ny, nx, CV_64F, cv::Scalar(0.0));
-
-        for (int j = 0; j < ny; j++) {
-            for (int i = 0; i < nx; i++) {
-                double mu = mu_map(j, i);         // μ = μ₀μ_r [H/m]
-                double mu_r = mu / mu0;           // relative permeability
-                double bx = Bx(j, i);
-                double by = By(j, i);
-
-                // M = B(μ_r - 1)/(μ₀μ_r) = B · chi / μ₀ where chi = (μ_r - 1)/μ_r
-                double chi = (mu_r - 1.0) / mu_r;
-                Mx_map.at<double>(j, i) = bx * chi / mu0;
-                My_map.at<double>(j, i) = by * chi / mu0;
-            }
-        }
-
-        // ============================================================
-        // Step 2: Optional Gaussian smoothing of M
-        // This captures surface magnetization current through numerical curl
-        // ============================================================
-        if (sigma_smooth > 0) {
-            int ksize = static_cast<int>(std::ceil(sigma_smooth * 6)) | 1;  // Ensure odd
-            if (ksize < 3) ksize = 3;
-            cv::GaussianBlur(Mx_map, Mx_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
-            cv::GaussianBlur(My_map, My_map, cv::Size(ksize, ksize), sigma_smooth, sigma_smooth);
-            std::cout << "  Applied Gaussian smoothing (kernel size: " << ksize << ")" << std::endl;
-        }
-
-        // ============================================================
-        // Step 3: Compute bound current J_bz = ∂My/∂x - ∂Mx/∂y
-        // Using central differences with periodic boundary handling
-        // ============================================================
-        bool x_periodic = (bc_left.type == "periodic" && bc_right.type == "periodic");
-        bool y_periodic = (bc_bottom.type == "periodic" && bc_top.type == "periodic");
-
-        cv::Mat Jz_map(ny, nx, CV_64F, cv::Scalar(0.0));
-
-        // Lambda for wrapped index access
-        auto getMx = [&](int j, int i) -> double {
-            if (x_periodic) i = (i + nx) % nx;
-            else i = std::max(0, std::min(nx - 1, i));
-            if (y_periodic) j = (j + ny) % ny;
-            else j = std::max(0, std::min(ny - 1, j));
-            return Mx_map.at<double>(j, i);
-        };
-        auto getMy = [&](int j, int i) -> double {
-            if (x_periodic) i = (i + nx) % nx;
-            else i = std::max(0, std::min(nx - 1, i));
-            if (y_periodic) j = (j + ny) % ny;
-            else j = std::max(0, std::min(ny - 1, j));
-            return My_map.at<double>(j, i);
-        };
-
-        for (int j = 0; j < ny; j++) {
-            for (int i = 0; i < nx; i++) {
-                // Central differences: ∂My/∂x, ∂Mx/∂y
-                double dMy_dx = (getMy(j, i + 1) - getMy(j, i - 1)) / (2.0 * dx);
-                double dMx_dy = (getMx(j + 1, i) - getMx(j - 1, i)) / (2.0 * dy);
-
-                // J_bz = ∂My/∂x - ∂Mx/∂y (curl of M in 2D)
-                Jz_map.at<double>(j, i) = dMy_dx - dMx_dy;
-            }
-        }
-
-        // ============================================================
-        // Step 4: For each material, integrate F = J_b × B over dilated region
-        // Dilated region ensures surface current contribution is captured
-        // ============================================================
-        cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-        int dilation_size = 2;  // Dilate by 2 pixels to capture interface current
-
-        for (const auto& material : config["materials"]) {
-            std::string name = material.first.as<std::string>();
-            const auto& props = material.second;
-            bool calc_force = props["calc_force"].as<bool>(false);
-            if (!calc_force) continue;
-
-            std::vector<int> rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255, 255, 255});
-
-            // Build material mask (in FDM coordinates, y=0 at bottom)
-            cv::Mat image_flipped;
-            cv::flip(image, image_flipped, 0);
-
-            cv::Mat mat_mask(ny, nx, CV_8U, cv::Scalar(0));
-            for (int jj = 0; jj < ny; jj++) {
-                for (int ii = 0; ii < nx; ii++) {
-                    cv::Vec3b px = image_flipped.at<cv::Vec3b>(jj, ii);
-                    if (px[0] == rgb[0] && px[1] == rgb[1] && px[2] == rgb[2]) {
-                        mat_mask.at<uchar>(jj, ii) = 255;
-                    }
-                }
-            }
-
-            // Dilate material mask to include interface region
-            cv::Mat mat_dilated;
-            if (x_periodic || y_periodic) {
-                int pad = dilation_size + 1;
-                int pad_top = y_periodic ? pad : 0;
-                int pad_bottom = y_periodic ? pad : 0;
-                int pad_left = x_periodic ? pad : 0;
-                int pad_right = x_periodic ? pad : 0;
-
-                cv::Mat mat_padded;
-                cv::copyMakeBorder(mat_mask, mat_padded, pad_top, pad_bottom, pad_left, pad_right,
-                                   cv::BORDER_WRAP);
-                cv::Mat mat_padded_dilated;
-                cv::dilate(mat_padded, mat_padded_dilated, kernel, cv::Point(-1, -1), dilation_size);
-                mat_dilated = mat_padded_dilated(cv::Rect(pad_left, pad_top, nx, ny)).clone();
-            } else {
-                cv::dilate(mat_mask, mat_dilated, kernel, cv::Point(-1, -1), dilation_size);
-            }
-
-            ForceResult result;
-            result.material_name = name;
-            result.rgb = cv::Scalar(rgb[0], rgb[1], rgb[2]);
-            result.force_x = result.force_y = result.force_radial = 0.0;
-            result.torque = result.torque_origin = result.torque_center = 0.0;
-            result.pixel_count = 0;
-            result.magnetic_energy = 0.0;
-
-            std::cout << "\nCalculating force for material: " << name << " (Amperian)" << std::endl;
-
-            // ============================================================
-            // Step 5: Integrate Lorentz force F = J × B
-            // For 2D with J = (0, 0, Jz) and B = (Bx, By, 0):
-            //   J × B = (-Jz·By, +Jz·Bx, 0)
-            //   => Fx = -Jz·By, Fy = +Jz·Bx
-            //
-            // Physics note: For constant-current sources (Jz specified),
-            // the force is F = +∂W'/∂x where W' is magnetic co-energy.
-            // For linear materials, W = W' numerically, so F = +∂W/∂x.
-            // The Lorentz formula F = J × B is always valid.
-            // ============================================================
-            double dV = dx * dy;  // Volume element (per unit depth)
-
-            for (int j = 0; j < ny; j++) {
-                for (int i = 0; i < nx; i++) {
-                    if (mat_dilated.at<uchar>(j, i) == 0) continue;
-
-                    double jz = Jz_map.at<double>(j, i);
-                    double bx = Bx(j, i);
-                    double by = By(j, i);
-
-                    // Force: F = J × B (Lorentz force)
-                    // Fx = (J × B)_x = -Jz·By
-                    // Fy = (J × B)_y = +Jz·Bx
-                    double fx = -jz * by * dV;
-                    double fy = +jz * bx * dV;
-
-                    result.force_x += fx;
-                    result.force_y += fy;
-                    result.pixel_count++;
-
-                    // Torque: τ = r × F
-                    double x_c = (i + 0.5) * dx;
-                    double y_c = (j + 0.5) * dy;
-
-                    result.torque_origin += x_c * fy - y_c * fx;
-                    result.torque_center += (x_c - cx_physical) * fy - (y_c - cy_physical) * fx;
-                }
-            }
-
-            // Calculate force magnitude
-            result.force_radial = std::sqrt(result.force_x * result.force_x + result.force_y * result.force_y);
-            result.torque = result.torque_origin;
-
-            // Output results
-            std::cout << "  Material: " << name << std::endl;
-            std::cout << "    Integration pixels: " << result.pixel_count << std::endl;
-            std::cout << "    Fx: " << result.force_x << " N/m, Fy: " << result.force_y << " N/m (per unit depth)" << std::endl;
-            std::cout << "    Force magnitude: " << result.force_radial << " N/m (per unit depth)" << std::endl;
-            std::cout << "    Torque about origin: " << result.torque_origin << " N*m (per unit depth)" << std::endl;
-            std::cout << "    Torque about image center: " << result.torque_center << " N*m (per unit depth)" << std::endl;
-
-            force_results_amperian.push_back(result);
-        }
+    if (step < 0 || current_field_step != step) {
+        if (coordinate_system == "polar") calculateMagneticFieldPolar();
+        else calculateMagneticField();
+        current_field_step = step;
     }
-
-    std::cout << "\nDistributed Amperian force calculation complete!" << std::endl;
+    using namespace openmagfdm::detail;
+    AmperianGrid g;
+    g.polar = coordinate_system == "polar";
+    g.h1 = g.polar ? dr : dx; g.h2 = g.polar ? dtheta : dy;
+    g.rStart = r_start; g.thetaOffset = theta_offset;
+    g.periodic1 = !g.polar && bc_left.type == "periodic" && bc_right.type == "periodic";
+    g.periodic2 = g.polar
+        ? bc_theta_min.type == "periodic" && bc_theta_max.type == "periodic"
+        : bc_bottom.type == "periodic" && bc_top.type == "periodic";
+    // Cartesian assembly currently implements unsigned periodic wrapping only.
+    g.anti1 = false;
+    g.anti2 = g.polar && g.periodic2 && (bc_theta_min.value < 0 || bc_theta_max.value < 0);
+    const bool transpose = g.polar && r_orientation == "vertical";
+    auto normalized = [&](const Eigen::MatrixXd& m) -> Eigen::MatrixXd {
+        if (transpose) return m.transpose().eval();
+        return m;
+    };
+    const Eigen::MatrixXd a = normalized(Az);
+    const Eigen::MatrixXd b1 = normalized(g.polar ? Br : Bx);
+    const Eigen::MatrixXd b2 = normalized(g.polar ? Btheta : By);
+    const int rows = static_cast<int>(a.rows()), cols = static_cast<int>(a.cols());
+    cv::Mat flipped;
+    cv::flip(image, flipped, 0);
+    std::cout << "\n=== Amperian force: body-local free, permanent and face-induced currents ===\n";
+    for (const auto& material : config["materials"]) {
+        const auto& props = material.second;
+        if (!props["calc_force"].as<bool>(false)) continue;
+        const auto rgb = props["rgb"].as<std::vector<int>>(std::vector<int>{255,255,255});
+        ForceResult result{};
+        result.material_name = material.first.as<std::string>();
+        result.rgb = cv::Scalar(rgb[0],rgb[1],rgb[2]);
+        Eigen::MatrixXd dn = Eigen::MatrixXd::Zero(rows,cols);
+        Eigen::MatrixXd mx = dn, my = dn, jf = dn;
+        for (int y=0; y<rows; ++y) for (int x=0; x<cols; ++x) {
+            const int row = transpose ? x : y, col = transpose ? y : x;
+            const cv::Vec3b pixel = flipped.at<cv::Vec3b>(row,col);
+            if (pixel[0]!=rgb[0] || pixel[1]!=rgb[1] || pixel[2]!=rgb[2]) continue;
+            ++result.pixel_count;
+            const double mu = mu_map(row,col);
+            if (!(mu > 0) || !std::isfinite(mu)) throw std::runtime_error("Invalid permeability in force body");
+            // Exact zero in a source-free mu_r=1 marker, even in a nonuniform field.
+            dn(y,x) = (MU_0-mu)/(MU_0*mu);
+            jf(y,x) = jz_map(row,col);
+            // These are the actual prescribed magnetization sources used in the
+            // field equation (Br/mu0 in this solver), not a reconstructed Br/mu.
+            if (Mx_map.rows()==mu_map.rows() && Mx_map.cols()==mu_map.cols()) {
+                mx(y,x) = Mx_map(row,col); my(y,x) = My_map(row,col);
+            }
+        }
+        // Mask BEFORE differentiation and integrate the complete compact support.
+        // Dilating masks over a global curl counts neighbouring bodies twice.
+        const auto current = amperianCurrent(a,dn,mx,my,jf,g);
+        const auto load = integrateAmperianCurrent(current,b1,b2,g);
+        result.force_x=load.fx; result.force_y=load.fy;
+        result.force_radial=std::hypot(load.fx,load.fy); // Legacy magnitude column.
+        result.torque=result.torque_origin=load.torque; result.torque_center=load.torqueCenter;
+        std::cout << "  " << result.material_name << ": Fx=" << load.fx << " N/m, Fy=" << load.fy
+                  << " N/m, torque=" << load.torque << " N*m/m\n";
+        force_results_amperian.push_back(result);
+    }
 }
-
 
 double MagneticFieldAnalyzer::calculateTotalMagneticEnergy(int step) {
     std::cout << "\n=== Calculating Total Magnetic Energy ===" << std::endl;
@@ -10853,17 +10358,19 @@ void MagneticFieldAnalyzer::exportForcesToCSV(const std::string& output_path) co
     }
 
     // CSV header (include both torque measures and magnetic energy)
-    file << "Material,RGB_R,RGB_G,RGB_B,Force_X[N/m],Force_Y[N/m],Force_Magnitude[N/m],Force_Radial[N/m],Torque_Origin[N*m],Torque_Center[N*m],Magnetic_Energy[J/m],Boundary_Pixels\n";
+    file << "Material,RGB_R,RGB_G,RGB_B,Force_X[N/m],Force_Y[N/m],Force_Magnitude[N/m],Force_Radial[N/m],Torque_Origin[N*m/m],Torque_Center[N*m/m],Magnetic_Energy[J/m],Boundary_Pixels\n";
     file << "# Note: Forces and energies are per unit depth (2D analysis)\n";
-    file << "# Torque_Origin: torque about origin (polar)\n";
-    file << "# Torque_Center: torque about image center (x=center_x, y=center_y)\n";
-    file << "# Magnetic_Energy: magnetic potential energy W = integral(B^2/(2*mu) dV)\n";
-    file << "# _SYSTEM_TOTAL: Total magnetic energy of entire system (for virtual work calculation)\n";
-    file << "# Force calculation method: Distributed Amperian Force (J_b = curl(M), F = J_b x B)\n";
+    file << "# Torque_Origin: torque about coordinate origin; multiply by axial depth [m] for N*m\n";
+    file << "# Torque_Center: Cartesian nodal-grid midpoint, or polar origin\n";
+    file << "# _SYSTEM_TOTAL: Existing co-energy diagnostic; derivatives require fixed excitation and consistent PM energy\n";
+    file << "# Boundary_Pixels: number of selected material nodes (legacy column name)\n";
+    file << "# Force calculation method: Amperian, J = J_free + curl(M_source) + div((nu_body-nu0_body) grad(Az)), F = integral(J x B)\n";
 
-    file << std::scientific << std::setprecision(6);
+    file << "# Per-material Magnetic_Energy is not evaluated (legacy zero placeholder); use _SYSTEM_TOTAL only\n";
+    file << "# Touching-material rows are an additive source decomposition, not contact tractions\n";
+    file << std::scientific << std::setprecision(15);
 
-    // Output Distributed Amperian force results (default method)
+    // Output body-local Amperian force results (default method)
     // This uses bound current from magnetization: J_b = ∇×M, F = ∫J_b × B dV
     // Key advantage: No ghost force (M = 0 exactly in air where μ_r = 1)
     for (const auto& result : force_results_amperian) {
