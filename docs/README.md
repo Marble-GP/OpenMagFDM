@@ -12,6 +12,7 @@ Latest release: **v1.7.4**. See the [Changelog](../CHANGELOG.md).
 | HTTP authentication, files, jobs, fields, images and ZIP backups | [REST API](REST_API.md) |
 | Shared HTTPS, ownership, storage, metadata and upgrades | [Operations](OPERATIONS.md) |
 | Local agent connections over HTTP/stdio | [MCP](MCP_INTEGRATION.md) |
+| Experimental flux/EMF display estimates and repeat-state assumptions | [Flux and EMF filtering](EMF_FILTER.md) |
 
 Public interfaces and current manuals use English. User-authored filenames,
 descriptions and configurations may use other languages. Historical records
