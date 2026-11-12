@@ -11,7 +11,7 @@ const {Workspace,noLinks}=require('../automation/workspace');
 const {AnalysisJobs}=require('../automation/jobs');
 const {FileOperations}=require('../automation/operations');
 const storage=require('../automation/storage');
-async function temp(t){const dir=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'omfdm-v2-'));t.after(async()=>{await noLinks(dir);assert.ok(path.basename(dir).startsWith('omfdm-v2-'));await fs.rm(dir,{recursive:true,force:true});});return dir;}
+async function temp(t){const dir=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'omfdm-v2-'));t.after(async()=>{await noLinks(dir);assert.ok(path.basename(dir).startsWith('omfdm-v2-'));await fs.rm(dir,{recursive:true,force:true,maxRetries:10,retryDelay:100});});return dir;}
 test('shared sessions enforce workspace ownership, CSRF, disable and restart persistence',async t=>{
     const base=await temp(t),directory=path.join(base,'private');await fs.mkdir(directory);
     const accounts=new Accounts(base,{mode:'shared'},{directory});

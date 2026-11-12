@@ -8,7 +8,7 @@ const {privateDirectory}=require('../automation/access');
 async function fixture(t) {
     const temp=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'omfdm-storage-'));
     const base=path.join(temp,'app');await fs.mkdir(base);const privateDir=privateDirectory(base);
-    t.after(async()=>{await noLinks(temp);assert.ok(path.basename(temp).startsWith('omfdm-storage-'));await fs.rm(temp,{recursive:true,force:true});await noLinks(privateDir,{missing:true});await fs.rm(privateDir,{recursive:true,force:true});});
+    t.after(async()=>{await noLinks(temp);assert.ok(path.basename(temp).startsWith('omfdm-storage-'));await fs.rm(temp,{recursive:true,force:true,maxRetries:10,retryDelay:100});await noLinks(privateDir,{missing:true});await fs.rm(privateDir,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
     return {temp,base,privateDir};
 }
 test('workspace root covers every category and preserves a separate results override',async t=>{

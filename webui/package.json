@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node launcher.js",
     "dev": "node launcher.js",
-    "test": "node --test tests/*.test.js",
+    "test": "node --test --test-timeout=600000 --test-force-exit tests/*.test.js",
     "package": "node tools/build-mcp-package.cjs"
   },
   "keywords": [

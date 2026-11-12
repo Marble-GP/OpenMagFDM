@@ -14,7 +14,7 @@ test('CLI help never starts the server or creates state',()=>{
 test('CLI persists defaults and workspace overrides; quotas serialize creation and preserve replacement',async t=>{
     const base=await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()),'omfdm-limits-'));
     const directory=privateDirectory(base);
-    t.after(async()=>{await noLinks(base);await fs.rm(base,{recursive:true,force:true});await noLinks(directory,{missing:true});await fs.rm(directory,{recursive:true,force:true});});
+    t.after(async()=>{await noLinks(base);await fs.rm(base,{recursive:true,force:true,maxRetries:10,retryDelay:100});await noLinks(directory,{missing:true});await fs.rm(directory,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
     await run(base,['limits','set-default','configs','1']);
     await run(base,['limits','set','alice','images','0']);
     await run(base,['limits','set','bob','configs','2']);

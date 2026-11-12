@@ -29,7 +29,7 @@ async function fixture(t) {
     const actor=runtime.access.actor(a.id),other=runtime.access.actor(b.id);
     const wa=new Workspace(base,actor.user,{guard:actor.guard,busy:id=>runtime.jobs.busy(actor.user,id)}),wb=new Workspace(base,other.user);
     await wa.init();await wb.init();
-    t.after(async()=>{await runtime.close();await noLinks(temp);assert.ok(path.basename(temp).startsWith('omfdm-mcp-'));await fs.rm(temp,{recursive:true,force:true});});
+    t.after(async()=>{await runtime.close();await noLinks(temp);assert.ok(path.basename(temp).startsWith('omfdm-mcp-'));await fs.rm(temp,{recursive:true,force:true,maxRetries:10,retryDelay:100});});
     return {temp,base,runtime,actor,other,wa,wb,a,b,backend,starts:()=>starts};
 }
 test('Windows security utilities always use System32, never Git Bash PATH',()=>{
