@@ -18,6 +18,8 @@ add_library(omfdm_core STATIC
     MagneticFieldAnalyzer.h
     AsyncWriter.cpp
     AsyncWriter.h
+    FemMesh.cpp
+    FemMesh.h
     tinyexpr/tinyexpr.cpp
     tinyexpr/tinyexpr.h
 )
@@ -96,7 +98,11 @@ target_link_libraries(omfdm_core PUBLIC
     ${TIFF_LIBRARIES}
     $<$<BOOL:${OpenMP_CXX_FOUND}>:OpenMP::OpenMP_CXX>
 )
-target_include_directories(omfdm_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} PRIVATE ${TIFF_INCLUDE_DIRS})
+target_include_directories(omfdm_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/CDT/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/picosha2
+    PRIVATE ${TIFF_INCLUDE_DIRS})
 target_link_libraries(MagFDMsolver PRIVATE omfdm_core)
 
 if(BUILD_TESTING)
@@ -138,4 +144,11 @@ if(BUILD_TESTING)
         NAME polar_magnetization_curl
         COMMAND polar_magnetization_curl_test
     )
+endif()
+
+if(BUILD_TESTING)
+    add_executable(fem_mesh_pipeline_test tests/fem_mesh_pipeline_test.cpp)
+    target_include_directories(fem_mesh_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(fem_mesh_pipeline_test PRIVATE omfdm_core)
+    add_test(NAME fem_mesh_pipeline COMMAND fem_mesh_pipeline_test)
 endif()

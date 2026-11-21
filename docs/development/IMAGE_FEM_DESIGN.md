@@ -612,7 +612,8 @@ Alternatives considered:
 
 ## 13. Open questions
 
-1. CDT library and license (decide before Phase 0 exits).
+1. CDT library: **resolved** — `artem-ogre/CDT` (MPL-2.0), vendored under
+   `third_party/CDT/` (header-only, robust predicates). Phase 0 uses it.
 2. Is `subpixel_boundaries` in scope for the first release, or is exact-match
    rasterisation acceptable with a documented limitation?
 3. Should FEM mode support the `anti_aliasing` materials as graded elements
