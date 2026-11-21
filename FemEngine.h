@@ -29,6 +29,9 @@ public:
     // Run the full pipeline and write results under outDir. Returns exit code.
     int run(const std::string& outDir, FemEngineResult* info = nullptr);
 
+    // Solve (linear or nonlinear depending on materials). Returns 0 on success.
+    int solve();
+
     // Accessors for tests.
     const FemMesh& mesh() const { return mesh_; }
     const Eigen::VectorXd& solution() const { return A_; }
@@ -62,7 +65,10 @@ private:
         double jz = 0.0;
         bool hasMagnetization = false;
         double Br = 0.0;
-        double magAngle = 0.0; // radians
+        double magAngle = 0.0;
+        // B-H table (optional): pairs (H, B), monotone.
+        std::vector<double> bhH, bhB;
+        bool hasBH() const { return !bhH.empty() && bhH.size() == bhB.size(); }
     };
     std::vector<MatData> matData_;
     std::vector<double> nodeMu_;   // per-vertex mu (for export)
@@ -76,12 +82,40 @@ private:
     // parsed mesh params
     std::string engine_ = "fem";
     MeshBuildOptions meshOpts_;
+    // nonlinear config
+    bool nonlinearEnabled_ = true;
+    int nonlinearMaxIter_ = 50;
+    double nonlinearTol_ = 5e-4;
+    double relaxation_ = 0.7;
+    std::string jacobianMode_ = "tangent"; // tangent | secant (secant->tangent fallback)
+    double lineSearchC_ = 1e-4;
+    double lineSearchRho_ = 0.65;
+    int lineSearchMax_ = 50;
+    // Robin BCs: list of (edge endpoints index pair, alpha,beta,gamma)
+    struct RobinEdge { int i, j; double alpha,beta,gamma; };
+    std::vector<RobinEdge> robinEdges_;
+    std::vector<std::pair<int,int>> periodicPairs_;
+    // refinement config
+    bool refinementEnabled_ = false;
+    int refinementMaxRounds_ = 8;
+    double refinementTheta_ = 0.5;
+    double refinementTarget_ = 1e-3;
+    std::vector<Point2D> extraInteriorPoints_;
+
+    // helpers
+    bool anyNonlinear() const;
+    void parseNonlinearConfig();
+    void parseRobinPeriodic();
+    double evalNu(double Bmag, int mid) const;
+    double evalDnu(double Bmag, int mid) const;
+    void assembleJacobian(Eigen::SparseMatrix<double,Eigen::RowMajor>& J) const;
 
     bool parseConfig(std::string& err);
     bool loadImage(std::string& err);
     bool buildMesh(std::string& err);
     void assemble(std::string& err);
     void solveLinear();
+    void refine();
     void exportResults(const std::string& outDir);
 };
 

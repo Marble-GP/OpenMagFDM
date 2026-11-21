@@ -11,7 +11,7 @@
         (i === 1 && ['materials', 'material_presets', 'variables'].includes(path[0])) ? '*' : p).join('.');
     const rootKeys = ['coordinate_system', 'variables', 'omp', 'mesh', 'polar_domain',
         'polar_boundary_conditions', 'boundary_conditions', 'materials', 'material_presets',
-        'flux_linkage', 'transient', 'nonlinear_solver', 'domain_decomposition', 'export', 'image_path'];
+        'flux_linkage', 'transient', 'nonlinear_solver', 'domain_decomposition', 'export', 'image_path', 'solver'];
     const extra = {
         '': ['dx', 'dy', 'polar', 'boundary'], // accepted legacy CLI aliases, not suggested
         'nonlinear_solver': ['initial_az_path', 'gmres_restart', 'jacobian', 'line_search_objective',

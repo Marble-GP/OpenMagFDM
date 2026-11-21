@@ -171,20 +171,23 @@ std::vector<Contour> MeshBuilder::extractContours(const std::vector<int>& mask,
         for (int y = 0; y < ny; ++y)
             for (int x = 0; x < nx; ++x)
                 if (mask[(size_t)y * nx + x] == mid) bin.at<uint8_t>(y, x) = 255;
+        // Pad with a 1-pixel background border so the outer boundary of a
+        // full-image material is found at the image edge (0..nx, 0..ny),
+        // not one pixel inset.
+        cv::Mat padded;
+        cv::copyMakeBorder(bin, padded, 1, 1, 1, 1, cv::BORDER_CONSTANT, cv::Scalar(0));
         std::vector<std::vector<cv::Point>> contours;
         std::vector<cv::Vec4i> hierarchy;
-        cv::findContours(bin, contours, hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
+        cv::findContours(padded, contours, hierarchy, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
         for (size_t ci = 0; ci < contours.size(); ++ci) {
             if (contours[ci].size() < 3) continue;
             Contour c;
             for (const auto& pt : contours[ci]) {
-                // mask is already flipped (Y-up); image coords -> metres.
-                c.points.push_back({pt.x * dx, pt.y * dy});
+                // subtract the 1-pixel pad offset
+                c.points.push_back({(pt.x - 1) * dx, (pt.y - 1) * dy});
             }
             c.materialInside = mid;
-            // material outside = sample a point just outside the first vertex normal; approximate by air (-1-> materials.size())
             c.materialOutside = -1;
-            // hole detection: if hierarchy parent != -1 it's a hole
             if (ci < hierarchy.size() && hierarchy[ci][3] != -1) c.isHole = true;
             result.push_back(std::move(c));
         }
@@ -233,7 +236,8 @@ std::vector<Point2D> MeshBuilder::simplifyContour(const std::vector<Point2D>& in
 FemMesh MeshBuilder::build(const cv::Mat& imageRgb,
                            const std::vector<MaterialDesc>& materials,
                            double dx, double dy,
-                           const MeshBuildOptions& opts) {
+                           const MeshBuildOptions& opts,
+                           const std::vector<Point2D>& extraInterior) {
     FemMesh mesh;
     mesh.dx = dx; mesh.dy = dy;
 
@@ -255,6 +259,16 @@ FemMesh MeshBuilder::build(const cv::Mat& imageRgb,
     // material count for air: use materials.size() as air index if air not declared.
     // extract contours
     auto contours = extractContours(mask, mesh.nx, mesh.ny, dx, dy);
+    // Replace full-image outer contours with the exact domain rectangle.
+    for (auto& c : contours) {
+        if (c.points.empty()) continue;
+        double xmin=1e9,xmax=-1e9,ymin=1e9,ymax=-1e9;
+        for (const auto& p : c.points) { xmin=std::min(xmin,p.x); xmax=std::max(xmax,p.x); ymin=std::min(ymin,p.y); ymax=std::max(ymax,p.y); }
+        const double eps = 1e-12;
+        if (xmin < eps && ymin < eps && std::fabs(xmax - (mesh.nx-1)*dx) < 1e-9 && std::fabs(ymax - (mesh.ny-1)*dy) < 1e-9) {
+            c.points = { {0.0,0.0}, {mesh.nx*dx,0.0}, {mesh.nx*dx,mesh.ny*dy}, {0.0,mesh.ny*dy} };
+        }
+    }
     // simplify each contour
     double tol = opts.boundaryTolerance > 0 ? opts.boundaryTolerance : 0.5 * dx;
     double minS = opts.minSpacing > 0 ? opts.minSpacing : dx;
@@ -289,6 +303,16 @@ FemMesh MeshBuilder::build(const cv::Mat& imageRgb,
             intPts.push_back({x, y});
             intMat.push_back(mid);
         }
+    }
+
+    // Add extra interior points (from adaptive refinement).
+    for (const auto& p : extraInterior) {
+        int ix = std::min(mesh.nx - 1, std::max(0, (int)(p.x / dx)));
+        int iy = std::min(mesh.ny - 1, std::max(0, (int)(p.y / dy)));
+        int mid = mask[(size_t)iy * mesh.nx + ix];
+        if (mid < 0) continue;
+        intPts.push_back(p);
+        intMat.push_back(mid);
     }
 
     // Assemble vertex list.
@@ -371,6 +395,27 @@ FemMesh MeshBuilder::build(const cv::Mat& imageRgb,
         return mesh;
     }
     tri.eraseOuterTrianglesAndHoles();
+
+    // Compact: drop vertices not referenced by any triangle (isolated).
+    {
+        std::vector<char> used(tri.vertices.size(), 0);
+        for (const auto& t : tri.triangles)
+            for (int k = 0; k < 3; ++k) used[t.vertices[k]] = 1;
+        std::vector<int> remap(tri.vertices.size(), -1);
+        std::vector<CDT::V2d<double>> newVerts;
+        for (size_t i = 0; i < tri.vertices.size(); ++i) {
+            if (used[i]) { remap[i] = (int)newVerts.size(); newVerts.push_back(tri.vertices[i]); }
+        }
+        // remap triangles
+        std::vector<CDT::Triangle> newTris;
+        for (const auto& t : tri.triangles) {
+            CDT::Triangle nt = t;
+            for (int k = 0; k < 3; ++k) nt.vertices[k] = remap[t.vertices[k]];
+            newTris.push_back(nt);
+        }
+        tri.vertices = newVerts;
+        tri.triangles = newTris;
+    }
 
     // Build FemMesh.
     mesh.vertices.reserve(tri.vertices.size());

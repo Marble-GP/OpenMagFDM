@@ -115,7 +115,8 @@ public:
     static FemMesh build(const cv::Mat& imageRgb,
                          const std::vector<MaterialDesc>& materials,
                          double dx, double dy,
-                         const MeshBuildOptions& opts);
+                         const MeshBuildOptions& opts,
+                         const std::vector<Point2D>& extraInterior = {});
 };
 
 } // namespace fem
