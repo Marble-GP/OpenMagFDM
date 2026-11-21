@@ -1,0 +1,17 @@
+{
+  "repo": "Marble-GP/OpenMagFDM",
+  "model": "opencode-go/kimi-k3.1-pro",
+  "language": "ja",
+  "skipDrafts": false,
+  "secretName": "OPENCODE_API_KEY",
+  "maxDiffChars": 120000,
+  "timeoutMinutes": 15,
+  "excludePaths": [
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "*.min.js",
+    "*.map"
+  ],
+  "workflowMode": "actions"
+}
