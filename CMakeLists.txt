@@ -20,6 +20,8 @@ add_library(omfdm_core STATIC
     AsyncWriter.h
     FemMesh.cpp
     FemMesh.h
+    FemEngine.cpp
+    FemEngine.h
     tinyexpr/tinyexpr.cpp
     tinyexpr/tinyexpr.h
 )
@@ -151,4 +153,9 @@ if(BUILD_TESTING)
     target_include_directories(fem_mesh_pipeline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(fem_mesh_pipeline_test PRIVATE omfdm_core)
     add_test(NAME fem_mesh_pipeline COMMAND fem_mesh_pipeline_test)
+
+    add_executable(fem_linear_test tests/fem_linear_test.cpp)
+    target_include_directories(fem_linear_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(fem_linear_test PRIVATE omfdm_core)
+    add_test(NAME fem_linear COMMAND fem_linear_test)
 endif()

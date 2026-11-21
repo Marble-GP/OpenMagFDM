@@ -43,6 +43,7 @@
 #define SOLVER_TOLERANCE (1e-6)
 #define SOLVER_MAX_ITERATIONS (5000)
 namespace omfdm { struct TangentKrylovWorkspace; }
+namespace omfdm { namespace fem { class FemEngine; } }
 
 /**
  * @brief 2D Magnetic Field Analyzer using Finite Difference Method
@@ -52,6 +53,7 @@ namespace omfdm { struct TangentKrylovWorkspace; }
  */
 class MagneticFieldAnalyzer {
 public:
+    friend class omfdm::fem::FemEngine;
     /**
      * @brief Constructor
      * @param config_path Path to YAML configuration file
