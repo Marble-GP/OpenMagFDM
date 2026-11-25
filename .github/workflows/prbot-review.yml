@@ -37,7 +37,7 @@ jobs:
           node-version: "20"
 
       - name: Install OpenCode
-        run: npm install -g @opencode/cli
+        run: npm install -g @opencode/cli@2.4.1
 
       - name: Run prbot review
         env:
