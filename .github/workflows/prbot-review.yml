@@ -1,0 +1,48 @@
+# prbot PR Review
+#
+# 信頼モデル:
+# - pull_request_target を使い、ワークフロー定義は常にベースブランチ側のものを使う。
+#   PR 側でこのワークフローを書き換えても、マージされるまで実行されない。
+# - チェックアウトするのはベースコミットのみ。PR のコードはチェックアウトも実行もしない。
+#   PR の差分は gh pr diff でテキストとして取得するだけ。
+# - フォークからの PR には Secrets と書き込みトークンを与えないため、既定でスキップする。
+#   （フォーク PR もレビューしたい場合は if 条件を外す前に必ず脅威モデルを確認すること）
+name: prbot PR Review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout trusted base commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install OpenCode
+        run: npm install -g @opencode/cli@2.4.1
+
+      - name: Run prbot review
+        env:
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          OPENCODE_MODEL: opencode-go/kimi-k3.1-pro
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node .prbot/review.mjs --pr ${{ github.event.pull_request.number }}
