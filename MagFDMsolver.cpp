@@ -231,6 +231,10 @@ void exportConditionsJSON(const std::string& output_path,
     std::string coord_system = config["coordinate_system"]
         ? config["coordinate_system"].as<std::string>() : "cartesian";
     j["coordinate_system"] = coord_system;
+    j["solver"] = {
+        {"engine", (config["solver"] && config["solver"]["engine"])
+            ? config["solver"]["engine"].as<std::string>() : "fdm"}
+    };
 
     // Image dimensions
     j["image_width"] = image.cols;

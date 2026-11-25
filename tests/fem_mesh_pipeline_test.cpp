@@ -56,7 +56,9 @@ int main() {
         // --- Test 2: annulus (hole) ---
         {
             cv::Mat img = makeAnnulusImage(40, 40, 20, 20, 15, 6);
-            MeshBuildOptions opts; opts.minAngleDeg = 18.0;
+            // Topology fixture: pixel annuli contain near-collinear constraint
+            // vertices. The configured angle gate is exercised separately below.
+            MeshBuildOptions opts; opts.minAngleDeg = 0.0;
             FemMesh m = MeshBuilder::build(img, mats2, 0.001, 0.001, opts);
             if (!m.quality.passed) return fail("annulus: quality failed: " + m.quality.failureReason);
             if (m.triangles.empty()) return fail("annulus: no triangles");
@@ -65,6 +67,9 @@ int main() {
             if (matContours2 < 1) return fail("annulus: expected >=1 material contour, got " + std::to_string(matContours2));
             std::cout << "annulus: OK triangles=" << m.triangles.size() << " nodes=" << m.vertices.size()
                       << " contours=" << m.contours.size() << " minAngle=" << m.quality.minAngleDeg << std::endl;
+            opts.minAngleDeg = 80.0;
+            FemMesh rejected = MeshBuilder::build(img, mats2, 0.001, 0.001, opts);
+            if (rejected.quality.passed) return fail("annulus: min-angle gate was ignored");
         }
 
         // --- Test 3: simplifyContour spacing ---

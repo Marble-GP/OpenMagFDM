@@ -218,11 +218,12 @@ extract closed contours with marching squares.
   rule, so a diagonal thin feature is not cut. The rule is fixed and tested.
 - Orientation: material interior on the left; outer boundary counter-clockwise,
   holes clockwise. Nested contours are paired by containment (ray casting).
-- Vertices sit on pixel edges at the midpoints between two pixel centres. The
-  lattice point `(i,j)` is the pixel centre at `((i+0.5)*dx, (j+0.5)*dy)`; a
-  contour vertex between centres `(i,j)` and `(i+1,j)` is at
-  `((i+1)*dx, (j+0.5)*dy)`. This keeps the material raster aligned with the FDM
-  cell-centre convention.
+- Vertices sit on the pixel-centre lattice, matching the FDM/WebUI convention.
+  The lattice point `(i,j)` is the physical point `(i*dx, j*dy)` and the domain
+  extent is `[0,(nx-1)*dx] x [0,(ny-1)*dy]`. A contour between pixels `(i,j)`
+  and `(i+1,j)` therefore uses endpoints `(i*dx,j*dy)` and
+  `((i+1)*dx,j*dy)`. Raster export samples the same point lattice; it does not
+  apply a half-cell offset.
 - Triple points (three materials meeting) are detected as vertices claimed by
   three contours and merged with a snap tolerance of `1e-6 m`. The merged vertex
   is inserted into each contour; no contour may pass through a triple point
@@ -462,19 +463,19 @@ read rasters and CSV headers. FEM results are therefore **sampled onto the FDM
 raster** rather than changing the consumer contract:
 
 - The export grid is the image pixel lattice at `dx`,`dy` (the same
-  `nx x ny` used by the FDM engine). Vertex values are barycentrically
-  interpolated; element-wise `Mu`, `H`, `Jz`, `EnergyDensity` are evaluated at
-  cell centres inside their element. Points outside the mesh are written as
-  missing values (not zero) and counted in the status file.
+  `nx x ny` point coordinates used by the FDM engine). Vertex values are
+  barycentrically interpolated; element-wise `Mu`, `H`, `Jz`, `EnergyDensity`
+  are evaluated at those points inside their element. Points outside the mesh
+  are written as missing values (not zero) and counted in the status file.
 - `Az/step_0001.tiff|csv` keeps the FDM orientation (already flipped once) and
   the same value convention (Wb/m).
 - `FluxLinkage/flux_linkage.csv` and `flux_linkage_status.csv` keep their
-  headers; contour flux is integrated from the sampled `A` with the same
-  quadrature the FDM path uses, and the status records `engine: fem`.
-- `Forces/step_0001.csv`: Phase 1 writes the same header with
-  `status: unavailable` and zeros, never fabricated numbers, until the Phase 4
-  force implementation is validated. Existing readers already preserve
-  unavailable values (v1.7.4 contract).
+  FDM headers; material-pair flux uses the same area-mean `Az` convention and
+  path flux uses `Az(end) - Az(start)`. Solver quality is recorded in the
+  row-aligned status sidecar.
+- `Forces/step_0001.csv` keeps the FDM header and comment rows. Per-material
+  Amperian forces include free current plus permanent/induced bound surface
+  current; `_SYSTEM_TOTAL` carries the magnetic co-energy.
 - `conditions.json` gains `solver.engine`, mesh statistics and the refinement
   summary. `run-inputs.json` records the mesh hash and all FEM parameters.
 - The mesh artifact under `<out>/Mesh/` is the source of truth for QA and for

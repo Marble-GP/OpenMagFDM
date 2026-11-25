@@ -19,6 +19,11 @@
             'precond_update_frequency', 'precond_verbose', 'fine_finishing_iterations',
             'fine_finishing_tolerance', 'strict_convergence', 'eisenstat_walker_enabled'],
         'nonlinear_solver.eisenstat_walker': ['residual_cap'],
+        'solver': ['engine', 'fem'],
+        'solver.fem': ['mesh', 'refinement'],
+        'solver.fem.mesh': ['boundary_tolerance', 'min_spacing', 'max_spacing',
+            'boundary_attraction', 'min_angle_deg', 'max_nodes', 'max_growth_ratio'],
+        'solver.fem.refinement': ['enabled', 'max_rounds', 'theta', 'target_relative_error'],
         'materials.*': ['coarsen', 'coarsen_ratio'],
     };
     const fields = {

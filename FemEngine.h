@@ -11,6 +11,7 @@
 #include <yaml-cpp/yaml.h>
 #include <string>
 #include <vector>
+#include <map>
 
 namespace omfdm {
 namespace fem {
@@ -36,6 +37,10 @@ public:
     const FemMesh& mesh() const { return mesh_; }
     const Eigen::VectorXd& solution() const { return A_; }
     const std::vector<double>& nodeMu() const { return nodeMu_; }
+    const std::vector<double>& elementMu() const { return elemMu_; }
+    std::array<double,2> remanentMagnetization(int materialIndex) const;
+    double residual() const { return lastResidual_; }
+    bool converged() const { return lastConverged_; }
     // Test hook: override the source J_z(x,y) (used by MMS).
     void setSourceFunction(std::function<double(double,double)> f) { sourceFn_ = f; }
     double dx() const { return dx_; }
@@ -68,11 +73,15 @@ private:
         double magAngle = 0.0;
         // B-H table (optional): pairs (H, B), monotone.
         std::vector<double> bhH, bhB;
-        bool hasBH() const { return !bhH.empty() && bhH.size() == bhB.size(); }
+        bool hasBH() const { return bhH.size() >= 2 && bhH.size() == bhB.size(); }
     };
     std::vector<MatData> matData_;
     std::vector<double> nodeMu_;   // per-vertex mu (for export)
-    std::vector<double> elemMu_;   // per-element mu
+    std::vector<double> elemMu_;   // per-element secant mu
+    std::vector<std::vector<int>> vertexTriangles_; // vertex -> incident elements
+    std::vector<std::vector<int>> triangleGrid_;    // uniform point-location grid
+    double triangleCell_ = 0.0;
+    int gridNx_ = 0, gridNy_ = 0;
 
     Eigen::VectorXd A_;            // solution (nodal A_z)
     Eigen::VectorXd rhs_;
@@ -95,12 +104,16 @@ private:
     struct RobinEdge { int i, j; double alpha,beta,gamma; };
     std::vector<RobinEdge> robinEdges_;
     std::vector<std::pair<int,int>> periodicPairs_;
+    std::vector<int> periodicSigns_; // +1 periodic, -1 antiperiodic
     // refinement config
     bool refinementEnabled_ = false;
     int refinementMaxRounds_ = 8;
     double refinementTheta_ = 0.5;
     double refinementTarget_ = 1e-3;
     std::vector<Point2D> extraInteriorPoints_;
+    int lastIterations_ = 0;
+    double lastResidual_ = 0.0;
+    bool lastConverged_ = false;
 
     // helpers
     bool anyNonlinear() const;
@@ -108,14 +121,21 @@ private:
     void parseRobinPeriodic();
     double evalNu(double Bmag, int mid) const;
     double evalDnu(double Bmag, int mid) const;
+    double coEnergyDensity(double Bmag, int mid) const;
+    std::map<int,double> dirichletNodes() const;
+    std::vector<int> periodicDofRoots(const std::map<int,double>& fixed,
+                                      std::vector<int>& freeNodes,
+                                      std::vector<int>& signs) const;
     void assembleJacobian(Eigen::SparseMatrix<double,Eigen::RowMajor>& J) const;
 
     bool parseConfig(std::string& err);
     bool loadImage(std::string& err);
     bool buildMesh(std::string& err);
-    void assemble(std::string& err);
-    void solveLinear();
-    void refine();
+    void buildTriangleIndex();
+    int findTriangle(double x, double y) const;
+    void assemble();
+    bool solveLinear();
+    void refine(const std::string& outDir);
     void exportResults(const std::string& outDir);
 };
 

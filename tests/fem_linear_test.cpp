@@ -17,7 +17,7 @@ static void makeFiles(const fs::path& dir, int n) {
     // uniform air image (white), n x n
     cv::Mat img(n, n, CV_8UC3, cv::Scalar(255,255,255));
     cv::imwrite((dir / "model.png").string(), img);
-    double dx = 0.01 / n; // domain Lx = 0.01
+    double dx = 0.01 / (n - 1); // FDM point lattice: domain [0,(n-1)*dx] = 0.01
     std::ofstream c(dir / "config.yaml");
     c << "coordinate_system: cartesian\n";
     c << "mesh: { dx: " << dx << ", dy: " << dx << " }\n";
@@ -55,7 +55,7 @@ int main() {
             makeFiles(dir, n);
             FemEngine eng((dir / "config.yaml").string(), (dir / "model.png").string());
             eng.setSourceFunction([&](double x, double y) {
-                return nu * (M_PI*M_PI/(L*L) + M_PI*M_PI/(L*L)) * std::sin(M_PI*x/L) * std::sin(M_PI*y/L);
+                return -nu * (M_PI*M_PI/(L*L) + M_PI*M_PI/(L*L)) * std::sin(M_PI*x/L) * std::sin(M_PI*y/L);
             });
             FemEngineResult info;
             int rc = eng.run((dir / "out").string(), &info);
