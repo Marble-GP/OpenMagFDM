@@ -17,6 +17,8 @@ export function sh(cmd, args, options = {}) {
     maxBuffer: options.maxBuffer ?? 256 * 1024 * 1024,
     shell: useShell,
     cwd: options.cwd,
+    // env が指定されない場合は process.env を継承（後方互換）
+    env: options.env ?? process.env,
   });
   return {
     status: result.status,

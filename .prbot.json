@@ -1,9 +1,9 @@
 {
   "repo": "Marble-GP/OpenMagFDM",
   "model": "opencode-go/kimi-k3.1-pro",
+  "secretName": "OPENCODE_API_KEY",
   "language": "ja",
   "skipDrafts": false,
-  "secretName": "OPENCODE_API_KEY",
   "maxDiffChars": 120000,
   "timeoutMinutes": 15,
   "excludePaths": [
