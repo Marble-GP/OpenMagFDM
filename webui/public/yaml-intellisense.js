@@ -11,7 +11,7 @@
         (i === 1 && ['materials', 'material_presets', 'variables'].includes(path[0])) ? '*' : p).join('.');
     const rootKeys = ['coordinate_system', 'variables', 'omp', 'mesh', 'polar_domain',
         'polar_boundary_conditions', 'boundary_conditions', 'materials', 'material_presets',
-        'flux_linkage', 'transient', 'nonlinear_solver', 'domain_decomposition', 'export', 'image_path'];
+        'flux_linkage', 'transient', 'nonlinear_solver', 'domain_decomposition', 'export', 'image_path', 'solver'];
     const extra = {
         '': ['dx', 'dy', 'polar', 'boundary'], // accepted legacy CLI aliases, not suggested
         'nonlinear_solver': ['initial_az_path', 'gmres_restart', 'jacobian', 'line_search_objective',
@@ -19,6 +19,11 @@
             'precond_update_frequency', 'precond_verbose', 'fine_finishing_iterations',
             'fine_finishing_tolerance', 'strict_convergence', 'eisenstat_walker_enabled'],
         'nonlinear_solver.eisenstat_walker': ['residual_cap'],
+        'solver': ['engine', 'fem'],
+        'solver.fem': ['mesh', 'refinement'],
+        'solver.fem.mesh': ['boundary_tolerance', 'min_spacing', 'max_spacing',
+            'boundary_attraction', 'min_angle_deg', 'max_nodes', 'max_growth_ratio'],
+        'solver.fem.refinement': ['enabled', 'max_rounds', 'theta', 'target_relative_error'],
         'materials.*': ['coarsen', 'coarsen_ratio'],
     };
     const fields = {

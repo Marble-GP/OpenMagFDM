@@ -24,6 +24,9 @@ retain their original language.
   implemented changes, measured comparisons, regression tests and limitations.
 - [Single-step force and torque correction plan](development/FORCE_EVALUATION_PLAN.md):
   issue history, original implementation audit and broader method-selection gates.
+- [Image-based 2D FEM solver design](development/IMAGE_FEM_DESIGN.md):
+  proposed mesh pipeline, Galerkin discretisation, adaptive refinement, integration
+  and verification gates; not implemented.
 
 - [v1.7.2 MCP practical trial — 2026-10-24](development/V1_7_2_MCP_TRIAL_20261024.md):
   connected baseline, release/source distinction and pending practical checks.

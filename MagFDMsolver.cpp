@@ -1,4 +1,5 @@
 #include "MagneticFieldAnalyzer.h"
+#include "FemEngine.h"
 #include "tinyexpr/tinyexpr.h"
 #include <iostream>
 #include <fstream>
@@ -230,6 +231,10 @@ void exportConditionsJSON(const std::string& output_path,
     std::string coord_system = config["coordinate_system"]
         ? config["coordinate_system"].as<std::string>() : "cartesian";
     j["coordinate_system"] = coord_system;
+    j["solver"] = {
+        {"engine", (config["solver"] && config["solver"]["engine"])
+            ? config["solver"]["engine"].as<std::string>() : "fdm"}
+    };
 
     // Image dimensions
     j["image_width"] = image.cols;
@@ -644,6 +649,21 @@ int main(int argc, char* argv[]) {
         std::cout << "Conditions saved to: " << base_folder << "/conditions.json" << std::endl;
         // Initialize analyzer
         std::cout << "\n=== Initialization ===" << std::endl;
+        YAML::Node cfg = YAML::LoadFile(config_path);
+        std::string engine = "fdm";
+        if (cfg["solver"] && cfg["solver"]["engine"]) engine = cfg["solver"]["engine"].as<std::string>();
+
+        if (engine == "fem") {
+            omfdm::fem::FemEngine fem(config_path, image_path);
+            omfdm::fem::FemEngineResult info;
+            int rc = fem.run(base_folder, &info);
+            std::cout << "\n========================================" << std::endl;
+            if (rc == 0) std::cout << "FEM analysis completed successfully!" << std::endl;
+            else std::cout << "FEM analysis failed: " << info.error << std::endl;
+            std::cout << "========================================" << std::endl;
+            return rc;
+        }
+
         MagneticFieldAnalyzer analyzer(config_path, image_path);
 
         // Check if transient analysis is enabled
