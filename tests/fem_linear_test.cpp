@@ -55,7 +55,7 @@ int main() {
             makeFiles(dir, n);
             FemEngine eng((dir / "config.yaml").string(), (dir / "model.png").string());
             eng.setSourceFunction([&](double x, double y) {
-                return -nu * (M_PI*M_PI/(L*L) + M_PI*M_PI/(L*L)) * std::sin(M_PI*x/L) * std::sin(M_PI*y/L);
+                return nu * (M_PI*M_PI/(L*L) + M_PI*M_PI/(L*L)) * std::sin(M_PI*x/L) * std::sin(M_PI*y/L);
             });
             FemEngineResult info;
             int rc = eng.run((dir / "out").string(), &info);

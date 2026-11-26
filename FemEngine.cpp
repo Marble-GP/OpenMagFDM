@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -321,7 +323,16 @@ bool FemEngine::buildMesh(std::string& err) {
     try {
         mesh_ = MeshBuilder::build(imageRaw_, materials_, dx_, dy_, meshOpts_, extraInteriorPoints_);
     } catch (const std::exception& e) { err = std::string("mesh build failed: ") + e.what(); return false; }
-    if (!mesh_.quality.passed) { err = "FEM_MESH_FAILED: " + mesh_.quality.failureReason; return false; }
+    if (!mesh_.quality.passed) {
+        std::fprintf(stderr,
+            "FEM mesh quality: minAngle=%.4f deg maxAngle=%.4f deg inverted=%d "
+            "nonConforming=%d coverageLoss=%.3e triangles=%zu vertices=%zu reason=%s\n",
+            mesh_.quality.minAngleDeg, mesh_.quality.maxAngleDeg, mesh_.quality.invertedCount,
+            mesh_.quality.nonConformingCount, mesh_.quality.coverageLoss,
+            mesh_.triangles.size(), mesh_.vertices.size(),
+            mesh_.quality.failureReason.c_str());
+        err = "FEM_MESH_FAILED: " + mesh_.quality.failureReason; return false;
+    }
     if (mesh_.vertices.size() > (size_t)meshOpts_.maxNodes) { err = "FEM_MESH_TOO_LARGE"; return false; }
     // mask and vertex incidence (shared by export, forces and refinement)
     mask_ = MeshBuilder::buildMask(imageFlippedRgb_, materials_);
@@ -367,6 +378,13 @@ int FemEngine::findTriangle(double x, double y) const {
             if (pointInTri(x,y,mesh_,ti,l0,l1,l2)) return ti;
         }
     }
+    // A point outside the domain rectangle cannot be inside any triangle.
+    // Rejecting it here keeps force/flux sampling queries that probe just
+    // beyond the boundary from degrading into an O(triangles) linear scan,
+    // which dominated export postprocessing on large meshes.
+    const double Lx = (nx_ - 1) * dx_, Ly = (ny_ - 1) * dy_;
+    const double tol = 1e-12 * std::max({std::fabs(dx_), std::fabs(dy_), 1e-30});
+    if (x < -tol || x > Lx + tol || y < -tol || y > Ly + tol) return -1;
     return findTri(mesh_, x, y);
 }
 
@@ -452,7 +470,7 @@ void FemEngine::assemble() {
         const double matJz = (mid >= 0 && mid < (int)matData_.size()) ? matData_[mid].jz : 0.0;
         const double jz = sourceFn_ ? sourceFn_((p0.x+p1.x+p2.x)/3.0, (p0.y+p1.y+p2.y)/3.0) : matJz;
         if (jz != 0.0)
-            for (int a = 0; a < 3; ++a) rhs_[vi[a]] -= jz * area / 3.0;
+            for (int a = 0; a < 3; ++a) rhs_[vi[a]] += jz * area / 3.0;
     }
 
     // Prescribed permanent-magnet surface currents. Induced magnetization is
@@ -485,8 +503,8 @@ void FemEngine::assemble() {
             const int vi0 = findVertex(p0), vi1 = findVertex(p1);
             if (vi0 < 0 || vi1 < 0) continue;
             const double contrib = Kz * len * 0.5;
-            rhs_[vi0] -= contrib;
-            rhs_[vi1] -= contrib;
+            rhs_[vi0] += contrib;
+            rhs_[vi1] += contrib;
         }
     }
 
@@ -599,6 +617,15 @@ bool FemEngine::solveLinear() {
 }
 
 void FemEngine::exportResults(const std::string& outDir) {
+    const bool profile = std::getenv("OMFDM_PROFILE") != nullptr;
+    auto clk = std::chrono::steady_clock::now();
+    auto mark = [&](const char* phase) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "FEM_PROFILE export_%s %.3f s\n", phase,
+                     std::chrono::duration<double>(now - clk).count());
+        clk = now;
+    };
     fs::create_directories(outDir);
     // create subdirs
     for (const char* d : {"Az","Mu","H","Jz","EnergyDensity","Forces","FluxLinkage","BoundaryImg","InputImg","Mesh"}) {
@@ -653,6 +680,7 @@ void FemEngine::exportResults(const std::string& outDir) {
     Eigen::MatrixXd Ht = Hmag.transpose();
     Eigen::MatrixXd Jt = Jz.transpose();
     Eigen::MatrixXd Et = Ed.transpose();
+    mark("sample_lattice");
 
     MagneticFieldAnalyzer::ExportConfig opts;
     bool writeCsv = false, writeTiff = true;
@@ -682,6 +710,7 @@ void FemEngine::exportResults(const std::string& outDir) {
     // copy input image
     cv::Mat inp = cv::imread(imagePath_, cv::IMREAD_COLOR);
     if (!inp.empty()) cv::imwrite(outDir + "/InputImg/step_0001.png", inp);
+    mark("write_fields");
 
     // Mesh artifact includes bounds, coordinate convention and missing samples.
     std::ofstream mf(outDir + "/Mesh/mesh.json");
@@ -693,6 +722,7 @@ void FemEngine::exportResults(const std::string& outDir) {
        << ",\"coordinates\":\"pixel-point-y-up\""
        << ",\"missing_samples\":" << missingSamples << "}";
     mf.close();
+    mark("mesh_hash");
 
     // Direct FemEngine users do not go through MagFDMsolver's conditions
     // exporter. Create a minimal file only when it is absent; never overwrite
@@ -837,6 +867,7 @@ void FemEngine::exportResults(const std::string& outDir) {
     }
     ff << "_SYSTEM_TOTAL,0,0,0,0,0,0,0,0,0," << E << ",0\n";
     ff.close();
+    mark("forces");
 
     // flux linkage (material-pair variant)
     if (config_["flux_linkage"]) {
@@ -898,6 +929,7 @@ void FemEngine::exportResults(const std::string& outDir) {
            << lastIterations_ << "," << std::scientific << std::setprecision(10) << lastResidual_ << "\n";
         statusFile.close();
     }
+    mark("postprocess");
 }
 
 // ---- Phase 2 helpers ----
@@ -1382,16 +1414,30 @@ void FemEngine::refine(const std::string& outDir) {
 int FemEngine::run(const std::string& outDir, FemEngineResult* info) {
     FemEngineResult res;
     std::string err;
+    const bool profile = std::getenv("OMFDM_PROFILE") != nullptr;
+    auto clk = std::chrono::steady_clock::now();
+    auto mark = [&](const char* phase) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "FEM_PROFILE %s %.3f s\n", phase,
+                     std::chrono::duration<double>(now - clk).count());
+        clk = now;
+    };
     if (!parseConfig(err)) { res.exitCode = 1; res.error = err; if(info)*info=res; std::cerr << err << std::endl; return 1; }
+    mark("parse_config");
     if (!loadImage(err)) { res.exitCode = 1; res.error = err; if(info)*info=res; std::cerr << err << std::endl; return 1; }
+    mark("load_image");
     if (!buildMesh(err)) { res.exitCode = 1; res.error = err; if(info)*info=res; std::cerr << err << std::endl; return 1; }
+    mark("build_mesh");
     parseRobinPeriodic();
     int rc = 0;
-    if (refinementEnabled_) { refine(outDir); rc = solve(); }
+    if (refinementEnabled_) { refine(outDir); mark("refine"); rc = solve(); }
     else { rc = solve(); }
+    mark("solve");
     res.nodes = (int)mesh_.vertices.size();
     res.triangles = (int)mesh_.triangles.size();
     exportResults(outDir);
+    mark("export");
     res.exitCode = rc;
     if (rc == 1) res.error = "FEM_SOLVE_FAILED: factorization or solve failure";
     else if (rc == 2) res.error = "FEM_NONCONVERGED: nonlinear solver did not reach tolerance";

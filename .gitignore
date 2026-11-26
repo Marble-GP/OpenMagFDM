@@ -113,5 +113,9 @@ technical_report.md
 
 
 poc_active_contour.html
+# Benchmark run outputs (keep the directory via .gitkeep)
+benchmarks/fem_vs_fdm/results/*
+!benchmarks/fem_vs_fdm/results/.gitkeep
+
 # prbot review work files
 .prbot/work/

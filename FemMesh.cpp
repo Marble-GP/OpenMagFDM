@@ -115,26 +115,28 @@ static double arcLen(const std::vector<Point2D>& p) {
 static std::vector<Point2D> resampleClosed(const std::vector<Point2D>& in, double spacing) {
     if (in.size() < 3 || spacing <= 0) return in;
     const size_t n = in.size();
-    std::vector<double> cum(n + 1, 0.0); // cum[k] = arc length from in[0] to in[k]; cum[n] = perimeter
-    for (size_t k = 1; k <= n; ++k) {
-        const Point2D& a = in[k - 1];
-        const Point2D& b = in[k % n];
-        cum[k] = cum[k - 1] + std::hypot(b.x - a.x, b.y - a.y);
-    }
-    const double total = cum[n];
-    if (total < 1e-30) return in;
-    const int count = std::max(3, (int)std::ceil(total / spacing));
+    // Resample each edge independently, always keeping the original vertices
+    // exactly. Uniform arc-length sampling of the whole loop
+    // (ceil(total/spacing) points at k/count*total) silently cuts every
+    // polygon corner whenever total/spacing is not an exact integer ratio:
+    // the corner's arc position then falls between two samples and the CDT
+    // polygon is chamfered, leaving corner pixels outside the mesh (NaN
+    // exports) and distorting material interfaces.
     std::vector<Point2D> out;
-    out.reserve(count);
-    size_t seg = 0;
-    for (int k = 0; k < count; ++k) {
-        const double s = (double)k / count * total;
-        while (seg + 1 < n && cum[seg + 1] < s) ++seg;
-        const double segLen = cum[seg + 1] - cum[seg];
-        const double t = segLen > 1e-30 ? (s - cum[seg]) / segLen : 0.0;
-        const Point2D& a = in[seg];
-        const Point2D& b = in[(seg + 1) % n];
-        out.push_back({a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)});
+    for (size_t i = 0; i < n; ++i) {
+        const Point2D& a = in[i];
+        const Point2D& b = in[(i + 1) % n];
+        const double segLen = std::hypot(b.x - a.x, b.y - a.y);
+        if (!out.empty() &&
+            std::hypot(a.x - out.back().x, a.y - out.back().y) < 1e-12)
+            continue; // duplicate/degenerate joint
+        out.push_back(a);
+        if (segLen < 1e-30) continue;
+        const int sub = std::max(1, (int)std::ceil(segLen / spacing));
+        for (int k = 1; k < sub; ++k) {
+            const double t = (double)k / (double)sub;
+            out.push_back({a.x + t * (b.x - a.x), a.y + t * (b.y - a.y)});
+        }
     }
     return out;
 }
@@ -446,9 +448,16 @@ FemMesh MeshBuilder::build(const cv::Mat& imageRgb,
     try {
         tri.insertEdges(edges);
         // Ruppert-style refinement to remove small angles from staircased boundaries.
+        // The refinement target must sit strictly above the acceptance gate:
+        // empirically the CDT refinement stops 20-30% short of its target
+        // (target 10 deg -> ~7.1 deg achieved, 15 -> ~11.9), so refining
+        // exactly to the gate value guarantees spurious FEM_MESH_FAILED
+        // rejections on faithful, corner-exact polygons.
+        const double refineTargetDeg =
+            std::min(35.0, std::max(opts.minAngleDeg * 2.0, opts.minAngleDeg + 10.0));
         try {
             tri.refineTriangles((CDT::VertInd)opts.maxNodes, CDT::RefinementCriterion::SmallestAngle,
-                                CDT::degToRad((double)opts.minAngleDeg), nullptr, 1e-9,
+                                CDT::degToRad(refineTargetDeg), nullptr, 1e-9,
                                 CDT::RefinementOrder::WorstFirst);
         } catch (...) {
             refinementFailed = true;

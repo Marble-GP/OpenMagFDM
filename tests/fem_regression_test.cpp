@@ -205,7 +205,7 @@ static int testBoundaryConditions() {
     const double nu = 1.0 / (4.0 * M_PI * 1e-7);
     per.setSourceFunction([&](double x, double y) {
         (void)x;
-        return -nu * (M_PI*M_PI/(L*L)) * std::sin(M_PI*y/L);
+        return nu * (M_PI*M_PI/(L*L)) * std::sin(M_PI*y/L);
     });
     if (per.run((dir / "periodic_out").string()) != 0)
         return fail("bc: periodic solve failed");
@@ -241,7 +241,7 @@ static int testBoundaryConditions() {
     FemEngine anti((dir / "antiperiodic.yaml").string(), (dir / "model.png").string());
     anti.setSourceFunction([&](double x, double y) {
         const double kx = M_PI/L, ky = M_PI/L;
-        return -nu * (kx*kx + ky*ky) * std::sin(kx*x) * std::sin(ky*y);
+        return nu * (kx*kx + ky*ky) * std::sin(kx*x) * std::sin(ky*y);
     });
     if (anti.run((dir / "antiperiodic_out").string()) != 0)
         return fail("bc: antiperiodic solve failed");
@@ -296,7 +296,9 @@ static int testIntegration() {
         return fail("integration: force/flux solve failed");
     const double fxLeft = forceX(dir / "out" / "Forces" / "step_0001.csv", "left");
     const double fxRight = forceX(dir / "out" / "Forces" / "step_0001.csv", "right");
-    if (!(fxLeft > 0.0) || !(fxRight < 0.0))
+    // Opposite currents repel: left (+jz) is pushed left (fx<0), right (-jz)
+    // is pushed right (fx>0). The prior assertion encoded the wrong RHS sign.
+    if (!(fxLeft < 0.0) || !(fxRight > 0.0))
         return fail("integration: free-current force sign is reversed fx=" + std::to_string(fxLeft) + "," + std::to_string(fxRight));
     if (!fileContains(dir / "out" / "Forces" / "step_0001.csv", "Material,RGB_R,RGB_G,RGB_B,Force_X[N/m]"))
         return fail("integration: Forces CSV header does not match FDM");
@@ -334,7 +336,7 @@ static int testIntegration() {
     FemEngine refined((refineDir / "config.yaml").string(), (refineDir / "model.png").string());
     const double nu = 1.0 / (4.0 * M_PI * 1e-7);
     refined.setSourceFunction([&](double x, double y) {
-        return -nu * (2.0*M_PI*M_PI/(0.01*0.01)) * std::sin(M_PI*x/0.01) * std::sin(M_PI*y/0.01);
+        return nu * (2.0*M_PI*M_PI/(0.01*0.01)) * std::sin(M_PI*x/0.01) * std::sin(M_PI*y/0.01);
     });
     if (refined.run((refineDir / "out").string()) != 0)
         return fail("integration: adaptive refinement failed");
