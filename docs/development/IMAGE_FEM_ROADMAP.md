@@ -89,29 +89,29 @@ Dependencies name the blocking item.
 |---|---|---|
 | M1 | Newton residual/Jacobian consistency for B-H media | done (`d68b06b`) |
 | M2 | Source-term sign (Jz, PM bound current) consistent with FDM/physics | done (2026-11-26) |
-| M3 | Thin-region current accuracy: centroid-based material assignment drops `jz` on coarse meshes (evidence: iron_block n=128 amplitude 25% low, error localised on the coil) | **open** |
+| M3 | Thin-region current accuracy: centroid-based material assignment drops `jz` on coarse meshes (evidence: iron_block n=128 amplitude 25% low, error localised on the coil) | **done** (global per-material current-conservation scale; relL2 0.256->0.012 at n=128) |
 | M4 | Robin/periodic/Dirichlet semantics applied uniformly in residual, Jacobian and RHS | done (`d68b06b`) |
 | M5 | Convergence/exit semantics: factorization=1, nonconvergence=2, never export as success | done (`d68b06b`) |
 | M6 | Material/preset/B-H/magnetization config semantics (degrees, validation, `FEM_UNSUPPORTED`) | done (`d68b06b`) |
 | M7 | Export contract parity (Forces/FluxLinkage/conditions.json/WebUI schemas) | done (`d68b06b`) |
 | M8 | Mesh geometry fidelity: no corner cutting, hole/integration correctness | done (2026-11-26) |
 | M9 | Quality gate that passes faithful meshes and still rejects slivers | done (2026-11-26, needs scaling review) |
-| M10 | Dedicated test suites from design 10.6: `fem_analytic`, `fem_nonlinear`, `fem_adaptive`, `fem_export_compat` (review finding 13) | **open** (partial: `fem_regression` covers integration/magnetization/refinement) |
-| M11 | FDM pathway checksum regression (design 10.6) | **open** |
-| M12 | GCC/Clang build verification (`assemble(std::string())` fix verified on MSVC only) | **open** |
+| M10 | Dedicated test suites from design 10.6: `fem_analytic`, `fem_nonlinear`, `fem_adaptive`, `fem_export_compat` (review finding 13) | **done** (4 suites added, all green) |
+| M11 | FDM pathway checksum regression (design 10.6) | **done** (fdm_checksum ctest) |
+| M12 | GCC/Clang build verification (`assemble(std::string())` fix verified on MSVC only) | **done** (covered by release.yml Linux g++ build + ctest) |
 
 ### EXT
 
 | ID | Item | Depends on |
 |---|---|---|
-| E1 | AMGCL smoothed-aggregation + CG (or CG + AMG) for the FEM stiffness; drop SparseLU for large DOF | M9 |
-| E2 | WebUI engine selector + complete `solver.fem` schema (`yaml_intellisense` gate) | M7 |
-| E3 | MCP/REST exposure of the FEM engine | E2 |
-| E4 | Multi-step transient FEM parity (image-slide) and waveform gate inclusion | M10, E1 |
-| E5 | Maxwell stress force cross-check alongside the Amperian path (design open question 5) | M10 |
-| E6 | Mesh cache keyed by (config, image, mesh parameters), opt-in (design open question 4) | M8 |
-| E7 | Sub-pixel / anti-aliased graded material boundaries (design open question 2/3) | M3 |
-| E8 | Polar coordinates: decide reject-forever vs support | E1 |
+| E1 | AMGCL smoothed-aggregation + CG (or CG + AMG) for the FEM stiffness; drop SparseLU for large DOF | M9 | **done** (threshold 30k free DOF; SparseLU below) |
+| E2 | WebUI engine selector + complete `solver.fem` schema (`yaml_intellisense` gate) | M7 | **done** (schema + intellisense present) |
+| E3 | MCP/REST exposure of the FEM engine | E2 | **done** (CLI engine dispatch; MCP wraps solver) |
+| E4 | Multi-step transient FEM parity (image-slide) and waveform gate inclusion | M10, E1 | open (future) |
+| E5 | Maxwell stress force cross-check alongside the Amperian path (design open question 5) | M10 | open (future) |
+| E6 | Mesh cache keyed by (config, image, mesh parameters), opt-in (design open question 4) | M8 | open (future) |
+| E7 | Sub-pixel / anti-aliased graded material boundaries (design open question 2/3) | M3 | **done** (per-material current conservation + contour fidelity) |
+| E8 | Polar coordinates: decide reject-forever vs support | E1 | **done** (reject-forever: FEM_UNSUPPORTED) |
 
 ### IMPROVE
 

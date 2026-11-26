@@ -77,6 +77,7 @@ private:
     };
     std::vector<MatData> matData_;
     std::vector<double> nodeMu_;   // per-vertex mu (for export)
+    std::vector<double> jzScale_;  // per-material current-conservation scale for thin regions
     std::vector<double> elemMu_;   // per-element secant mu
     std::vector<std::vector<int>> vertexTriangles_; // vertex -> incident elements
     std::vector<std::vector<int>> triangleGrid_;    // uniform point-location grid

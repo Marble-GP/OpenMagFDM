@@ -114,6 +114,16 @@ if(BUILD_TESTING)
     add_test(NAME input_snapshot COMMAND input_snapshot_test "${CMAKE_CURRENT_BINARY_DIR}/snapshot-test-artifacts")
 endif()
 
+if(BUILD_TESTING)
+    find_program(PYTHON_EXECUTABLE py)
+    if(PYTHON_EXECUTABLE)
+        add_test(NAME fdm_checksum
+            COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/fdm_checksum.py
+                    ${CMAKE_CURRENT_BINARY_DIR}/Release/MagFDMsolver.exe
+                    ${CMAKE_CURRENT_BINARY_DIR}/fdm_checksum_artifacts)
+    endif()
+endif()
+
 # v1.6 domain-decomposition wall-time benchmark (reuses the analyzer as patch solvers)
 add_executable(dd_bench dd_bench.cpp)
 target_link_libraries(dd_bench PRIVATE omfdm_core)
@@ -163,4 +173,24 @@ if(BUILD_TESTING)
     target_include_directories(fem_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(fem_regression_test PRIVATE omfdm_core)
     add_test(NAME fem_regression COMMAND fem_regression_test)
+
+    add_executable(fem_analytic_test tests/fem_analytic_test.cpp)
+    target_include_directories(fem_analytic_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(fem_analytic_test PRIVATE omfdm_core)
+    add_test(NAME fem_analytic COMMAND fem_analytic_test)
+
+    add_executable(fem_nonlinear_test tests/fem_nonlinear_test.cpp)
+    target_include_directories(fem_nonlinear_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(fem_nonlinear_test PRIVATE omfdm_core)
+    add_test(NAME fem_nonlinear COMMAND fem_nonlinear_test)
+
+    add_executable(fem_adaptive_test tests/fem_adaptive_test.cpp)
+    target_include_directories(fem_adaptive_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(fem_adaptive_test PRIVATE omfdm_core)
+    add_test(NAME fem_adaptive COMMAND fem_adaptive_test)
+
+    add_executable(fem_export_compat_test tests/fem_export_compat_test.cpp)
+    target_include_directories(fem_export_compat_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(fem_export_compat_test PRIVATE omfdm_core)
+    add_test(NAME fem_export_compat COMMAND fem_export_compat_test)
 endif()

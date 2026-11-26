@@ -1,5 +1,12 @@
 #include "FemEngine.h"
 
+#include <amgcl/adapter/eigen.hpp>
+#include <amgcl/amg.hpp>
+#include <amgcl/backend/builtin.hpp>
+#include <amgcl/coarsening/smoothed_aggregation.hpp>
+#include <amgcl/relaxation/spai0.hpp>
+#include <amgcl/solver/cg.hpp>
+
 #include "MagneticFieldAnalyzer.h"
 
 #include <Eigen/Sparse>
@@ -23,6 +30,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+AMGCL_USE_EIGEN_VECTORS_WITH_BUILTIN_BACKEND();
 
 namespace omfdm {
 namespace fem {
@@ -442,8 +451,44 @@ void FemEngine::assemble() {
     elemMu_.clear();
     elemMu_.reserve(mesh_.triangles.size());
 
+    // Per-material current-conservation scale for thin regions: OpenCV traces
+    // pixel centres, so the mesh contour is inset and the integrated Jz on
+    // coarse meshes falls below the true pixel current. Scale each material's
+    // Jz by (true pixel count) / (mesh triangle area in pixels) to conserve
+    // the total current without changing mesh geometry.
+    jzScale_.assign(matData_.size(), 1.0);
+    {
+        std::vector<double> truePx(matData_.size(), 0.0);
+        for (int y = 0; y < ny_; ++y)
+            for (int x = 0; x < nx_; ++x) {
+                int m = (x + y * nx_ < (int)mask_.size()) ? mask_[y * nx_ + x] : -1;
+                if (m >= 0 && m < (int)matData_.size() && matData_[m].jz != 0.0) truePx[m] += 1.0;
+            }
+        std::vector<double> meshPx(matData_.size(), 0.0);
+        for (const auto& tri : mesh_.triangles) {
+            const auto& p0 = mesh_.vertices[tri.v[0]].p;
+            const auto& p1 = mesh_.vertices[tri.v[1]].p;
+            const auto& p2 = mesh_.vertices[tri.v[2]].p;
+            double a = (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
+            a = std::fabs(a) * 0.5;
+            if (tri.material >= 0 && tri.material < (int)matData_.size())
+                meshPx[tri.material] += a / (dx_ * dy_);
+        }
+        for (size_t m = 0; m < matData_.size(); ++m) {
+            if (meshPx[m] > 1e-12 && truePx[m] > 0.0) {
+                double sc = truePx[m] / meshPx[m];
+                // Only correct significant inset (thin regions). Materials whose
+                // mesh already covers their pixel area (e.g. background air)
+                // keep scale 1 to avoid spurious amplitude drift.
+                if (sc < 1.05) sc = 1.0;
+                jzScale_[m] = sc;
+            }
+        }
+    }
+
     // Element stiffness evaluated at the current A_z. For B-H materials this
     // makes K_ * A_ - rhs_ the actual nonlinear residual, not a linear surrogate.
+    std::map<int, double> _jzAreaAccum;
     for (const auto& tri : mesh_.triangles) {
         const int vi[3] = {tri.v[0], tri.v[1], tri.v[2]};
         const auto& p0 = mesh_.vertices[vi[0]].p;
@@ -468,9 +513,15 @@ void FemEngine::assemble() {
                     nu * area * (g[a][0]*g[b][0] + g[a][1]*g[b][1])));
 
         const double matJz = (mid >= 0 && mid < (int)matData_.size()) ? matData_[mid].jz : 0.0;
-        const double jz = sourceFn_ ? sourceFn_((p0.x+p1.x+p2.x)/3.0, (p0.y+p1.y+p2.y)/3.0) : matJz;
-        if (jz != 0.0)
+        double jz = matJz;
+        if (mid >= 0 && mid < (int)jzScale_.size()) jz *= jzScale_[mid];
+        if (sourceFn_) {
+            jz = sourceFn_((p0.x + p1.x + p2.x) / 3.0, (p0.y + p1.y + p2.y) / 3.0);
+        }
+        if (jz != 0.0) {
             for (int a = 0; a < 3; ++a) rhs_[vi[a]] += jz * area / 3.0;
+            _jzAreaAccum[mid] += jz * area;
+        }
     }
 
     // Prescribed permanent-magnet surface currents. Induced magnetization is
@@ -538,6 +589,12 @@ void FemEngine::assemble() {
         trips.push_back(Eigen::Triplet<double>(pr.first, pr.second, -P*sign));
         trips.push_back(Eigen::Triplet<double>(pr.second, pr.first, -P*sign));
     }
+    if (std::getenv("OMFDM_PROFILE")) {
+        std::fprintf(stderr, "FEM_PROFILE jz_area_by_material:");
+        for (const auto& kv : _jzAreaAccum)
+            std::fprintf(stderr, " mid%d=%.6g", kv.first, kv.second);
+        std::fprintf(stderr, " (total triangles=%zu)\\n", mesh_.triangles.size());
+    }
     K_.setFromTriplets(trips.begin(), trips.end());
 
     nodeMu_.assign(N, mu0());
@@ -587,18 +644,54 @@ bool FemEngine::solveLinear() {
     for (int vi = 0; vi < (int)roots.size(); ++vi)
         if (roots[vi] >= 0) rf[roots[vi]] -= signs[vi] * r0[vi];
 
-    Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
-    solver.compute(Kff);
-    if (solver.info() != Eigen::Success || freeNodes.empty()) {
-        std::cerr << "FEM: factorization failed" << std::endl;
-        A_.setZero(K_.rows());
-        return false;
-    }
-    const Eigen::VectorXd af = solver.solve(rf);
-    if (solver.info() != Eigen::Success) {
-        std::cerr << "FEM: solve failed" << std::endl;
-        A_.setZero(K_.rows());
-        return false;
+    Eigen::VectorXd af;
+    const size_t nFree = freeNodes.size();
+    if (nFree > 30000) {
+        // AMGCL smoothed-aggregation AMG + CG for large systems (E1).
+        typedef amgcl::make_solver<
+            amgcl::amg<
+                amgcl::backend::builtin<double>,
+                amgcl::coarsening::smoothed_aggregation,
+                amgcl::relaxation::spai0
+            >,
+            amgcl::solver::cg<amgcl::backend::builtin<double>>
+        > AMGSolver;
+        std::vector<double> rhs_vec(rf.data(), rf.data() + rf.size());
+        std::vector<double> x_vec(rf.size(), 0.0);
+        AMGSolver::params params;
+        params.solver.tol = 1e-10;
+        params.solver.maxiter = 5000;
+        bool ok = true;
+        try {
+            AMGSolver amg(Kff, params);
+            auto [iters, err] = amg(rhs_vec, x_vec);
+            if (err > 1e-6) ok = false;
+        } catch (...) { ok = false; }
+        if (!ok) {
+            // Fallback to SparseLU.
+            Eigen::SparseLU<Eigen::SparseMatrix<double>> fb;
+            fb.compute(Kff);
+            if (fb.info() != Eigen::Success) { A_.setZero(K_.rows()); return false; }
+            Eigen::VectorXd x = fb.solve(rf);
+            if (fb.info() != Eigen::Success) { A_.setZero(K_.rows()); return false; }
+            af = x;
+        } else {
+            af = Eigen::Map<Eigen::VectorXd>(x_vec.data(), x_vec.size());
+        }
+    } else {
+        Eigen::SparseLU<Eigen::SparseMatrix<double>> solver;
+        solver.compute(Kff);
+        if (solver.info() != Eigen::Success) {
+            std::cerr << "FEM: factorization failed" << std::endl;
+            A_.setZero(K_.rows());
+            return false;
+        }
+        af = solver.solve(rf);
+        if (solver.info() != Eigen::Success) {
+            std::cerr << "FEM: solve failed" << std::endl;
+            A_.setZero(K_.rows());
+            return false;
+        }
     }
     A_.setZero(K_.rows());
     for (const auto& kv : fixed) A_[kv.first] = kv.second;

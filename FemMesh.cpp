@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <set>
 #include <sstream>
@@ -651,6 +652,13 @@ FemMesh MeshBuilder::build(const cv::Mat& imageRgb,
         expectedArea += c.isHole ? -std::fabs(signedPolygonArea(c.points))
                                  :  std::fabs(signedPolygonArea(c.points));
     const double coverageLoss = expectedArea > 1e-30 ? std::max(0.0, 1.0 - triangleArea / expectedArea) : 0.0;
+    if (std::getenv("OMFDM_PROFILE")) {
+        for (const auto& c : mesh.contours)
+            std::fprintf(stderr, "FEM_PROFILE contour: matIn=%d isHole=%d pts=%zu area=%.6g\\n",
+                         c.materialInside, c.isHole, c.points.size(), std::fabs(signedPolygonArea(c.points)));
+        std::fprintf(stderr, "FEM_PROFILE mesh_area: expectedArea=%.6g triangleArea=%.6g coverageLoss=%.3e\\n",
+                     expectedArea, triangleArea, coverageLoss);
+    }
     if (mesh.triangles.empty()) { minA = 0; maxA = 0; }
     mesh.quality.minAngleDeg = minA;
     mesh.quality.maxAngleDeg = maxA;
